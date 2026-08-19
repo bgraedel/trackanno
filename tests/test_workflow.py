@@ -497,7 +497,7 @@ def test_task_panel(app) -> None:
 
 
 def test_hub(app, project_config: Path) -> None:
-    from trackanno.gui.hub import PAGES, DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import PAGES, ConfigPage, DistributionPage, ExportPage, Hub
 
     hub = Hub(str(project_config))
     hub.show()
@@ -588,13 +588,51 @@ def test_hub(app, project_config: Path) -> None:
     # in the detection model row rather than off in a corner.
     from qtpy.QtWidgets import QPushButton
 
-    row = config_page.form._widgets["paths.model"].layout()
+    row = config_page.form._widgets["paths.model"].row
     labels = [row.itemAt(i).widget().text() for i in range(row.count())
               if isinstance(row.itemAt(i).widget(), QPushButton)]
     check("the shared-model button leads the detection model row",
           labels == ["Choose shared model...", "Browse"], str(labels))
     check("and says what it does rather than where it comes from",
           "shared model" in labels[0].lower())
+
+    # A project running a downloaded model still has a file path in
+    # paths.model, so the field on its own reads as the wrong answer.
+    field = config_page.form._widgets["paths.model"]
+    # isHidden, not isVisible: the page itself may not be the one on screen.
+    check("nothing is claimed while the project uses a local file",
+          field.status.isHidden() and not field.status.text(), field.status.text())
+
+    from trackanno.project import write_config as _write
+
+    _write(project_config, {"model.source": "some-model", "model.version": "v3"})
+    hub.open_project(project_config)
+    app.processEvents()
+    field = next(p for p in hub.pages if isinstance(p, ConfigPage)).form._widgets["paths.model"]
+    check("with a shared model it names the one in use",
+          "some-model v3" in field.status.text(), field.status.text())
+    check("and says the path is not what runs",
+          "not used" in field.status.text() and not field.status.isHidden())
+    check("the path is greyed out, since nothing reads it", not field.edit.isEnabled())
+    check("and carries no amber outline for pointing at nothing",
+          "paths.model" not in (config_page._show_warnings() or {}))
+    _write(project_config, {"model.source": ""})
+    hub.open_project(project_config)
+    app.processEvents()
+
+    # What is wrong on Detect & crop is a sentence, so it goes under the
+    # buttons rather than into the strip left over beside them.
+    from trackanno.gui.hub import PreparePage
+
+    prepare_page = next(p for p in hub.pages if isinstance(p, PreparePage))
+    box = prepare_page.scan_state.parentWidget().layout()
+    rows = [box.itemAt(i) for i in range(box.count())]
+    button_row = next(i for i, it in enumerate(rows) if it.layout() is not None)
+    label_row = next(i for i, it in enumerate(rows)
+                     if it.widget() is prepare_page.scan_state)
+    check("the scan message sits below the button row, not in it",
+          label_row == button_row + 1, f"buttons at {button_row}, message at {label_row}")
+    check("and wraps rather than being clipped", prepare_page.scan_state.wordWrap())
 
     hub.close()
     app.processEvents()

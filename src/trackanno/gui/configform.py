@@ -636,10 +636,26 @@ class _PathField(QWidget):
         button = QPushButton("Browse")
         button.setFixedWidth(70)
         button.clicked.connect(self._browse)
-        layout = QHBoxLayout(self)
+        # A second line under the row, for a field whose value is not the whole
+        # story: paths.model reads as a file even when a downloaded model is
+        # what the project actually runs.
+        self.status = QLabel("")
+        self.status.setProperty("role", "muted")
+        self.status.setWordWrap(True)
+        self.status.setVisible(False)
+        self.row = QHBoxLayout()
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.addWidget(self.edit, 1)
+        self.row.addWidget(button)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.edit, 1)
-        layout.addWidget(button)
+        layout.setSpacing(2)
+        layout.addLayout(self.row)
+        layout.addWidget(self.status)
+
+    def set_status(self, text: str) -> None:
+        self.status.setText(text)
+        self.status.setVisible(bool(text))
 
     def setToolTip(self, text):  # noqa: N802 (Qt naming)
         super().setToolTip(text)

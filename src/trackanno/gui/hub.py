@@ -531,7 +531,7 @@ class ConfigPage(Page):
         self.registry_btn.clicked.connect(self._pick_registry_model)
         model_field = self.form._widgets.get("paths.model")
         if model_field is not None:
-            model_field.layout().insertWidget(1, self.registry_btn)
+            model_field.row.insertWidget(1, self.registry_btn)
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
@@ -576,6 +576,37 @@ class ConfigPage(Page):
         self.banner.setStyleSheet(banner_style("danger"))
         self.pose_notice.setStyleSheet(banner_style("warning"))
         self._show_warnings()
+
+    def _sync_model_status(self) -> None:
+        """Say which model the project actually runs.
+
+        paths.model still holds a file path when a downloaded model is in use,
+        so the field alone reads as the wrong answer.
+        """
+        field = self.form._widgets.get("paths.model")
+        if field is None or not hasattr(field, "set_status"):
+            return
+        spec = getattr(self.cfg, "model", None) if self.cfg else None
+        if spec is None or not spec.is_remote:
+            field.set_status("")
+            field.edit.setEnabled(True)
+            return
+
+        from ..models import cache_dir, find_model, local_model_path
+
+        entry = find_model(spec.source, spec.version)
+        name = " ".join(b for b in (spec.source, spec.version) if b)
+        here = local_model_path(self.cfg)
+        if here.exists() and cache_dir() in here.parents:
+            where = f"cached, {here.stat().st_size / 1e6:.0f} MB"
+        elif entry is None:
+            where = "not in this registry"
+        else:
+            where = "downloads when detection runs"
+        field.set_status(
+            f"using shared model <b>{name}</b> ({where}). The path above is not used."
+        )
+        field.edit.setEnabled(False)
 
     def _pick_registry_model(self) -> None:
         """Choose shared weights, fetch them, and let them configure the project."""
@@ -752,12 +783,18 @@ class ConfigPage(Page):
         self._save_timer.stop()
         self.banner.setVisible(False)
         self.state.setText("")
+        self._sync_model_status()
         self._show_warnings()
 
     def _show_warnings(self) -> None:
         """Amber outlines for things that point at nothing. Never blocks a save."""
         root = self.cfg.path.parent if self.cfg else None
         warnings = {**self.form.warnings(root), **self.advanced.warnings(root)}
+        # A shared model makes paths.model dead text, so an amber outline on it
+        # would be pointing at a value nothing reads.
+        spec = getattr(self.cfg, "model", None) if self.cfg else None
+        if spec is not None and spec.is_remote:
+            warnings.pop("paths.model", None)
         self.form.mark(warnings)
         self.advanced.mark(warnings)
         picker = self.advanced._widgets.get("suggest.feature_groups")
@@ -1040,7 +1077,7 @@ class PreparePage(Page):
         movie_bar.addWidget(self.select_all)
         movie_bar.addWidget(self.select_none)
         movie_bar.addWidget(self.fix_button)
-        movie_bar.addWidget(self.scan_state, 1)
+        movie_bar.addStretch(1)
 
         self.force = QCheckBox("redo movies that are already prepared")
         self.limit_frames = QSpinBox()
@@ -1069,6 +1106,10 @@ class PreparePage(Page):
         movies_box = QGroupBox("Movies")
         movies_layout = QVBoxLayout(movies_box)
         movies_layout.addLayout(movie_bar)
+        # Under the buttons, not beside them: what is wrong is usually a
+        # sentence, and a sentence in the space left over by four buttons
+        # wraps to three cramped lines.
+        movies_layout.addWidget(self.scan_state)
         movies_layout.addWidget(self.movies)
 
         splitter = QSplitter(Qt.Vertical)
