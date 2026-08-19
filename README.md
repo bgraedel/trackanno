@@ -224,31 +224,36 @@ always names the current set while each entry points at one immutable asset:
 
 ```json
 {"models": [{
-  "id": "leishmania-pose", "version": "v2", "task": "pose", "modality": "brightfield",
-  "url": "https://github.com/bgraedel/leishmania-models/releases/download/v2/leishmania-pose.pt",
+  "id": "leishmania-pose", "version": "v2",
+  "framework": "ultralytics", "task": "pose", "modality": "brightfield",
+  "url": "https://github.com/bgraedel/leishmania-models/releases/download/v2/best_pose.pt",
   "sha256": "9f3c...", "size": 52428800,
-  "notes": "8-point flagellum, brightfield 20x",
+  "notes": "8-point flagellum, 20x",
   "config": {
     "detection": {"imgsz": 1280, "conf": 0.25},
     "tiling": {"tile": 640, "overlap": 96},
-    "keypoints": {"nodes": ["Head", "Base", "Flag1", "Flag2", "Flag3", "Flag4", "Flag5", "Tip"],
+    "keypoints": {"nodes": ["Head", "Base", "Flag1", "..."],
                   "edges": [["Head", "Base"], ["Base", "Flag1"]]}},
-  "assumes": {"fps": 100, "pixel_size_um": 0.325}}]}
+  "preprocess": {},
+  "assumes": {"fps": 100, "pixel_size_um": [0.2, 0.65]}}]}
 ```
 
-`modality` and `task` are for choosing rather than for applying. A registry may
-list segmentation or classification models beside the detectors, and often will;
-trackanno drives `detect` and `pose`, so anything else is listed, described and
-downloadable, marked as one it cannot set as a project's detector, and its task
-is reported rather than written into `detection.task`.
+`config` is keyed by consumer. trackanno reads `detection`, `tiling`,
+`tracking`, `clips` and `spectral` and ignores the rest, so a cellpose entry can
+carry `config.cellpose` in the same index. `preprocess` says how pixels reach the
+model, for frameworks that do not handle that themselves.
 
-The `config` block is where the value is. A checkpoint already reports its task,
-keypoint count and class names, and `read_model_info` recovers those. It cannot
-report the keypoint **names**, the skeleton **edges** (which the section below
-notes cannot be inferred at all), the `imgsz` it was validated at, or a tile size
-that suits it. Those are applied to the project and reported, never changed
-silently, and `assumes` becomes a warning where the movies disagree rather than a
-correction.
+The value is in what a checkpoint cannot report: the keypoint **names**, the
+skeleton **edges**, the resolution it was validated at, a tile size that suits
+it. Those are applied to the project and reported, never changed silently.
+
+`assumes` takes a number or a list, so a model trained across magnifications
+states `[0.2, 0.65]` and a project is checked for containment rather than
+equality. It is never applied, only warned about.
+
+`framework` names what loads the file. trackanno runs `ultralytics` `detect` and
+`pose` models; anything else is listed with what it is, marked as one it cannot
+drive, and left to whatever does run it.
 
 **Three rules, all about not running the wrong code.** Loading a checkpoint
 executes the pickle inside it, so this is a security boundary rather than a
@@ -607,7 +612,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eleven suites, 132 tests, 1003 named checks. `uv sync` installs pytest. Nothing is
+Eleven suites, 134 tests, 1019 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
