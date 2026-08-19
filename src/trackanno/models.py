@@ -47,7 +47,7 @@ __all__ = [
     "ModelEntry", "registry_url", "set_registry_url", "list_models", "find_model",
     "cache_dir", "cached_path", "fetch", "resolve_model", "apply_manifest",
     "prune_cache", "RegistryError", "is_trusted_url", "local_model_path",
-    "token", "set_token",
+    "token", "set_token", "RUNNABLE_TASKS",
 ]
 
 REGISTRY_FILE = "registry.json"
@@ -56,6 +56,13 @@ INDEX_NAME = "index.json"
 ENV_REGISTRY = "TRACKANNO_MODEL_REGISTRY"
 CHUNK = 1 << 20
 TIMEOUT = 30.0
+
+# What trackanno can drive as a detector. A registry may list anything, and
+# often will: segmentation and fluorescence models are useful to publish beside
+# these even while this tool cannot run them. They are shown and explained
+# rather than hidden, since a registry that silently omits half its contents is
+# worse than one that says why.
+RUNNABLE_TASKS = ("detect", "pose")
 
 
 class RegistryError(RuntimeError):
@@ -86,6 +93,7 @@ class ModelEntry:
     size: int = 0
     filename: str = ""
     asset: str = ""
+    modality: str = ""
     notes: str = ""
     config: dict = field(default_factory=dict)
     assumes: dict = field(default_factory=dict)
@@ -95,9 +103,26 @@ class ModelEntry:
         bits = [self.id]
         if self.version:
             bits.append(self.version)
-        if self.task:
-            bits.append(f"({self.task})")
+        kind = " ".join(b for b in (self.modality, self.task) if b)
+        if kind:
+            bits.append(f"({kind})")
         return " ".join(bits)
+
+    @property
+    def runnable(self) -> bool:
+        """Whether trackanno can use this as its detector."""
+        return not self.task or self.task in RUNNABLE_TASKS
+
+    @property
+    def unsupported_reason(self) -> str:
+        """Why this cannot be used here, or "" when it can."""
+        if self.runnable:
+            return ""
+        return (
+            f"trackanno runs {' and '.join(RUNNABLE_TASKS)} models; {self.id} is a "
+            f"{self.task} model. It is listed so it can be found and downloaded, "
+            "but it cannot be set as this project's detector."
+        )
 
     @property
     def name(self) -> str:
@@ -131,6 +156,7 @@ class ModelEntry:
             size=int(d.get("size") or 0),
             filename=str(d.get("filename", "") or "").strip(),
             asset=str(d.get("asset", "") or "").strip(),
+            modality=str(d.get("modality", "") or "").strip(),
             notes=str(d.get("notes", "") or "").strip(),
             config=dict(d.get("config") or {}),
             assumes=dict(d.get("assumes") or {}),
@@ -570,7 +596,12 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
                 updates[f"{section}.{key}"] = value
                 told.append(f"{section}.{key} {value}")
 
-    if entry.task and before.detection.task != entry.task:
+    # A task this tool cannot drive is reported rather than written: setting
+    # detection.task to something the loader rejects would fail the whole apply
+    # with a config error, which says nothing about what actually went wrong.
+    if entry.task and not entry.runnable:
+        told.append(f"NOT applied: {entry.unsupported_reason}")
+    elif entry.task and before.detection.task != entry.task:
         updates["detection.task"] = entry.task
         told.append(f"task {entry.task}")
 

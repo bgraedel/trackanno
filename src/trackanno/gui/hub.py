@@ -903,6 +903,7 @@ class ModelRegistryDialog(QDialog):
         self.url = QLineEdit(registry_url())
         self.url.setPlaceholderText(
             "https://github.com/<owner>/<repo>/releases/latest/download/index.json"
+            "   or   github://owner/repo"
         )
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._refresh)
@@ -972,13 +973,15 @@ class ModelRegistryDialog(QDialog):
 
     def _describe(self) -> None:
         entry = self.chosen()
-        self.ok.setEnabled(entry is not None)
+        self.ok.setEnabled(entry is not None and entry.runnable)
         if entry is None:
             return
         size = f"{entry.size / 1e6:.0f} MB" if entry.size else "size unknown"
-        self.detail.setText(
-            f"{entry.notes or 'no description'}\n{size}   |   {entry.url}"
-        )
+        where = entry.url or f"asset {entry.asset}"
+        lines = [entry.notes or "no description", f"{size}   |   {where}"]
+        if not entry.runnable:
+            lines.insert(0, entry.unsupported_reason)
+        self.detail.setText("\n".join(lines))
 
     def chosen(self):
         row = self.list.currentRow()

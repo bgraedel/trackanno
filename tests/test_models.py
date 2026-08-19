@@ -365,3 +365,37 @@ def test_a_token_is_only_ever_sent_to_github(root, monkeypatch) -> None:
         pass
     check("but api.github.com does get one",
           any(k.lower() == "authorization" for k in sent), str(sent))
+
+
+def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch) -> None:
+    """The registry is broader than trackanno: segmentation and fluorescence
+    models belong beside the detectors even while this tool cannot drive them.
+
+    Hiding them would make the registry lie about its own contents, and writing
+    their task into detection.task would fail the whole apply with a config
+    error that says nothing about the real reason.
+    """
+    seg = M.ModelEntry(id="leish-seg", url="https://example.org/seg.pt",
+                       task="segment", modality="fluorescence",
+                       config={"detection": {"imgsz": 1024}})
+    check("a segmentation model parses fine", seg.task == "segment")
+    check("but is not runnable here", not seg.runnable)
+    check("and says why, naming what this tool does run",
+          "segment" in seg.unsupported_reason and "detect" in seg.unsupported_reason)
+    check("the modality shows in the picker label",
+          "fluorescence" in seg.label and "leish-seg" in seg.label, seg.label)
+
+    pose = M.ModelEntry(id="p", url="https://example.org/p.pt", task="pose")
+    detect = M.ModelEntry(id="d", url="https://example.org/d.pt", task="detect")
+    unstated = M.ModelEntry(id="u", url="https://example.org/u.pt")
+    check("pose and detect are runnable", pose.runnable and detect.runnable)
+    check("and so is an entry that does not state a task", unstated.runnable)
+
+    path = create_project(root / "seg")
+    told = M.apply_manifest(path, seg)
+    cfg = load_config(path)
+    check("its inference settings still apply", cfg.detection.imgsz == 1024)
+    check("the task is left alone rather than written and rejected",
+          cfg.detection.task in ("detect", "pose"), cfg.detection.task)
+    check("and the report says it was not applied",
+          any(t.startswith("NOT applied") for t in told), str(told))

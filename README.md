@@ -19,7 +19,7 @@ trackanno                             # the pipeline in one window
 ```
 
 Replace `trackanno` with `.` from a clone, or with
-`git+https://github.com/<you>/trackanno`.
+`git+https://github.com/bgraedel/trackanno`.
 
 `uv tool install` puts `trackanno` on PATH in an isolated environment.
 
@@ -219,13 +219,13 @@ model:
 ```
 
 The index is one release asset, so
-`https://github.com/<owner>/<repo>/releases/latest/download/index.json` always
-names the current set while each entry points at one immutable asset:
+`https://github.com/bgraedel/leishmania-models/releases/latest/download/index.json`
+always names the current set while each entry points at one immutable asset:
 
 ```json
 {"models": [{
-  "id": "trypanosome-pose", "version": "v2", "task": "pose",
-  "url": "https://github.com/<owner>/<repo>/releases/download/v2/trypanosome-pose.pt",
+  "id": "leishmania-pose", "version": "v2", "task": "pose", "modality": "brightfield",
+  "url": "https://github.com/bgraedel/leishmania-models/releases/download/v2/leishmania-pose.pt",
   "sha256": "9f3c...", "size": 52428800,
   "notes": "8-point flagellum, brightfield 20x",
   "config": {
@@ -235,6 +235,12 @@ names the current set while each entry points at one immutable asset:
                   "edges": [["Head", "Base"], ["Base", "Flag1"]]}},
   "assumes": {"fps": 100, "pixel_size_um": 0.325}}]}
 ```
+
+`modality` and `task` are for choosing rather than for applying. A registry may
+list segmentation or classification models beside the detectors, and often will;
+trackanno drives `detect` and `pose`, so anything else is listed, described and
+downloadable, marked as one it cannot set as a project's detector, and its task
+is reported rather than written into `detection.task`.
 
 The `config` block is where the value is. A checkpoint already reports its task,
 keypoint count and class names, and `read_model_info` recovers those. It cannot
@@ -601,7 +607,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eleven suites, 129 tests, 983 named checks. `uv sync` installs pytest. Nothing is
+Eleven suites, 132 tests, 1003 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
