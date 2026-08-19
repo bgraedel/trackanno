@@ -11,18 +11,36 @@ advances.
 ## Install
 
 ```bash
-uv tool install --with catboost .     # or git+https://github.com/<you>/trackanno
-trackanno                             # the whole pipeline in one window
+uv tool install --with catboost "trackanno[cuda]"    # NVIDIA, Linux or Windows
+uv tool install --with catboost "trackanno[mps]"     # Apple Silicon
+uv tool install --with catboost trackanno            # CPU
+
+trackanno                                            # the pipeline in one window
 ```
 
-`uv tool install` puts `trackanno` on PATH in an isolated environment. Add
-`--with catboost` for the label suggester; without it the suggester falls back to
-scikit-learn.
+Replace `trackanno` with `.` from a clone, or with
+`git+https://github.com/<you>/trackanno`.
+
+`uv tool install` puts `trackanno` on PATH in an isolated environment.
+`--with catboost` adds the label suggester's preferred backend; without it the
+suggester falls back to scikit-learn.
+
+**The GPU backend is chosen at install time**, because torch ships one wheel per
+backend rather than loading one at runtime. The bracketed extras select it;
+`--with` installs an additional package and cannot. `[cuda]` takes torch from
+PyTorch's cu124 index and is unavailable on macOS. `[mps]` takes the ordinary
+PyPI wheel, which on Apple Silicon already carries Metal support, and requires
+macOS 14 or later. Without either, torch comes from PyPI for the running
+platform.
+
+`detection.device: auto` (the default in a new project) then selects the first
+CUDA device, else MPS, else the CPU, so a `config.yaml` moves between a Mac and a
+CUDA box unchanged.
 
 From a clone:
 
 ```bash
-uv sync                    # add --extra cuda for GPU torch
+uv sync                    # add --extra cuda or --extra mps
 uv run gui.py
 ```
 
@@ -120,9 +138,12 @@ that re-admits any object too large to be complete in any tile. Frames fitting a
 single tile skip the mechanism.
 
 **Tracking.** `model.track()` owns the inference stream and would track tiles
-rather than frames, so ultralytics' `BYTETracker` is driven directly with the
-merged full-frame boxes. `tracking.backend: greedy` selects a nearest-centroid
-tracker, adequate at 100 fps where per-frame motion is ~1 px.
+rather than frames, so an ultralytics tracker is driven directly with the merged
+full-frame boxes. `tracking.backend` defaults to `tracktrack`, built for crowded
+scenes with frequent occlusion, which is what ~50 organisms in one field of view
+produce; `bytetrack`, `botsort`, `ocsort`, `deepocsort` and `fasttrack` are also
+available, and `greedy` selects a nearest-centroid tracker that is adequate at
+100 fps where per-frame motion is ~1 px. `tracktrack` needs ultralytics >= 8.4.
 
 **Output** in `work/<movie_id>/`:
 
@@ -544,8 +565,9 @@ uv run prepare.py --self-test --tile 320 --movies <id>
 
 * `requires-python >=3.10,<3.13`; `.python-version` pins 3.12, since torch has no
   3.13 wheels. `uv` fetches the interpreter.
-* `uv sync` installs CPU torch; `uv sync --extra cuda` installs the CUDA build.
-  On a small GPU, lower `detection.batch` and `tiling.tile` first.
+* `uv sync --extra cuda` and `--extra mps` are declared as conflicting extras,
+  so the lockfile carries a separate torch resolution for each. On a small GPU,
+  lower `detection.batch` and `tiling.tile` first.
 * `opencv-python` is overridden out of the resolution in favour of
   `opencv-python-headless`. ultralytics pulls the former, which ships its own Qt
   plugins and conflicts with PyQt at startup.

@@ -89,8 +89,9 @@ detection:
   iou: 0.5            # per-tile NMS
   imgsz: 640          # inference size - match what the model was trained at
   max_det: 300
-  device: "0"         # "0" for the first GPU, "cpu" otherwise
-  batch: 8            # tiles per forward pass (lower if CUDA runs out of memory)
+  device: auto        # auto = first CUDA GPU, else Apple MPS, else the CPU.
+                      # "0" pins the first CUDA device, "mps", or "cpu".
+  batch: 8            # tiles per forward pass (lower if the GPU runs out of memory)
   half: false
 
 
@@ -110,7 +111,7 @@ tiling:
 
 # --- Tracking ----------------------------------------------------------------
 tracking:
-  backend: bytetrack        # bytetrack | botsort | tracktrack | ocsort | greedy
+  backend: tracktrack       # tracktrack | bytetrack | botsort | ocsort | greedy
   tracker_cfg: ""           # "" = the backend's bundled ultralytics yaml
   overrides:
     # Compensates for CAMERA motion. On a static stage everything that moves is

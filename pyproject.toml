@@ -42,8 +42,26 @@ dev = ["pytest>=8"]
 catboost = [
     "catboost>=1.2",
 ]
-# `uv sync --extra cuda` pulls CUDA wheels instead of the CPU-only default.
-cuda = ["torch>=2.2", "torchvision>=0.17"]
+# The GPU backend is chosen at INSTALL time, because torch ships one wheel per
+# backend rather than loading one at runtime. Pick with the extra, not with
+# `--with`, which installs a package rather than selecting an extra:
+#
+#     uv tool install "trackanno[cuda]"      NVIDIA, Linux and Windows
+#     uv tool install "trackanno[mps]"       Apple Silicon
+#     uv tool install trackanno              CPU
+#
+# `mps` resolves to the ordinary PyPI wheel, which on macOS arm64 already
+# carries Metal support; the marker keeps it from claiming anything elsewhere.
+# Either way `detection.device: auto` picks CUDA, then MPS, then the CPU, so a
+# config stays portable between machines.
+cuda = [
+    "torch>=2.2; sys_platform != 'darwin'",
+    "torchvision>=0.17; sys_platform != 'darwin'",
+]
+mps = [
+    "torch>=2.2; sys_platform == 'darwin'",
+    "torchvision>=0.17; sys_platform == 'darwin'",
+]
 # `uv sync --extra sleap` adds the optional SLEAP .h5 export (keypoint-MoSeq compatibility).
 sleap = ["sleap-io>=0.1"]
 
@@ -74,9 +92,22 @@ packages = ["src/trackanno"]
 [tool.uv]
 override-dependencies = ["opencv-python; python_version < '3.0'"]
 
+# The two GPU extras must resolve to different torch builds, so declare them in
+# conflict: without this the lock pins one torch for every platform and extra,
+# and the +cu124 build it picks has no macOS wheel, which breaks a plain install
+# on a Mac before any extra is asked for.
+conflicts = [[{ extra = "cuda" }, { extra = "mps" }]]
+
+# Only the cuda extra is redirected, and only off macOS: the cu124 index
+# publishes no macOS wheels, so without the marker `[cuda]` on a Mac fails to
+# resolve instead of falling back.
 [tool.uv.sources]
-torch = [{ index = "pytorch-cuda", extra = "cuda" }]
-torchvision = [{ index = "pytorch-cuda", extra = "cuda" }]
+torch = [
+    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform != 'darwin'" },
+]
+torchvision = [
+    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform != 'darwin'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cuda"

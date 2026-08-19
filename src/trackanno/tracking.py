@@ -5,9 +5,15 @@ stream, so with tiling it would track *tiles* rather than frames. Detection runs
 separately (see :mod:`trackanno.tiling`) and the tracker takes the merged
 full-frame boxes.
 
-Backends: any bundled ultralytics tracker (``bytetrack`` by default, fed through
-a small results shim), or ``greedy`` nearest-centroid matching with a distance
-gate - an adequate fallback at 100 fps, where per-frame motion is ~1 px.
+Backends: any bundled ultralytics tracker, fed through a small results shim, or
+``greedy`` nearest-centroid matching with a distance gate, which is adequate at
+100 fps where per-frame motion is ~1 px.
+
+``tracktrack`` is the default, being built for crowded scenes with frequent
+occlusion, which is what ~50 organisms in one field of view produce. It needs
+ultralytics >= 8.4; ``bytetrack`` is the conservative alternative, and the only
+backend with built-in defaults here, so it is also the one that survives a
+missing or unreadable tracker yaml.
 """
 
 from __future__ import annotations
