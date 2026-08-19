@@ -1,0 +1,34 @@
+# A project's own data lives beside its config.yaml, and none of it belongs in
+# the repository: the clip cache is gigabytes of pixels, the annotations are
+# somebody's judgement, and config.yaml carries absolute paths to their movies.
+work/
+annotations.csv
+annotations.csv.bak-*
+config.yaml
+predictions.parquet
+renders/
+
+# Model weights and anything derived from them.
+*.pt
+*.joblib
+*.parquet
+*.npy
+*.dat
+
+# Analysis scratch left beside the code by a one-off investigation.
+real_impact.csv
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Editors and platforms
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
