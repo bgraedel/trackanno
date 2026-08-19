@@ -3281,7 +3281,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'mps'", specifier = ">=0.17" },
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cu124", conflict = { package = "trackanno", extra = "cuda" } },
     { name = "tqdm", specifier = ">=4.66" },
-    { name = "ultralytics", specifier = ">=8.3" },
+    { name = "ultralytics", specifier = ">=8.4" },
 ]
 provides-extras = ["cuda", "mps", "sleap"]
 

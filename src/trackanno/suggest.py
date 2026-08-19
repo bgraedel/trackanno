@@ -199,7 +199,7 @@ def _fit(model, X, y, cfg: Config, reporter, label: str):
             reporter.raise_if_cancelled()
             return model
         except TypeError:
-            # Older CatBoost builds, and the GPU backend, reject `callbacks`.
+            # The GPU backend rejects `callbacks`; fit without the ticker.
             pass
     model.fit(X, y)
     reporter.advance(cfg.suggest.iterations)
@@ -686,19 +686,19 @@ class Suggester:
         # The name check below catches a renamed or dropped feature but not a
         # REDEFINED one, which is the failure that matters. Hence the version
         # stamp: bump ``FEATURE_VERSION`` whenever a feature's MEANING changes,
-        # not only when one is added. An absent stamp means version 1, never
-        # "unknown, assume fine" - reading it as None on both sides makes two
-        # unstamped artefacts agree.
-        fitted_on = int(payload.get("feature_version", 1))
-        built_with = 1
+        # not only when one is added. Both artefacts must carry it; an unstamped
+        # one is refused rather than assumed to match, since "unknown" is exactly
+        # the case the stamp exists to catch.
+        fitted_on = payload.get("feature_version")
+        built_with = None
         if "_feature_version" in features.columns and len(features):
             built_with = int(features["_feature_version"].iloc[0])
-        if fitted_on != built_with:
+        if fitted_on is None or built_with is None or int(fitted_on) != built_with:
             self.problem = (
                 f"this model was fitted on feature version {fitted_on!r} but "
                 f"{CLIP_FEATURES_FILE} was built with version {built_with!r}. The "
                 "columns may still line up by name while meaning something "
-                "different - retrain on the Model page rather than trusting it."
+                "different - rebuild the features and retrain on the Model page."
             )
             return False
 

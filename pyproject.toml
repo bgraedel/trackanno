@@ -19,7 +19,9 @@ dependencies = [
     "opencv-python-headless>=4.9",
     "imageio[ffmpeg]>=2.34",
     "tqdm>=4.66",
-    "ultralytics>=8.3",
+    # 8.4 for the TRACKTRACK tracker, which tracking.backend defaults to, and
+    # for the tracker __init__(args) / update(results, img) signature.
+    "ultralytics>=8.4",
     "torch>=2.2",
     "torchvision>=0.17",
     # qtpy is a shim over whichever binding is installed; name the binding

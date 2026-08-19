@@ -671,7 +671,6 @@ class UI:
     follow: str = "centred"
     view_zoom: float = 1.0
     smooth_window: int = 15
-    stabilised: bool = False       # legacy alias for follow: locked
     prefetch: int = 8
     resume: str = "first_unannotated"
     annotator: str = ""
@@ -688,11 +687,6 @@ class UI:
              "kymo_interpolate", "kymo_smooth_px", "kymo_field", "kymo_sign",
              "follow",
              "view_zoom", "smooth_window",
-             # Accepted and ignored rather than warned about: `zoom` was an
-             # integer upscale factor for the old fixed-size canvas, and
-             # `backend` chose between the built-in player and an embedded
-             # ndv.ArrayViewer, which no longer exists.
-             "stabilised", "zoom", "backend",
              "prefetch", "resume", "annotator", "shuffle", "shuffle_seed"],
         )
         resume = str(d.get("resume", "first_unannotated"))
@@ -702,10 +696,7 @@ class UI:
         if theme not in ("dark", "light", "system"):
             raise ConfigError("ui.theme must be 'dark', 'light' or 'system'")
 
-        # `stabilised: true` predates the three-way control and means "re-centre
-        # every frame"; honour it rather than reverting to a fixed view.
-        stabilised = bool(d.get("stabilised", False))
-        follow = str(d.get("follow", "locked" if stabilised else "centred"))
+        follow = str(d.get("follow", "centred"))
         if follow not in ("centred", "smooth", "locked"):
             raise ConfigError(
                 "ui.follow must be 'centred' (one view on the track's median position - all "
@@ -732,7 +723,6 @@ class UI:
             follow=follow,
             view_zoom=max(1.0, float(d.get("view_zoom", 1.0))),
             smooth_window=max(1, int(d.get("smooth_window", 15))),
-            stabilised=stabilised,
             prefetch=max(0, int(d.get("prefetch", 8))),
             resume=resume,
             annotator=str(d.get("annotator", "")),

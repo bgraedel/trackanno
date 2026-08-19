@@ -115,7 +115,7 @@ def build_case(
     """
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE
+    from trackanno.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
     from trackanno.config import load_config
     from trackanno.project import write_config
     from trackanno.store import AnnotationStore
@@ -159,6 +159,9 @@ def build_case(
         "f_start": manifest["f_start"].astype(int),
         "speed_mean": np.arange(len(manifest), dtype=float),
         "area_mean": np.linspace(10.0, 20.0, len(manifest)),
+        # Both artefacts carry the stamp, as build_clip_features and train do:
+        # Suggester.load refuses an unstamped pair rather than assuming it fits.
+        "_feature_version": FEATURE_VERSION,
     })
     features.to_parquet(work / CLIP_FEATURES_FILE, index=False)
 
@@ -166,7 +169,8 @@ def build_case(
     if model:
         joblib.dump(
             {"columns": ["speed_mean", "area_mean"],
-             "models": {g: StubModel() for g in wanted}},
+             "models": {g: StubModel() for g in wanted},
+             "feature_version": FEATURE_VERSION},
             work / MODEL_FILE,
         )
     if report:

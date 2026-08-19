@@ -545,14 +545,18 @@ def _stub_model_files(cfg, columns, extra_feature_columns=()):
 
     work = cfg.paths.work_dir
     work.mkdir(parents=True, exist_ok=True)
+    from trackanno.clipfeatures import FEATURE_VERSION
+
     frame = {"clip_id": ["a", "b"], "movie_id": ["m", "m"],
-             "track_id": [1, 2], "f_start": [0, 0]}
+             "track_id": [1, 2], "f_start": [0, 0],
+             "_feature_version": [FEATURE_VERSION, FEATURE_VERSION]}
     for i, name in enumerate(extra_feature_columns):
         frame[name] = [float(i), float(i) + 1.0]
     import pandas as pd
 
     pd.DataFrame(frame).to_parquet(work / CLIP_FEATURES_FILE, index=False)
-    joblib.dump({"columns": list(columns), "models": {"state": _ConstantModel()}},
+    joblib.dump({"columns": list(columns), "models": {"state": _ConstantModel()},
+                 "feature_version": FEATURE_VERSION},
                 work / MODEL_FILE)
 
 

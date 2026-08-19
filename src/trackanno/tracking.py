@@ -10,10 +10,10 @@ Backends: any bundled ultralytics tracker, fed through a small results shim, or
 100 fps where per-frame motion is ~1 px.
 
 ``tracktrack`` is the default, being built for crowded scenes with frequent
-occlusion, which is what ~50 organisms in one field of view produce. It needs
-ultralytics >= 8.4; ``bytetrack`` is the conservative alternative, and the only
-backend with built-in defaults here, so it is also the one that survives a
-missing or unreadable tracker yaml.
+occlusion, which is what ~50 organisms in one field of view produce.
+``bytetrack`` is the conservative alternative, and the only backend with
+built-in defaults here, so it is also the one that survives a missing or
+unreadable tracker yaml.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ _BYTETRACK_DEFAULTS = {
 }
 
 # name -> (ultralytics class, bundled config). All take __init__(args) and
-# update(results, img=None) in ultralytics >= 8.4.
+# update(results, img=None).
 TRACKERS = {
     "bytetrack": ("BYTETracker", "bytetrack.yaml"),
     "tracktrack": ("TRACKTRACK", "tracktrack.yaml"),
@@ -80,8 +80,7 @@ TRACKERS = {
 def _load_tracker_yaml(name: str) -> dict:
     """Read a tracker YAML by path, or by name from ultralytics' bundled configs.
 
-    Not via ultralytics' own yaml helpers: they move between releases
-    (``ultralytics.utils.yaml_load`` is gone in 8.4)."""
+    Not via ultralytics' own yaml helpers, which move between releases."""
     import yaml
 
     path = Path(name)
@@ -115,9 +114,9 @@ def _tracker_args(cfg: Config, fps: float):
         )
         params = dict(_BYTETRACK_DEFAULTS)
 
-    # ultralytics <= 8.3 scaled the lost-track buffer by frame_rate/30 internally,
-    # 8.4 takes track_buffer verbatim; scale here so the tolerance stays the same
-    # duration at any fps.
+    # ultralytics takes track_buffer verbatim, in frames. Scale it by fps/30, the
+    # rate its bundled yamls are written for, so the lost-track tolerance stays
+    # the same DURATION whatever the acquisition rate.
     if "track_buffer" in params:
         params["track_buffer"] = int(round(params["track_buffer"] * max(1.0, fps) / 30.0))
 
