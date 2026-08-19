@@ -19,7 +19,7 @@ from trackanno.clips import (
 )
 from trackanno.config import load_config
 from trackanno.movies import MovieSource, Normalizer
-from trackanno.overlay import build_clip_view, render_clip_rgb, render_view_rgb
+from trackanno.overlay import build_clip_view, render_clip_rgb
 from trackanno.store import AnnotationStore
 from trackanno.tiling import tile_grid
 
@@ -302,10 +302,6 @@ def test_pipeline(root, cfg, movie, tracks) -> None:
     zoomed = build_clip_view(clip_boxes, clip.shape[0], size, mode="locked", zoom=2.0)
     check("zoom halves the visible square", abs(zoomed.side - size / 2) < 1e-6)
 
-    view_rgb = render_view_rgb(clip, zoomed, cfg)
-    check("rasterised view keeps the cache shape",
-          view_rgb.shape == (clip.shape[0], size, size, 3), f"got {view_rgb.shape}")
-    check("rasterised view is not the raw clip", not np.array_equal(view_rgb[..., 0], clip))
 
     # A clip whose track was never detected must still produce a usable view.
     empty = build_clip_view(clip_boxes.iloc[0:0], clip.shape[0], size, mode="locked")

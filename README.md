@@ -11,19 +11,17 @@ advances.
 ## Install
 
 ```bash
-uv tool install --with catboost "trackanno[cuda]"    # NVIDIA, Linux or Windows
-uv tool install --with catboost "trackanno[mps]"     # Apple Silicon
-uv tool install --with catboost trackanno            # CPU
+uv tool install "trackanno[cuda]"     # NVIDIA, Linux or Windows
+uv tool install "trackanno[mps]"      # Apple Silicon
+uv tool install trackanno             # CPU
 
-trackanno                                            # the pipeline in one window
+trackanno                             # the pipeline in one window
 ```
 
 Replace `trackanno` with `.` from a clone, or with
 `git+https://github.com/<you>/trackanno`.
 
 `uv tool install` puts `trackanno` on PATH in an isolated environment.
-`--with catboost` adds the label suggester's preferred backend; without it the
-suggester falls back to scikit-learn.
 
 **The GPU backend is chosen at install time**, because torch ships one wheel per
 backend rather than loading one at runtime. The bracketed extras select it;
@@ -228,16 +226,11 @@ TIFF carries no frame rate, so set `tiff.fps`.
 
 ```bash
 uv run annotate.py
-uv run annotate.py --backend ndv         # embed ndv.ArrayViewer
 uv run annotate.py --csv other.csv       # a second annotator's log
 ```
 
 The screen the workflow window hosts on its Annotate page, in a window of its
 own.
-
-`ui.backend: simple` (default) is a built-in player and the only backend that
-draws the marker as a separate vector layer with centring and zoom as view
-transforms. `ndv` takes a finished array, so both are burned into pixels there.
 
 **One keypress labels and advances.** With `ui.auto_advance: true`, picking a
 value in a single-choice group commits the row and moves on once every
@@ -364,7 +357,8 @@ Trains a classifier on the labels so far and displays its prediction on the next
 clip without pre-selecting it, so labels stay statistically independent of the
 model trained on them.
 
-**CatBoost is the default**, for two properties of this data:
+**CatBoost is the default**, and an ordinary dependency, for two properties of
+this data:
 
 * **The label distribution is lopsided.** One state dominates and the interesting
   states are rare, so an unweighted model scores well by predicting the majority.
@@ -377,8 +371,7 @@ CatBoost trees are symmetric, so `suggest.depth` alone sets the width at
 2<sup>depth</sup> leaves. The default 5 is 32 leaves; 6 is 64, which overfits a
 few-hundred-clip hand-labelled set quickly. Feature importances come from the fit
 rather than from column shuffling. `suggest.model: hist` selects scikit-learn's
-HistGradientBoosting with matched hyperparameters, and is the automatic fallback
-when catboost is absent.
+HistGradientBoosting with matched hyperparameters.
 
 **Feature families.** `suggest.feature_groups` selects what the model may see.
 The Configure page disables families this project cannot compute and states why.
@@ -522,7 +515,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Ten suites, 112 tests, 910 named checks. `uv sync` installs pytest. Nothing is
+Ten suites, 112 tests, 908 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real

@@ -1,15 +1,11 @@
 """Clip viewers behind one small interface.
 
-``SimpleViewer``, the default, is a self-contained player (canvas + QTimer +
-slider) and does two things a generic array viewer cannot. The overlay is never
-rasterised: the cached clip stays grayscale and the marker is vector graphics
-over the zoomed frame, one hairline wide at 1x or 8x. Centring and zoom are
-display-time transforms of a :class:`~trackanno.overlay.ClipView`, unclamped, so
-a clip cropped at the movie border still shows the animal dead centre.
-
-``NdvViewer`` embeds ``ndv.ArrayViewer`` via its ``.widget()`` accessor and has
-no overlay layer, so it takes a pre-rasterised RGB stack and loses the
-crispness; ``ui.backend: auto`` tries it first.
+``SimpleViewer`` is a self-contained player (canvas + QTimer + slider) that does
+two things a generic array viewer cannot. The overlay is never rasterised: the
+cached clip stays grayscale and the marker is vector graphics over the zoomed
+frame, one hairline wide at 1x or 8x. Centring and zoom are display-time
+transforms of a :class:`~trackanno.overlay.ClipView`, unclamped, so a clip
+cropped at the movie border still shows the animal dead centre.
 """
 
 from __future__ import annotations
@@ -24,7 +20,7 @@ from qtpy.QtWidgets import (
 from ..overlay import CONTEXT_RGB, TARGET_RGB, ClipView
 from .theme import tokens
 
-__all__ = ["ClipViewer", "SimpleViewer", "NdvViewer", "ClipCanvas", "build_viewer"]
+__all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas"]
 
 def _background() -> QColor:
     """Deliberately darker than the window: the crop should read as film, not
@@ -367,120 +363,3 @@ class SimpleViewer(ClipViewer):
         if self._array is not None:
             self._counter.setText(f"{self._frame + 1} / {self._array.shape[0]}")
         self.frame_changed.emit(self._frame)
-
-
-# --------------------------------------------------------------------------- #
-# ndv
-# --------------------------------------------------------------------------- #
-class NdvViewer(ClipViewer):
-    """Embeds ndv.ArrayViewer. Raises on construction if ndv is unusable."""
-
-    def __init__(self, fps: int = 30, loop: bool = True, parent=None):
-        super().__init__(parent)
-        import ndv
-
-        self._viewer = ndv.ArrayViewer()
-        widget = self._viewer.widget()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(widget)
-
-        self._n_frames = 0
-        self._frame = 0
-        self._loop = loop
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._advance)
-        self.set_fps(fps)
-
-    def set_clip(self, array: np.ndarray, view: ClipView | None = None) -> None:
-        # ndv needs the whole array up front; the caller pre-composes it
-        # (AnnotationWidget._load).
-        self._n_frames = int(array.shape[0])
-        self._frame = 0
-        model = self._viewer.display_model
-        if array.ndim == 4:
-            # RGB overlay stack (T, H, W, 3). ndv defaults visible_axes to the
-            # last two - here (W, C) - so declare the colour axis AND move the
-            # visible axes to (H, W), or ndv renders nothing.
-            try:
-                self._viewer.data = array
-                model.visible_axes = (-3, -2)
-                model.channel_axis = array.ndim - 1
-                model.channel_mode = "rgba"
-            except Exception:
-                # Any ndv version that will not take RGB gets the luminance view.
-                self._reset_to_gray()
-                self._viewer.data = np.ascontiguousarray(array[..., 0])
-        else:
-            self._reset_to_gray()
-            self._viewer.data = array
-        self._set_index(0)
-
-    def set_overlay(self, show: bool, context: bool = False, skeleton: bool = False) -> None:
-        pass  # ndv has no overlay layer; the caller rasterises instead
-
-    def clear(self) -> None:
-        try:
-            self._viewer.data = np.zeros((1, 1, 1), np.uint8)
-        except Exception:
-            pass
-
-    def _reset_to_gray(self) -> None:
-        """Undo the RGB configuration, or a later grayscale clip renders wrong."""
-        model = self._viewer.display_model
-        for attr, value in (("channel_mode", "grayscale"), ("channel_axis", None),
-                            ("visible_axes", (-2, -1))):
-            try:
-                setattr(model, attr, value)
-            except Exception:
-                pass
-
-    def _set_index(self, t: int) -> None:
-        try:
-            self._viewer.display_model.current_index.update({0: int(t)})
-        except Exception:
-            pass
-
-    def set_fps(self, fps: int) -> None:
-        self._timer.setInterval(max(10, int(1000 / max(1, fps))))
-
-    def play(self) -> None:
-        self._timer.start()
-
-    def pause(self) -> None:
-        self._timer.stop()
-
-    def toggle_play(self) -> None:
-        self.pause() if self._timer.isActive() else self.play()
-
-    @property
-    def is_playing(self) -> bool:
-        return self._timer.isActive()
-
-    def _advance(self) -> None:
-        if self._n_frames <= 1:
-            return
-        self._frame += 1
-        if self._frame >= self._n_frames:
-            if not self._loop:
-                self.pause()
-                return
-            self._frame = 0
-        self._set_index(self._frame)
-        self.frame_changed.emit(self._frame)
-
-
-def build_viewer(backend: str, fps: int, loop: bool) -> tuple[ClipViewer, str]:
-    """Returns (viewer, backend_actually_used). ``simple`` is the default: it
-    alone draws the marker as a separate vector layer and treats centring as a
-    transform. ndv takes a finished array, so with it both are burned in.
-    """
-    if backend in ("auto", "ndv"):
-        try:
-            return NdvViewer(fps=fps, loop=loop), "ndv"
-        except Exception as exc:
-            if backend == "ndv":
-                raise RuntimeError(f"ui.backend is 'ndv' but ndv failed to start: {exc}") from exc
-            print(f"[trackanno] ndv unavailable ({exc}); using the built-in viewer")
-    return SimpleViewer(fps=fps, loop=loop), "simple"

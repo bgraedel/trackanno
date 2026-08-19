@@ -173,7 +173,7 @@ features:
 # model trained on them. It stays silent until it clears a chance-corrected bar.
 suggest:
   enabled: true
-  model: hist           # hist (sklearn) | catboost (uv sync --extra catboost)
+  model: catboost       # catboost | hist (sklearn HistGradientBoosting)
   # Which families of measurement the model may use. Drop 'cnn' if you want a
   # behaviour model rather than one that can re-identify individuals; drop
   # 'pose'/'waveform' automatically happens when detection.task is 'detect'.
@@ -247,9 +247,6 @@ categories:
 # --- GUI ---------------------------------------------------------------------
 ui:
   theme: dark          # dark | light | system (follow the desktop)
-  backend: simple       # simple = built-in player, and the only backend that
-                        # draws the marker as vectors rather than into pixels
-                        # ndv    = embed ndv.ArrayViewer  |  auto = try ndv first
   fps: 20               # playback rate in the GUI (not the acquisition rate)
   autoplay: true
   loop: true

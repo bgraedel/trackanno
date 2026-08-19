@@ -654,7 +654,6 @@ def _one_of(value, allowed, where: str) -> str:
 
 @dataclass
 class UI:
-    backend: str = "simple"
     theme: str = "dark"
     fps: int = 30
     autoplay: bool = True
@@ -683,19 +682,19 @@ class UI:
     def parse(cls, d: dict) -> "UI":
         _known(
             "ui", d,
-            ["backend", "theme", "fps", "autoplay", "loop", "auto_advance", "show_overlay",
+            ["theme", "fps", "autoplay", "loop", "auto_advance", "show_overlay",
              "show_skeleton",
              "show_context_tracks", "show_minimap", "show_kymograph",
              "kymo_interpolate", "kymo_smooth_px", "kymo_field", "kymo_sign",
              "follow",
              "view_zoom", "smooth_window",
-             # `zoom` was an integer upscale factor for the old fixed-size
-             # canvas; accepted and ignored rather than warned about.
-             "stabilised", "zoom", "prefetch", "resume", "annotator", "shuffle", "shuffle_seed"],
+             # Accepted and ignored rather than warned about: `zoom` was an
+             # integer upscale factor for the old fixed-size canvas, and
+             # `backend` chose between the built-in player and an embedded
+             # ndv.ArrayViewer, which no longer exists.
+             "stabilised", "zoom", "backend",
+             "prefetch", "resume", "annotator", "shuffle", "shuffle_seed"],
         )
-        backend = str(d.get("backend", "simple"))
-        if backend not in ("auto", "ndv", "simple"):
-            raise ConfigError("ui.backend must be 'auto', 'ndv' or 'simple'")
         resume = str(d.get("resume", "first_unannotated"))
         if resume not in ("first_unannotated", "last_position"):
             raise ConfigError("ui.resume must be 'first_unannotated' or 'last_position'")
@@ -714,7 +713,6 @@ class UI:
                 "beat kept) or 'locked' (re-centred every frame - translation invisible)"
             )
         return cls(
-            backend=backend,
             theme=theme,
             fps=int(d.get("fps", 30)),
             autoplay=bool(d.get("autoplay", True)),

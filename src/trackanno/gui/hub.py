@@ -1066,7 +1066,7 @@ class AnnotatePage(Page):
             tuple(sorted((k, tuple(v)) for k, v in self.cfg.keys.items())),
             tuple(self.cfg.keypoints.nodes), tuple(self.cfg.keypoints.edges),
             # Everything the panel or store reads at write time, ui.annotator too.
-            ui.backend, ui.shuffle, ui.shuffle_seed, ui.resume, ui.annotator,
+            ui.shuffle, ui.shuffle_seed, ui.resume, ui.annotator,
             ui.auto_advance, ui.follow, ui.view_zoom, ui.smooth_window, ui.fps,
             ui.show_overlay, ui.show_context_tracks, ui.show_skeleton,
             ui.show_minimap, ui.prefetch, ui.autoplay, ui.loop,

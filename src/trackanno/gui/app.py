@@ -37,14 +37,14 @@ from qtpy.QtWidgets import (
 
 from ..clips import ClipStore
 from ..config import Config, load_config
-from ..overlay import FOLLOW_MODES, build_clip_view, render_view_rgb
+from ..overlay import FOLLOW_MODES, build_clip_view
 from ..store import AnnotationStore
 from ..suggest import Suggester
 from .panels import CategoryPanel, MetadataPanel, MinimapWidget
 from .prefetch import Prefetcher
 from .theme import app_icon, apply_theme, compact_button
 from .kymograph import KymographView
-from .viewer import build_viewer
+from .viewer import SimpleViewer
 
 STATE_FILE = ".gui_state.json"
 
@@ -116,10 +116,7 @@ class AnnotationWidget(QWidget):
         self.status_message.emit(message, timeout)
 
     def _build_ui(self) -> None:
-        self.viewer, backend = build_viewer(
-            self.cfg.ui.backend, self.cfg.ui.fps, self.cfg.ui.loop
-        )
-        self._backend = backend
+        self.viewer = SimpleViewer(fps=self.cfg.ui.fps, loop=self.cfg.ui.loop)
         if hasattr(self.viewer, "set_edges"):
             self.viewer.set_edges(self.cfg.keypoints.edge_idx if self.cfg.is_pose else [])
 
@@ -407,22 +404,11 @@ class AnnotationWidget(QWidget):
         self._boxes = self.store.clip_boxes(index)
         view = self._build_view(self._clip.shape[0], self._clip.shape[1])
 
-        if self._backend == "simple":
-            # Grayscale in, marker painted as vectors: no RGB stack is ever built.
-            self.viewer.set_overlay(
-                self.show_overlay, self.show_context, self.cfg.ui.show_skeleton
-            )
-            self.viewer.set_clip(self._clip, view)
-        else:
-            # ndv takes a finished array, so rasterise the same geometry.
-            self.viewer.set_clip(
-                render_view_rgb(
-                    self._clip, view, self.cfg,
-                    show_overlay=self.show_overlay,
-                    show_skeleton=self.cfg.ui.show_skeleton,
-                    show_context=self.show_context,
-                )
-            )
+        # Grayscale in, marker painted as vectors: no RGB stack is ever built.
+        self.viewer.set_overlay(
+            self.show_overlay, self.show_context, self.cfg.ui.show_skeleton
+        )
+        self.viewer.set_clip(self._clip, view)
         if self.cfg.ui.autoplay and not self.viewer.is_playing:
             self.viewer.play()
 
@@ -456,20 +442,10 @@ class AnnotationWidget(QWidget):
         if self._clip is None:
             return
         view = self._build_view(self._clip.shape[0], self._clip.shape[1])
-        if self._backend == "simple":
-            self.viewer.set_overlay(
-                self.show_overlay, self.show_context, self.cfg.ui.show_skeleton
-            )
-            self.viewer.set_view(view)
-        else:
-            self.viewer.set_clip(
-                render_view_rgb(
-                    self._clip, view, self.cfg,
-                    show_overlay=self.show_overlay,
-                    show_skeleton=self.cfg.ui.show_skeleton,
-                    show_context=self.show_context,
-                )
-            )
+        self.viewer.set_overlay(
+            self.show_overlay, self.show_context, self.cfg.ui.show_skeleton
+        )
+        self.viewer.set_view(view)
 
     def _update_progress(self, index: int, meta, load_ms: float) -> None:
         done = self.annotations.done_ids
@@ -488,7 +464,7 @@ class AnnotationWidget(QWidget):
             self._pending_message = None
         else:
             self._status(
-                f"viewer: {self._backend}   |   load {load_ms:.1f} ms   |   "
+                f"load {load_ms:.1f} ms   |   "
                 f"{self.annotations.path.name}: {len(self.annotations)} rows"
             )
 
@@ -980,8 +956,7 @@ class AnnotationWindow(QMainWindow):
         self.setCentralWidget(self.panel)
         self.panel.setFocus()
         self.statusBar().showMessage(
-            f"viewer: {self.panel._backend}   |   cache: {cfg.paths.work_dir}   |   "
-            f"csv: {cfg.paths.csv}"
+            f"cache: {cfg.paths.work_dir}   |   csv: {cfg.paths.csv}"
         )
 
     def __getattr__(self, name):
@@ -1003,14 +978,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="annotate", description="Annotate track clips.")
     parser.add_argument("--config", default=None, help="path to config.yaml")
     parser.add_argument("--csv", default=None, help="override paths.csv")
-    parser.add_argument("--backend", default=None, choices=["auto", "ndv", "simple"])
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if args.csv:
         cfg.paths.csv = Path(args.csv).resolve()
-    if args.backend:
-        cfg.ui.backend = args.backend
 
     try:
         store = ClipStore(cfg.paths.work_dir)

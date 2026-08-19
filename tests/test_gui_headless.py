@@ -116,7 +116,6 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
     window.show()
     app.processEvents()
     check("window built", window.isVisible())
-    print(f"  viewer backend: {window._backend}")
     check("navigation order populated", len(window.order) == len(store))
 
     first_id = window._clip_ids[window.order[window.position]]
@@ -197,51 +196,50 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
     app.processEvents()
     check("view toggles survive", True)
 
-    if window._backend == "simple":
-        from qtpy.QtGui import QPixmap
+    from qtpy.QtGui import QPixmap
 
-        canvas = window.viewer.canvas
-        canvas.resize(600, 600)
-        app.processEvents()
+    canvas = window.viewer.canvas
+    canvas.resize(600, 600)
+    app.processEvents()
 
-        def painted() -> np.ndarray:
-            pixmap = QPixmap(canvas.size())
-            canvas.render(pixmap)
-            image = pixmap.toImage()
-            raw = image.constBits().asstring(image.sizeInBytes())
-            return np.frombuffer(raw, np.uint8).reshape(
-                image.height(), image.bytesPerLine() // 4, 4
-            )[..., :3]
+    def painted() -> np.ndarray:
+        pixmap = QPixmap(canvas.size())
+        canvas.render(pixmap)
+        image = pixmap.toImage()
+        raw = image.constBits().asstring(image.sizeInBytes())
+        return np.frombuffer(raw, np.uint8).reshape(
+            image.height(), image.bytesPerLine() // 4, 4
+        )[..., :3]
 
-        def marker_pixels(frame: np.ndarray) -> int:
-            # QImage on Windows is BGRA; the marker is the only strongly amber
-            # thing on a grayscale frame.
-            b, g, r = frame[..., 0].astype(int), frame[..., 1].astype(int), frame[..., 2].astype(int)
-            return int(((r > 150) & (g > 90) & (r - b > 80) & (g - b > 40)).sum())
+    def marker_pixels(frame: np.ndarray) -> int:
+        # QImage on Windows is BGRA; the marker is the only strongly amber
+        # thing on a grayscale frame.
+        b, g, r = frame[..., 0].astype(int), frame[..., 1].astype(int), frame[..., 2].astype(int)
+        return int(((r > 150) & (g > 90) & (r - b > 80) & (g - b > 40)).sum())
 
-        window.overlay_box.setChecked(True)
-        app.processEvents()
-        with_marker = marker_pixels(painted())
-        window.overlay_box.setChecked(False)
-        app.processEvents()
-        without_marker = marker_pixels(painted())
-        check("the marker is painted over the frame",
-              with_marker > 50 and without_marker == 0,
-              f"on={with_marker} off={without_marker}")
-        check("the marker is not burned into the clip array",
-              window._clip.ndim == 3, f"clip is {window._clip.shape}")
-        window.overlay_box.setChecked(True)
-        app.processEvents()
+    window.overlay_box.setChecked(True)
+    app.processEvents()
+    with_marker = marker_pixels(painted())
+    window.overlay_box.setChecked(False)
+    app.processEvents()
+    without_marker = marker_pixels(painted())
+    check("the marker is painted over the frame",
+          with_marker > 50 and without_marker == 0,
+          f"on={with_marker} off={without_marker}")
+    check("the marker is not burned into the clip array",
+          window._clip.ndim == 3, f"clip is {window._clip.shape}")
+    window.overlay_box.setChecked(True)
+    app.processEvents()
 
-        times = []
-        for i in range(30):
-            canvas.set_frame(i % max(1, window._clip.shape[0]))
-            t0 = time.perf_counter()
-            canvas.render(QPixmap(canvas.size()))
-            times.append((time.perf_counter() - t0) * 1000)
-        print(f"  canvas paint: median {np.median(times):.2f} ms at 600x600")
-        check("painting keeps up with playback", np.median(times) < 20,
-              f"{np.median(times):.1f} ms")
+    times = []
+    for i in range(30):
+        canvas.set_frame(i % max(1, window._clip.shape[0]))
+        t0 = time.perf_counter()
+        canvas.render(QPixmap(canvas.size()))
+        times.append((time.perf_counter() - t0) * 1000)
+    print(f"  canvas paint: median {np.median(times):.2f} ms at 600x600")
+    check("painting keeps up with playback", np.median(times) < 20,
+          f"{np.median(times):.1f} ms")
 
     window.next_unannotated()
     app.processEvents()

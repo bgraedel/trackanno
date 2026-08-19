@@ -215,10 +215,6 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
     ("ui", "theme", "choice", "appearance",
      "dark, light, or follow the desktop.",
      {"options": ["dark", "light", "system"]}),
-    ("ui", "backend", "choice", "viewer",
-     "simple is the built-in player and the only backend that draws the marker "
-     "as vectors. ndv embeds ndv.ArrayViewer; auto tries ndv first.",
-     {"options": ["simple", "ndv", "auto"]}),
 
     # -- suggest --
     ("suggest", "enabled", "bool", "suggest labels",
@@ -235,8 +231,8 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
      "Which families of measurement the classifier is allowed to see. Groups "
      "that this project cannot compute are disabled with the reason.", {}),
     ("suggest", "model", "choice", "classifier",
-     "catboost handles the lopsided label distribution and NaN natively; hist "
-     "is scikit-learn's HistGradientBoosting and needs no extra install.",
+     "catboost, the default, handles the lopsided label distribution and NaN "
+     "natively; hist is scikit-learn's HistGradientBoosting.",
      {"options": ["catboost", "hist"]}),
     ("suggest", "balance_classes", "bool", "balance the classes",
      "Weight the loss by inverse class frequency. Without it the model answers "

@@ -1,7 +1,7 @@
 [project]
 name = "trackanno"
 version = "0.1.0"
-description = "Track-clip annotation pipeline: tiled YOLO detection/tracking -> cropped clip cache -> PyQt/ndv annotation GUI -> labelled overlay movies"
+description = "Track-clip annotation pipeline: tiled YOLO detection/tracking -> cropped clip cache -> PyQt annotation GUI -> labelled overlay movies"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
@@ -22,10 +22,16 @@ dependencies = [
     "ultralytics>=8.3",
     "torch>=2.2",
     "torchvision>=0.17",
-    "ndv[qt,vispy]>=0.3",
+    # qtpy is a shim over whichever binding is installed; name the binding
+    # explicitly, since it used to arrive only as a side effect of ndv[qt].
     "qtpy>=2.4",
+    "PyQt6>=6.6",
     "scikit-learn>=1.4",
     "joblib>=1.3",
+    # The suggester's default estimator. Weights the loss by inverse class
+    # frequency and splits on NaN natively, both of which this data needs;
+    # suggest.model: hist falls back to sklearn without it.
+    "catboost>=1.2",
     # ByteTrack's linear assignment. Ultralytics pip-installs this at runtime if
     # it is absent, which uv sync then prunes again - pin it so the environment
     # stays reproducible and no run mutates its own venv mid-flight.
@@ -37,11 +43,6 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.optional-dependencies]
-# `uv sync --extra catboost` enables suggest.model: catboost (~100 MB); the
-# default sklearn HistGradientBoosting needs nothing extra.
-catboost = [
-    "catboost>=1.2",
-]
 # The GPU backend is chosen at INSTALL time, because torch ships one wheel per
 # backend rather than loading one at runtime. Pick with the extra, not with
 # `--with`, which installs a package rather than selecting an extra:

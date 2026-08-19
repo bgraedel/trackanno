@@ -117,9 +117,12 @@ def _build_model(cfg: Config, n_classes: int):
                 verbose=False, random_seed=cfg.suggest.seed, allow_writing_files=False,
             )
         except ImportError:
+            # catboost is an ordinary dependency, so this means a broken
+            # environment rather than a missing extra. Say so and carry on with
+            # sklearn instead of failing the whole run.
             print(
-                "suggest.model is 'catboost' but catboost is not installed "
-                "(uv sync --extra catboost); using sklearn instead",
+                "suggest.model is 'catboost' but catboost will not import; "
+                "using sklearn instead. Reinstall to get the default estimator.",
                 file=sys.stderr,
             )
     from sklearn.ensemble import HistGradientBoostingClassifier

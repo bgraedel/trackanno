@@ -1,15 +1,14 @@
 """Shared overlay geometry and drawing.
 
-Three consumers, two jobs:
+Two consumers, two jobs:
 
 * The **GUI** draws no pixels. ``build_clip_view`` turns a clip's box table into
   a :class:`ClipView` and the Qt canvas paints the marker as vector graphics, so
   the reticle stays one hairline wide at 8x zoom.
-* The **ndv backend** takes no separate overlay layer, so it gets a burned-in
-  RGB stack from ``render_view_rgb``: the same geometry, rasterised.
 * ``render.py`` burns the category-labelled overlay onto the full-resolution
   movie.
 
+``render_clip_rgb`` rasterises the same geometry for a caller that wants pixels.
 Everything that returns pixels returns RGB, which is what imageio and Qt want.
 """
 
@@ -26,7 +25,6 @@ __all__ = [
     "gray_to_rgb",
     "ClipView",
     "build_clip_view",
-    "render_view_rgb",
     "render_clip_rgb",
     "draw_detections",
     "TARGET_RGB",
@@ -189,61 +187,6 @@ def _kpt_columns(frame, n_kpts: int) -> np.ndarray | None:
 # --------------------------------------------------------------------------- #
 # GUI: clip overlay
 # --------------------------------------------------------------------------- #
-def render_view_rgb(
-    clip: np.ndarray,
-    view: ClipView,
-    cfg: Config,
-    show_overlay: bool = True,
-    show_skeleton: bool = False,
-    show_context: bool = False,
-) -> np.ndarray:
-    """Rasterise a :class:`ClipView` into an RGB stack, for backends that cannot
-    take a separate overlay layer (ndv).
-
-    One ``warpAffine`` per frame does centring, zoom and padding outside the
-    cached crop together, so the result matches the Qt canvas exactly.
-    """
-    import cv2
-
-    size = int(view.size)
-    scale = size / view.side
-    out = np.empty((clip.shape[0], size, size, 3), dtype=np.uint8)
-    edges = cfg.keypoints.edge_idx if cfg.is_pose else []
-    draw_kpts = show_skeleton and cfg.is_pose and view.kpts is not None
-    identity = view.side == size
-
-    for t in range(clip.shape[0]):
-        x0, y0, _, _ = view.source_rect(t)
-        if identity and x0 == 0 and y0 == 0:
-            frame = cv2.cvtColor(np.ascontiguousarray(clip[t]), cv2.COLOR_GRAY2RGB)
-        else:
-            matrix = np.array([[scale, 0.0, -scale * x0], [0.0, scale, -scale * y0]])
-            frame = cv2.warpAffine(
-                np.ascontiguousarray(clip[t]), matrix, (size, size),
-                flags=cv2.INTER_NEAREST if scale >= 1.0 else cv2.INTER_AREA,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-            )
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        out[t] = frame
-        if not show_overlay:
-            continue
-
-        def to_view(pts):
-            return (np.asarray(pts, dtype=np.float64) - [x0, y0]) * scale
-
-        if show_context:
-            for b in view.context_for(t):
-                p = to_view(np.asarray(b).reshape(2, 2))
-                _draw_box(out[t], p[0, 0], p[0, 1], p[1, 0], p[1, 1], CONTEXT_RGB, 1)
-        box = view.box(t)
-        if box is not None:
-            p = to_view(box.reshape(2, 2))
-            _draw_reticle(out[t], p[0, 0], p[0, 1], p[1, 0], p[1, 1], TARGET_RGB, 1)
-            if draw_kpts:
-                _draw_skeleton(out[t], to_view(view.kpts[t]), edges, TARGET_RGB)
-    return out
-
-
 def render_clip_rgb(
     clip: np.ndarray,
     boxes,
