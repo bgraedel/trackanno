@@ -48,7 +48,7 @@ class _Server:
 
 def _index(base, digest=DIGEST, model_id="trypanosome-pose"):
     return {"models": [{
-        "id": model_id, "version": "v2", "task": "pose",
+        "id": model_id, "version": "v2", "task": "pose", "framework": "ultralytics",
         "url": f"{base}/{model_id}.pt", "sha256": digest, "size": len(WEIGHTS),
         "notes": "8-point flagellum, brightfield 20x",
         "config": {
@@ -286,6 +286,7 @@ def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None
     }
     index = json.dumps({"models": [{
         "id": "tryp", "version": "v2", "task": "pose", "asset": "tryp.pt",
+        "framework": "ultralytics",
         "sha256": DIGEST, "size": len(WEIGHTS),
     }]}).encode("utf-8")
 
@@ -377,19 +378,25 @@ def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch)
     """
     seg = M.ModelEntry(id="leish-seg", url="https://example.org/seg.pt",
                        task="segment", modality="fluorescence",
+                       framework="ultralytics",
                        config={"detection": {"imgsz": 1024}})
     check("a segmentation model parses fine", seg.task == "segment")
     check("but is not runnable here", not seg.runnable)
     check("and says why, naming what this tool does run",
           "segment" in seg.unsupported_reason and "detect" in seg.unsupported_reason)
-    check("the modality shows in the picker label",
-          "fluorescence" in seg.label and "leish-seg" in seg.label, seg.label)
+    check("the framework and modality show in the picker label",
+          "fluorescence" in seg.label and "ultralytics" in seg.label, seg.label)
 
-    pose = M.ModelEntry(id="p", url="https://example.org/p.pt", task="pose")
-    detect = M.ModelEntry(id="d", url="https://example.org/d.pt", task="detect")
-    unstated = M.ModelEntry(id="u", url="https://example.org/u.pt")
+    pose = M.ModelEntry(id="p", url="https://example.org/p.pt", task="pose",
+                        framework="ultralytics")
+    detect = M.ModelEntry(id="d", url="https://example.org/d.pt", task="detect",
+                          framework="ultralytics")
+    unstated = M.ModelEntry(id="u", url="https://example.org/u.pt",
+                            framework="ultralytics")
     check("pose and detect are runnable", pose.runnable and detect.runnable)
-    check("and so is an entry that does not state a task", unstated.runnable)
+    check("and so is an entry that states no task", unstated.runnable)
+    check("an entry that states no framework is not, since nothing knows how to "
+          "load it", not M.ModelEntry(id="q", url="https://example.org/q.pt").runnable)
 
     path = create_project(root / "seg")
     told = M.apply_manifest(path, seg)
@@ -399,3 +406,64 @@ def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch)
           cfg.detection.task in ("detect", "pose"), cfg.detection.task)
     check("and the report says it was not applied",
           any(t.startswith("NOT applied") for t in told), str(told))
+
+
+def test_the_cache_holds_whatever_the_asset_is(registry, root) -> None:
+    """An entry is bytes plus a digest, so the format is not the cache's business.
+
+    A Mask2Former checkpoint, an ONNX export or a zipped model directory all
+    cache and verify the same way. Only running them is trackanno-specific, and
+    `runnable` is what says so.
+    """
+    served = root / "release"
+    payload = b"not a torch checkpoint at all" * 100
+    (served / "m2f.tar.gz").write_bytes(payload)
+    sha = hashlib.sha256(payload).hexdigest()
+    entry = M.ModelEntry(id="leish-m2f", url=f"{registry.base}/m2f.tar.gz", sha256=sha,
+                         task="segment", framework="hf-transformers",
+                         preprocess={"input_size": [1024, 1024],
+                                     "normalize": {"mean": [0.485], "std": [0.229]}})
+
+    path = M.fetch(entry)
+    check("a non-.pt asset caches like any other", path.read_bytes() == payload)
+    check("under a name of its own", path.name == "m2f.tar.gz", path.name)
+    check("and is found again without knowing the extension",
+          M.cached_path(sha) == path, str(M.cached_path(sha)))
+    check("the sidecar manifest is not mistaken for the model",
+          M.cached_path(sha).name != "manifest.json")
+    check("preprocessing travels with it, for whatever runs the model",
+          entry.preprocess["input_size"] == [1024, 1024])
+    check("but trackanno declines to run it, naming the framework it does",
+          not entry.runnable and "ultralytics" in entry.unsupported_reason)
+
+
+def test_a_scale_range_is_compared_rather_than_announced(root) -> None:
+    """A model trained across magnifications has no single pixel size to state."""
+    path = create_project(root / "scales")
+    multi = M.ModelEntry(id="multi", url="https://x/m.pt", framework="ultralytics",
+                         assumes={"pixel_size_um": [0.2, 0.65], "fps": 100})
+    single = M.ModelEntry(id="single", url="https://x/s.pt", framework="ultralytics",
+                          assumes={"pixel_size_um": 0.325})
+    cfg = load_config(path)
+
+    check("a range reads as the interval it covers", M.span([0.2, 0.65]) == (0.2, 0.65))
+    check("discrete values read as their span", M.span([0.325, 0.65, 1.3]) == (0.325, 1.3))
+    check("a scalar is an interval of no width", M.span(0.325) == (0.325, 0.325))
+    check("and it is described as one number, not a range",
+          M.describe_span(0.325, "um") == "0.325 um"
+          and M.describe_span([0.2, 0.65], "um") == "0.2 to 0.65 um")
+
+    check("a multi-scale model says nothing when there is nothing to compare",
+          not any("pixel" in w for w in M.mismatch_warnings(cfg, multi)),
+          str(M.mismatch_warnings(cfg, multi)))
+    check("a single-scale one states its constraint",
+          any("0.325" in w for w in M.mismatch_warnings(cfg, single)))
+
+    inside = M.mismatch_warnings(cfg, multi, pixel_size_um=0.5)
+    outside = M.mismatch_warnings(cfg, multi, pixel_size_um=1.3)
+    check("a measured pixel size inside the range is not a warning",
+          not any("pixel" in w for w in inside), str(inside))
+    check("one outside it is, quoting both", any("1.3" in w and "0.65" in w for w in outside),
+          str(outside))
+    check("and the picker can say what a model was trained on",
+          multi.trained_at == "100 fps, 0.2 to 0.65 um/px", multi.trained_at)

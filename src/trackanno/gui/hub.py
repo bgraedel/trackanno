@@ -978,7 +978,8 @@ class ModelRegistryDialog(QDialog):
             return
         size = f"{entry.size / 1e6:.0f} MB" if entry.size else "size unknown"
         where = entry.url or f"asset {entry.asset}"
-        lines = [entry.notes or "no description", f"{size}   |   {where}"]
+        trained = f"   |   trained at {entry.trained_at}" if entry.trained_at else ""
+        lines = [entry.notes or "no description", f"{size}{trained}", where]
         if not entry.runnable:
             lines.insert(0, entry.unsupported_reason)
         self.detail.setText("\n".join(lines))

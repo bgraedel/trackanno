@@ -47,7 +47,8 @@ __all__ = [
     "ModelEntry", "registry_url", "set_registry_url", "list_models", "find_model",
     "cache_dir", "cached_path", "fetch", "resolve_model", "apply_manifest",
     "prune_cache", "RegistryError", "is_trusted_url", "local_model_path",
-    "token", "set_token", "RUNNABLE_TASKS",
+    "token", "set_token", "RUNNABLE_TASKS", "RUNNABLE_FRAMEWORKS", "span", "describe_span",
+    "mismatch_warnings",
 ]
 
 REGISTRY_FILE = "registry.json"
@@ -62,6 +63,9 @@ TIMEOUT = 30.0
 # these even while this tool cannot run them. They are shown and explained
 # rather than hidden, since a registry that silently omits half its contents is
 # worse than one that says why.
+# What this tool can load and drive. An entry naming anything else is listed
+# and downloadable, and something else runs it.
+RUNNABLE_FRAMEWORKS = ("ultralytics",)
 RUNNABLE_TASKS = ("detect", "pose")
 
 
@@ -94,8 +98,10 @@ class ModelEntry:
     filename: str = ""
     asset: str = ""
     modality: str = ""
+    framework: str = ""
     notes: str = ""
     config: dict = field(default_factory=dict)
+    preprocess: dict = field(default_factory=dict)
     assumes: dict = field(default_factory=dict)
 
     @property
@@ -103,7 +109,7 @@ class ModelEntry:
         bits = [self.id]
         if self.version:
             bits.append(self.version)
-        kind = " ".join(b for b in (self.modality, self.task) if b)
+        kind = " ".join(b for b in (self.framework, self.modality, self.task) if b)
         if kind:
             bits.append(f"({kind})")
         return " ".join(bits)
@@ -111,18 +117,27 @@ class ModelEntry:
     @property
     def runnable(self) -> bool:
         """Whether trackanno can use this as its detector."""
-        return not self.task or self.task in RUNNABLE_TASKS
+        return (self.framework in RUNNABLE_FRAMEWORKS
+                and (not self.task or self.task in RUNNABLE_TASKS))
+
+    @property
+    def trained_at(self) -> str:
+        """What acquisition this model saw, for choosing between two of them."""
+        from_ = self.assumes or {}
+        bits = [describe_span(from_.get("fps"), "fps"),
+                describe_span(from_.get("pixel_size_um"), "um/px")]
+        return ", ".join(b for b in bits if b)
 
     @property
     def unsupported_reason(self) -> str:
         """Why this cannot be used here, or "" when it can."""
         if self.runnable:
             return ""
-        return (
-            f"trackanno runs {' and '.join(RUNNABLE_TASKS)} models; {self.id} is a "
-            f"{self.task} model. It is listed so it can be found and downloaded, "
-            "but it cannot be set as this project's detector."
-        )
+        runs = f"{'/'.join(RUNNABLE_FRAMEWORKS)} {' and '.join(RUNNABLE_TASKS)} models"
+        is_a = " ".join(b for b in (self.framework or "an unstated framework",
+                                    self.task) if b)
+        return (f"trackanno runs {runs}; {self.id} is {is_a}. It can be found and "
+                "downloaded here, and something else has to run it.")
 
     @property
     def name(self) -> str:
@@ -157,8 +172,10 @@ class ModelEntry:
             filename=str(d.get("filename", "") or "").strip(),
             asset=str(d.get("asset", "") or "").strip(),
             modality=str(d.get("modality", "") or "").strip(),
+            framework=str(d.get("framework", "") or "").strip().lower(),
             notes=str(d.get("notes", "") or "").strip(),
             config=dict(d.get("config") or {}),
+            preprocess=dict(d.get("preprocess") or {}),
             assumes=dict(d.get("assumes") or {}),
         )
 
@@ -411,7 +428,9 @@ def cached_path(sha256: str, name: str = "") -> Path | None:
         candidate = directory / name
         if candidate.exists():
             return candidate
-    files = sorted(p for p in directory.glob("*.pt") if p.is_file())
+    # Any file: weights may be .pt, .onnx, extensionless or a zipped directory.
+    files = sorted(f for f in directory.iterdir()
+                   if f.is_file() and f.name != "manifest.json")
     return files[0] if files else None
 
 
@@ -561,6 +580,10 @@ def resolve_model(cfg, reporter=None, allow_download: bool = True) -> Path:
 # --------------------------------------------------------------------------- #
 # what the manifest configures
 # --------------------------------------------------------------------------- #
+# `config` is keyed by consumer: trackanno reads the sections below and ignores
+# the rest, so `config.cellpose` reaches a cellpose runner untouched.
+# `preprocess` says how pixels must reach the model. Neither is interpreted here
+# beyond the sections listed.
 # Only these sections may be set from a manifest. A model may say how it should
 # be run; it may not point the project at different movies, a different work
 # directory or a different annotation log.
@@ -625,25 +648,92 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     return told
 
 
-def mismatch_warnings(cfg, entry: ModelEntry) -> list[str]:
-    """Where the project disagrees with what the model was trained on.
+def span(value) -> tuple[float, float] | None:
+    """What a range in ``assumes`` covers, as ``(low, high)``. None if absent.
+
+    Accepts a scalar for a model trained at one scale, and a list for one
+    trained across several: ``[0.2, 0.65]`` reads as a range and
+    ``[0.325, 0.65, 1.3]`` as discrete values. Both answer the only question
+    asked of them, which is whether a given acquisition falls inside what the
+    model saw, so the two spellings need not be told apart.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return (float(value), float(value))
+    try:
+        numbers = [float(v) for v in value]
+    except (TypeError, ValueError):
+        return None
+    return (min(numbers), max(numbers)) if numbers else None
+
+
+def describe_span(value, unit: str) -> str:
+    """``0.325 um`` or ``0.2 to 0.65 um``, for a person choosing a model."""
+    bounds = span(value)
+    if bounds is None:
+        return ""
+    low, high = bounds
+    if low == high:
+        return f"{low:g} {unit}"
+    return f"{low:g} to {high:g} {unit}"
+
+
+def _outside(measured, value) -> bool:
+    """Whether a measured acquisition falls outside what the model was trained on.
+
+    A tolerance of 1% absorbs the difference between a nominal magnification and
+    what the metadata actually reports, which is not a mismatch worth a warning.
+    """
+    bounds = span(value)
+    if bounds is None or measured is None:
+        return False
+    low, high = bounds
+    tol = max(1e-9, 0.01 * max(abs(low), abs(high)))
+    return not (low - tol <= float(measured) <= high + tol)
+
+
+def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
+    """Where a project disagrees with what the model was trained on.
 
     Reported, never corrected: a model trained at 100 fps still runs on a 30 fps
-    movie, and only the person knows whether that is the experiment or a mistake.
+    movie, and only the person knows whether that is the experiment or a
+    mistake.
+
+    Silent when they agree, and silent when nothing can be compared. A project
+    carries no pixel size of its own, since it is a property of each movie
+    (ND2 records it, TIFF does not), so pass ``pixel_size_um`` when one has been
+    read. Without it, a model trained at a SINGLE scale still gets a line,
+    because that is a real constraint on what it can be pointed at; a
+    multi-scale model gets nothing, having no constraint to state.
     """
     out: list[str] = []
     assumes = entry.assumes or {}
+
     fps = assumes.get("fps")
-    if fps and getattr(cfg.tiff, "fps", None) and abs(float(cfg.tiff.fps) - float(fps)) > 1e-6:
+    project_fps = getattr(getattr(cfg, "tiff", None), "fps", None)
+    if _outside(project_fps, fps):
         out.append(
-            f"{entry.id} was trained at {fps} fps; tiff.fps is {cfg.tiff.fps}. "
-            "Every rate this reports is per second, so the features stay "
-            "comparable, but the beat may fall outside what the clip can resolve."
+            f"{entry.id} was trained at {describe_span(fps, 'fps')}; this project "
+            f"reads TIFFs at {project_fps} fps. Every rate reported is per second, "
+            "so the features stay comparable, but the beat may fall outside what a "
+            "clip of this length can resolve."
         )
-    pixel = assumes.get("pixel_size_um")
-    if pixel:
-        out.append(
-            f"{entry.id} was trained on {pixel} um pixels. A different "
-            "magnification changes the apparent size of everything it detects."
-        )
+
+    pixels = assumes.get("pixel_size_um")
+    bounds = span(pixels)
+    if bounds is not None:
+        if _outside(pixel_size_um, pixels):
+            out.append(
+                f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels; "
+                f"these movies are {float(pixel_size_um):g} um. Magnification "
+                "changes the apparent size of everything it detects, so check the "
+                "first few detections before running the whole batch."
+            )
+        elif pixel_size_um is None and bounds[0] == bounds[1]:
+            out.append(
+                f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels "
+                "only. At a different magnification, scale detection.imgsz and "
+                "tiling.tile with it, or retrain."
+            )
     return out
