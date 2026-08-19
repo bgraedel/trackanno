@@ -467,3 +467,26 @@ def test_a_scale_range_is_compared_rather_than_announced(root) -> None:
           str(outside))
     check("and the picker can say what a model was trained on",
           multi.trained_at == "100 fps, 0.2 to 0.65 um/px", multi.trained_at)
+
+
+def test_a_value_the_loader_rejects_costs_only_that_value(root) -> None:
+    """A manifest is written elsewhere, so one bad number must not stop a model
+    configuring the rest of the project.
+
+    tiling.overlap is a fraction of the tile; a manifest giving it in pixels used
+    to fail the whole apply with a config error, leaving nothing set.
+    """
+    path = create_project(root / "badvalue")
+    entry = M.ModelEntry(id="sloppy", url="https://x/s.pt", framework="ultralytics",
+                         task="pose",
+                         config={"detection": {"imgsz": 1280},
+                                 "tiling": {"tile": 1280, "overlap": 192}})
+    told = M.apply_manifest(path, entry)
+    cfg = load_config(path)
+
+    check("the good values still applied", cfg.detection.imgsz == 1280 and cfg.tiling.tile == 1280,
+          f"imgsz {cfg.detection.imgsz}, tile {cfg.tiling.tile}")
+    check("the bad one did not", cfg.tiling.overlap < 0.9, str(cfg.tiling.overlap))
+    check("and it is reported with the loader's own complaint",
+          any("NOT applied" in t and "overlap" in t for t in told), str(told))
+    check("the project still loads", load_config(path) is not None)

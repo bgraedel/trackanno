@@ -402,7 +402,10 @@ def find_model(model_id: str, version: str = "") -> ModelEntry | None:
     if version:
         exact = [m for m in matches if m.version.lower() == str(version).strip().lower()]
         return exact[0] if exact else None
-    return matches[0] if matches else None
+    # No version asked for: the newest. An index keeps one entry per (id,
+    # version) in that order, so an id can offer several and a project that
+    # pinned an older one keeps getting it.
+    return matches[-1] if matches else None
 
 
 # --------------------------------------------------------------------------- #
@@ -644,7 +647,25 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     if digest or entry.sha256:
         updates["model.sha256"] = (digest or entry.sha256).lower()
 
-    write_config(config_path, updates, keypoints=keypoints)
+    # A value the loader rejects must cost that value, not the whole apply. A
+    # manifest is written elsewhere, so one bad number should not stop a model
+    # configuring the rest of the project.
+    try:
+        write_config(config_path, updates, keypoints=keypoints)
+    except Exception:
+        from .config import ConfigError
+
+        applied: dict[str, object] = {}
+        refused: list[str] = []
+        for key, value in updates.items():
+            try:
+                write_config(config_path, {**applied, key: value}, keypoints=keypoints)
+                applied[key] = value
+            except (ConfigError, ValueError) as exc:
+                refused.append(f"NOT applied: {key} {value!r} ({exc})")
+        told = [t for t in told if not any(t.startswith(k) for k in
+                                           (r.split()[2] for r in refused))]
+        told.extend(refused)
     return told
 
 
