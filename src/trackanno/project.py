@@ -95,6 +95,19 @@ detection:
   half: false
 
 
+# --- Detection model ---------------------------------------------------------
+# Leave `source` empty to use paths.model, a .pt file on this machine. Otherwise
+# name a model from the registry (Configure -> "From registry...") or give an
+# https URL to a .pt, and it is downloaded once into a shared cache. `sha256` is
+# filled in on the first fetch and pins the weights from then on, so a release
+# that later moves is a loud mismatch rather than a different model under the
+# same name.
+model:
+  source: ""
+  version: ""
+  sha256: ""
+
+
 # --- Tiled inference ---------------------------------------------------------
 # Movies larger than one model input get cut into overlapping tiles, run as a
 # batch, mapped back to full-frame coordinates and merged with a global NMS.
@@ -569,7 +582,9 @@ def project_status(cfg) -> ProjectStatus:
         except OSError:
             status.video_dir_ok = False
         status.n_videos = len(seen)
-    status.model_ok = _exists(cfg.paths.model, "file")
+    from .models import local_model_path
+
+    status.model_ok = _exists(local_model_path(cfg), "file")
 
     work = cfg.paths.work_dir
     if _exists(work, "dir"):

@@ -13,7 +13,8 @@ from typing import Any, Sequence
 
 import yaml
 
-__all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption", "RESERVED_GROUP_NAMES"]
+__all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption",
+           "ModelSource", "RESERVED_GROUP_NAMES"]
 
 # A category group becomes a CSV column, so a group named like a built-in column
 # silently overwrites it. Kept here rather than imported from store.py, which
@@ -458,6 +459,55 @@ class Predict:
 
 
 @dataclass
+class ModelSource:
+    """Where the detection weights come from, when not a file on this disk.
+
+    ``source`` is a model id from the registry (see :mod:`trackanno.models`) or
+    an ``https://`` URL to a ``.pt``. Empty means ``paths.model``, which is what
+    a project made from a local file uses.
+
+    ``sha256`` is written back on the first successful fetch and pins the
+    weights from then on. A registry that later moves a tag to different weights
+    is then a loud mismatch rather than a silent change of model under an
+    unchanged name.
+    """
+
+    source: str = ""
+    version: str = ""
+    sha256: str = ""
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(self.source.strip())
+
+    @property
+    def is_url(self) -> bool:
+        return self.source.strip().lower().startswith(("http://", "https://"))
+
+    @classmethod
+    def parse(cls, d: dict) -> "ModelSource":
+        _known("model", d, ["source", "version", "sha256"])
+        source = str(d.get("source", "") or "").strip()
+        if source.lower().startswith("http://"):
+            from .models import is_trusted_url
+
+            if not is_trusted_url(source):
+                raise ConfigError(
+                    "model.source must be https, not http: weights are executed "
+                    "when they are loaded, so they may not be fetched over a "
+                    "channel that can be rewritten in transit"
+                )
+        digest = str(d.get("sha256", "") or "").strip().lower()
+        if digest and (len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest)):
+            raise ConfigError("model.sha256 must be a 64-character hex digest, or empty")
+        return cls(
+            source=source,
+            version=str(d.get("version", "") or "").strip(),
+            sha256=digest,
+        )
+
+
+@dataclass
 class Keypoints:
     nodes: list[str] = field(default_factory=list)
     edges: list[tuple[str, str]] = field(default_factory=list)
@@ -799,6 +849,7 @@ class Config:
     tiff: TiffOptions
     normalize: Normalize
     detection: Detection
+    model: ModelSource
     tiling: Tiling
     tracking: Tracking
     keypoints: Keypoints
@@ -872,6 +923,7 @@ def load_config(path: str | Path | None = None) -> Config:
         tiff=TiffOptions.parse(_section(data, "tiff")),
         normalize=Normalize.parse(_section(data, "normalize")),
         detection=Detection.parse(_section(data, "detection")),
+        model=ModelSource.parse(_section(data, "model")),
         tiling=Tiling.parse(_section(data, "tiling")),
         tracking=Tracking.parse(_section(data, "tracking")),
         keypoints=Keypoints.parse(_section(data, "keypoints")),

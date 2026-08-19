@@ -512,11 +512,18 @@ class ConfigPage(Page):
 
         revert = QPushButton("Revert to saved")
         revert.clicked.connect(self.on_project)
+        self.registry_btn = QPushButton("From registry...")
+        self.registry_btn.setToolTip(
+            "Pick shared weights instead of a file on this machine. They are "
+            "downloaded once, cached, and bring their own settings."
+        )
+        self.registry_btn.clicked.connect(self._pick_registry_model)
         self.state = QLabel("")
         self.state.setWordWrap(True)
 
         bar = QHBoxLayout()
         bar.addWidget(self.state, 1)
+        bar.addWidget(self.registry_btn)
         bar.addWidget(revert)
 
         layout = QVBoxLayout(self)
@@ -562,6 +569,54 @@ class ConfigPage(Page):
         self.banner.setStyleSheet(banner_style("danger"))
         self.pose_notice.setStyleSheet(banner_style("warning"))
         self._show_warnings()
+
+    def _pick_registry_model(self) -> None:
+        """Choose shared weights, fetch them, and let them configure the project."""
+        from ..models import apply_manifest, fetch, mismatch_warnings
+
+        if self.cfg is None:
+            QMessageBox.information(self, "From registry", "Open a project first.")
+            return
+        dialog = ModelRegistryDialog(self)
+        if not dialog.run():
+            return
+        entry = dialog.chosen()
+        if entry is None:
+            return
+
+        def work(reporter):
+            path = fetch(entry, reporter)
+            import hashlib
+
+            sha = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    sha.update(block)
+            return path, sha.hexdigest()
+
+        self.save()
+        runner = TaskRunner(work, self)
+
+        def done(result):
+            path, digest = result
+            try:
+                told = apply_manifest(self.cfg.path, entry, digest)
+            except Exception as exc:
+                QMessageBox.warning(self, "From registry", str(exc))
+                return
+            self.hub.open_project(self.cfg.path)
+            summary = ", ".join(told) if told else "already matched the settings"
+            self.status_message.emit(f"{entry.id}: {summary}   ->   {path}", 12000)
+            for warning in mismatch_warnings(self.hub.cfg, entry):
+                self.status_message.emit(warning, 15000)
+
+        runner.succeeded.connect(done)
+        runner.failed.connect(
+            lambda message: QMessageBox.warning(self, "From registry", message)
+        )
+        self._fetch_runner = runner
+        self.status_message.emit(f"fetching {entry.id}...", 0)
+        runner.start()
 
     def _probe_model(self) -> None:
         """Read whatever the selected checkpoint says about itself."""
@@ -711,7 +766,9 @@ class ConfigPage(Page):
         """Ask the checkpoint how many keypoints it predicts. Names stay yours."""
         if self.cfg is None or (self._keypoint_reader and self._keypoint_reader.isRunning()):
             return
-        model_path = self.cfg.paths.model
+        from ..models import local_model_path
+
+        model_path = local_model_path(self.cfg)
         if not _exists(model_path, "file"):
             self._fail("Cannot read the keypoint count:",
                        [f"the model file was not found: {model_path}"])
@@ -827,6 +884,113 @@ class ConfigPage(Page):
 # --------------------------------------------------------------------------- #
 # 3. detect & crop
 # --------------------------------------------------------------------------- #
+class ModelRegistryDialog(QDialog):
+    """Pick shared weights, and set where this machine looks for them.
+
+    The registry URL is edited here rather than in ``config.yaml`` on purpose: a
+    project someone sends you may name a model, but must not be able to decide
+    which server the weights come from.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from ..models import registry_url
+
+        self.setWindowTitle("Detection models")
+        self.setMinimumWidth(640)
+        self._entries: list = []
+
+        self.url = QLineEdit(registry_url())
+        self.url.setPlaceholderText(
+            "https://github.com/<owner>/<repo>/releases/latest/download/index.json"
+        )
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._refresh)
+        url_row = QHBoxLayout()
+        url_row.addWidget(self.url, 1)
+        url_row.addWidget(refresh)
+
+        self.list = QListWidget()
+        self.list.setAlternatingRowColors(True)
+        self.list.itemSelectionChanged.connect(self._describe)
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setProperty("role", "muted")
+
+        self.ok = QPushButton("Use this model")
+        self.ok.setDefault(True)
+        self.ok.setEnabled(False)
+        self.ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok)
+
+        form = QFormLayout()
+        form.addRow("registry", url_row)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.list, 1)
+        layout.addWidget(self.detail)
+        layout.addLayout(buttons)
+        self._fill(refresh=False)
+
+    def _refresh(self) -> None:
+        from ..models import RegistryError, set_registry_url
+
+        try:
+            set_registry_url(self.url.text())
+        except RegistryError as exc:
+            QMessageBox.warning(self, "Detection models", str(exc))
+            return
+        self._fill(refresh=True)
+
+    def _fill(self, refresh: bool) -> None:
+        from ..models import RegistryError, cached_path, list_models, registry_url
+
+        self.list.clear()
+        if not registry_url():
+            self.detail.setText(
+                "No registry is set on this machine. Paste the index URL above "
+                "and press Refresh. Models stay available offline once fetched."
+            )
+            return
+        try:
+            self._entries = list_models(refresh=refresh)
+        except RegistryError as exc:
+            self._entries = []
+            self.detail.setText(str(exc))
+            return
+        for entry in self._entries:
+            here = cached_path(entry.sha256, entry.name) is not None
+            item = QListWidgetItem(f"{entry.label}{'   [cached]' if here else ''}")
+            self.list.addItem(item)
+        if not self._entries:
+            self.detail.setText("The registry index lists no models.")
+
+    def _describe(self) -> None:
+        entry = self.chosen()
+        self.ok.setEnabled(entry is not None)
+        if entry is None:
+            return
+        size = f"{entry.size / 1e6:.0f} MB" if entry.size else "size unknown"
+        self.detail.setText(
+            f"{entry.notes or 'no description'}\n{size}   |   {entry.url}"
+        )
+
+    def chosen(self):
+        row = self.list.currentRow()
+        if 0 <= row < len(self._entries):
+            return self._entries[row]
+        return None
+
+    def run(self) -> bool:
+        runner = getattr(self, "exec_", None) or self.exec
+        return bool(runner())
+
+
 class PreparePage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)

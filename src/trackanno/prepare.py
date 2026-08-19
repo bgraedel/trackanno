@@ -249,10 +249,16 @@ def prepare_all(
     """Prepare every requested movie; one bad movie never stops the batch. The
     CLI and the GUI both come through here, differing only in the Reporter."""
     reporter = reporter or NullReporter()
+    # Resolve a registry model to a cached file first, then carry on as if it had
+    # always been local: nothing downstream needs to know a network was involved.
+    from .models import resolve_model
+
+    cfg.paths.model = resolve_model(cfg, reporter)
     if not cfg.paths.model.exists():
         raise FileNotFoundError(
             f"detection model not found: {cfg.paths.model}\n"
-            "Set paths.model to the .pt weights file."
+            "Set paths.model to the .pt weights file, or model.source to a model "
+            "from the registry."
         )
 
     cfg.paths.work_dir.mkdir(parents=True, exist_ok=True)

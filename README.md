@@ -204,6 +204,63 @@ retried. `ClipStore` independently refuses any movie whose manifest disagrees
 with its header or whose `clips.dat` is short, since pairing a manifest row with
 another clip's pixels looks normal during annotation.
 
+### Shared models
+
+Weights do not have to be a file somebody copied onto this machine.
+*Configure -> From registry...* lists the models a GitHub release offers,
+downloads the one you pick into a shared cache, and applies the settings it was
+trained with.
+
+```yaml
+model:
+  source: trypanosome-pose   # "" uses paths.model, a .pt on this disk
+  version: v2
+  sha256: 9f3c...            # written on the first fetch, pins it thereafter
+```
+
+The index is one release asset, so
+`https://github.com/<owner>/<repo>/releases/latest/download/index.json` always
+names the current set while each entry points at one immutable asset:
+
+```json
+{"models": [{
+  "id": "trypanosome-pose", "version": "v2", "task": "pose",
+  "url": "https://github.com/<owner>/<repo>/releases/download/v2/trypanosome-pose.pt",
+  "sha256": "9f3c...", "size": 52428800,
+  "notes": "8-point flagellum, brightfield 20x",
+  "config": {
+    "detection": {"imgsz": 1280, "conf": 0.25},
+    "tiling": {"tile": 640, "overlap": 96},
+    "keypoints": {"nodes": ["Head", "Base", "Flag1", "Flag2", "Flag3", "Flag4", "Flag5", "Tip"],
+                  "edges": [["Head", "Base"], ["Base", "Flag1"]]}},
+  "assumes": {"fps": 100, "pixel_size_um": 0.325}}]}
+```
+
+The `config` block is where the value is. A checkpoint already reports its task,
+keypoint count and class names, and `read_model_info` recovers those. It cannot
+report the keypoint **names**, the skeleton **edges** (which the section below
+notes cannot be inferred at all), the `imgsz` it was validated at, or a tile size
+that suits it. Those are applied to the project and reported, never changed
+silently, and `assumes` becomes a warning where the movies disagree rather than a
+correction.
+
+**Three rules, all about not running the wrong code.** Loading a checkpoint
+executes the pickle inside it, so this is a security boundary rather than a
+convenience feature.
+
+* **The registry URL is a machine setting**, kept in the state directory beside
+  the recent-projects list. A `config.yaml` somebody sends you may name a model
+  id; it may not decide which server the weights come from.
+* **https only, and the digest is checked.** A download whose sha256 disagrees
+  with its manifest is deleted rather than cached. `model.sha256` is written back
+  on the first success, so a release that later moves a tag to different weights
+  is a loud mismatch instead of a silent substitution. Plain `http` is refused
+  except to loopback, which is what makes the suite testable.
+* **A cache hit never reaches the network.** The cache is content-addressed under
+  the state directory, so two ids naming the same weights share one copy, and a
+  miss with no connection fails naming the id, the digest and the directory it
+  looked in.
+
 ### Pose models
 
 Set `detection.task: pose`. A checkpoint stores `kpt_shape`, so the keypoint
@@ -544,7 +601,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Ten suites, 117 tests, 938 named checks. `uv sync` installs pytest. Nothing is
+Eleven suites, 129 tests, 983 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
@@ -567,6 +624,7 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_kymograph.py` | curvature against shapes with analytically known curvature |
 | `test_predict.py` | provenance of a prediction at every stage |
 | `test_reassociate.py` | label repair, largely the cases where it must decline |
+| `test_models.py` | the model registry, largely the cases where a fetch must be refused |
 
 `test_pipeline.py` asserts the reassociation contract directly, mapping cached
 clip coordinates back through `crop_x0 + cache_x / scale` and comparing against
