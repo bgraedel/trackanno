@@ -512,19 +512,26 @@ class ConfigPage(Page):
 
         revert = QPushButton("Revert to saved")
         revert.clicked.connect(self.on_project)
-        self.registry_btn = QPushButton("From registry...")
-        self.registry_btn.setToolTip(
-            "Pick shared weights instead of a file on this machine. They are "
-            "downloaded once, cached, and bring their own settings."
-        )
-        self.registry_btn.clicked.connect(self._pick_registry_model)
         self.state = QLabel("")
         self.state.setWordWrap(True)
 
         bar = QHBoxLayout()
         bar.addWidget(self.state, 1)
-        bar.addWidget(self.registry_btn)
         bar.addWidget(revert)
+
+        # The usual way to get a model is to download a shared one, so this sits
+        # in the "detection model" row itself, ahead of Browse.
+        self.registry_btn = QPushButton("Choose shared model...")
+        self.registry_btn.setProperty("accent", "true")
+        self.registry_btn.setToolTip(
+            "Download a model from the shared registry. It is fetched once, "
+            "cached for later, and fills in the settings it was trained with. "
+            "Browse instead for a .pt already on this machine."
+        )
+        self.registry_btn.clicked.connect(self._pick_registry_model)
+        model_field = self.form._widgets.get("paths.model")
+        if model_field is not None:
+            model_field.layout().insertWidget(1, self.registry_btn)
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
@@ -896,7 +903,7 @@ class ModelRegistryDialog(QDialog):
         super().__init__(parent)
         from ..models import registry_url
 
-        self.setWindowTitle("Detection models")
+        self.setWindowTitle("Choose a shared model")
         self.setMinimumWidth(640)
         self._entries: list = []
 
@@ -918,7 +925,7 @@ class ModelRegistryDialog(QDialog):
         self.detail.setWordWrap(True)
         self.detail.setProperty("role", "muted")
 
-        self.ok = QPushButton("Use this model")
+        self.ok = QPushButton("Download and use")
         self.ok.setDefault(True)
         self.ok.setEnabled(False)
         self.ok.clicked.connect(self.accept)
@@ -959,17 +966,28 @@ class ModelRegistryDialog(QDialog):
             )
             return
         try:
-            self._entries = list_models(refresh=refresh)
+            offered = list_models(refresh=refresh)
         except RegistryError as exc:
             self._entries = []
             self.detail.setText(str(exc))
             return
+        # Only what this project can run. The rest of the registry is counted
+        # rather than listed, so the choice stays a choice.
+        self._entries = [e for e in offered if e.runnable]
         for entry in self._entries:
             here = cached_path(entry.sha256, entry.name) is not None
-            item = QListWidgetItem(f"{entry.label}{'   [cached]' if here else ''}")
-            self.list.addItem(item)
+            self.list.addItem(QListWidgetItem(entry.label + ("   [cached]" if here else "")))
+        others = len(offered) - len(self._entries)
         if not self._entries:
-            self.detail.setText("The registry index lists no models.")
+            self.detail.setText(
+                f"This registry offers {len(offered)} model(s), none of which "
+                "trackanno can run." if offered
+                else "The registry index lists no models."
+            )
+        elif others:
+            self.detail.setText(
+                f"{others} further model(s) here are for other tools, not shown."
+            )
 
     def _describe(self) -> None:
         entry = self.chosen()
@@ -977,12 +995,8 @@ class ModelRegistryDialog(QDialog):
         if entry is None:
             return
         size = f"{entry.size / 1e6:.0f} MB" if entry.size else "size unknown"
-        where = entry.url or f"asset {entry.asset}"
         trained = f"   |   trained at {entry.trained_at}" if entry.trained_at else ""
-        lines = [entry.notes or "no description", f"{size}{trained}", where]
-        if not entry.runnable:
-            lines.insert(0, entry.unsupported_reason)
-        self.detail.setText("\n".join(lines))
+        self.detail.setText(f"{entry.notes or 'no description'}\n{size}{trained}")
 
     def chosen(self):
         row = self.list.currentRow()

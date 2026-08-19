@@ -207,9 +207,10 @@ another clip's pixels looks normal during annotation.
 ### Shared models
 
 Weights do not have to be a file somebody copied onto this machine.
-*Configure -> From registry...* lists the models a GitHub release offers,
-downloads the one you pick into a shared cache, and applies the settings it was
-trained with.
+**Choose shared model...**, in the detection model row on the Configure page,
+lists the models a GitHub release offers, downloads the one you pick into a
+shared cache, and applies the settings it was trained with. Only models this
+project can run are listed; the rest of the registry is counted below the list.
 
 ```yaml
 model:
@@ -612,7 +613,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eleven suites, 134 tests, 1019 named checks. `uv sync` installs pytest. Nothing is
+Eleven suites, 136 tests, 1030 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real

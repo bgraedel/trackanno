@@ -490,3 +490,38 @@ def test_a_value_the_loader_rejects_costs_only_that_value(root) -> None:
     check("and it is reported with the loader's own complaint",
           any("NOT applied" in t and "overlap" in t for t in told), str(told))
     check("the project still loads", load_config(path) is not None)
+
+
+def test_the_picker_offers_only_what_this_tool_can_run(app, root, monkeypatch) -> None:
+    """Choosing a model is the point, so the list is models this project can use.
+
+    The rest of the registry is counted rather than listed: hidden entirely it
+    would look like the registry was smaller than it is.
+    """
+    from trackanno.gui.hub import ModelRegistryDialog
+
+    offered = [
+        M.ModelEntry(id="pose", url="https://x/p.pt", version="v2", task="pose",
+                     framework="ultralytics", notes="the one to use"),
+        M.ModelEntry(id="seg", url="https://x/s.pt", task="segment",
+                     framework="ultralytics"),
+        M.ModelEntry(id="m2f", url="https://x/m.zip", task="segment",
+                     framework="hf-transformers"),
+    ]
+    monkeypatch.setattr(M, "list_models", lambda refresh=False: offered)
+    monkeypatch.setattr(M, "registry_url", lambda: "https://example.org/index.json")
+
+    dialog = ModelRegistryDialog()
+    listed = [dialog.list.item(i).text() for i in range(dialog.list.count())]
+    check("only the runnable model is listed", len(listed) == 1 and "pose" in listed[0],
+          str(listed))
+    check("the others are counted, not hidden", "2 further" in dialog.detail.text(),
+          dialog.detail.text())
+
+    dialog.list.setCurrentRow(0)
+    check("choosing it enables the download", dialog.ok.isEnabled())
+    check("and the button says what it will do", "Download" in dialog.ok.text(),
+          dialog.ok.text())
+    check("the description is what a person needs to choose",
+          "the one to use" in dialog.detail.text(), dialog.detail.text())
+    dialog.close()

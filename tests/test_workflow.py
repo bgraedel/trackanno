@@ -584,6 +584,18 @@ def test_hub(app, project_config: Path) -> None:
     check("navigating away flushes instead of prompting",
           not config_page._dirty and abs(hub.cfg.clips.pad - 3.0) < 1e-9)
 
+    # Downloading a shared model is the usual way to get one, so its button sits
+    # in the detection model row rather than off in a corner.
+    from qtpy.QtWidgets import QPushButton
+
+    row = config_page.form._widgets["paths.model"].layout()
+    labels = [row.itemAt(i).widget().text() for i in range(row.count())
+              if isinstance(row.itemAt(i).widget(), QPushButton)]
+    check("the shared-model button leads the detection model row",
+          labels == ["Choose shared model...", "Browse"], str(labels))
+    check("and says what it does rather than where it comes from",
+          "shared model" in labels[0].lower())
+
     hub.close()
     app.processEvents()
 
