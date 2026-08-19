@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -2056,6 +2057,30 @@ def _read_annotation_rows(cfg):
         return [], f"could not read {path.name}: {exc}"
 
 
+def _reveal(path) -> str:
+    """Open a folder in the desktop's file manager. Returns "" or why it failed.
+
+    The rendered movies are files somebody then does something else with, and
+    hunting for the folder that the GUI already knows the path of is busywork.
+    """
+    import subprocess
+    import sys as _sys
+
+    path = Path(path)
+    if not path.exists():
+        return f"{path} does not exist yet"
+    try:
+        if _sys.platform == "win32":
+            os.startfile(str(path))                       # noqa: S606 - a directory
+        elif _sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:
+        return str(exc)
+    return ""
+
+
 class ExportPage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
@@ -2096,6 +2121,17 @@ class ExportPage(Page):
         movies_layout = QVBoxLayout(movies_box)
         movies_layout.addWidget(self.movies)
 
+        self.open_folder = QPushButton("Open project folder")
+        self.open_folder.setToolTip(
+            "Show the project in the file manager. The rendered movies land in "
+            "render.out_dir inside it."
+        )
+        self.open_folder.clicked.connect(self._open_project_folder)
+        folder_bar = QHBoxLayout()
+        folder_bar.addWidget(self.open_folder)
+        folder_bar.addStretch(1)
+        movies_layout.addLayout(folder_bar)
+
         self.tasks = TaskPanel("Render overlay movies")
         self.tasks.set_work(self._build_work)
 
@@ -2120,6 +2156,13 @@ class ExportPage(Page):
             "mistaken for something you decided.",
         ))
         layout.addWidget(splitter, 1)
+
+    def _open_project_folder(self) -> None:
+        if self.cfg is None:
+            return
+        problem = _reveal(self.cfg.path.parent)
+        if problem:
+            self.status_message.emit(f"could not open the project folder: {problem}", 8000)
 
     def source_value(self) -> str:
         """"labels", "predictions" or "both"."""

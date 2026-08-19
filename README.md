@@ -597,6 +597,9 @@ category of the clip covering that frame, using the colours from `config.yaml`.
 Works on a partially annotated CSV. Unlabelled tracks are drawn grey or hidden.
 Output goes to `render.out_dir`.
 
+**Open project folder** on the Export page shows the project in the file
+manager; the rendered movies land in `render.out_dir` inside it.
+
 `--source` selects `labels` (default), `predictions` or `both`. The categories
 already own the colours, so provenance is carried by line style instead: a model
 value is drawn as a dashed outline with its confidence beside it, and the output
@@ -613,7 +616,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eleven suites, 136 tests, 1030 named checks. `uv sync` installs pytest. Nothing is
+Eleven suites, 137 tests, 1040 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real

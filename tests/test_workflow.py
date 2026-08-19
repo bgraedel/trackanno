@@ -901,3 +901,28 @@ def test_the_new_project_dialog_offers_the_templates(app, root) -> None:
           dialog.values()["template"] == "from the dialog")
     dialog.close()
     delete_template("from the dialog")
+
+
+def test_export_can_open_the_project_folder(app, root, monkeypatch) -> None:
+    """The rendered movies are files somebody then does something else with."""
+    from trackanno.gui import hub as H
+    from trackanno.gui.hub import ExportPage, Hub
+
+    project = make_project(root / "reveal", pose=True)
+    window = Hub(str(project))
+    try:
+        page = next(p for p in window.pages if isinstance(p, ExportPage))
+        check("the button is on the Export page", page.open_folder.text() == "Open project folder")
+
+        opened: list = []
+        monkeypatch.setattr(H.os, "startfile", opened.append, raising=False)
+        monkeypatch.setattr(H.sys, "platform", "win32")
+        page._open_project_folder()
+        check("it opens the folder the config lives in",
+              opened == [str(project.parent)], str(opened))
+
+        check("a folder that is not there is reported, not raised",
+              "does not exist" in H._reveal(root / "gone"))
+    finally:
+        window.close()
+        app.processEvents()
