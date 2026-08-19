@@ -22,7 +22,8 @@ from qtpy.QtCore import QSize, Qt, QTimer, Signal
 from qtpy.QtGui import QFont
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem,
     QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter,
     QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
@@ -109,10 +110,18 @@ class ProjectPage(Page):
         new_btn.clicked.connect(self._new_project)
         open_btn = QPushButton("Open project...")
         open_btn.clicked.connect(self._open_project)
+        self.template_btn = QPushButton("Save as template...")
+        self.template_btn.setToolTip(
+            "Keep this project's settings, minus its paths, to start the next "
+            "project from."
+        )
+        self.template_btn.clicked.connect(self._save_template)
+        self.template_btn.setEnabled(False)
 
         buttons = QHBoxLayout()
         buttons.addWidget(new_btn)
         buttons.addWidget(open_btn)
+        buttons.addWidget(self.template_btn)
         buttons.addStretch(1)
 
         self.recent = QListWidget()
@@ -204,6 +213,36 @@ class ProjectPage(Page):
                 "project created - check the settings, then run detection", 8000
             )
 
+    def _save_template(self) -> None:
+        """Store the open project's settings for the next project to start from."""
+        from ..templates import find_template, save_template
+
+        if self.cfg is None:
+            return
+        suggested = self.cfg.path.parent.name
+        name, ok = QInputDialog.getText(
+            self, "Save as template", "Name for these settings:", text=suggested
+        )
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if find_template(name) is not None:
+            answer = QMessageBox.question(
+                self, "Save as template",
+                f"A template named {name!r} already exists. Replace it?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            template = save_template(name, self.cfg.path, overwrite=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save as template", str(exc))
+            return
+        self.status_message.emit(
+            f"saved template {template.name!r} - New project can start from it", 8000
+        )
+
     def _go_next(self) -> None:
         self.hub.go_to(self._next_page)
 
@@ -215,6 +254,9 @@ class ProjectPage(Page):
 
     # -- display ------------------------------------------------------------ #
     def on_project(self) -> None:
+        # Saving a template needs a config, nothing more: it copies the file and
+        # does not care whether anything has been prepared or annotated.
+        self.template_btn.setEnabled(self.cfg is not None)
         self.refresh_recent()
         self._paint_summary()
 
@@ -260,15 +302,27 @@ class NewProjectDialog(QDialog):
         self.videos = _Browse("dir", "")
         self.model = _Browse("file", "", "PyTorch weights (*.pt);;All files (*)")
 
+        self.template = QComboBox()
+        self.forget_btn = QPushButton("Forget")
+        self.forget_btn.setToolTip("Delete the selected template.")
+        self.forget_btn.clicked.connect(self._forget_template)
+        self._fill_templates()
+        template_row = QHBoxLayout()
+        template_row.addWidget(self.template, 1)
+        template_row.addWidget(self.forget_btn)
+
         form = QFormLayout()
         form.addRow("project name", self.name)
         form.addRow("create in", self.location)
+        form.addRow("start from", template_row)
         form.addRow("video folder", self.videos)
         form.addRow("detection model", self.model)
 
         note = QLabel(
             "The clip cache and annotations.csv are created inside the project "
-            "folder. You can change any of this afterwards on the Configure page."
+            "folder. A template supplies every other setting, and 'Save as "
+            "template' on the Project page makes one from a project you have "
+            "already tuned. You can change any of this on the Configure page."
         )
         note.setWordWrap(True)
         note.setProperty("role", "muted")
@@ -331,12 +385,41 @@ class NewProjectDialog(QDialog):
         runner = getattr(self, "exec_", None) or self.exec
         return bool(runner())
 
+    def _fill_templates(self) -> None:
+        from ..templates import list_templates
+
+        current = self.template.currentData()
+        self.template.clear()
+        for template in list_templates():
+            self.template.addItem(template.label, template.name)
+        index = self.template.findData(current)
+        self.template.setCurrentIndex(max(0, index))
+        self._sync_forget()
+        self.template.currentIndexChanged.connect(self._sync_forget)
+
+    def _sync_forget(self) -> None:
+        from ..templates import BUILTIN_NAME
+
+        self.forget_btn.setEnabled(self.template.currentData() != BUILTIN_NAME)
+
+    def _forget_template(self) -> None:
+        from ..templates import delete_template
+
+        name = self.template.currentData()
+        answer = QMessageBox.question(
+            self, "Forget template", f"Delete the template {name!r}?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes and delete_template(name):
+            self._fill_templates()
+
     def values(self) -> dict:
         directory = Path(self.location.value()) / self.name.text().strip()
         return {
             "directory": directory,
             "video_dir": self.videos.value() or None,
             "model": self.model.value() or None,
+            "template": self.template.currentData(),
         }
 
 

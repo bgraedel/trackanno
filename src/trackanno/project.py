@@ -339,15 +339,24 @@ def create_project(
     csv: str | Path | None = None,
     categories: list[dict] | None = None,
     overwrite: bool = False,
+    template: str | None = None,
 ) -> Path:
-    """Write a fresh, fully commented ``config.yaml``. Returns its path."""
+    """Write a fresh, fully commented ``config.yaml``. Returns its path.
+
+    ``template`` names a set of saved settings to start from
+    (:mod:`trackanno.templates`); without one, the packaged default is used. The
+    paths below are applied on top either way, so a template never carries
+    another project's movie folder into this one.
+    """
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONFIG_NAME
     if path.exists() and not overwrite:
         raise FileExistsError(f"{path} already exists")
 
-    text = DEFAULT_CONFIG
+    from .templates import template_text
+
+    text = template_text(template)
     updates: dict[str, object] = {}
     if video_dir:
         updates["paths.video_dir"] = _relative_to(Path(video_dir), directory)

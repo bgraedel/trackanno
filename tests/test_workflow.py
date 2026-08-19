@@ -702,3 +702,152 @@ def test_later_steps_unlock(app) -> None:
 
     hub.close()
     app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# config templates
+# --------------------------------------------------------------------------- #
+def test_a_template_carries_settings_but_not_paths(root) -> None:
+    """The point of a template: keep the tuning, drop the project it came from.
+
+    Tuning the detector, the crop geometry and the category buttons is most of
+    the setup work for a dataset, and the next dataset wants the same answers.
+    What it must NOT bring is the previous project's movie folder or clip cache.
+    """
+    from trackanno.config import load_config
+    from trackanno.project import create_project, write_config
+    from trackanno.templates import list_templates, save_template
+
+    videos = root / "tpl-videos"
+    videos.mkdir()
+    weights = root / "tpl-model.pt"
+    weights.write_bytes(b"")
+
+    source = create_project(root / "tpl-a", video_dir=videos, model=weights)
+    write_config(source, {
+        "clips.frames": 33, "clips.min_clip_frames": 25, "clips.crop_size": 128,
+        "detection.imgsz": 1280, "detection.conf": 0.4,
+        "tracking.backend": "botsort", "ui.annotator": "someone",
+    }, categories=[{"name": "state", "type": "single", "required": True,
+                    "options": [{"name": "swimming", "key": "1", "color": "#4C9F70"},
+                                {"name": "stuck", "key": "2", "color": "#D95F02"}]}])
+
+    template = save_template("Trypanosome 100 fps", source)
+    check("the typed name is kept, punctuation and all",
+          template.name == "Trypanosome 100 fps", template.name)
+    check("the file name is a slug of it",
+          template.path.name == "trypanosome-100-fps.yaml", template.path.name)
+    check("it appears in the picker after the built-in",
+          [t.name for t in list_templates()] == ["default", "Trypanosome 100 fps"])
+
+    other = root / "tpl-videos-2"
+    other.mkdir()
+    made = create_project(root / "tpl-b", video_dir=other, template="Trypanosome 100 fps")
+    cfg = load_config(made)
+
+    check("the tuning came across",
+          (cfg.clips.frames, cfg.detection.imgsz, cfg.tracking.backend)
+          == (33, 1280, "botsort"),
+          f"{cfg.clips.frames}, {cfg.detection.imgsz}, {cfg.tracking.backend}")
+    check("so did the category buttons",
+          [g.name for g in cfg.categories] == ["state"]
+          and [o.name for o in cfg.categories[0].options] == ["swimming", "stuck"])
+    check("the model came across, since weights are reused between projects",
+          cfg.paths.model == weights.resolve(), str(cfg.paths.model))
+    check("the movie folder did NOT: this project has its own",
+          cfg.paths.video_dir == other.resolve(), str(cfg.paths.video_dir))
+    check("nor did the clip cache",
+          cfg.paths.work_dir == (root / "tpl-b" / "work").resolve(), str(cfg.paths.work_dir))
+    check("nor did the annotation log",
+          cfg.paths.csv == (root / "tpl-b" / "annotations.csv").resolve(), str(cfg.paths.csv))
+    check("nor the annotator: a template is a protocol, not a person",
+          cfg.ui.annotator == "", repr(cfg.ui.annotator))
+
+    text = made.read_text(encoding="utf-8")
+    check("the comments that document every setting survived", text.count("#") > 40)
+    check("and the template's own header line did not leak into the project",
+          not text.startswith("# trackanno template:"), text.splitlines()[0][:40])
+
+
+def test_a_template_can_be_found_however_it_is_named(root) -> None:
+    """The typed name, its slug and the file name all mean the same template."""
+    from trackanno.config import load_config
+    from trackanno.project import create_project
+    from trackanno.templates import delete_template, find_template, save_template
+
+    source = create_project(root / "tpl-c")
+    save_template("Wide Field 20x", source)
+    for spelling in ("Wide Field 20x", "wide field 20x", "wide-field-20x"):
+        found = find_template(spelling)
+        check(f"{spelling!r} finds it", found is not None and found.name == "Wide Field 20x")
+    check("an unknown name finds nothing", find_template("no such thing") is None)
+    check("and creating from it falls back to the built-in rather than failing",
+          load_config(create_project(root / "tpl-d", template="no such thing")).clips.frames
+          == 50)
+
+    check("the built-in cannot be deleted", not delete_template("default"))
+    check("a saved one can", delete_template("Wide Field 20x"))
+    check("and is then gone", find_template("Wide Field 20x") is None)
+
+
+
+def test_a_template_that_would_not_load_is_refused(root) -> None:
+    """Storing a broken template only moves the failure to project creation."""
+    from trackanno.project import create_project
+    from trackanno.templates import find_template, save_template
+
+    source = create_project(root / "tpl-e")
+    text = source.read_text(encoding="utf-8")
+    source.write_text(text.replace("frames: 50", "frames: not-a-number"), encoding="utf-8")
+
+    try:
+        save_template("broken", source)
+        refused = False
+    except Exception:
+        refused = True
+    check("a template that cannot be parsed is refused at save time", refused)
+    check("and nothing was stored", find_template("broken") is None)
+
+
+def test_saving_a_template_twice_needs_permission(root) -> None:
+    """Overwriting somebody's tuned settings is a decision, not a default."""
+    from trackanno.project import create_project
+    from trackanno.templates import delete_template, save_template
+
+    source = create_project(root / "tpl-f")
+    save_template("dup", source)
+    try:
+        save_template("dup", source)
+        refused = False
+    except FileExistsError:
+        refused = True
+    check("a second save under the same name is refused", refused)
+    check("unless overwrite is asked for",
+          save_template("dup", source, overwrite=True).name == "dup")
+    delete_template("dup")
+
+
+def test_the_new_project_dialog_offers_the_templates(app, root) -> None:
+    """The picker is the only place most people will meet this."""
+    from trackanno.gui.hub import NewProjectDialog
+    from trackanno.project import create_project
+    from trackanno.templates import BUILTIN_NAME, delete_template, save_template
+
+    source = create_project(root / "tpl-g")
+    save_template("from the dialog", source)
+
+    dialog = NewProjectDialog()
+    items = [dialog.template.itemText(i) for i in range(dialog.template.count())]
+    check("the built-in is offered first and marked as such",
+          items[0] == "default (built in)", str(items))
+    check("the saved one is offered too", "from the dialog" in items, str(items))
+    check("the default selection is the built-in",
+          dialog.values()["template"] == BUILTIN_NAME)
+    check("the built-in cannot be forgotten", not dialog.forget_btn.isEnabled())
+
+    dialog.template.setCurrentIndex(items.index("from the dialog"))
+    check("a saved one can be", dialog.forget_btn.isEnabled())
+    check("and choosing it is what create_project is handed",
+          dialog.values()["template"] == "from the dialog")
+    dialog.close()
+    delete_template("from the dialog")

@@ -88,6 +88,35 @@ bottom.
 `annotations.csv`. *New project* writes a fully commented `config.yaml` with the
 paths filled in.
 
+**Templates.** Tuning the detector, the crop geometry and the category buttons
+is most of the setup for a dataset, and the next dataset usually wants the same
+answers. *Save as template* on the Project page stores the open project's
+settings under a name; *New project* then offers them under **start from**.
+
+A template is a whole `config.yaml`, comments included, kept outside any project
+so it outlives the one it came from. It carries everything except the three
+paths that describe one project on one disk: `video_dir`, `work_dir` and `csv`
+are reset, since a template pointing at last month's movie folder is worse than
+one pointing nowhere. `paths.model` is kept, because the same weights are
+normally reused, and the New Project form overrides it when a model is chosen.
+`ui.annotator` is cleared, a template being a protocol rather than a person.
+
+Saving copies the file rather than re-serialising it, so the comments survive,
+and the result is parsed by the real loader before it is stored: a template that
+would not load cannot be saved. They live under the state directory
+(`%APPDATA%	rackanno	emplates`, or `~/.config/trackanno/templates`), one
+`.yaml` each, so a template can be handed to somebody else as a file.
+
+From the API:
+
+```python
+from trackanno.project import create_project
+from trackanno.templates import save_template, list_templates
+
+save_template("Trypanosome 100 fps", "path/to/config.yaml")
+create_project("new-project", video_dir="movies/", template="Trypanosome 100 fps")
+```
+
 **Configure** has four tabs. *Basics* holds the fifteen settings that must be
 decided (movie location, model, clip length); *Labels* is the button editor;
 *Keypoints* is the pose table, active only for `task: pose`; *Advanced* holds
@@ -515,7 +544,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Ten suites, 112 tests, 908 named checks. `uv sync` installs pytest. Nothing is
+Ten suites, 117 tests, 938 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
