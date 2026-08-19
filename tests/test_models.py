@@ -262,3 +262,106 @@ def test_the_cache_can_be_pruned(registry, root) -> None:
     check("pruning keeps what is asked for", M.prune_cache(keep={DIGEST}) == 0)
     check("and removes what is not", M.prune_cache(keep=set()) >= 1)
     check("after which the cache is empty", M.cached_path(DIGEST) is None)
+
+
+# --------------------------------------------------------------------------- #
+# private repositories, which have no anonymous download url
+# --------------------------------------------------------------------------- #
+def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None:
+    """A private repo's assets are reachable only with a token, through the API.
+
+    ``github://owner/repo`` resolves the release, finds each asset by name and
+    downloads it with ``Accept: application/octet-stream``, which is the one
+    combination GitHub serves for a private release. Assets are looked up by
+    name every time rather than by id, so re-uploading a release does not
+    invalidate the index.
+    """
+    seen: list[tuple[str, dict]] = []
+    release = {
+        "tag_name": "v2",
+        "assets": [
+            {"name": M.INDEX_NAME, "url": "https://api.github.com/repos/o/r/releases/assets/1"},
+            {"name": "tryp.pt", "url": "https://api.github.com/repos/o/r/releases/assets/2"},
+        ],
+    }
+    index = json.dumps({"models": [{
+        "id": "tryp", "version": "v2", "task": "pose", "asset": "tryp.pt",
+        "sha256": DIGEST, "size": len(WEIGHTS),
+    }]}).encode("utf-8")
+
+    class _Response:
+        def __init__(self, body):
+            self.body = body
+        def read(self, n=-1):
+            out, self.body = (self.body, b"") if n == -1 else (self.body[:n], self.body[n:])
+            return out
+        @property
+        def headers(self):
+            return {}
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_get(url, timeout=M.TIMEOUT, accept=""):
+        seen.append((url, {"accept": accept, "token": M.token()}))
+        if url.endswith("/releases/latest"):
+            return _Response(json.dumps(release).encode("utf-8"))
+        if url.endswith("/assets/1"):
+            return _Response(index)
+        if url.endswith("/assets/2"):
+            return _Response(WEIGHTS)
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(M, "_get", fake_get)
+    monkeypatch.setenv("GH_TOKEN", "ghp_pretend")
+    monkeypatch.setenv(M.ENV_REGISTRY, "github://o/r")
+
+    check("a github:// registry is accepted", M._github_source("github://o/r") == ("o", "r", ""))
+    check("and a pinned tag comes through",
+          M._github_source("github://o/r@v2") == ("o", "r", "v2"))
+
+    models = M.list_models(refresh=True)
+    check("the index is read out of the release", [m.id for m in models] == ["tryp"])
+    check("an entry may name an asset instead of a url", models[0].asset == "tryp.pt")
+    check("and still knows what to call the file", models[0].name == "tryp.pt")
+
+    M.prune_cache(keep=set())
+    path = M.fetch(models[0])
+    check("the weights arrive through the API", path.read_bytes() == WEIGHTS)
+    check("the asset was requested as a byte stream, which is what serves a "
+          "private release",
+          any(u.endswith("/assets/2") and o["accept"] == "application/octet-stream"
+              for u, o in seen), str(seen[-1]))
+    check("and the token was available for it", all(o["token"] for _u, o in seen))
+
+
+def test_a_token_is_only_ever_sent_to_github(root, monkeypatch) -> None:
+    """A registry may name any host; the credential must not follow it there."""
+    monkeypatch.setenv("GH_TOKEN", "ghp_pretend")
+    sent: dict = {}
+
+    class _Boom(Exception):
+        pass
+
+    def capture(request, timeout=None):
+        sent.update(dict(request.header_items()))
+        raise _Boom()
+
+    monkeypatch.setattr(M.urllib.request, "urlopen", capture)
+    for url in ("https://elsewhere.example.org/index.json", "http://127.0.0.1:1/x"):
+        sent.clear()
+        try:
+            M._get(url)
+        except _Boom:
+            pass
+        check(f"no credential goes to {url.split('/')[2]}",
+              not any(k.lower() == "authorization" for k in sent), str(sent))
+
+    sent.clear()
+    try:
+        M._get("https://api.github.com/repos/o/r/releases/latest")
+    except _Boom:
+        pass
+    check("but api.github.com does get one",
+          any(k.lower() == "authorization" for k in sent), str(sent))

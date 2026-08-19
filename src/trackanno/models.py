@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import shutil
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,7 @@ __all__ = [
     "ModelEntry", "registry_url", "set_registry_url", "list_models", "find_model",
     "cache_dir", "cached_path", "fetch", "resolve_model", "apply_manifest",
     "prune_cache", "RegistryError", "is_trusted_url", "local_model_path",
+    "token", "set_token",
 ]
 
 REGISTRY_FILE = "registry.json"
@@ -83,6 +85,7 @@ class ModelEntry:
     sha256: str = ""
     size: int = 0
     filename: str = ""
+    asset: str = ""
     notes: str = ""
     config: dict = field(default_factory=dict)
     assumes: dict = field(default_factory=dict)
@@ -98,17 +101,22 @@ class ModelEntry:
 
     @property
     def name(self) -> str:
-        return self.filename or Path(self.url.split("?")[0]).name or f"{self.id}.pt"
+        from_url = Path(self.url.split("?")[0]).name if self.url else ""
+        return self.filename or self.asset or from_url or f"{self.id}.pt"
 
     @classmethod
     def parse(cls, d: dict) -> "ModelEntry":
         if not isinstance(d, dict):
             raise RegistryError("every entry in the registry index must be a mapping")
-        for required in ("id", "url"):
-            if not str(d.get(required, "")).strip():
-                raise RegistryError(f"a registry entry is missing {required!r}")
-        url = str(d["url"]).strip()
-        if not is_trusted_url(url):
+        if not str(d.get("id", "")).strip():
+            raise RegistryError("a registry entry is missing 'id'")
+        if not (str(d.get("url", "")).strip() or str(d.get("asset", "")).strip()):
+            raise RegistryError(
+                f"{d['id']}: an entry needs either a 'url' or an 'asset' naming a "
+                "file in the same release"
+            )
+        url = str(d.get("url", "") or "").strip()
+        if url and not is_trusted_url(url):
             raise RegistryError(
                 f"{d['id']}: model urls must be https, got {url!r}. Weights are "
                 "executed when they are loaded, so they are not fetched over a "
@@ -122,6 +130,7 @@ class ModelEntry:
             sha256=str(d.get("sha256", "") or "").strip().lower(),
             size=int(d.get("size") or 0),
             filename=str(d.get("filename", "") or "").strip(),
+            asset=str(d.get("asset", "") or "").strip(),
             notes=str(d.get("notes", "") or "").strip(),
             config=dict(d.get("config") or {}),
             assumes=dict(d.get("assumes") or {}),
@@ -150,13 +159,21 @@ def registry_url() -> str:
 
 
 def set_registry_url(url: str) -> None:
-    """Point this machine at a registry. Empty clears it."""
+    """Point this machine at a registry. Empty clears it.
+
+    Takes ``github://owner/repo[@tag]``, which goes through the API and so works
+    on a private repository, or a plain https URL to an index.json.
+    """
     url = str(url or "").strip()
-    if url and not is_trusted_url(url):
-        raise RegistryError("the registry url must be https")
+    if url and _github_source(url) is None and not is_trusted_url(url):
+        raise RegistryError(
+            "the registry must be github://owner/repo or an https url to an index.json"
+        )
+    settings = _settings()
+    settings["url"] = url
     directory = _state_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / REGISTRY_FILE).write_text(json.dumps({"url": url}, indent=2), encoding="utf-8")
+    (directory / REGISTRY_FILE).write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def cache_dir() -> Path:
@@ -166,9 +183,103 @@ def cache_dir() -> Path:
 # --------------------------------------------------------------------------- #
 # the index
 # --------------------------------------------------------------------------- #
-def _get(url: str, timeout: float = TIMEOUT):
-    request = urllib.request.Request(url, headers={"User-Agent": "trackanno"})
-    return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - https enforced above
+def token() -> str:
+    """The GitHub token, from the environment or the state file. "" if none.
+
+    Kept beside the registry URL and never in ``config.yaml``, for the same
+    reason: a project someone sends you may name a model, and must not be able
+    to make your credentials fetch from somewhere else.
+    """
+    for name in ("TRACKANNO_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return str(_settings().get("token", "") or "").strip()
+
+
+def _settings() -> dict:
+    try:
+        data = json.loads((_state_dir() / REGISTRY_FILE).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _get(url: str, timeout: float = TIMEOUT, accept: str = ""):
+    """One GET, with the token attached only when talking to GitHub.
+
+    Scoped deliberately: a token sent to whatever host an index happens to name
+    would leak it to that host. Anything outside api.github.com is fetched
+    anonymously, which is all a public release needs.
+    """
+    headers = {"User-Agent": "trackanno"}
+    if accept:
+        headers["Accept"] = accept
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in ("api.github.com", "uploads.github.com"):
+        auth = token()
+        if auth:
+            headers["Authorization"] = f"Bearer {auth}"
+    request = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - scheme checked above
+
+
+# --------------------------------------------------------------------------- #
+# GitHub releases
+# --------------------------------------------------------------------------- #
+def _github_source(url: str) -> tuple[str, str, str] | None:
+    """``github://owner/repo[@tag]`` -> (owner, repo, tag). None for anything else.
+
+    A private repository has no anonymous download URL, so its assets have to be
+    fetched through the API. Naming the repository rather than an asset URL also
+    survives re-uploading a release, since assets are resolved by name each time.
+    """
+    text = str(url or "").strip()
+    if not text.lower().startswith("github://"):
+        return None
+    rest, _, tag = text[len("github://"):].partition("@")
+    parts = [p for p in rest.split("/") if p]
+    if len(parts) != 2:
+        raise RegistryError(
+            f"{url!r} should look like github://owner/repo or github://owner/repo@tag"
+        )
+    return parts[0], parts[1], tag
+
+
+def _release(owner: str, repo: str, tag: str = "") -> dict:
+    where = f"tags/{tag}" if tag else "latest"
+    url = f"https://api.github.com/repos/{owner}/{repo}/releases/{where}"
+    try:
+        with _get(url, accept="application/vnd.github+json") as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        hint = "" if token() else (
+            "\nNo GitHub token is set on this machine, which a private "
+            "repository needs. Set one with `trackanno.models.set_token(...)` or "
+            "the GH_TOKEN environment variable."
+        )
+        raise RegistryError(f"could not read the release at {url}: {exc}{hint}") from exc
+
+
+def _asset_url(release: dict, name: str) -> str:
+    """The API URL of a named asset, which is what works on a private repo."""
+    for asset in release.get("assets") or []:
+        if str(asset.get("name", "")) == name:
+            return str(asset.get("url", ""))
+    offered = ", ".join(str(a.get("name")) for a in release.get("assets") or []) or "none"
+    raise RegistryError(
+        f"the release {release.get('tag_name', '?')!r} has no asset named {name!r}. "
+        f"It offers: {offered}"
+    )
+
+
+def set_token(value: str) -> None:
+    """Store a GitHub token for private registries. Empty clears it."""
+    settings = _settings()
+    settings["token"] = str(value or "").strip()
+    directory = _state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / REGISTRY_FILE).write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def list_models(refresh: bool = False) -> list[ModelEntry]:
@@ -185,8 +296,7 @@ def list_models(refresh: bool = False) -> list[ModelEntry]:
     text = ""
     if refresh or not cached.exists():
         try:
-            with _get(url) as response:
-                text = response.read().decode("utf-8")
+            text = _read_index(url)
             cache_dir().mkdir(parents=True, exist_ok=True)
             cached.write_text(text, encoding="utf-8")
         except Exception:
@@ -207,6 +317,37 @@ def list_models(refresh: bool = False) -> list[ModelEntry]:
             "with a 'models' list"
         )
     return [ModelEntry.parse(e) for e in entries]
+
+
+def _read_index(url: str) -> str:
+    """The index text, from a release asset or a plain URL."""
+    source = _github_source(url)
+    if source is None:
+        with _get(url) as response:
+            return response.read().decode("utf-8")
+    owner, repo, tag = source
+    release = _release(owner, repo, tag)
+    with _get(_asset_url(release, INDEX_NAME), accept="application/octet-stream") as response:
+        return response.read().decode("utf-8")
+
+
+def download_url(entry: "ModelEntry") -> str:
+    """Where ``entry``'s weights actually come from.
+
+    An absolute ``url`` is used as given. An ``asset`` name is looked up in the
+    registry's own release, which is what lets a PRIVATE repository work: its
+    assets have no anonymous download URL and must go through the API.
+    """
+    if entry.url:
+        return entry.url
+    source = _github_source(registry_url())
+    if source is None:
+        raise RegistryError(
+            f"{entry.id} names the asset {entry.asset!r}, but the registry is not a "
+            "github://owner/repo source, so there is no release to look it up in"
+        )
+    owner, repo, tag = source
+    return _asset_url(_release(owner, repo, tag), entry.asset)
 
 
 def find_model(model_id: str, version: str = "") -> ModelEntry | None:
@@ -274,7 +415,9 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     seen = 0
     try:
         reporter.stage(f"downloading {entry.name}", max(1, total))
-        with _get(entry.url, timeout=TIMEOUT) as response, staged.open("wb") as out:
+        source_url = download_url(entry)
+        with _get(source_url, timeout=TIMEOUT,
+                  accept="application/octet-stream") as response, staged.open("wb") as out:
             declared = response.headers.get("Content-Length")
             if not total and declared and declared.isdigit():
                 total = int(declared)
@@ -288,7 +431,7 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     except Exception as exc:
         staged.unlink(missing_ok=True)
         raise RegistryError(
-            f"could not download {entry.id} from {entry.url}: {exc}\n"
+            f"could not download {entry.id} ({entry.url or entry.asset}): {exc}\n"
             f"The cache is {directory}; a model already there is used without "
             "any network access."
         ) from exc
@@ -297,7 +440,8 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     if wanted and got != wanted:
         staged.unlink(missing_ok=True)
         raise RegistryError(
-            f"{entry.id} downloaded from {entry.url} has sha256 {got}, but "
+            f"{entry.id} downloaded from {entry.url or entry.asset} has sha256 "
+            f"{got}, but "
             f"{wanted} was expected. Nothing was cached. Either the release was "
             "changed after this project pinned it, or the download is not what "
             "it claims to be; weights are executed when loaded, so this is "
@@ -309,8 +453,9 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     target = target_dir / entry.name
     staged.replace(target)
     (target_dir / "manifest.json").write_text(
-        json.dumps({"id": entry.id, "version": entry.version, "url": entry.url,
-                    "sha256": got, "size": seen}, indent=2),
+        json.dumps({"id": entry.id, "version": entry.version,
+                    "source": entry.url or entry.asset, "sha256": got, "size": seen},
+                   indent=2),
         encoding="utf-8",
     )
     reporter.log(f"{entry.id}: {seen / 1e6:.1f} MB cached at {target}")
