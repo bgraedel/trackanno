@@ -267,8 +267,8 @@ def prepare_all(
     if not movies:
         return []
 
-    reporter.log(f"loading model {cfg.paths.model.name} on device {cfg.detection.device}")
-    detector = TiledDetector(cfg)
+    reporter.log(f"loading model {cfg.paths.model.name}...")
+    detector = TiledDetector(cfg, reporter=reporter)
     results: list[dict] = []
     try:
         for i, movie in enumerate(movies):

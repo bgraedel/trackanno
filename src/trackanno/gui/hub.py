@@ -533,6 +533,7 @@ class ConfigPage(Page):
         model_field = self.form._widgets.get("paths.model")
         if model_field is not None:
             model_field.row.insertWidget(1, self.registry_btn)
+            model_field.picked.connect(self._use_local_model)
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
@@ -549,6 +550,19 @@ class ConfigPage(Page):
         # Probed off the UI thread: importing torch costs a second or two.
         self._device_probe: TaskRunner | None = None
         QTimer.singleShot(0, self._probe_devices)
+        # A laptop GPU asleep behind hybrid graphics, or a driver that has just
+        # been reset, answers "no CUDA here" once and differently a minute
+        # later. Without this the only way to ask again is to restart the app.
+        self.recheck_btn = QPushButton("Re-check")
+        self.recheck_btn.setToolTip(
+            "Ask torch again what this machine has. Worth a click if a GPU you "
+            "expect is missing from the list - a card asleep or a driver that "
+            "has just come back reports itself only when asked again."
+        )
+        self.recheck_btn.clicked.connect(lambda: self._probe_devices(again=True))
+        device_row = self.form.row_for("detection.device")
+        if device_row is not None:
+            device_row.addWidget(self.recheck_btn)
 
         # Pick a .pt and the project configures itself: task, count, names table.
         self._model_probe: TaskRunner | None = None
@@ -608,6 +622,35 @@ class ConfigPage(Page):
             f"using shared model <b>{name}</b> ({where}). The path above is not used."
         )
         field.edit.setEnabled(False)
+
+    def _use_local_model(self, path: str) -> None:
+        """Browsing to a .pt means run THAT file, shared model or not.
+
+        ``model.source`` outranks ``paths.model`` everywhere downstream, so
+        leaving it set would keep running the downloaded weights while the field
+        showed the file just picked. Picking one is the one unambiguous signal
+        that the shared model is no longer wanted.
+        """
+        spec = getattr(self.cfg, "model", None) if self.cfg else None
+        if spec is None or not spec.is_remote:
+            return
+        was = " ".join(b for b in (spec.source, spec.version) if b)
+        # The field's own edit goes out with the ordinary save; the model block
+        # is not a form field, so it is cleared here.
+        if not self.save():
+            return
+        try:
+            write_config(self.cfg.path,
+                         {"model.source": "", "model.version": "", "model.sha256": ""})
+        except (ConfigError, ValueError, OSError) as exc:
+            self._fail("The shared model could not be cleared, so it is still what "
+                       "runs:", [str(exc)])
+            return
+        self.hub.reload_project()
+        self.status_message.emit(
+            f"now using {Path(path).name}; the shared model {was} is no longer used.",
+            12000,
+        )
 
     def _pick_registry_model(self) -> None:
         """Choose shared weights, fetch them, and let them configure the project."""
@@ -723,21 +766,36 @@ class ConfigPage(Page):
             self._mark_dirty()
         self._show_warnings()
 
-    def _probe_devices(self) -> None:
+    def _probe_devices(self, again: bool = False) -> None:
         if self._device_probe is not None:
-            return
+            if not again or self._device_probe.isRunning():
+                return
+            # Worth re-running: torch caches a device count only once it is
+            # non-zero, so a card that was asleep the first time is found by
+            # asking again, in this same process.
+            self._device_probe = None
 
         def work(reporter):
-            from ..tiling import describe_devices
+            from ..tiling import describe_auto, describe_devices
 
-            return describe_devices()
+            # Both in one job: importing torch is what costs the seconds, and
+            # asking a second question of it afterwards is free.
+            return describe_devices(), describe_auto()
 
         runner = TaskRunner(work, self)
         runner.succeeded.connect(self._on_devices)
+        runner.failed.connect(lambda message: self.form.set_status(
+            "detection.device", f"could not ask torch what this machine has: {message}"))
         self._device_probe = runner
+        # Until it answers, the list holds only the two entries every machine
+        # has. Saying so is what separates "still looking" from "no GPU here",
+        # which are otherwise identical for the ten seconds torch takes to load.
+        self.form.set_status(
+            "detection.device", "checking this machine for GPUs (a few seconds)...")
         runner.start()
 
-    def _on_devices(self, devices) -> None:
+    def _on_devices(self, result) -> None:
+        devices, note = result
         widget = self.form._widgets.get("detection.device")
         if widget is None or not devices:
             return
@@ -755,6 +813,7 @@ class ConfigPage(Page):
             + "\n\n'auto' falls back to the CPU where there is no GPU, so the "
               "project stays portable between machines."
         )
+        self.form.set_status("detection.device", note)
 
     def _mark_dirty(self) -> None:
         if self._loading:

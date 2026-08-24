@@ -926,3 +926,124 @@ def test_export_can_open_the_project_folder(app, root, monkeypatch) -> None:
     finally:
         window.close()
         app.processEvents()
+
+
+def test_browsing_to_a_file_stops_using_the_shared_model(app, root) -> None:
+    """paths.model is what you see; model.source is what runs.
+
+    Picking a local .pt while a downloaded model is configured used to change
+    only the visible half: the field showed the file, the project kept running
+    the shared weights, and the page kept saying so.
+    """
+    from trackanno.config import load_config
+    from trackanno.gui.hub import ConfigPage, Hub
+    from trackanno.project import write_config as _write
+
+    project = make_project(root / "swap")
+    _write(project, {"model.source": "some-model", "model.version": "v3",
+                     "model.sha256": "ab" * 32})
+    local = project.parent / "small.pt"
+    local.write_bytes(b"not really weights")
+
+    window = Hub(str(project))
+    try:
+        page = next(p for p in window.pages if isinstance(p, ConfigPage))
+        field = page.form._widgets["paths.model"]
+        check("the shared model is in use to begin with", not field.edit.isEnabled())
+
+        # Exactly what the Browse dialog does once a file has been chosen.
+        field.edit.setText(str(local).replace("\\", "/"))
+        field.picked.emit(str(local).replace("\\", "/"))
+        check("the save lands", pump(app, lambda: not page._dirty, timeout=10))
+
+        after = load_config(project)
+        check("the shared model is dropped", not after.model.is_remote,
+              repr(after.model.source))
+        check("its pin goes with it", not after.model.version and not after.model.sha256)
+        check("and the picked file is what the project runs",
+              after.paths.model.name == "small.pt", str(after.paths.model))
+        check("the page stops claiming a shared model", not field.status.text(),
+              field.status.text())
+        check("and the path is editable again", field.edit.isEnabled())
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_the_device_list_says_when_it_is_still_looking(app, root) -> None:
+    """Importing torch takes seconds, and the list is auto/cpu until it lands.
+
+    A settings page showing only 'cpu' reads as "no GPU on this machine", which
+    is the wrong answer while the probe has simply not finished.
+    """
+    from trackanno.gui.hub import ConfigPage, Hub
+
+    project = make_project(root / "devices")
+    window = Hub(str(project))
+    try:
+        page = next(p for p in window.pages if isinstance(p, ConfigPage))
+        app.processEvents()
+        status = page.form._status["detection.device"]
+        check("the device row starts by saying the probe is running",
+              "checking" in status.text().lower(), status.text())
+        check("and it is visible, not a tooltip nobody hovers", not status.isHidden())
+
+        check("the probe answers", pump(app, lambda: "checking" not in status.text().lower(),
+                                        timeout=120))
+        check("and it says what auto resolves to here",
+              status.text().startswith("auto uses"), status.text())
+        items = [page.form._widgets["detection.device"].itemText(i)
+                 for i in range(page.form._widgets["detection.device"].count())]
+        check("with auto and cpu always offered", {"auto", "cpu"} <= set(items), str(items))
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
+    """One probe answers both, or the page shows one thing and the run does another.
+
+    The list counted CUDA devices while ``resolve_device`` only asked whether
+    CUDA was available at all and then assumed device 0. Those two questions are
+    answered by different layers of torch and are allowed to differ - so the
+    Configure page could offer no GPU while ``auto`` picked one regardless, which
+    is a run landing somewhere nobody was ever shown.
+    """
+    from trackanno import tiling
+
+    offered = {value for value, _label in tiling.describe_devices()}
+    check("the list always offers auto and cpu", {"auto", "cpu"} <= offered, str(offered))
+
+    indices = tiling.cuda_devices()
+    check("the listed GPUs are exactly the usable ones",
+          {str(i) for i in indices} <= offered, f"{indices} vs {offered}")
+
+    resolved = tiling.resolve_device("auto")
+    check("and auto only ever resolves to something on that list",
+          resolved in offered or resolved == "cpu", f"auto -> {resolved}, offered {offered}")
+    if indices:
+        check("auto takes the first usable GPU", resolved == str(indices[0]), resolved)
+    else:
+        check("auto falls back rather than assuming device 0",
+              resolved != "0", resolved)
+
+    check("an index nobody offered is refused, not handed to ultralytics",
+          tiling.resolve_device("99") == "cpu", tiling.resolve_device("99"))
+
+
+def test_describe_auto_says_why_it_landed_on_the_cpu() -> None:
+    """"cpu" alone cannot be acted on; the reason is what tells you the fix."""
+    from trackanno import tiling
+
+    sentence = tiling.describe_auto()
+    check("it is one sentence about auto", sentence.startswith("auto uses"), sentence)
+    if tiling.resolve_device("auto") == "cpu":
+        check("and a CPU answer explains itself", ":" in sentence, sentence)
+
+    usable, why = tiling.cuda_status()
+    check("a refusal always carries a reason", usable or bool(why), repr((usable, why)))
+    check("and a working GPU carries none", not usable or not why, repr(why))
+
+    check("a CUDA index is named with its card",
+          tiling.device_label("cpu") == "the CPU" and "mps" in tiling.device_label("mps"),
+          tiling.device_label("mps"))

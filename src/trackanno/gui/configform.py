@@ -25,7 +25,7 @@ from ..project import _exists
 from .theme import compact_button
 
 __all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "FIELDS", "BASIC",
-           "NEEDS_REPREPARE"]
+           "NEEDS_REPREPARE", "HAS_STATUS"]
 
 # The settings someone setting up a project has to decide. Everything else is a
 # tuning knob with a defensible default; all 54 on one page is unusable.
@@ -37,6 +37,10 @@ BASIC = {
     "tracking.min_track_length",
     "ui.fps", "ui.annotator", "ui.auto_advance", "ui.shuffle", "ui.theme",
 }
+
+# Fields that need a second line under the row for something the value alone
+# cannot say. paths.model has its own (see :class:`_PathField`).
+HAS_STATUS = {"detection.device"}
 
 # Changing these invalidates a clip cache that has already been built.
 NEEDS_REPREPARE = {
@@ -327,6 +331,8 @@ class ConfigForm(QScrollArea):
         self.setFrameShape(QFrame.NoFrame)
         self._widgets: dict[str, QWidget] = {}
         self._kinds: dict[str, str] = {}
+        self._status: dict[str, QLabel] = {}
+        self._rows: dict[str, QHBoxLayout] = {}
 
         body = QWidget()
         layout = QVBoxLayout(body)
@@ -356,7 +362,7 @@ class ConfigForm(QScrollArea):
                 widget.setToolTip(tip)
                 name = QLabel(label + ("  *" if dotted in NEEDS_REPREPARE else ""))
                 name.setToolTip(tip)
-                form.addRow(name, widget)
+                form.addRow(name, self._with_status(dotted, widget))
                 self._widgets[dotted] = widget
                 self._kinds[dotted] = kind
             layout.addWidget(box)
@@ -373,6 +379,49 @@ class ConfigForm(QScrollArea):
         self.setWidget(body)
 
     # -- widget construction ------------------------------------------------ #
+    def _with_status(self, dotted: str, widget: QWidget) -> QWidget:
+        """The field as it goes into the row, with room under it for a note.
+
+        Same shape as :class:`_PathField`: the control keeps a row of its own so
+        a page can put a button beside it, and a muted line underneath says what
+        the value cannot.
+        """
+        if dotted not in HAS_STATUS:
+            return widget
+        holder = QWidget()
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(widget, 1)
+        box = QVBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(2)
+        box.addLayout(row)
+        status = QLabel("")
+        status.setProperty("role", "muted")
+        status.setWordWrap(True)
+        status.setVisible(False)
+        box.addWidget(status)
+        self._rows[dotted] = row
+        self._status[dotted] = status
+        return holder
+
+    def row_for(self, dotted: str) -> QHBoxLayout | None:
+        """The field's own row, for a page adding a button beside it."""
+        widget = self._widgets.get(dotted)
+        return getattr(widget, "row", None) or self._rows.get(dotted)
+
+    def set_status(self, dotted: str, text: str) -> None:
+        """Say something under a field that its value cannot say for itself."""
+        widget = self._widgets.get(dotted)
+        if widget is not None and hasattr(widget, "set_status"):
+            widget.set_status(text)
+            return
+        label = self._status.get(dotted)
+        if label is None:
+            return
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _make_widget(self, kind: str, extra: dict) -> QWidget:
         if kind == "bool":
             widget = QCheckBox()
@@ -627,6 +676,11 @@ class _GroupPicker(QWidget):
 class _PathField(QWidget):
     """Line edit plus a Browse button that knows what it is picking."""
 
+    # Browsing is a deliberate choice of THIS file, which is more than a text
+    # change: paths.model may be shadowed by a shared model, and only the
+    # picking tells the page the person meant to stop using it.
+    picked = Signal(str)
+
     def __init__(self, kind: str, extra: dict, changed_signal):
         super().__init__()
         self._kind = kind
@@ -681,7 +735,9 @@ class _PathField(QWidget):
                 self, "Choose file", start, self._extra.get("filter", "All files (*)")
             )
         if picked:
-            self.edit.setText(str(Path(picked)).replace("\\", "/"))
+            text = str(Path(picked)).replace("\\", "/")
+            self.edit.setText(text)
+            self.picked.emit(text)
 
 
 # --------------------------------------------------------------------------- #

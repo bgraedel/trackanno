@@ -152,10 +152,28 @@ uv run prepare.py --self-test --tile 320       # check the tiling merge
 ```
 
 **Device.** `detection.device: auto` selects the first CUDA device, then MPS,
-then CPU, and logs the choice. A config naming a specific GPU is a claim about
-the machine it was written on, so an absent device is reported and the run
-continues on CPU. The Configure page reads the available hardware on a worker
-thread, since importing torch costs a second or two.
+then CPU. A config naming a specific GPU is a claim about the machine it was
+written on, so an absent device is reported and the run continues on CPU. Detect
+& crop logs what `auto` actually resolved to, card name and all, so a slow run is
+never a guess.
+
+One probe answers both the list and the resolution, which is not free: torch
+will tell you CUDA is *available* and separately that it can enumerate *no
+device*, because those questions are answered by different layers and only one
+of them reads `CUDA_VISIBLE_DEVICES`. The list used to count devices while `auto`
+only asked whether CUDA existed and then assumed device 0, so the page could
+offer no GPU while the run picked one anyway. `cuda_devices()` is now the single
+answer, and `auto` takes the first entry on the list you were actually shown.
+
+The Configure page runs that probe on a worker thread, since importing torch
+costs the better part of ten seconds. Until it lands the list holds only `auto`
+and `cpu`, so the row says which it is doing - "checking this machine for GPUs"
+while it looks, then one line naming what `auto` picks here. A CPU answer says
+*why*, because `torch.cuda.is_available()` returns the same `False` for a
+CPU-only wheel, an absent driver and a laptop card asleep behind hybrid
+graphics, and those need different things from you. **Re-check** beside the row
+asks again without restarting: torch caches a device count only once it is
+non-zero, so a card that has since woken up is found.
 
 **Tiled inference.** Each frame is cut into overlapping tiles (`tiling.tile`,
 `tiling.overlap`), run as one batch, mapped back to full-frame coordinates and
@@ -218,6 +236,12 @@ model:
   version: v2
   sha256: 9f3c...            # written on the first fetch, pins it thereafter
 ```
+
+`model.source` outranks `paths.model`, which is why the field is greyed out and
+labelled while a shared model is in use. **Browse** stays live and is the way
+back: picking a `.pt` clears the block above and runs the file you picked, since
+choosing a file is the one unambiguous statement that the shared model is no
+longer wanted.
 
 The index is one release asset, so
 `https://github.com/bgraedel/leishmania-models/releases/latest/download/index.json`

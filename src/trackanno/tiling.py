@@ -8,6 +8,7 @@ the mechanism entirely.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Sequence
@@ -17,7 +18,108 @@ import numpy as np
 from .config import Config
 
 __all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
-           "default_node_names", "resolve_device", "describe_devices", "read_model_info"]
+           "default_node_names", "resolve_device", "describe_devices", "device_label",
+           "describe_auto", "cuda_status", "cuda_devices", "read_model_info"]
+
+
+def cuda_status() -> tuple[bool, str]:
+    """``(usable, why not)`` for CUDA on this machine, with the reason kept.
+
+    ``torch.cuda.is_available()`` answers False for a CPU-only wheel, an absent
+    driver, a card asleep behind hybrid graphics and a driver that has fallen
+    over - and says which only in a warning it raises on the way past, which no
+    GUI ever shows. Swallowing that leaves "this machine has no GPU", which is
+    the one reading that needs nothing done about it. So catch the warning and
+    hand the reason back to whoever can put it on screen.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False, "torch is not installed"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            usable = bool(torch.cuda.is_available())
+            count = int(torch.cuda.device_count()) if usable else 0
+        except Exception as exc:  # noqa: BLE001 - any failure here means "no GPU"
+            return False, f"{type(exc).__name__}: {exc}"
+    if usable and count > 0:
+        return True, ""
+    if usable:
+        # The two ask different layers and are allowed to disagree; CUDA_VISIBLE_DEVICES
+        # is read by only one of them. Nothing can be run on a device that cannot
+        # be enumerated, so this counts as no GPU - said out loud, not assumed.
+        return False, ("torch reports CUDA available but can enumerate no device "
+                       "(CUDA_VISIBLE_DEVICES is the usual cause)")
+
+    said = "; ".join(
+        str(w.message).strip().splitlines()[0] for w in caught if str(w.message).strip()
+    )
+    if said:
+        return False, said
+    if not getattr(torch.version, "cuda", None):
+        return False, f"torch {torch.__version__} is a CPU-only build"
+    # The default check inside torch never raises - a missing or unresponsive
+    # driver is simply a device count of zero. So the interesting question is
+    # whether the driver disagrees, which is the difference between "no card
+    # here" and "the card is there and torch could not reach it".
+    cards = _driver_sees()
+    if cards:
+        return False, (
+            f"torch {torch.__version__} could not initialise CUDA, though the "
+            f"driver reports {cards}"
+        )
+    return False, f"no CUDA device is visible to torch {torch.__version__}"
+
+
+def _driver_sees() -> str:
+    """What ``nvidia-smi`` lists, or "" if it is absent or says nothing.
+
+    Only ever called once torch has already said no, so the happy path spawns
+    nothing. Bounded and fully guarded: a diagnosis must not be able to hang or
+    break the thing it is diagnosing.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:  # noqa: BLE001 - no nvidia-smi, no answer, no problem
+        return ""
+    names = [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
+    return ", ".join(names)
+
+
+def cuda_devices() -> list[int]:
+    """The CUDA indices this machine can actually be told to use.
+
+    The one place either half of the app asks. The settings list counted devices
+    while ``resolve_device`` only asked whether CUDA was available at all and
+    then assumed device 0 - so the page could offer no GPU while ``auto`` picked
+    one anyway, which is a run quietly landing somewhere the person was never
+    shown.
+    """
+    usable, _why = cuda_status()
+    if not usable:
+        return []
+    try:
+        import torch
+
+        return list(range(int(torch.cuda.device_count())))
+    except Exception:
+        return []
+
+
+def _mps_available() -> bool:
+    try:
+        import torch
+
+        return bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+    except Exception:
+        return False
 
 
 def describe_devices() -> list[tuple[str, str]]:
@@ -32,19 +134,15 @@ def describe_devices() -> list[tuple[str, str]]:
     except ImportError:
         return out + [("cpu", "cpu (torch is not installed)")]
 
-    try:
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                total = torch.cuda.get_device_properties(i).total_memory / 1e9
-                out.append((str(i), f"{i}: {name} ({total:.1f} GB)"))
-    except Exception:
-        pass
-    try:
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            out.append(("mps", "mps (Apple GPU)"))
-    except Exception:
-        pass
+    for i in cuda_devices():
+        try:
+            name = torch.cuda.get_device_name(i)
+            total = torch.cuda.get_device_properties(i).total_memory / 1e9
+            out.append((str(i), f"{i}: {name} ({total:.1f} GB)"))
+        except Exception:
+            out.append((str(i), f"{i}: CUDA device {i}"))
+    if _mps_available():
+        out.append(("mps", "mps (Apple GPU)"))
     out.append(("cpu", "cpu"))
     return out
 
@@ -58,24 +156,17 @@ def resolve_device(device: str) -> str:
     """
     requested = str(device).strip()
     try:
-        import torch
+        import torch  # noqa: F401 - the probes below need it importable
     except ImportError:
         return "cpu"
 
-    cuda = False
-    try:
-        cuda = torch.cuda.is_available()
-    except Exception:
-        pass
-    mps = False
-    try:
-        mps = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
-    except Exception:
-        pass
+    # The same list the settings page is shown, so the two cannot disagree.
+    cuda = cuda_devices()
+    mps = _mps_available()
 
     if requested in ("", "auto"):
         if cuda:
-            return "0"
+            return str(cuda[0])
         return "mps" if mps else "cpu"
     if requested == "cpu":
         return "cpu"
@@ -83,7 +174,7 @@ def resolve_device(device: str) -> str:
         return "mps" if mps else "cpu"
     if requested.replace("cuda:", "").isdigit():
         index = int(requested.replace("cuda:", ""))
-        if cuda and index < torch.cuda.device_count():
+        if index in cuda:
             return str(index)
         print(
             f"[trackanno] detection.device is {requested!r} but no such CUDA device "
@@ -91,6 +182,48 @@ def resolve_device(device: str) -> str:
         )
         return "cpu"
     return requested
+
+
+def device_label(device: str) -> str:
+    """Name a resolved device the way a log line should read it."""
+    value = str(device).strip()
+    index = value.replace("cuda:", "")
+    if index.isdigit():
+        try:
+            import torch
+
+            return f"CUDA device {index} ({torch.cuda.get_device_name(int(index))})"
+        except Exception:
+            return f"CUDA device {index}"
+    if value == "mps":
+        return "the Apple GPU (mps)"
+    if value == "cpu":
+        return "the CPU"
+    return value
+
+
+def describe_auto() -> str:
+    """One sentence on what ``auto`` picks here, and - if it is the CPU - why.
+
+    A settings page that lists only ``cpu`` looks identical whether the machine
+    has no GPU, the driver is asleep or the installed torch is the CPU-only
+    wheel. Those need different answers from the person, so say which it is.
+    """
+    resolved = resolve_device("auto")
+    if resolved != "cpu":
+        return f"auto uses {device_label(resolved)} on this machine."
+    usable, why = cuda_status()
+    if usable:  # a CUDA card exists but auto still declined it - say so plainly
+        return "auto uses the CPU here, though CUDA reports itself usable."
+    extra = ""
+    if "CPU-only build" in why:
+        extra = (' Reinstall with the GPU extra - uv tool install "trackanno[cuda]" - '
+                 "if this machine has an NVIDIA card.")
+    elif "could not initialise" in why or "visible to torch" in why:
+        # The two states a click can change: a card asleep behind hybrid
+        # graphics, and a driver that has just come back.
+        extra = " Re-check once the card is awake."
+    return f"auto uses the CPU here: {why}.{extra}"
 
 
 def default_node_names(n: int) -> list[str]:
@@ -336,14 +469,28 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 class TiledDetector:
     """Runs a YOLO model over a frame, tiling it when it does not fit."""
 
-    def __init__(self, cfg: Config, model=None):
+    def __init__(self, cfg: Config, model=None, reporter=None):
         from ultralytics import YOLO
 
         self.cfg = cfg
         # Resolved once, here, so every predict call and every log line agree.
+        # Said out loud every time, not only when it changed: "auto" on its own
+        # never tells you whether a slow run is on the GPU or the CPU, and the
+        # GUI log is the only place most people would ever see it.
         self.device = resolve_device(cfg.detection.device)
-        if self.device != cfg.detection.device:
-            print(f"[trackanno] detection device {cfg.detection.device!r} -> {self.device!r}")
+        wanted = str(cfg.detection.device).strip()
+        told = f"detection.device {wanted!r} -> {device_label(self.device)}"
+        level = "info"
+        # Asking for a GPU and silently getting the CPU is the failure that
+        # looks like nothing at all - the run just takes twenty times as long.
+        if self.device == "cpu" and wanted not in ("cpu",):
+            _usable, why = cuda_status()
+            told += f" - NOT the GPU: {why}"
+            level = "warning"
+        if reporter is not None:
+            reporter.log(told, level)
+        else:
+            print(f"[trackanno] {told}")
         self.model = model if model is not None else YOLO(str(cfg.paths.model))
         if cfg.is_pose and getattr(self.model, "task", None) != "pose":
             raise ValueError(
