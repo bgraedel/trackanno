@@ -1281,3 +1281,49 @@ def test_the_model_page_labels_every_clip(app, root: Path) -> None:
     page.shutdown()
     hub.close()
     app.processEvents()
+
+
+def test_a_movie_with_no_detector_embeddings_is_refused_not_filled_with_nan(
+    root: Path,
+) -> None:
+    """Found by running the real project: a movie missing instance_features.npy
+    used to write every cnn* column as NaN and predict on them anyway.
+
+    The classifier is NaN-native, so nothing objected. On three real movies that
+    silenced an entire behaviour class - 197 windows of `frozen` became 0 - while
+    mean confidence stayed at 0.83 and the log said nothing at all. The two
+    checks beside this one already refused a MISALIGNED and a WRONG-WIDTH
+    embeddings file; absent was the third case and the only silent one.
+    """
+    import joblib
+    from sklearn.decomposition import PCA
+
+    from trackanno.clipfeatures import PCA_FILE
+    from trackanno.densepredict import FEATURES_FILE, build_dense_features
+
+    cfg, _ = build_case(root, "noembed", coverage="dense")
+    work = cfg.paths.work_dir
+
+    # A saved PCA is what says "the training features contain a cnn* block", so
+    # it is the whole trigger. The fixture's movies carry no embeddings, which
+    # is exactly the state being refused.
+    pca = PCA(n_components=2).fit(np.arange(60, dtype=float).reshape(20, 3))
+    joblib.dump(pca, work / PCA_FILE)
+    present = [d / FEATURES_FILE for d in work.iterdir() if d.is_dir()]
+    check("the fixture supplies no embeddings to begin with",
+          not any(p.exists() for p in present))
+
+    try:
+        build_dense_features(cfg)
+        check("a movie that cannot supply cnn* columns is refused", False)
+    except RuntimeError as exc:
+        message = str(exc)
+        check("a movie that cannot supply cnn* columns is refused", True)
+        check("...and the message names the missing file",
+              FEATURES_FILE in message, message)
+        check("...and the file whose presence made it required",
+              PCA_FILE in message, message)
+        check("...and says what would otherwise happen to those columns",
+              "NaN" in message, message)
+        check("...and names which movie to re-prepare",
+              any(d.name in message for d in work.iterdir() if d.is_dir()), message)

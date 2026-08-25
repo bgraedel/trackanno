@@ -632,11 +632,20 @@ with nothing left over. Worth stating, because it says exactly what a smaller
 stride buys - halve the stride, halve the error, down to wherever the cost stops
 being worth it.
 
-**The cost is windows, not pixels.** Featurising a track costs about 37 ms fixed
-plus about 4 ms per window (measured on a 500-frame track, 8 keypoints,
-`spectral.window: 75`). Against that track's exact tiling as the baseline, five
-times the windows costs about 2.8x the wall time and ten times about 5.4x. The
-dense stage reads no pixels and re-detects nothing, so this stays cheap in
+**The cost is windows, not pixels.** Featurising one track costs about 37 ms
+fixed plus about 4 ms per window (a 500-frame synthetic track, 8 keypoints,
+`spectral.window: 75`), so the per-track arithmetic is linear in the window
+count over a substantial constant.
+
+Do not extrapolate that microbenchmark to a project. Measured end to end on a
+real one - three movies, 500 frames each, `clips.frames: 25` - going from the
+tiling default to `window_stride: 5` took **18s to 74s**, about 4x for 5x the
+windows, including rebuilding the feature table at the finer stride. The
+single-track figure predicts 2.8x and is wrong at project scale, because a run
+pays per-movie and per-track costs the one-track measurement amortises away.
+Budget from the 4x.
+
+The dense stage reads no pixels and re-detects nothing, so this stays cheap in
 absolute terms - it is arithmetic over `tracks.parquet` and the saved
 embeddings, not another pass over the recording.
 
@@ -725,7 +734,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eighteen suites, 213 tests, 1573 named checks. `uv sync` installs pytest. Nothing is
+Eighteen suites, 214 tests, 1579 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real

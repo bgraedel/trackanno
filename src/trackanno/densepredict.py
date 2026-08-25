@@ -308,6 +308,24 @@ def build_dense_features(
         movie_id = d.name
         fps = float(header["movie"]["fps"])
         feats = np.load(d / FEATURES_FILE) if (d / FEATURES_FILE).exists() else None
+        if pca is not None and feats is None:
+            # A saved PCA means the training features CONTAIN a cnn* block, so a
+            # movie that cannot supply one is not a degraded input, it is a
+            # different feature space wearing the same column names. Every cnn*
+            # column comes out NaN, and because the classifier is NaN-native
+            # nothing downstream objects: it predicts at unchanged confidence on
+            # 55% fewer inputs and can drop a whole class from the output. That
+            # is what this refusal is for. The two checks below already refuse a
+            # file that is MISALIGNED or the WRONG WIDTH; absent is the third
+            # case, and it was the silent one.
+            raise RuntimeError(
+                f"{movie_id}: {FEATURES_FILE} is missing, but {PCA_FILE} exists, "
+                "so the model was fitted with detector-embedding columns this "
+                "movie cannot supply. They would be written as NaN and predicted "
+                "on without complaint. Re-prepare this movie with the same "
+                "detection weights as the others, or retrain without the "
+                "embedding features."
+            )
         if feats is not None and len(feats) != len(tracks):
             # instance_features.npy is written row-aligned with tracks.parquet.
             # Assert it rather than trust it: these vectors re-identify

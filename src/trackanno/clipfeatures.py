@@ -368,7 +368,10 @@ def window_features(
     fixed per track plus about 4 ms per window. Taking that track's exact tiling
     as the baseline (50-frame windows at stride 50 = 10 windows, ~77 ms), 5x the
     windows costs about 2.8x the wall time and 10x about 5.4x. Linear in the
-    window count over a substantial constant - not free. (The 2.7x/6.7x figures
+    window count over a substantial constant - not free. These are ONE TRACK:
+    a real project measured 4x for 5x the windows, because a run also pays
+    per-movie and per-track costs a single-track timing amortises away. Quote
+    the project number when budgeting; see the README. (The 2.7x/6.7x figures
     this paragraph used to quote were `trackseries`-only numbers from
     `tests/test_trackseries.py`, which measure the amortised half alone and are
     not the cost of `window_features`. Do not reinstate them.)
