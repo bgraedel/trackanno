@@ -820,7 +820,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eighteen suites, 214 tests, 1579 named checks. `uv sync` installs pytest. Nothing is
+Twenty-three suites, 273 tests, 2010 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
@@ -845,6 +845,11 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_render.py` | which rows the overlay may paint over, and the one it refuses |
 | `test_reassociate.py` | label repair, largely the cases where it must decline |
 | `test_models.py` | the model registry, largely the cases where a fetch must be refused |
+| `test_selection_wiring.py` | the candidate pool a selector ranks, and what must stay out of it |
+| `test_selection_queue.py` | which clip the annotator is handed, and what the CSV records about why |
+| `test_audit_stability.py` | the holdout is the same clips tomorrow that it is today |
+| `test_discover.py` | sub-behaviours found where they were planted, and the batch effect that is not one |
+| `test_bout_review.py` | reading decoded bouts back, including a file that holds windows instead |
 | `test_bouts.py` | frame posteriors and the two decoders, against closed forms |
 | `test_dense_grid.py` | the window grid at every stride, and the frames a plan must reach |
 | `test_select.py` | which clip to annotate next, and what the audit draw must ignore |

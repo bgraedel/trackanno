@@ -22,8 +22,8 @@ from pathlib import Path
 from harness import check
 from trackanno.config import RESERVED_GROUP_NAMES, ConfigError, load_config
 from trackanno.store import (
-    IDENTITY_COLUMNS, PROVENANCE_COLUMN, TRAILING_COLUMNS, AnnotationStore,
-    decode_provenance, encode_provenance,
+    AUDIT_COLUMN, IDENTITY_COLUMNS, PROVENANCE_COLUMN, TRAILING_COLUMNS,
+    AnnotationStore, decode_provenance, encode_provenance,
 )
 
 CONFIG_TEXT = """
@@ -66,9 +66,15 @@ def _meta(i: int) -> dict:
 
 
 def _schema_before_this_change(cfg) -> list[str]:
-    """Exactly the header an installed release wrote, last week."""
+    """Exactly the header an installed release wrote before either new column.
+
+    Both are excluded, not only ``selected_by``: a build that predates the
+    provenance column predates everything added after it too, and a fixture
+    that carried ``audit_holdout`` while omitting ``selected_by`` would be a
+    file no release ever wrote.
+    """
     columns = IDENTITY_COLUMNS + [g.name for g in cfg.categories] + TRAILING_COLUMNS
-    return [c for c in columns if c != PROVENANCE_COLUMN]
+    return [c for c in columns if c not in (PROVENANCE_COLUMN, AUDIT_COLUMN)]
 
 
 def _write_old_csv(path: Path, cfg, rows: list[dict]) -> None:
@@ -223,9 +229,14 @@ def test_a_csv_from_before_the_column_still_opens_and_admits_it_does_not_know(ro
 
     check("the file itself was upgraded in place, once",
           PROVENANCE_COLUMN in _header(path), str(_header(path)))
+    # By column position rather than by the line's trailing bytes: the
+    # provenance cell stopped being the last field on the line when a later
+    # column was appended after it, and the claim was never about where it sits.
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        raw = list(csv.reader(fh))
+    at = raw[0].index(PROVENANCE_COLUMN)
     check("the upgrade left the cell empty rather than guessing",
-          path.read_text(encoding="utf-8").splitlines()[1].endswith(",0,"),
-          path.read_text(encoding="utf-8").splitlines()[1])
+          all(row[at] == "" for row in raw[1:]), str(raw[1]))
     check("and it said so out loud, in the one moment it mattered",
           any(PROVENANCE_COLUMN in m and "NOT RECORDED" in m for m in said), str(said))
 
@@ -242,11 +253,12 @@ def test_an_older_build_reading_a_new_csv_leaves_it_alone(root: Path) -> None:
     it is tested by running old code's *rule*: `_load` treats an unrecognised
     column as `extra` and appends it to the end of its own column list.
 
-    That reconstruction matches the header on disk only because the provenance
-    column is LAST, and if it matches, the old build does not rewrite the file
-    and does not drop the column - it carries the values through untouched. The
-    worst it can do is append its own rows with the cell blank, which decodes to
-    "not recorded" and is the truth: that build did not know why it showed them.
+    That reconstruction matches the header on disk only because the columns
+    added since are LAST and in the order they were added, and if it matches,
+    the old build does not rewrite the file and does not drop them - it carries
+    the values through untouched. The worst it can do is append its own rows
+    with the cells blank, which decodes to "not recorded" and is the truth: that
+    build did not know why it showed them.
     """
     cfg = _cfg(root, "downgrade")
     store = AnnotationStore(cfg.paths.csv, cfg)
@@ -256,8 +268,8 @@ def test_an_older_build_reading_a_new_csv_leaves_it_alone(root: Path) -> None:
     disk = _header(cfg.paths.csv)
     old_columns = _schema_before_this_change(cfg)
     extra = [c for c in disk if c not in old_columns]
-    check("an older build sees exactly one column it does not know",
-          extra == [PROVENANCE_COLUMN], str(extra))
+    check("an older build sees exactly the columns added since, in that order",
+          extra == [PROVENANCE_COLUMN, AUDIT_COLUMN], str(extra))
     check("...and its union reproduces the header exactly, so it does not rewrite",
           old_columns + extra == disk, f"{old_columns + extra} vs {disk}")
     check("...so the values it cannot interpret are still preserved",

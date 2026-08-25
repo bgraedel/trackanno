@@ -43,6 +43,7 @@ from .theme import (
     Heading, app_icon, apply_theme, banner_style, compact_button, current,
     set_role, theme_icon, tokens,
 )
+from .timeline import BoutReviewDialog
 from .tasks import TaskPanel, TaskRunner
 
 PAGES = ["Project", "Configure", "Detect & crop", "Annotate", "Model",
@@ -1565,8 +1566,22 @@ class ModelPage(Page):
         self.predict_note = _muted(QLabel(""))
         self.predict_note.setWordWrap(True)
 
+        # Reviewing what came out is a separate question from making it, and the
+        # only gate it needs is the file: a run whose model has since been
+        # gated off still wrote rows somebody has to be able to look at.
+        self._has_predictions = False
+        self._review: BoutReviewDialog | None = None
+        self.review_button = QPushButton("Review predictions...")
+        self.review_button.setEnabled(False)
+        self.review_button.setToolTip(
+            "Draw one track's predicted spans along the frame axis - where each "
+            "begins and ends, which class, and how confident. Read-only."
+        )
+        self.review_button.clicked.connect(self._review_predictions)
+
         predict_row = QHBoxLayout()
         predict_row.addWidget(self.predict_button)
+        predict_row.addWidget(self.review_button)
         predict_row.addWidget(self.predict_note, 1)
 
         splitter = QSplitter(Qt.Vertical)
@@ -1605,12 +1620,20 @@ class ModelPage(Page):
         )
         # Cached too: a reliable model appears only when one is trained.
         self.predict_button.setEnabled(not self._predict_blocker and not self.tasks.busy)
+        # Cached for the same reason - this runs on the annotation keystroke
+        # path and must not stat predictions.parquet there.
+        self.review_button.setEnabled(self._has_predictions and not self.tasks.busy)
 
     def on_project(self) -> None:
         self._count_orphans()
         self._refresh_predict_gate()
         self.refresh_gate()
         self._load_report()
+        # Only while it is on screen. A labelling run ends in reload_project, so
+        # this is what stops an open review window describing the rows the
+        # previous run wrote; closed, it re-reads on the next open anyway.
+        if self._review is not None and self._review.isVisible():
+            self._review.panel.set_config(self.cfg)
 
     def _refresh_predict_gate(self) -> None:
         """Re-read whether any group cleared the reliability bar. Only from
@@ -1618,10 +1641,12 @@ class ModelPage(Page):
         :meth:`refresh_gate`, which runs on the annotation keystroke path."""
         if self.cfg is None:
             self._predict_blocker = "no project open"
+            self._has_predictions = False
         else:
             from ..predict import prediction_blocker, predictions_path, staleness
 
             self._predict_blocker = prediction_blocker(self.cfg)
+            self._has_predictions = predictions_path(self.cfg).exists()
             if not self._predict_blocker and predictions_path(self.cfg).exists():
                 stale = staleness(self.cfg)
                 self.predict_note.setText(
@@ -1823,6 +1848,24 @@ class ModelPage(Page):
         self.tasks.start(work, throttle=1)
         self.refresh_gate()
 
+    # -- looking at what came out -------------------------------------------- #
+    def _review_predictions(self) -> None:
+        """Open the read-only timeline over predictions.parquet.
+
+        One dialog, reused: a second press on a window already open would leave
+        two views of a file that can change under both, and the older one would
+        go on showing rows that are no longer on disk.
+        """
+        if self.cfg is None:
+            return
+        if self._review is None:
+            self._review = BoutReviewDialog(self.cfg, self)
+        else:
+            self._review.panel.set_config(self.cfg)
+        self._review.show()
+        self._review.raise_()
+        self._review.activateWindow()
+
     def _build_work(self):
         blocker = self.blocker()
         if blocker:
@@ -1866,6 +1909,13 @@ class ModelPage(Page):
 
     def shutdown(self) -> None:
         self.tasks.shutdown()
+        # A dialog parented to this page outlives it otherwise, and it holds a
+        # Config and two loaded parquet tables belonging to a project that is
+        # being closed.
+        if self._review is not None:
+            self._review.close()
+            self._review.deleteLater()
+            self._review = None
         # Wait for it: a QThread still running at teardown aborts the process.
         runner = self._repair_runner
         if runner is not None:

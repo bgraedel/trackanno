@@ -21,6 +21,7 @@ import argparse
 import json
 import sys
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from .clipfeatures import (
 )
 from .config import Config, load_config
 from .select import select_batch
+from .store import AUDIT_COLUMN, decode_audit, read_audit_records
 
 MODEL_FILE = "suggest_model.joblib"
 REPORT_FILE = "suggest_report.json"
@@ -56,24 +58,63 @@ REPORT_FILE = "suggest_report.json"
 _LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
 
 
-def is_audit_clip(clip_id: str, cfg: Config) -> bool:
-    """Deterministically hold a share of clips out of the suggestion loop.
+def is_audit_clip(clip_id: str, cfg: Config,
+                  recorded: Mapping[str, bool] | None = None) -> bool:
+    """Hold a share of clips out of the suggestion loop: never suggested on,
+    never trained on, so agreement measured there is unbiased.
 
-    Never suggested on and never trained on, so agreement there is unbiased.
-    Uses its OWN seed: on ``suggest.seed`` a seed change made to check CV
-    stability silently redraws the audit set (0 -> 1 overlap 10%, chance).
+    THE RECORD WINS, and the hash is only consulted where there is none.
+    ``clip_id`` embeds the track id, so re-running detection renumbers the
+    tracks, every id changes, and a hash of the id redraws the holdout from
+    scratch - roughly ``2*f*(1-f)`` of the clips change side, about a fifth at
+    the default fraction. ``reassociate`` then rewrites the id in place to put
+    each label back on its clip, so a label earned on a held-out clip can arrive
+    under an id that hashes into the training set: the next fit trains on the
+    holdout and reports ``audit_accuracy`` over a different, partly overlapping
+    set. Membership is therefore written into the CSV when a clip is LABELLED
+    (``store.AUDIT_COLUMN``) and read back here.
+
+    A recorded value that disagrees with the hash is the NORMAL state of a
+    re-detected project, not an error, and is not reported per clip; the count
+    is surfaced once, by :func:`train` and by the store on open, because it is
+    the only way anyone learns their project was re-detected.
+
+    ``recorded`` maps ``clip_id`` to its recorded membership, holding only the
+    clips that HAVE one. Absent (the default) means no records were available,
+    which is the pre-existing behaviour exactly - so ``predict`` and any caller
+    that only ever asks about unlabelled clips need no records and no change.
+
+    Uses its OWN seed - see :meth:`trackanno.config.Suggest.audit_by_hash`.
     """
-    frac = cfg.suggest.audit_fraction
-    if frac <= 0:
-        return False
-    import hashlib
+    if recorded:
+        member = recorded.get(str(clip_id))
+        if member is not None:
+            return bool(member)
+    return cfg.suggest.audit_by_hash(str(clip_id))
 
-    digest = hashlib.blake2b(
-        f"{cfg.suggest.audit_seed}:{clip_id}".encode(), digest_size=8
-    ).digest()
-    return (int.from_bytes(digest, "big") % 10_000) < frac * 10_000
 
-__all__ = ["Suggester", "train", "main", "MODEL_FILE", "REPORT_FILE"]
+def audit_records(labels: pd.DataFrame | None) -> dict[str, bool]:
+    """``{clip_id: was_held_out}`` from an annotation table already in memory.
+
+    The same mapping :func:`trackanno.store.read_audit_records` builds from the
+    file, for the callers that have the frame instead (``train`` reads the CSV
+    with pandas once and hands it to every group). Sharing the codec rather than
+    re-deriving the flag is what keeps the two readings from disagreeing about a
+    cell - a disagreement that would put a clip in the training set for one
+    group and the holdout for another.
+    """
+    if labels is None or AUDIT_COLUMN not in getattr(labels, "columns", ()):
+        return {}
+    out: dict[str, bool] = {}
+    for clip_id, cell in zip(labels["clip_id"].astype(str), labels[AUDIT_COLUMN]):
+        member = decode_audit(cell)
+        if member is not None:
+            out[clip_id] = member
+    return out
+
+
+__all__ = ["Suggester", "train", "main", "is_audit_clip", "audit_records",
+           "MODEL_FILE", "REPORT_FILE"]
 
 
 def _selection_slots(n: int, share: float, ranked: int, audit: int) -> int:
@@ -127,7 +168,25 @@ class GroupReport:
     # while the saved model uses the global one already in clip_features.parquet.
     # Both deliberate, but different fits - `top_features` is the saved model's.
     cv_pca: str
-    audit_n: int                      # clips never shown a suggestion nor trained on
+    # How the CNN basis was fitted for the AUDIT score, which is a different
+    # answer and an honest admission rather than a description. The audit clips
+    # are scored on `columns`, whose `cnn*` block comes from a PCA fitted in
+    # `clipfeatures` over the detections of every prepared movie - the audit
+    # clips' own included. The CV path refits that basis inside each fold and so
+    # keeps the held-out movie out of it; the audit path has no folds and does
+    # not. The labels never leak, so this is unsupervised leakage only and is
+    # probably small - but "probably small" is not measured here, and the figure
+    # it inflates is the one number this tool asks people to trust. Stated in
+    # the report so a reader is not left to infer it from the source. NOT fixed:
+    # a per-audit-clip refit is a different change with its own cost.
+    audit_pca: str
+    audit_n: int                      # audit clips actually SCORED below
+    # The audit population and the labelled part of it, because `audit_n` alone
+    # cannot be read: "10 audit clips, all correct" and "10 of 200 audit clips
+    # have been labelled" are the same 10 and completely different claims about
+    # how much of the holdout has been spent.
+    audit_population: int             # audit clips this project HAS, labelled or not
+    audit_labelled: int               # of those, how many carry a label for this group
     audit_accuracy: float
     audit_kappa: float
     confusion: list
@@ -362,9 +421,23 @@ def train_group(
 
     # Hold the audit clips out of TRAINING as well as out of the display;
     # training on them makes the "unbiased" estimate circular.
-    audit_mask = merged["clip_id"].astype(str).map(lambda c: is_audit_clip(c, cfg))
+    #
+    # Read off the CSV, not recomputed: a labelled clip's membership is whatever
+    # was recorded when it was labelled, and after a re-detection that is no
+    # longer what its clip_id hashes to. Recomputing here is what would let a
+    # clip the model was deliberately kept away from walk into this fit.
+    recorded = audit_records(labels)
+    audit_mask = merged["clip_id"].astype(str).map(lambda c: is_audit_clip(c, cfg, recorded))
     audit_set = merged[audit_mask].copy()
     merged = merged[~audit_mask]
+
+    # The DENOMINATOR for `audit_n`: audit clips this project has at all, not
+    # only the ones a human has reached. Counted over the feature table because
+    # that is the set of clips that could be scored; a clip with no features
+    # cannot be audited whether it is held out or not.
+    audit_population = int(sum(
+        is_audit_clip(c, cfg, recorded) for c in features["clip_id"].astype(str)
+    ))
     if dropped:
         merged = merged[~merged[group_name].astype(str).isin(dropped)]
 
@@ -382,7 +455,14 @@ def train_group(
             per_class_counts=counts, dropped_classes=dropped, macro_f1=0.0, accuracy=0.0,
             baseline_accuracy=0.0, kappa=0.0, kappa_lower=0.0, n_groups=0,
             scope="not validated", cv_pca="not validated",
-            audit_n=len(audit_set), audit_accuracy=float("nan"),
+            audit_pca="not scored",
+            # 0 SCORED, which is what audit_n counts: nothing was fitted, so
+            # nothing was scored. The labelled count goes in its own field
+            # rather than standing in here, or a report that never reached a fit
+            # would claim an audit result it does not have.
+            audit_n=0,
+            audit_population=audit_population, audit_labelled=len(audit_set),
+            audit_accuracy=float("nan"),
             audit_kappa=float("nan"), confusion=[], top_features=[], reliable=False,
             reason=reason,
         )
@@ -450,7 +530,8 @@ def train_group(
     reporter.log(
         f"{group_name}: {n_splits}-fold leave-movie-out over {n_movies} movie(s), "
         f"classes {', '.join(classes)}"
-        + (f"; {len(audit_set)} audit clips held out entirely" if len(audit_set) else "")
+        + (f"; {len(audit_set)} of this project's {audit_population} audit clips are "
+           "labelled and held out entirely" if len(audit_set) else "")
     )
     pred = _grouped_cv_predictions(X_cv, y, groups, cfg, n_splits, raw_cnn=fold_cnn,
                                    reporter=reporter, label=f"{group_name} ")
@@ -497,7 +578,10 @@ def train_group(
     _fit(model, X, y, cfg, reporter, f"{group_name}: final fit on all {len(X)} clips")
 
     # The audit clips, scored by a model that never saw them: the only number
-    # here free of both training leakage and suggestion feedback.
+    # here free of both training LABEL leakage and suggestion feedback. Not free
+    # of the unsupervised kind - `columns` carries the globally-fitted CNN basis
+    # and these rows were in the fit of it. See `GroupReport.audit_pca`, which is
+    # where that is written down rather than left to be discovered.
     audit_n, audit_acc, audit_kappa = 0, float("nan"), float("nan")
     audit_eval = audit_set[audit_set[group_name].astype(str).isin(classes)]
     if len(audit_eval) >= 3:
@@ -530,7 +614,16 @@ def train_group(
             "no CNN columns" if not any(c.startswith("cnn") for c in columns)
             else "global CNN PCA (clip_cnn_raw.npy unavailable)"
         ),
+        audit_pca=(
+            "global CNN PCA, fitted over every prepared movie INCLUDING these "
+            "audit clips' own detections - unsupervised leakage into this score, "
+            "unmeasured. The labels never enter it. Not refitted per audit clip "
+            "the way the CV refits per fold."
+            if any(c.startswith("cnn") for c in columns) else "no CNN columns"
+        ),
         audit_n=audit_n,
+        audit_population=audit_population,
+        audit_labelled=len(audit_set),
         audit_accuracy=round(audit_acc, 4) if np.isfinite(audit_acc) else float("nan"),
         audit_kappa=round(audit_kappa, 4) if np.isfinite(audit_kappa) else float("nan"),
         confusion=confusion_matrix(y, pred, labels=classes).tolist(),
@@ -582,6 +675,32 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     labels = pd.read_csv(cfg.paths.csv)
     if labels.empty:
         raise RuntimeError(f"{cfg.paths.csv} has no rows")
+
+    # Said ONCE per run, next to the scores it qualifies, and only when it is
+    # non-zero. A labelled clip is held to the membership recorded when it was
+    # labelled; disagreeing with the hash is what a re-detected project looks
+    # like and is not an error, so there is no per-row warning. The count is
+    # still news: on a project detection has only ever run once it is zero, so a
+    # non-zero number is how someone finds out theirs was re-run - and that the
+    # holdout below is the original one rather than a fresh draw.
+    recorded = audit_records(labels)
+    moved = sum(1 for clip_id, member in recorded.items()
+                if member != cfg.suggest.audit_by_hash(clip_id))
+    if moved:
+        reporter.log(
+            f"{moved} of {len(recorded)} labelled clip(s) are held to the audit "
+            "membership recorded when they were labelled, which is no longer what "
+            "their clip_id hashes to - detection has been re-run since. The recorded "
+            "value is what keeps the holdout from being redrawn under the model."
+        )
+    elif not recorded and len(labels):
+        reporter.log(
+            f"no labelled clip in {cfg.paths.csv.name} records its audit membership, "
+            "so the holdout below is derived from the clip_ids alone and will be "
+            "redrawn if detection is re-run. Opening the project in the GUI writes "
+            "the memberships down as they stand.",
+            "warning",
+        )
 
     # Positional tag, so the un-reduced CNN aggregate can be re-indexed after the
     # label merge reorders rows.
@@ -722,6 +841,11 @@ class Suggester:
         self.reports: dict = {}
         self.features: pd.DataFrame | None = None
         self.problem: str = ""
+        # Audit membership as recorded in the annotation CSV, for the clips that
+        # record one. Kept here because this object is what the GUI asks "is
+        # this clip held out", and it is the only reader of that file on this
+        # path; see `load` for why it is refreshed there and nowhere else.
+        self._audit_records: dict[str, bool] = {}
         # Frames per window the training rows were measured over. None for a
         # model saved before this was recorded - those still load; see
         # `window_problem`.
@@ -744,6 +868,16 @@ class Suggester:
         self.columns, self.models, self.reports = [], {}, {}
         self.features, self._by_clip = None, {}
         self.trained_window = None
+
+        # Before every early return below, because `is_audit_clip` is asked on
+        # clips whether or not a model exists - the GUI asks it to decide
+        # whether to explain a missing suggestion. Refreshed HERE and not per
+        # question: a clip labelled since the last refit is a clip the annotator
+        # has finished with, and re-reading the CSV on every clip change would
+        # put a file read in the path of turning a page. An unreadable flag is
+        # allowed to raise: it means nobody can say which clips are held out,
+        # and carrying on would train on the holdout silently.
+        self._audit_records = read_audit_records(self.cfg.paths.csv)
 
         work = self.cfg.paths.work_dir
         model_path, feat_path = work / MODEL_FILE, work / CLIP_FEATURES_FILE
@@ -874,7 +1008,7 @@ class Suggester:
         )
 
     def is_audit_clip(self, clip_id: str) -> bool:
-        return is_audit_clip(clip_id, self.cfg)
+        return is_audit_clip(clip_id, self.cfg, self._audit_records)
 
     # ---------------------------------------------------------- selection -- #
     def selection_group(self) -> str:
@@ -1002,7 +1136,8 @@ class Suggester:
         # `select_batch` removes them from the ranked pool itself and draws the
         # reserved slots from them. Filtering them here would leave it with
         # nothing to draw and silently turn the random stratum off.
-        audit = np.array([is_audit_clip(c, cfg) for c in pool_ids], dtype=bool)
+        audit = np.array([is_audit_clip(c, cfg, self._audit_records) for c in pool_ids],
+                         dtype=bool)
         n_audit = int((candidates & audit).sum())
         n_ranked = int((candidates & ~audit).sum())
 
@@ -1169,14 +1304,30 @@ def _print_report(reports: dict) -> None:
         if rep.get("dropped_classes"):
             print(f"  NOT modelled (too few labels): {rep['dropped_classes']}")
         print(f"  scope: {rep.get('scope', '?')}")
-        if rep.get("audit_n"):
-            ak, aa = rep.get("audit_kappa"), rep.get("audit_accuracy")
-            ak = "n/a" if ak is None or ak != ak else f"{ak:+.3f}"
-            aa = "n/a" if aa is None or aa != aa else f"{aa:.3f}"
-            print(
-                f"  audit holdout ({rep['audit_n']} clips, never suggested nor trained on): "
-                f"kappa {ak}  accuracy {aa}"
-            )
+        # Against the POPULATION, always. "12 audit clips, all correct" and "12
+        # of 340 audit clips have been labelled" are the same 12 and different
+        # claims: the first reads as a result, the second as a result resting on
+        # 3.5% of the holdout. Printed even when nothing was scored, because
+        # "the holdout exists and is empty" is the more actionable of the two.
+        population = rep.get("audit_population")
+        labelled = rep.get("audit_labelled", rep.get("audit_n", 0))
+        if population:
+            of_population = f"{labelled} of {population} audit clips labelled"
+            if rep.get("audit_n"):
+                ak, aa = rep.get("audit_kappa"), rep.get("audit_accuracy")
+                ak = "n/a" if ak is None or ak != ak else f"{ak:+.3f}"
+                aa = "n/a" if aa is None or aa != aa else f"{aa:.3f}"
+                print(
+                    f"  audit holdout ({of_population}, {rep['audit_n']} scored, "
+                    f"never suggested nor trained on): kappa {ak}  accuracy {aa}"
+                )
+                if rep.get("audit_pca"):
+                    print(f"    caveat: {rep['audit_pca']}")
+            else:
+                print(
+                    f"  audit holdout ({of_population}): too few to score, so there "
+                    "is no unbiased estimate for this group yet"
+                )
         print(
             f"  kappa {rep.get('kappa', 0):+.3f} (5th pct {rep.get('kappa_lower', 0):+.3f})   "
             f"macro-F1 {rep['macro_f1']:.3f}   accuracy {rep['accuracy']:.3f}   "

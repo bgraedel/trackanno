@@ -203,6 +203,19 @@ suggest:
   # Held-out clips show NO suggestion at any confidence. Set audit_fraction
   # to 0 to suggest on every clip and give up the agreement measure; set
   # audit_visible to true to be told which clips those are.
+  #
+  # Which clips these are is decided by a hash of the clip_id ONLY while a clip
+  # is unlabelled. The moment you label one, whether it was held out is written
+  # into the `audit_holdout` column of annotations.csv and that recording is
+  # what counts from then on. It has to be: clip_id embeds the track id, and
+  # re-running detection renumbers every track, so a hash of the id would redraw
+  # the holdout from scratch - about a fifth of the clips at 0.10 - and clips
+  # the model was deliberately kept away from would end up in its training set,
+  # with the "never trained on" accuracy quietly measured over something else.
+  # Raising or lowering audit_fraction therefore changes which of your UNLABELLED
+  # clips are held out, and leaves the clips you have already judged where they
+  # are. That is the intended behaviour and not a rounding error: it is what
+  # stops the one unbiased number in the tool from moving under you.
   audit_visible: false  # share of clips that never show a suggestion, so
                         # human-vs-model agreement stays measurable
   seed: 0

@@ -274,6 +274,49 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
      "default: knowing a clip is being audited can change how carefully it is "
      "judged, which is the very influence the holdout exists to exclude. Turn "
      "it on if silent clips are more confusing than that bias is costly.", {}),
+    ("suggest", "select_rule", "choice", "choose the next clip by",
+     "'off' hands clips over in the GUI's own shuffled order, so the labelled "
+     "set stays a random sample of the project and every number computed over "
+     "it - the class balance, the cross-validated F1 - is a statement about "
+     "your data. Any other value lets the model pick instead: it ranks the "
+     "unlabelled clips by how unsure it is and gives you the ones a label would "
+     "teach it most, which saves your time and makes the labelled set one "
+     "assembled to be HARD, so accuracy measured on it reads lower than the "
+     "truth by an amount nobody can work out afterwards. margin reads the gap "
+     "between the model's top two answers, least_confidence only the top one, "
+     "entropy the whole vector and so mostly its tail.",
+     {"options": ["off", "margin", "least_confidence", "entropy"]}),
+    ("suggest", "select_batch_size", "int", "clips per batch",
+     "How many clips one ranking pass hands over. Twice 'retrain every N "
+     "labels' by default, so a batch outlives the refit that produced it, and "
+     "big enough that the audit share below is a whole slot rather than "
+     "rounding to no draw at all.", {"min": 1, "max": 1000}),
+    ("suggest", "select_audit_share", "autonum", "audit share of a batch",
+     "Share of each batch drawn at random from the audit holdout instead of "
+     "being ranked. 'auto' is the audit holdout above, so the labelled audit "
+     "set keeps growing at the rate the project holds audit clips; anything "
+     "else and the one unbiased accuracy in the tool starts describing a "
+     "differently composed sample from the one it names.", {}),
+    ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
+     "Two clips of the same track must start this many frames apart before "
+     "both can be in one batch. 'auto' is the clip length: closer than that "
+     "they overlap, which is the same footage judged twice. 0 turns it off.",
+     {}),
+    ("suggest", "select_target_quota", "int", "labels a class is chased to",
+     "Labels a class needs before batch slots go hunting for it. 0 is off, and "
+     "off even with a rule set: filling a rare class deliberately skews the "
+     "label balance, and the reliability gate (Cohen's kappa, the majority "
+     "baseline) is computed against that balance - so a targeted run can turn "
+     "the suggester silent on a model that has not changed.",
+     {"min": 0, "max": 100000}),
+    ("suggest", "select_target_rule", "choice", "how a starved class is chased",
+     "target_runner_up picks clips where the starved class is the model's "
+     "SECOND choice - the boundary between it and its rival, the only place a "
+     "label moves the decision surface - and fills the class slowly, since many "
+     "come back as the other class. target_confident picks clips the model "
+     "already calls that class: fastest to fill the count, and it only ever "
+     "confirms what the model already believes.",
+     {"options": ["target_runner_up", "target_confident"]}),
 
     # -- render --
     ("render", "out_dir", "dir", "render output", "Where overlay movies are written.", {}),
@@ -450,6 +493,17 @@ class ConfigForm(QScrollArea):
             return _PathField(kind, extra, self.changed)
         if kind == "groups":
             return _GroupPicker(self.changed)
+        if kind == "autonum":
+            # A setting that is a number OR the word 'auto', where 'auto' stands
+            # for a value in another section entirely (clips.frames,
+            # suggest.audit_fraction). A spin box cannot hold the word, and a
+            # combo would write the number back as a quoted string, which the
+            # loader refuses - so it is free text, and the placeholder says what
+            # an empty box means.
+            widget = QLineEdit()
+            widget.setPlaceholderText("auto")
+            widget.textChanged.connect(self.changed)
+            return widget
         widget = QLineEdit()
         widget.textChanged.connect(self.changed)
         return widget
@@ -567,6 +621,14 @@ class ConfigForm(QScrollArea):
                 parts = [p.strip() for p in widget.text().split(",") if p.strip()]
                 if len(parts) == 2:
                     out[dotted] = [float(parts[0]), float(parts[1])]
+            elif kind == "autonum":
+                # An empty box writes the WORD, never null. Both mean auto to
+                # the loader, but a file that says `null` where the key's whole
+                # vocabulary is `auto` reads as a value somebody cleared, and
+                # the next person to open the form would see it blank again
+                # with nothing saying which of the two it is.
+                text = widget.text().strip()
+                out[dotted] = "auto" if not text else _parse_scalar(text)
             else:
                 out[dotted] = _parse_scalar(widget.text())
         return out

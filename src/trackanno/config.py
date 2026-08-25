@@ -6,6 +6,7 @@ errors here should read like advice, not like a stack trace.
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,7 @@ RESERVED_GROUP_NAMES = frozenset({
     "crop_x0", "crop_y0", "crop_w", "crop_h", "scale",
     "uncertain", "notes", "annotator", "timestamp_utc", "dwell_s",
     "suggested", "suggest_conf", "suggest_shown",
-    "selected_by",
+    "selected_by", "audit_holdout",
 })
 
 
@@ -439,6 +440,41 @@ class Suggest:
         if isinstance(self.select_audit_share, str):
             return float(self.audit_fraction)
         return float(self.select_audit_share)
+
+    def audit_by_hash(self, clip_id: str) -> bool:
+        """Whether ``clip_id`` hashes into the audit holdout - the FALLBACK answer.
+
+        Fallback, because this answer is not stable: ``clip_id`` embeds the
+        track id and re-running detection renumbers every track, so every id
+        changes and this redraws the holdout from scratch - about
+        ``2*f*(1-f)`` of the clips change side at fraction ``f``. A clip that
+        was labelled while held out would land in the training set, and the
+        "never trained on" estimate would be computed over a different set than
+        the one it was earned on, with nothing anywhere saying so. So a
+        LABELLED clip's membership is written down the first time it is asked
+        (``store.AUDIT_COLUMN``) and this is consulted only where no record
+        exists - an unlabelled clip, whose membership nothing has depended on
+        yet and is therefore free to move.
+
+        It lives on the config rather than in :mod:`trackanno.suggest` because
+        two modules need it and neither can own it: the store stamps membership
+        into the CSV at label time and suggest reads the stamp back. A second
+        copy of the digest would be a duplicate nothing in the language holds
+        together, and its drift would be silent - the copies would agree until
+        one was edited, after which some clips would be trained on and audited
+        at once.
+
+        Its own seed, not ``seed``: ``seed`` exists to be varied to check CV
+        stability, and doing that must not redraw the holdout (0 -> 1 leaves
+        about a tenth of it in place, by chance alone).
+        """
+        frac = float(self.audit_fraction)
+        if frac <= 0:
+            return False
+        digest = hashlib.blake2b(
+            f"{self.audit_seed}:{clip_id}".encode(), digest_size=8
+        ).digest()
+        return (int.from_bytes(digest, "big") % 10_000) < frac * 10_000
 
     def resolved_frame_gap(self, clips: "Clips") -> int:
         """``select_frame_gap`` with ``auto`` filled in: ``clips.frames``.

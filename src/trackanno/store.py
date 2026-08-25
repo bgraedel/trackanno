@@ -9,7 +9,10 @@ One CSV, one row per annotated clip. Design constraints:
   and crop rectangle in original pixel coordinates.
 * **Self-describing** - every row records *why* that clip was put in front of a
   human, because the answer stopped being "the next one in the manifest" the
-  moment a selector started picking by model uncertainty.
+  moment a selector started picking by model uncertainty, and *whether it was
+  held out for audit at the moment it was labelled*, because that answer used
+  to be recomputed from the clip_id and the clip_id does not survive a
+  re-detection.
 """
 
 from __future__ import annotations
@@ -28,8 +31,9 @@ from pathlib import Path
 from .config import Config
 
 __all__ = [
-    "AnnotationStore", "MULTI_SEP", "PROVENANCE_COLUMN",
+    "AnnotationStore", "MULTI_SEP", "PROVENANCE_COLUMN", "AUDIT_COLUMN",
     "encode_provenance", "decode_provenance",
+    "encode_audit", "decode_audit", "read_audit_records",
     "IDENTITY_COLUMNS", "TRAILING_COLUMNS",
 ]
 
@@ -37,6 +41,11 @@ MULTI_SEP = "|"
 
 # Why this clip was shown. See `encode_provenance` for what goes in it.
 PROVENANCE_COLUMN = "selected_by"
+
+# Whether this clip was in the audit holdout AT THE MOMENT IT WAS LABELLED.
+# See `encode_audit` for why that has to be a recorded fact rather than a
+# function of the clip_id.
+AUDIT_COLUMN = "audit_holdout"
 
 IDENTITY_COLUMNS = [
     "clip_id", "movie_id", "source_file", "series", "channel",
@@ -48,13 +57,19 @@ TRAILING_COLUMNS = [
     # Provenance for the suggestion model: without these, agreement cannot be
     # told from influence, nor drift measured.
     "suggested", "suggest_conf", "suggest_shown",
-    # LAST, and that position is load-bearing rather than cosmetic. An older
-    # build opening a file this one wrote treats an unrecognised column as
-    # `extra` and appends it to the end of its own list (see `_load`); only if
-    # it is already last does that reconstructed order match the header on disk,
-    # so the old build leaves the file alone instead of rewriting it. Insert it
-    # anywhere else and every downgrade churns the whole log.
+    # These two are LAST, in the order they were ADDED, and that is load-bearing
+    # rather than cosmetic. An older build opening a file this one wrote treats
+    # an unrecognised column as `extra` and appends it to the end of its own
+    # list (see `_load`); only if the newer columns are already last, in the
+    # order that build learned them, does the reconstruction match the header on
+    # disk, so the old build leaves the file alone instead of rewriting it. A
+    # build that knows `selected_by` but not `audit_holdout` reconstructs
+    # `... selected_by` + `[audit_holdout]`; one that predates both
+    # reconstructs `... suggest_shown` + `[selected_by, audit_holdout]`. Both
+    # match. Insert a new column anywhere but the end and every downgrade churns
+    # the whole log.
     PROVENANCE_COLUMN,
+    AUDIT_COLUMN,
 ]
 
 # config.RESERVED_GROUP_NAMES restates these two lists by hand, and a column
@@ -188,6 +203,100 @@ def decode_provenance(value: str | None) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# audit membership
+# --------------------------------------------------------------------------- #
+def encode_audit(member: bool | None) -> str:
+    """Serialise *was this clip held out for audit when it was labelled*.
+
+    Membership used to be recomputed on demand, as a hash of the ``clip_id``.
+    That is stable only for as long as the ``clip_id`` is, and it is not:
+    ``clip_id`` embeds the track id, re-running detection renumbers the tracks,
+    and ``reassociate`` then rewrites the id in place to put the label back on
+    its clip. The label survives; the membership it was earned under does not.
+    A clip deliberately never trained on can come back with an id that hashes
+    into the training set, the next fit trains on the holdout, and the
+    "unbiased" accuracy is reported over a different, partly overlapping set -
+    with nothing in the program able to notice, because there is nothing to
+    compare against. This column is that something to compare against.
+
+    Only a LABELLED clip needs the guarantee. Nothing has been trained on an
+    unlabelled clip and nothing has been withheld from it, so its membership can
+    move freely and is left to the hash; what must never happen is a clip moving
+    INTO the holdout after the model has already seen it, or OUT of it after
+    being excluded.
+
+    ``"1"``/``"0"``, matching the ``uncertain`` column rather than inventing a
+    third spelling of a flag in one file. ``None`` encodes as ``""``, which is
+    *not recorded* - a different fact from *not held out*, and deliberately the
+    only way to say it, so an old row and a training row stay distinguishable.
+    """
+    if member is None:
+        return ""
+    return "1" if member else "0"
+
+
+def decode_audit(value) -> bool | None:
+    """Read an ``audit_holdout`` cell back. ``None`` means *the row does not say*.
+
+    Accepts what the readers of this file actually produce, which is more than
+    the two strings written: ``suggest.train`` reads the CSV with
+    ``pandas.read_csv`` and no dtype, so a column of ``1``/``0``/``""`` arrives
+    as floats with ``NaN`` for the blanks.
+
+    Anything else RAISES rather than defaulting. A cell nobody can read means
+    nobody can say whether the clip was held out, and the two ways to guess are
+    both silent corruption: guess "held out" and a trained-on clip is scored as
+    if it were fresh; guess "not held out" and a clip kept out of the model is
+    fed to it. An unreadable log is a thing to fix, not a thing to average over.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return None
+    if text in ("1", "1.0", "True", "true"):
+        return True
+    if text in ("0", "0.0", "False", "false"):
+        return False
+    raise ValueError(
+        f"{AUDIT_COLUMN}={value!r} is not a readable audit-holdout flag: it must "
+        "be '1' (this clip was held out when it was labelled), '0' (it was not) "
+        "or empty (the row predates the column). Nothing can be trained or "
+        "audited while one row will not say which side it is on."
+    )
+
+
+def read_audit_records(path: str | Path) -> dict[str, bool]:
+    """``{clip_id: was_held_out}`` for the rows that SAY, straight off the CSV.
+
+    Rows with an empty cell are absent from the mapping rather than present as
+    ``None``: the caller's question is "is there a record", and a key that maps
+    to "no" would have to be checked for by identity at every call site, which
+    is exactly how the empty-cell-means-random conflation got into the
+    provenance column's first draft.
+
+    Read with the ``csv`` module and not pandas, because this is on the import
+    path of the GUI's clip view and pandas is not.
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    out: dict[str, bool] = {}
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if AUDIT_COLUMN not in (reader.fieldnames or []):
+            return {}
+        for row in reader:
+            clip_id = row.get("clip_id")
+            if not clip_id:
+                continue
+            member = decode_audit(row.get(AUDIT_COLUMN))
+            if member is not None:
+                out[str(clip_id)] = member
+    return out
+
+
 class AnnotationStore:
     def __init__(self, path: str | Path, cfg: Config):
         self.path = Path(path)
@@ -278,6 +387,56 @@ class AnnotationStore:
             for col in self.columns:
                 row.setdefault(col, "")
 
+        # FREEZE the audit membership of every labelled clip that has not
+        # recorded one, at whatever the hash says TODAY. Recording today's
+        # answer is what makes this an upgrade rather than a redraw: the
+        # holdout an existing project has right now is the holdout it keeps,
+        # clip for clip, and no row changes side. Re-deriving it later - after a
+        # re-detection has renumbered the tracks and rewritten every clip_id -
+        # would move about a fifth of them at the default fraction, silently.
+        #
+        # Here rather than at train time because this is the module that owns
+        # the file: a fit must be able to READ the membership without being the
+        # thing that decides it, or two fits of the same project could disagree.
+        stamped, by_record = 0, 0
+        for clip_id, row in self.rows.items():
+            try:
+                member = decode_audit(row.get(AUDIT_COLUMN))
+            except ValueError as exc:
+                raise ValueError(f"{self.path.name}: {exc}") from exc
+            hashed = self.cfg.suggest.audit_by_hash(clip_id)
+            if member is None:
+                row[AUDIT_COLUMN] = encode_audit(hashed)
+                stamped += 1
+            elif member != hashed:
+                by_record += 1
+
+        if stamped and AUDIT_COLUMN not in disk_columns:
+            warnings.warn(
+                f"{self.path.name} predates the {AUDIT_COLUMN!r} column: the audit "
+                f"membership of its {stamped} labelled clip(s) has been written down "
+                "as it stands today, so this upgrade moves no clip into or out of the "
+                "holdout. From here it is a recorded fact and survives a re-detection "
+                "renumbering the tracks.",
+                stacklevel=2,
+            )
+        # Said once per open, and only when it is true, because it is the ONLY
+        # way anyone finds out their project has been re-detected: these clips
+        # are held out (or trained on) against what their new clip_id hashes to.
+        # NOT a warning per row - disagreement is the case this column exists to
+        # handle, not an error - but the COUNT is news, because on a project
+        # that has never been re-detected it is zero.
+        if by_record:
+            warnings.warn(
+                f"{self.path.name}: {by_record} of {len(self.rows)} labelled clip(s) "
+                "are held to the audit membership recorded when they were labelled, "
+                "which is no longer what their clip_id hashes to. That is what "
+                "re-running detection does - it renumbers the tracks, so the ids "
+                "change - and the recorded value is the one that keeps the holdout "
+                "honest across it. Nothing to fix.",
+                stacklevel=2,
+            )
+
         # Say it once, in the one moment it matters: the rewrite below fills the
         # new column with "" for every historical row, and "" means NOT RECORDED.
         # Left unsaid, a later analysis would read those blanks as "chosen at
@@ -291,7 +450,13 @@ class AnnotationStore:
                 "it is claiming that of.",
                 stacklevel=2,
             )
-        if disk_columns and disk_columns != self.columns:
+        # `stamped` on its own is enough to force the rewrite: an older build
+        # appending to an upgraded file writes a row one field SHORT (its
+        # DictWriter does not know the column), which reads back as unrecorded
+        # while the header on disk already matches. Without this the stamp would
+        # live in memory only and be recomputed - from a possibly different hash
+        # - on the next open.
+        if stamped or (disk_columns and disk_columns != self.columns):
             self.rewrite()
 
     def _write_header_if_needed(self) -> None:
@@ -380,6 +545,13 @@ class AnnotationStore:
         - and deliberately not to "random": a caller that says nothing has not
         told us the sample was unbiased, it has told us nothing, and writing the
         stronger claim on its behalf is the guess this column exists to refuse.
+
+        ``audit_holdout`` has no parameter and is not the caller's to supply.
+        Provenance is a fact only the selector knows; membership is a fact
+        anyone with the clip_id and the config can derive, so leaving it to
+        callers would only create a way to forget it - and a row written without
+        it would fall back to the hash for ever after. See
+        :meth:`_audit_membership` for the one case where it is not derived.
         """
         clip_id = str(meta["clip_id"])
         previous = self.rows.get(clip_id)
@@ -410,6 +582,7 @@ class AnnotationStore:
             # serialised must stop the record outright, not land as a blank cell
             # that reads back as "this row does not know why it was shown".
             PROVENANCE_COLUMN: encode_provenance(selected_by),
+            AUDIT_COLUMN: encode_audit(self._audit_membership(clip_id, previous)),
         }
         for group in self.cfg.categories:
             # This runs AFTER the literal above, so a group named like a built-in
@@ -437,6 +610,28 @@ class AnnotationStore:
             position = self._order.index(clip_id)
             self._undo_stack.append((clip_id, dict(previous) if previous else None, position))
         return row
+
+    def _audit_membership(self, clip_id: str, previous: dict | None) -> bool:
+        """Whether this clip counts as held out, for the row about to be written.
+
+        An existing row KEEPS what it recorded, and that is the whole guarantee
+        rather than a nicety. After a re-detection, ``reassociate`` re-points a
+        label at the clip_id the same animal now has; re-deriving membership
+        here would let a clip that was held out - never suggested on, never
+        trained on, its label earned under those conditions - be re-hashed into
+        the training set by the act of correcting a typo in its notes. The
+        recorded value is what the human judged under, so it is what stands.
+
+        A row being written for the FIRST time has no record to keep and takes
+        the hash, which is the answer everything else in the program was already
+        using for it: an unlabelled clip's membership is nobody's dependency, so
+        this is the moment it stops being free to move, and not before.
+        """
+        if previous is not None:
+            recorded = decode_audit(previous.get(AUDIT_COLUMN))
+            if recorded is not None:
+                return recorded
+        return self.cfg.suggest.audit_by_hash(clip_id)
 
     def undo(self) -> str | None:
         """Revert the most recent record(). Returns the affected clip_id."""
