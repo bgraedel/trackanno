@@ -90,6 +90,56 @@ def _optional_auto(value, where: str, expected: str):
     return value
 
 
+def _window_scales(value) -> list[int]:
+    """``predict.window_scales`` as frame counts, or a refusal naming the choices.
+
+    Only the checks a single section can make: that the entries are frame counts
+    at all, and that none is repeated. Whether the list CONTAINS
+    ``predict.window_frames`` is a question about two sections and so belongs to
+    :func:`load_config`, which is the first place both have been parsed.
+
+    A repeat is refused rather than deduplicated because it is not a typo with
+    an obvious intent: the scales are averaged into the per-frame posterior with
+    equal weight each, so listing one twice gives it double weight, and a
+    weighting nobody chose is exactly the failure this whole setting exists to
+    replace. Deduplicating silently would grant the request and ignore it at the
+    same time.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ConfigError(
+            "predict.window_scales must be a list of window lengths in frames, "
+            f"like [25, 50, 100] (got {value!r}). Leave it empty to score at "
+            "predict.window_frames alone, which is what every earlier version did"
+        )
+    out: list[int] = []
+    for entry in value:
+        try:
+            frames = int(entry)
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"predict.window_scales entry {entry!r} is not a frame count; "
+                "each entry is how many frames one window of that scale spans"
+            ) from None
+        if frames < 1:
+            raise ConfigError(
+                f"predict.window_scales entry {frames} must be at least 1; it is "
+                "how many frames one window spans, and a window spanning none of "
+                "them has nothing to measure"
+            )
+        if frames in out:
+            raise ConfigError(
+                f"predict.window_scales lists {frames} twice. Every scale is "
+                "averaged into the per-frame posterior with the same weight, so a "
+                "repeated scale would count twice and quietly outvote the others - "
+                "which is the arbitrary weighting multi-scale scoring is meant to "
+                "remove, not to introduce. List each length once"
+            )
+        out.append(frames)
+    return out
+
+
 def _selection_rules(d: dict) -> tuple[str, str]:
     """``(select_rule, select_target_rule)``, or a refusal naming the choices.
 
@@ -379,6 +429,19 @@ class Suggest:
     # than re-identification may drop them.
     feature_groups: list[str] = field(
         default_factory=lambda: ["kinematic", "pose", "waveform", "cnn"])
+    # A second, ORTHOGONAL cut through the same columns. `feature_groups` asks
+    # which instrument a column came from; this asks how its value behaves when
+    # the window length changes, which is a different question with a different
+    # answer inside every group - `beat_*` is length-invariant and its
+    # groupmate `body_path_length` is not.
+    #
+    # 'all' is every column the groups selected, exactly as before.
+    # 'length_invariant' keeps only the columns whose value does not scale with
+    # the window, which is what makes ONE model legitimately applicable at
+    # several window lengths (`predict.window_scales`). It is a real cost - the
+    # extensive and dispersion columns carry signal - so it is opted into by a
+    # project that wants multi-scale scoring, never a default.
+    feature_scope: str = "all"
 
     # -- which clips the annotator is handed next (:mod:`trackanno.select`) --- #
     # Every key below is prefixed `select_` rather than living in a section of
@@ -497,7 +560,7 @@ class Suggest:
              "min_macro_f1", "audit_fraction", "audit_visible", "seed", "audit_seed",
              "min_confidence",
              "iterations", "depth", "learning_rate", "l2_leaf_reg", "balance_classes",
-             "feature_groups",
+             "feature_groups", "feature_scope",
              "select_rule", "select_batch_size", "select_audit_share",
              "select_frame_gap", "select_target_quota", "select_target_rule"],
         )
@@ -525,6 +588,14 @@ class Suggest:
             raise ConfigError(
                 "suggest.feature_groups is empty, so the model would have no "
                 f"inputs at all; choose at least one of {sorted(FEATURE_GROUPS)}"
+            )
+        scope = str(d.get("feature_scope", "all"))
+        if scope not in ("all", "length_invariant"):
+            raise ConfigError(
+                "suggest.feature_scope must be 'all' (every column the feature "
+                "groups selected) or 'length_invariant' (only the columns whose "
+                "value does not scale with the window length, which is what lets "
+                "one model be applied at several predict.window_scales)"
             )
         audit = float(d.get("audit_fraction", 0.10))
         if not 0.0 <= audit < 1.0:
@@ -610,6 +681,7 @@ class Suggest:
             l2_leaf_reg=float(d.get("l2_leaf_reg", 3.0)),
             balance_classes=bool(d.get("balance_classes", True)),
             feature_groups=groups,
+            feature_scope=scope,
             select_rule=rule,
             select_batch_size=batch,
             select_audit_share="auto" if share is None else float(share),
@@ -680,6 +752,21 @@ class Predict:
     speak for the same frame, and something has to decide what that frame is.
     That is what ``decode`` does, which is why the two settings are only valid
     together.
+
+    ``window_scales`` moves the same argument from OFFSET to DURATION. One
+    window length is one guess about how long a behaviour lasts: shorter events
+    are invisible inside it and longer ones are cut into verdicts that can
+    disagree. The two settings answer different questions and neither
+    substitutes for the other - a shorter stride moves WHERE a change is
+    reported, more scales change WHICH changes can be reported at all, and
+    ``tests/test_multiscale.py`` holds both halves of that as measurements on
+    constructed data. Scoring at several lengths and averaging the per-frame
+    posteriors is the fix, and it needs the same ``decode`` for the same reason - several
+    windows now speak for one frame - plus one more condition that overlap does
+    not need. Windows of different LENGTHS carry different feature values under
+    identical column names, so the model has to have been fitted on columns that
+    do not scale with the window. ``suggest.feature_scope`` is how a project says
+    it was, and ``load_config`` refuses the pairing when it does not.
     """
 
     coverage: str = "dense"
@@ -688,6 +775,25 @@ class Predict:
     # an exact tiling: the historical behaviour, and the only stride whose rows
     # can be painted straight out of predictions.parquet without a decode.
     window_stride: int | str = "auto"
+    # Every window LENGTH the dense pass scores at, `window_frames` included.
+    # Empty (the default) is the single length `window_frames` - one scale, and
+    # byte for byte the run this module has always done.
+    #
+    # Window length is a commitment about the timescale of behaviour, and a
+    # single one is a guess: a transition shorter than the window is invisible
+    # inside it, and a bout much longer than the window is chopped into
+    # independent verdicts that can disagree. Scoring the same frames at several
+    # lengths and averaging the per-frame posteriors is the same trick
+    # `window_stride` plays with OFFSET, played with DURATION instead - and it
+    # needs no new arithmetic, because `bouts.frame_posterior` already averages
+    # over whatever windows cover a frame whatever their spans.
+    #
+    # The cost is a feature build per scale and the constraint is severe: a
+    # model fitted at one length reads another length's features on the wrong
+    # scale, so several scales are only coherent for a model fitted on
+    # length-invariant columns (`suggest.feature_scope`). `load_config` refuses
+    # the combination rather than skewing quietly.
+    window_scales: list[int] = field(default_factory=list)
     # Detections a dense window needs before its features mean anything. Two is
     # the floor at which ANY motion feature can exist. Deliberately NOT
     # clips.min_clip_frames, which exists so an annotator gets a watchable video
@@ -735,6 +841,33 @@ class Predict:
             return self.resolved_window(clips)
         return max(1, int(self.window_stride))
 
+    def resolved_scales(self, clips: "Clips") -> list[int]:
+        """Every window length to score at, the base one first.
+
+        Empty ``window_scales`` is ONE scale, ``resolved_window`` - the run this
+        module did before scales existed, and the answer every caller downstream
+        can treat uniformly, so nothing has to branch on "is multi-scale on".
+
+        The base length leads and the rest follow in ASCENDING order rather than
+        in the order they were typed. Two configs listing the same scales
+        differently would otherwise lay the dense table out in a different row
+        order and rewrite a parquet that means exactly the same thing, which is
+        the kind of spurious difference `predict.window_stride`'s byte-identity
+        guarantee exists to rule out. The base leads because it is the length
+        every other part of the pipeline is planned at - the trained-window
+        check, `densepredict.window_length`, the clip ids that deliberately
+        collide with the annotation grid's - so it is the row block a reader
+        recognises.
+
+        ``load_config`` has already refused a non-empty list that does not
+        contain the base length, so the deduplication below can never silently
+        drop a scale the user asked for.
+        """
+        base = self.resolved_window(clips)
+        if not self.window_scales:
+            return [base]
+        return [base] + sorted({int(s) for s in self.window_scales} - {base})
+
     def resolved_self_transition(self) -> float:
         """``self_transition`` with ``auto`` filled in: 1 - 1/min_bout_frames.
 
@@ -751,8 +884,9 @@ class Predict:
     def parse(cls, d: dict) -> "Predict":
         _known(
             "predict", d,
-            ["coverage", "window_frames", "window_stride", "min_frames",
-             "decode", "min_bout_frames", "self_transition", "save_posteriors"],
+            ["coverage", "window_frames", "window_stride", "window_scales",
+             "min_frames", "decode", "min_bout_frames", "self_transition",
+             "save_posteriors"],
         )
         coverage = str(d.get("coverage", "dense"))
         if coverage not in ("dense", "manifest"):
@@ -785,6 +919,7 @@ class Predict:
                 f"predict.window_stride must be at least 1 (got {int(stride)}); it is "
                 "the step the window grid advances by, so 0 or less never terminates"
             )
+        scales = _window_scales(d.get("window_scales"))
         min_frames = int(d.get("min_frames", 2))
         if min_frames < 1:
             raise ConfigError(
@@ -855,6 +990,7 @@ class Predict:
             coverage=coverage,
             window_frames=window if isinstance(window, str) else int(window),
             window_stride=stride if isinstance(stride, str) else int(stride),
+            window_scales=scales,
             min_frames=min_frames,
             decode=decode,
             min_bout_frames=min_bout,
@@ -1381,6 +1517,62 @@ def load_config(path: str | Path | None = None) -> Config:
             "of frames. Set predict.decode to 'min_bout' or 'viterbi', or put "
             "predict.window_stride back to 'auto'"
         )
+
+    # Multi-scale scoring spans three sections, and every one of the refusals
+    # below is silent skew if it is not made here: nothing downstream can tell a
+    # posterior averaged over incommensurable scales from a good one.
+    written_scales = list(cfg.predict.window_scales)
+    if written_scales and length not in written_scales:
+        raise ConfigError(
+            f"predict.window_scales is {written_scales} but does not include "
+            f"predict.window_frames ({length_txt}), which is the length the rest "
+            "of the pipeline is planned at - densepredict.window_length, the "
+            "trained-window check and the dense clip ids all use it. Two keys "
+            "would then name the window length and disagree. Add "
+            f"{length} to predict.window_scales, or set predict.window_frames to "
+            "one of the scales you listed"
+        )
+    scales = cfg.predict.resolved_scales(cfg.clips)
+    if len(scales) > 1:
+        listed = ", ".join(str(s) for s in scales)
+        if cfg.predict.coverage != "dense":
+            raise ConfigError(
+                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
+                f"but predict.coverage is {cfg.predict.coverage!r}. Several scales "
+                "exist to be averaged onto the frames they cover, and only dense "
+                "coverage lays a grid over every frame; 'manifest' scores the clips "
+                "cut for annotation, whose length is clips.frames and nothing else. "
+                "Set predict.coverage to 'dense', or empty predict.window_scales"
+            )
+        if cfg.predict.decode == "none":
+            raise ConfigError(
+                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
+                "but predict.decode is 'none'. Windows of several lengths cover "
+                "the same frames, so this is the overlap problem again and worse: "
+                "the renderer paints range(f_start, f_end) per track and lets "
+                "whichever row came last win, so a frame's exported colour would be "
+                "decided by parquet row order - and here the competing rows are not "
+                "even the same length. The decode is what averages the scales into "
+                "one per-frame posterior and cuts it into disjoint bouts. Set "
+                "predict.decode to 'min_bout' or 'viterbi', or empty "
+                "predict.window_scales"
+            )
+        if cfg.suggest.feature_scope != "length_invariant":
+            raise ConfigError(
+                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
+                "but suggest.feature_scope is "
+                f"{cfg.suggest.feature_scope!r}, so the model is fitted on columns "
+                "whose VALUES scale with the window length - path_length over 100 "
+                "frames is simply twice the path_length over 50, under the same "
+                "column name. Scoring one such model at several lengths feeds it "
+                "rows on scales it was never fitted at and averages the results "
+                "together, at unchanged confidence and with nothing in the output "
+                "to show for it. Set suggest.feature_scope to 'length_invariant' "
+                "and retrain, or empty predict.window_scales. (This is the config "
+                "saying what the NEXT model will be fitted on; the model already on "
+                "disk is checked against its own recorded columns when a labelling "
+                "run starts.)"
+            )
 
     # Category keys must not collide with the navigation shortcuts.
     nav = {k.lower() for binds in keys.values() for k in binds}

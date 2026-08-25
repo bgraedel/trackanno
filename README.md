@@ -772,6 +772,187 @@ decode was run on, kept so a decode can be inspected and re-tuned without
 re-scoring the movie. Off by default because it is one row per frame per track
 rather than one per window, and so is much the larger file.
 
+**`window_scales` scores at several window lengths at once.** `window_stride`
+changes where a window starts; this changes how long it is. One window length is
+one commitment about the timescale of behaviour, and out of the box it is a
+guess: an episode shorter than the window is invisible *inside* it, and a bout
+much longer than the window is chopped into independent verdicts that can
+disagree. Listing several lengths builds the dense grid once per length and lets
+every row reach the same per-frame average.
+
+```yaml
+predict:
+  window_scales: []            # [] = window_frames alone, exactly as before
+  # window_scales: [25, 50, 100]
+suggest:
+  feature_scope: all           # all | length_invariant
+```
+
+`[]` and `[window_frames]` are the same run, byte for byte. The list must include
+`window_frames`, which is the length the rest of the pipeline is planned at; two
+keys naming the window length and disagreeing is not a configuration.
+
+**What it buys is duration sensitivity, not a sharper boundary.** On the test
+suite's planted movie a cell stops for 30 frames. No window of the 50-frame
+tiling grid is ever more than 40% stopped, so a model that reads the moving
+fraction back *exactly* still says "swimming" everywhere - the event is not
+missed because the model is weak, it is missed because a 50-frame window cannot
+represent it. Adding a 25-frame scale finds it; adding a 10-frame scale as well
+puts its start on the frame it happened. Meanwhile the planted *transition* at
+frame 137 is reported at 150 with one scale and at 150 with three, because every
+scale's grid still cuts at its own window edges. `window_stride` is the knob for
+*where* a boundary falls; `window_scales` is the knob for *what* can be seen at
+all, and they are worth using together.
+
+**Every scale carries the same weight**, and that is a decision rather than an
+accident of the arithmetic. Each scale's stride is scaled with its length so all
+of them cover a frame equally often, after which the plain mean already inside
+the decode does the rest. The alternative - one stride for every scale - weights
+a scale by its length: at 25/50/100 on a common stride the 100-frame window
+covers an interior frame four times against the 25-frame window's once, so it
+carries 4 of the 7 votes on its own, and the short scale you added to see a brief
+event is outvoted by the window too blunt to see it. Equal weight has its own
+cost, stated so it is not a surprise: a frame deep inside a long uniform bout
+gets no extra confidence from the long window agreeing. It is exact in a track's
+interior; near the ends the grid is clipped and the weights drift with the
+covering counts, which is what `n_covering_mean` on each bout reports.
+
+**The cost is a feature build per scale, but less than a whole one each.** All
+the scales of a track are measured in one pass, so the per-track setup - the
+series layout and the sliding spectral transform - is paid once and only the
+per-window work repeats. On the repository's synthetic fixture, `[25, 50, 100]`
+costs 3.3x the windows for 1.3x the wall time on a `task: detect` project and
+2.2x on a `task: pose` one, where the spectral half dominates. Those are a
+120-frame synthetic movie on one machine, so do not budget from them: the run
+logs the window count, the per-scale breakdown and the multiple before it spends
+any of it, and that line is the one to quote.
+
+**Several scales need `decode`, and a model whose features survive a change of
+length.** The decode for the same reason overlapping windows do - windows of
+several lengths cover the same frames, and without a decode the exported colour
+of a frame is decided by parquet row order. The second condition is the sharp
+edge of the whole feature: window length changes what the features are *worth*,
+not what they are *called*. `path_length` over 100 frames is simply twice the
+`path_length` over 50 under the same column name, so a model fitted at one length
+reads another length's rows on a scale it has never seen - at normal confidence,
+with nothing in the output to show for it, and then averaged into the same
+posterior as the rows that were right.
+
+`suggest.feature_scope: length_invariant` is how a project earns the right to do
+this. It keeps only the columns whose value does not scale with the window: the
+`beat_*` and `wave_*` families, which are measured over `spectral.window` and not
+over the requested window at all, plus the intensive means and fractions
+(`speed_mean`, `area_mean`, `immotile_frac`, `cnn*_mean`). Out go the extensive
+quantities (`path_length`, `net_displacement`, `radius_gyration`), everything
+derived from them (`straightness`), the dispersions (`*_std`), the order
+statistics (`speed_max`, `speed_p90`), `present_frac`, and the lag-based turn
+columns - the lag itself is `min(n_frames // 4, 25)`, an explicit function of the
+window length. It is an allowlist, so a feature added to the schema later is
+treated as length-dependent until somebody says otherwise; that costs a little
+signal and says so, where the other way round is silent.
+
+It composes with `feature_groups` rather than replacing it: `feature_groups:
+[pose, waveform]` with `feature_scope: length_invariant` is "the beat and
+waveform columns only, length-invariant" without typing out a column list. The
+subset costs real accuracy - those columns carry information, they are simply not
+comparable between lengths - and how much is a per-project number. `uv run
+suggest.py --ablate` prints it beside the full set; read the kappa 5th percentile
+rather than the macro-F1, because on a few hundred labels a macro-F1 difference
+of a few hundredths is not distinguishable from zero while the bootstrap bound
+over movies is about whether the subset survives the next one.
+
+**The incoherent combination is refused twice, on purpose.** `load_config`
+refuses several scales against a `feature_scope` that is not `length_invariant` -
+that is the config saying what the *next* model will be fitted on. A labelling
+run then asks the model *on disk* what it was actually fitted on, by reading the
+column names in its own payload, and names the offending columns if it cannot be
+scored at several lengths. Neither check subsumes the other: retraining is
+exactly what moves a project from failing the second to passing it, and editing a
+config alone must not.
+
+
+### Correcting a bout
+
+A decoded boundary is a claim about when an animal changed what it was doing,
+and the review window (**Model -> Review predictions...**) is where you can see
+whether it is in the right place. You can also move it. What you say is written
+to **`bout_corrections.csv`, beside `annotations.csv`** - never into
+`predictions.parquet` and never into the annotation CSV.
+
+That separation is the whole design, not filing tidiness. `annotations.csv` holds
+one row per **fixed-length window**, keyed by `clip_id`, and every consumer of it
+- the feature join, the suggester, the audit holdout, `reassociate` - assumes
+that shape. Saying "frames 812 to 1043 of track 3 are swimming" is *more* than a
+window label: it carries two boundaries, and no clip grid can express a boundary
+that does not fall on a grid multiple. Flattened into clip rows it would be
+destroyed at the moment it was recorded, and the clip table would quietly acquire
+rows of a second kind that nothing downstream could tell from a hand label. It
+sits beside the annotation log rather than under `work/` because `work/` is
+deleted and rebuilt whenever detection is re-run, and a human judgement a rebuild
+destroys is not a record.
+
+Each row is an **assertion** - these frames are this class - plus who said it,
+when, and what the model had said over those frames at the time. That last column
+is what keeps "the reviewer confirmed the model" distinguishable from "the
+reviewer overruled it" after the next prediction run has overwritten the
+evidence.
+
+```
+correction_id, movie_id, track_id, group, f_start, f_end, label,
+annotator, timestamp_utc, overruled
+```
+
+**One operation, four names.** The bouts of a track are a disjoint, gapless
+run-length encoding, so the state is just where the cuts are and what each cell
+is called. Dragging a boundary, splitting a bout, merging two and relabelling one
+are all the same edit - *name a class over a frame range* - with different
+arguments. Drag an edge in the record lane, or type a range and press **Set
+class**; **Merge into previous/next** takes the neighbour's class over the
+selection. Every edit is checked against the invariant and saved immediately, so
+there is no Save button to forget and nothing to lose by closing the window.
+
+**Only what you touched is written.** Correct one boundary and one or two rows
+appear, not a transcript of the whole track. The rest of the track is still the
+model's claim, and the window draws it that way: **each group gets two lanes**,
+the model's bouts above and *the record* below - your spans filled solid and
+outlined, spans still the model's faded and dashed. The record lane deliberately
+has no bar height, because `conf` is a mean over exactly a bout's frames and a
+bout you have cut in half no longer has one anybody measured. A boundary the
+decode placed keeps its stride error band; a boundary you placed is drawn as a
+hairline, because yours is exact to the frame you chose.
+
+Some things it refuses, and why. A file of fixed windows cannot be corrected at
+all - a window's edges are multiples the predictor chose, so moving one corrects
+nothing about the animal, and a window relabelled by hand is a clip label, which
+already has a file. A stretch no window could be featurised over cannot be
+*extended*: "nothing scored this" is a fact about the run, not something a person
+is in a position to assert. A class `config.yaml` does not declare is refused on
+the way in - it could not be coloured, trained on or exported - while a class the
+config has since *dropped* still loads, because a rename must not delete the
+record of what somebody judged. And two rows claiming one frame stop the window
+with both named: nothing can say what was judged while both stand.
+
+**Turning corrections into training data is a separate step, and it is not taken
+for you.** *Derived labels...* reports what your corrections would imply about
+the fixed windows the training set is actually built from, under one rule:
+
+> A window inherits a class **if and only if it lies entirely inside a single
+> corrected span**. A window that overlaps a correction without being contained
+> in one inherits nothing, and is listed with the frames that make it ambiguous.
+
+Not a majority vote and not the midpoint. A window straddling a transition
+genuinely contains both behaviours - that is the same blur a smaller
+`window_stride` cannot remove - so labelling it either way teaches the next model
+that a blend looks like a pure class, precisely at the transitions it is already
+worst at. A majority rule would label the most misleading windows most
+confidently. Straddlers are reported rather than dropped because they are the
+most informative windows you have: they are where the boundaries are.
+
+Nothing in that report is written anywhere. A derived label is not a hand label -
+it is what your correction *implies* about a clip nobody looked at - and the
+moment the two are indistinguishable in `annotations.csv`, nobody can say again
+what a person actually judged.
+
 ---
 
 ## 5 · Distribution
@@ -820,7 +1001,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Twenty-three suites, 273 tests, 2010 named checks. `uv sync` installs pytest. Nothing is
+Twenty-six suites, 306 tests, 2233 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
@@ -845,6 +1026,9 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_render.py` | which rows the overlay may paint over, and the one it refuses |
 | `test_reassociate.py` | label repair, largely the cases where it must decline |
 | `test_models.py` | the model registry, largely the cases where a fetch must be refused |
+| `test_defaults_lock.py` | every knob this branch added is off in a project a new user makes |
+| `test_multiscale.py` | one model at several window lengths: off is unchanged, the scales weigh equally, length-dependent columns are refused |
+| `test_bout_corrections.py` | correcting a boundary: the partition stays gapless, and what a correction does not imply |
 | `test_selection_wiring.py` | the candidate pool a selector ranks, and what must stay out of it |
 | `test_selection_queue.py` | which clip the annotator is handed, and what the CSV records about why |
 | `test_audit_stability.py` | the holdout is the same clips tomorrow that it is today |

@@ -31,6 +31,13 @@ two inferred behavioural boundaries. Bouts are what an overlapping
 tiling stride is legal and does something too, joining adjacent windows that
 agreed and enforcing ``predict.min_bout_frames``.
 
+``predict.window_scales`` widens the same posterior in the other direction: the
+dense grid is built at several window LENGTHS and their rows all reach the same
+average, so a behaviour shorter than the base window is visible to the shorter
+scales and a long one is not chopped up by the longer. It needs the decode for
+the same reason overlap does, and a model whose features do not scale with the
+window length as well - see :meth:`trackanno.suggest.Suggester.scale_problem`.
+
 Bouts go into ``predictions.parquet`` beside the windows rather than into a file
 of their own, because they carry the same ``f_start``/``f_end``/``track_id``/
 ``<group>_pred``/``<group>_conf`` the renderer already reads and are disjoint by
@@ -435,6 +442,16 @@ def _bout_predictions(
     movie's ``tracks.parquet`` and header to learn a grid this function is
     already holding.
 
+    That is also why ``predict.window_scales`` needs nothing here. Windows of
+    several LENGTHS are just more rows with different spans, and
+    ``frame_posterior`` was written to take ``(f_start, f_end)`` pairs of
+    arbitrary extent that may overlap, repeat and hang off either end - equal
+    spans were never an assumption it made. The multi-scale posterior is
+    therefore the same arithmetic over a wider set of windows, and the only
+    thing that had to be decided was the WEIGHT each scale carries, which
+    :func:`trackanno.densepredict.scale_grid` settles by making the covering
+    counts equal before the mean is taken.
+
     A window that could not be featurised is LEFT OUT of the array handed to
     ``frame_posterior``, never passed as NaN: that function refuses a non-finite
     probability because its running sum would spread one NaN over every later
@@ -633,6 +650,37 @@ def _check_trained_window(suggester, length: int, coverage: str, reporter) -> No
     )
 
 
+def _check_scales(suggester, scales: list[int]) -> None:
+    """Refuse a model that cannot be scored at several window lengths at once.
+
+    ``_check_trained_window`` above has already established that the BASE scale
+    is the one the model was fitted at. Every other scale is by definition one
+    it was not, so the question is no longer "do these two numbers match" but
+    "does this model read features that survive the difference" - and the answer
+    is in the column names in its own payload.
+
+    Unlike the unrecorded-window case this is never a warning. There is no
+    legacy model to be kind to: a project only reaches here by having typed
+    ``predict.window_scales`` into its config, and the mistake it makes is one
+    the output cannot show. Every scale's rows would be scored at unchanged
+    confidence and then averaged into the same per-frame posterior as the
+    correct ones, so the damage is spread evenly over every bout in the file.
+
+    ``load_config`` refuses the same combination against
+    ``suggest.feature_scope``. It is not the same check: that one is about the
+    model this project will fit next, and this one is about the model on disk.
+    Retraining is exactly what moves a project from failing this to passing it,
+    and a config edit alone must not.
+    """
+    problem = suggester.scale_problem(scales)
+    if not problem:
+        return
+    raise RuntimeError(
+        f"{problem} The scales are predict.window_scales, resolved against "
+        f"predict.window_frames: {', '.join(str(s) for s in scales)} frames."
+    )
+
+
 def _window_predictions(
     cfg: Config, features: pd.DataFrame, ends: np.ndarray, skip_reason: np.ndarray,
     extra: dict, suggester, groups: list[str], include_labelled: bool, noun: str,
@@ -781,6 +829,34 @@ def predict_all(
     length = (cfg.predict.resolved_window(cfg.clips) if coverage == "dense"
               else int(cfg.clips.frames))
     _check_trained_window(suggester, length, coverage, reporter)
+
+    # The other window-length skew, and it only exists on the dense path: the
+    # manifest path scores clip_features.parquet, which is one table built at
+    # one length, so there is nothing to score at several. Checked here for the
+    # same reason as the base length - the feature build is the expensive part
+    # of a dense run, and a refusal after it is a refusal that cost ten minutes.
+    scales = cfg.predict.resolved_scales(cfg.clips) if coverage == "dense" else [length]
+    _check_scales(suggester, scales)
+    if len(scales) > 1:
+        reporter.log(
+            f"scoring at {len(scales)} window lengths "
+            f"({', '.join(str(s) for s in scales)} frames), each carrying the same "
+            "weight in the per-frame posterior. A transition shorter than the "
+            f"{length}-frame grid is only visible to the shorter scales"
+        )
+    elif coverage != "dense" and len(cfg.predict.window_scales) > 1:
+        # Reachable only through `--coverage manifest`, which overrides a config
+        # `load_config` would otherwise have refused. Said rather than ignored:
+        # the run produces a perfectly ordinary file, and nothing in it shows
+        # that the scales the config asks for were not used.
+        reporter.log(
+            f"predict.window_scales lists {len(cfg.predict.window_scales)} window "
+            "lengths but this run was asked for manifest coverage, which scores "
+            f"{CLIP_FEATURES_FILE} - one table, built over the annotation clip "
+            f"grid at {int(cfg.clips.frames)} frames. Nothing is scored at any "
+            "other length.",
+            "warning",
+        )
 
     stride = cfg.predict.resolved_stride(cfg.clips)
     decoding = coverage == "dense" and str(cfg.predict.decode) != "none"

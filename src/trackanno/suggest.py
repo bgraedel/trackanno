@@ -57,6 +57,125 @@ REPORT_FILE = "suggest_report.json"
 # (`speed_mean`, `area_mean`, `body_len_mean`, `immotile_frac`, ...).
 _LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
 
+# --------------------------------------------------------------------------- #
+# which columns survive a change of window length
+# --------------------------------------------------------------------------- #
+# The paragraph above says which families move with the window. This turns it
+# into a predicate, because two things now have to agree about it and a prose
+# comment cannot hold them together: `train` uses it to FIT a model that may
+# legitimately be scored at several window lengths, and
+# :meth:`Suggester.scale_problem` uses it to REFUSE a model that may not. Two
+# copies of the rule would agree until one was edited, after which a project
+# would fit on one subset and be checked against another.
+#
+# An ALLOWLIST, deliberately, and this is the whole safety argument. Under a
+# denylist a column added to the schema later matches no "length-dependent"
+# pattern, is treated as invariant, and is scored at three window lengths with
+# nothing raising - which is precisely the silent skew this machinery exists to
+# stop. Under an allowlist the same new column is treated as dependent, costs a
+# little signal, and says so. Wrong in the recoverable direction.
+#
+# Two ways in:
+#
+# * ``beat_*`` and ``wave_*`` are invariant BY CONSTRUCTION, not by measurement.
+#   Since ``FEATURE_VERSION`` 2 they are measured over a window of
+#   ``cfg.spectral.window`` frames CENTRED on the requested range rather than
+#   over the range itself (:func:`trackanno.clipfeatures._beat_on_window`,
+#   :func:`trackanno.wavespectra.window_values`), so the requested length does
+#   not enter their definition at all.
+# * An INTENSIVE reduction of a per-frame series - a mean, a median, or the
+#   mean of an indicator, which is what a ``_frac`` is. Averaging more frames
+#   does not scale the average. The reducer is legible in the suffix because
+#   :data:`trackanno.trackseries.SERIES_SPEC` names features
+#   ``column + reducer``, so ``_std``, ``_p90`` and ``_max`` - the dispersions
+#   and order statistics, which do grow with the number of samples - are
+#   excluded by not being on this list rather than by being on another one.
+#   ``cnn{i}_mean`` comes through the same door: it is the mean of the window's
+#   per-detection embeddings, with no length term.
+_LENGTH_INVARIANT_PREFIXES = ("beat_", "wave_")
+_INTENSIVE_SUFFIXES = ("_mean", "_median", "_frac")
+
+# Named because the suffix rule would otherwise wave them through, and each is a
+# mean of something the window length itself changes:
+#
+# * ``present_frac``'s denominator IS the window. A longer window at a track's
+#   end reaches further past the last detection, so the fraction falls with
+#   length even though the animal did nothing different.
+# * ``turn_abs_mean`` averages turns measured over ``turn_lag_frames``, and
+#   :func:`trackanno.clipfeatures._heading_lag` sets that lag to
+#   ``min(n_frames // 4, 25)`` - an explicit function of the window length. The
+#   mean is intensive; the quantity being averaged is not the same quantity.
+_LENGTH_DEPENDENT_DESPITE_SUFFIX = frozenset({"present_frac", "turn_abs_mean"})
+
+# `shape_elong` reduced by `mean`, renamed in `trackseries._FEATURE_NAMES`
+# because renaming it back would change the input schema of every model already
+# trained. An intensive mean wearing no suffix, so it has to be named here.
+_LENGTH_INVARIANT_NAMES = frozenset({"shape_elongation"})
+
+# Deliberately NOT on the list, so that their absence reads as a decision rather
+# than an oversight: `body_rotation_speed`, `tip_angular_speed` and
+# `cnn*_delta` are all per-step means and so are intensive by construction, but
+# none of them has been measured across window lengths in this repository, and
+# the allowlist's rule is that construction alone is enough only where the
+# window length is absent from the definition outright (the two spectral
+# families above). Measure one and it can move.
+
+
+def is_length_invariant(column: str) -> bool:
+    """Whether ``column``'s VALUE survives a change of window length.
+
+    Not whether it is a good feature, and not whether it is stable: a column can
+    be invariant and useless. It answers the one question that decides whether a
+    model fitted at 50 frames may be shown a 100-frame row.
+    """
+    name = str(column)
+    if name.startswith(_LENGTH_INVARIANT_PREFIXES):
+        return True
+    if name in _LENGTH_INVARIANT_NAMES:
+        return True
+    if name in _LENGTH_DEPENDENT_DESPITE_SUFFIX:
+        return False
+    return name.endswith(_INTENSIVE_SUFFIXES)
+
+
+def length_invariant_columns(columns) -> list[str]:
+    """``columns`` in their original order, keeping only the invariant ones."""
+    return [c for c in columns if is_length_invariant(c)]
+
+
+def length_dependent_columns(columns) -> list[str]:
+    """``columns`` in their original order, keeping only the ones that scale.
+
+    The complement of :func:`length_invariant_columns`, spelled separately
+    because the refusal has to NAME the offenders: "your features scale with the
+    window" is not actionable and "path_length, speed_std and 71 others do" is.
+    """
+    return [c for c in columns if not is_length_invariant(c)]
+
+
+def scoped_columns(columns, scope: str) -> list[str]:
+    """``columns`` narrowed by ``suggest.feature_scope``.
+
+    The second axis of feature selection, applied after
+    :func:`trackanno.clipfeatures.feature_columns` has applied the first. They
+    compose rather than overlap: the groups say which instrument a column came
+    from, this says how it behaves when the window length changes, and a project
+    that wants "the spectral columns only, at three scales" gets there by
+    setting both rather than by typing out 34 column names.
+
+    An unknown scope RAISES rather than falling through to "all". Falling
+    through would fit on more columns than were asked for and report success,
+    which is the failure mode a typo in a config key already has too much of.
+    """
+    if scope == "all":
+        return list(columns)
+    if scope == "length_invariant":
+        return length_invariant_columns(columns)
+    raise ValueError(
+        f"unknown suggest.feature_scope {scope!r}; expected 'all' or "
+        "'length_invariant'"
+    )
+
 
 def is_audit_clip(clip_id: str, cfg: Config,
                   recorded: Mapping[str, bool] | None = None) -> bool:
@@ -114,6 +233,8 @@ def audit_records(labels: pd.DataFrame | None) -> dict[str, bool]:
 
 
 __all__ = ["Suggester", "train", "main", "is_audit_clip", "audit_records",
+           "is_length_invariant", "length_invariant_columns",
+           "length_dependent_columns", "scoped_columns",
            "MODEL_FILE", "REPORT_FILE"]
 
 
@@ -612,7 +733,11 @@ def train_group(
             "per-fold CNN PCA (saved model uses the global one)"
             if fold_cnn is not None else
             "no CNN columns" if not any(c.startswith("cnn") for c in columns)
-            else "global CNN PCA (clip_cnn_raw.npy unavailable)"
+            # Either clip_cnn_raw.npy is missing or the caller withheld it (see
+            # suggest.feature_scope in `train`); the run log says which, and
+            # what matters here is the same either way - the held-out movie's
+            # detections were in the basis these columns came from.
+            else "global CNN PCA (no fold-wise basis in use)"
         ),
         audit_pca=(
             "global CNN PCA, fitted over every prepared movie INCLUDING these "
@@ -749,6 +874,52 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
             f"the selected feature groups {usable} produced no columns; the "
             "clip features may predate them - rebuild them from the Model page."
         )
+    # The second cut, and it has to happen HERE rather than per group: `columns`
+    # is what gets written into the model payload, and that payload is what
+    # `Suggester.scale_problem` reads back to decide whether the model may be
+    # scored at several window lengths. Narrowing it later, or per group, would
+    # leave the file claiming a wider input space than the fit used.
+    scope = str(cfg.suggest.feature_scope)
+    if scope != "all":
+        dropped = length_dependent_columns(columns)
+        columns = scoped_columns(columns, scope)
+        if not columns:
+            raise RuntimeError(
+                f"suggest.feature_scope is {scope!r} and it removed every one of "
+                f"the {len(dropped)} columns the feature groups {usable} "
+                "selected, so the model would have no inputs at all. The "
+                "length-invariant columns are the beat_* and wave_* families "
+                "(both need detection.task: pose) and the intensive means; add a "
+                "feature group that has some, or set suggest.feature_scope back "
+                "to 'all'."
+            )
+        shown = ", ".join(dropped[:4]) + ("..." if len(dropped) > 4 else "")
+        reporter.log(
+            f"suggest.feature_scope is {scope!r}: {len(dropped)} column(s) whose "
+            f"value scales with the window length were dropped ({shown}). That is "
+            "a real loss of signal, bought to make one model applicable at "
+            "several predict.window_scales."
+        )
+        if raw_cnn is not None:
+            # The fold-wise basis is fitted on `clip_cnn_raw.npy`, which is the
+            # mean, the std AND the per-step delta of the embeddings
+            # concatenated - so its components mix the length-invariant half
+            # with the two halves this scope just removed, and no subset of the
+            # components is the invariant part. Left in, the CROSS-VALIDATED
+            # score would describe a model that is not the one being saved: it
+            # would be scored with length-dependent inputs the saved model does
+            # not have. Dropping it costs the fold-PCA leak fix on this path and
+            # says so, which is the lesser of two wrong numbers.
+            raw_cnn = None
+            reporter.log(
+                f"suggest.feature_scope is {scope!r}, so the fold-wise CNN basis "
+                f"is not used: {CLIP_CNN_RAW_FILE} holds the mean, std and delta "
+                "aggregate together and its components cannot be narrowed to the "
+                "length-invariant half. The cnn*_mean columns are cross-validated "
+                "on the GLOBAL PCA instead, which the held-out movie's detections "
+                "were in - that leak flatters the score below.",
+                "warning",
+            )
     reporter.log(f"features: {len(columns)} columns from {', '.join(usable)}")
 
     # Said before any group is fitted: every score below is computed on whatever
@@ -1005,6 +1176,49 @@ class Suggester:
             f"a {length}-frame row on the wrong scale while reporting normal "
             f"confidence. Retrain the model at {length} frames, or restore the "
             f"window length it was trained at ({self.trained_window} frames)."
+        )
+
+    def scale_problem(self, scales) -> str:
+        """'' if this model may be scored at all of ``scales``, else why not.
+
+        The authoritative half of the multi-scale check, and the reason there
+        are two. :func:`trackanno.config.load_config` refuses
+        ``predict.window_scales`` against ``suggest.feature_scope``, which is a
+        statement about the model the project will fit NEXT; this asks the model
+        actually on disk what it was fitted on, by reading the column names in
+        its own payload. A project whose config was changed after the last fit
+        passes the first check and fails this one, which is the case that
+        matters: the config is a plan and the payload is a fact.
+
+        ONE scale is always fine - that is the run this codebase has always
+        done, and :meth:`window_problem` is the check that belongs to it. Beyond
+        one, a length-dependent column is scored at a length the model has never
+        seen; the columns line up, the feature version matches, the confidences
+        look normal, and the answer is averaged together with the scales that
+        were right. Nothing downstream can see it, so it is refused here.
+
+        Returns a sentence rather than raising, like :meth:`window_problem`, so
+        the caller decides between refusing and warning.
+        """
+        lengths = [int(s) for s in scales]
+        if len(set(lengths)) <= 1:
+            return ""
+        offenders = length_dependent_columns(self.columns)
+        if not offenders:
+            return ""
+        shown = ", ".join(offenders[:6]) + ("..." if len(offenders) > 6 else "")
+        listed = ", ".join(str(s) for s in sorted(set(lengths)))
+        return (
+            f"this model was fitted on {len(offenders)} of its {len(self.columns)} "
+            f"columns whose VALUE scales with the window length ({shown}), so it "
+            f"cannot be scored at {len(set(lengths))} window lengths at once "
+            f"({listed} frames). path_length over 100 frames is simply twice the "
+            "path_length over 50 under the same column name, so the rows from "
+            "every scale but the one it was trained at reach it on a scale it has "
+            "never seen - at normal confidence, and then averaged into the same "
+            "per-frame posterior as the rows that were right. Retrain with "
+            "suggest.feature_scope: length_invariant, or empty "
+            "predict.window_scales."
         )
 
     def is_audit_clip(self, clip_id: str) -> bool:
@@ -1348,7 +1562,14 @@ def _print_report(reports: dict) -> None:
 
 
 def ablate(cfg: Config) -> None:
-    """Kinematic vs CNN vs both - does the 190 MB of embeddings earn its place?"""
+    """What each subset of the features is worth, on this project's own labels.
+
+    Kinematic vs CNN vs both - does the 190 MB of embeddings earn its place? -
+    plus the length-invariant subset, which is priced here because it is the
+    only one of these that buys something other than accuracy: it is the
+    condition on scoring at several ``predict.window_scales``, and what it costs
+    is a per-project number nothing else reports.
+    """
     features = build_clip_features(cfg, verbose=False)
     labels = pd.read_csv(cfg.paths.csv)
     from .clipfeatures import FEATURE_GROUPS, available_groups
@@ -1372,6 +1593,14 @@ def ablate(cfg: Config) -> None:
     subsets["everything"] = all_cols
     if "cnn" in usable:
         subsets["no CNN"] = feature_columns(features, [g for g in usable if g != "cnn"])
+    # The subset `suggest.feature_scope: length_invariant` would fit on, priced
+    # the same way as the groups. It is the only one of these that buys
+    # something other than accuracy - it is what makes `predict.window_scales`
+    # legitimate - so the number worth reading here is what dropping the
+    # length-dependent columns COSTS, which nothing else in this tool reports.
+    invariant = length_invariant_columns(all_cols)
+    if invariant and len(invariant) < len(all_cols):
+        subsets["length-invariant"] = invariant
     for group in cfg.categories:
         if group.is_multi:
             continue
@@ -1384,7 +1613,16 @@ def ablate(cfg: Config) -> None:
             fold_cnn = raw_cnn if any(c.startswith("cnn") for c in cols) else None
             _, rep = train_group(features, labels, group.name, cfg, cols,
                                  verbose=False, raw_cnn=fold_cnn)
-            print(f"  {name:<16} macro-F1 {rep.macro_f1:.3f}  acc {rep.accuracy:.3f}"
+            # kappa's 5th percentile is in the line because it is the column
+            # that answers the question a subset comparison is usually asked:
+            # macro-F1 differences of a few hundredths over a few hundred labels
+            # are not distinguishable from each other, while the bootstrap lower
+            # bound over MOVIES is about whether the subset holds up on the next
+            # one. Reading the point estimates alone is how a difference that is
+            # not there gets acted on.
+            print(f"  {name:<16} {len(cols):>4} cols  macro-F1 {rep.macro_f1:.3f}  "
+                  f"acc {rep.accuracy:.3f}  kappa {rep.kappa:+.3f} "
+                  f"[5th pct {rep.kappa_lower:+.3f}]"
                   + ("" if rep.reliable else f"   ({rep.reason})"))
 
 
@@ -1396,7 +1634,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--train", action="store_true", help="build features, fit, cross-validate")
     p.add_argument("--report", action="store_true", help="print the last saved report")
     p.add_argument("--ablate", action="store_true",
-                   help="compare kinematic-only vs CNN-only vs both")
+                   help="compare kinematic-only vs CNN-only vs both, and the "
+                        "length-invariant subset predict.window_scales needs")
     p.add_argument("--features-only", action="store_true", help="build clip features and stop")
     args = p.parse_args(argv)
     cfg = load_config(args.config)

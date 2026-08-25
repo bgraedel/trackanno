@@ -195,6 +195,30 @@ suggest:
   #   waveform   beat shape after Geyer, Howard & Sartori 2022 (needs task: pose)
   #   cnn        detector embeddings        (needs features.enabled)
   feature_groups: [kinematic, pose, waveform, cnn]
+  # A second, independent cut through the same columns: `feature_groups` asks
+  # which instrument a column came from, this asks what happens to its value
+  # when the window length changes. The two compose - "the beat and waveform
+  # families, length-invariant only" is `feature_groups: [pose, waveform]` with
+  # `feature_scope: length_invariant`.
+  #   all               -> every column the groups selected.  (default)
+  #   length_invariant  -> only the columns whose value does NOT scale with the
+  #                        window: the beat_* and wave_* families, which are
+  #                        measured over spectral.window and not over the window
+  #                        at all, plus the intensive means and fractions
+  #                        (speed_mean, area_mean, immotile_frac, cnn*_mean...).
+  #                        Out go the extensive quantities (path_length,
+  #                        net_displacement), everything derived from them
+  #                        (straightness), the dispersions (*_std), the order
+  #                        statistics (speed_max, speed_p90), present_frac and
+  #                        the lag-based turn columns - the lag itself is a
+  #                        function of the window length.
+  # This is what makes ONE model legitimately applicable at several
+  # predict.window_scales, and it costs real signal to get there: those columns
+  # carry information, they are simply not comparable between window lengths.
+  # `uv run suggest.py --ablate` prints what the subset is worth on YOUR labels
+  # beside the full set; read the kappa 5th percentile rather than the macro-F1,
+  # because it is the one that says whether a subset survives the next movie.
+  feature_scope: all
   pca_components: 32
   retrain_every: 10     # retrain in the background after this many new labels
   min_per_class: 5
@@ -321,6 +345,52 @@ predict:
   #   above window_frames -> refused: it leaves unscored gaps between windows,
   #              which is the hole `coverage: dense` exists to close.
   window_stride: auto
+
+  # Every window LENGTH to score at. `window_stride` above changes where the
+  # windows START; this changes how LONG they are, and averages the answers.
+  #   []       -> one scale, `window_frames`. Byte for byte the run every
+  #               earlier version did.  (default)
+  #   a list   -> the dense grid is built once per length and every row goes
+  #               into the same per-frame average, so a behaviour shorter than
+  #               `window_frames` is still visible to the shorter scales, and a
+  #               long bout is not cut into several windows that can disagree.
+  #               The list must INCLUDE `window_frames`: that is the length the
+  #               rest of the pipeline is planned at, and two keys naming the
+  #               window length and disagreeing is not a configuration.
+  # Every scale carries the SAME weight in the per-frame posterior - the stride
+  # of each scale is scaled with its length so that each covers a frame equally
+  # often, and the plain mean already in the decode does the rest. Weighting by
+  # length instead would let the longest window outvote the others two or three
+  # to one, which is precisely the answer adding a short scale was meant to
+  # question.
+  #
+  # What this does NOT buy is a sharper boundary. Each scale's grid still cuts
+  # at its own window edges, so on the test suite's planted movie - a transition
+  # at frame 137, window 50 - scales [25, 50, 100] report it at frame 150,
+  # exactly where one scale does. `window_stride` is the knob for WHERE a change
+  # is reported; this is the knob for WHICH changes exist to report. On the same
+  # movie a 30-frame stop is invisible to every window of a 50-frame grid (no
+  # window is ever more than 40% stopped, so a model reading that fraction back
+  # exactly still says "swimming" everywhere) and adding a 25-frame scale finds
+  # it. The two settings are independent and worth using together.
+  #
+  # Two costs, both real:
+  #   - A feature build per scale, but less than a whole one each: all the
+  #     scales of a track are measured in one pass, so the per-track setup is
+  #     paid once and only the per-window work repeats. On the test fixture,
+  #     scales [25, 50, 100] cost 3.3x the windows for 1.3x the wall time on a
+  #     `detect` project and 2.2x on a `pose` one. That is a 120-frame synthetic
+  #     movie, not your data - the run logs the window count and the multiple
+  #     before it spends them, and that line is the one to budget from.
+  #   - The model must have been fitted on columns that do not scale with the
+  #     window length, i.e. `suggest.feature_scope: length_invariant`, or the
+  #     extra scales reach it in units it was never fitted at - at unchanged
+  #     confidence, with nothing in the output to show for it. The config
+  #     refuses to load without it, and a labelling run refuses again against
+  #     the columns the saved model actually records.
+  # Needs a `decode` below, for the same reason an overlapping stride does.
+  window_scales: []
+
   # Detections a dense window needs before it is featurised. NOT
   # clips.min_clip_frames - that guarantees a watchable video clip, and nothing
   # here is watched. 2 is the floor at which any motion feature can exist.

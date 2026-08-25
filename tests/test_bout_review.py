@@ -329,12 +329,18 @@ def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
     app.processEvents()
     check("the timeline actually paints", ink(painted(panel.timeline)) > 500,
           str(ink(painted(panel.timeline))))
-    check("every drawn span is hit-testable, so the detail has somewhere to live",
-          len(panel.timeline._hits) == panel.timeline.track.n_segments,
-          f"{len(panel.timeline._hits)} rects for "
+    model_hits = [h for h in panel.timeline._hits if h[3] == "model"]
+    check("every drawn model span is hit-testable, so the detail has somewhere "
+          "to live",
+          len(model_hits) == panel.timeline.track.n_segments,
+          f"{len(model_hits)} rects for "
           f"{panel.timeline.track.n_segments} segments")
+    check("...and the record lane below it is hit-testable too, or a reviewer "
+          "could not click a span to correct it",
+          len([h for h in panel.timeline._hits if h[3] == "record"])
+          == sum(len(p) for p in panel.timeline.track.partitions.values()))
 
-    group, segment = panel.timeline._hits[0][1], panel.timeline._hits[0][2]
+    group, segment = model_hits[0][1], model_hits[0][2]
     tip = panel.timeline._describe(group, segment)
     check("the tooltip says confidence is a mean and not a peak",
           "MEAN posterior" in tip and "not its peak" in tip, tip)

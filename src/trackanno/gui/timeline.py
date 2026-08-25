@@ -8,12 +8,15 @@ row: what it claims is where it starts, where it stops, and how sure the model
 was over exactly those frames, and none of those three read off a column of
 integers. So they are drawn, on the axis the claim is about.
 
-Read-only, deliberately. Nothing here edits, splits, merges or writes a bout
-back. A corrected bout has no defined meaning yet for a training set built from
-fixed-length windows - see the note at the foot of this docstring - and a widget
-that let one be dragged would be inventing that meaning by accident.
+Editable, and the edits go somewhere else. A reviewer who can see that a
+boundary is wrong and cannot say so is being asked to trust a picture they have
+already disbelieved. What they say is recorded in ``bout_corrections.csv``
+(:mod:`trackanno.corrections`) and never in ``predictions.parquet`` or
+``annotations.csv``: a correction is a record ABOUT a run, not a rewritten run,
+and it is an assertion about a variable-length span, which the clip table has no
+row shape for. Nothing here re-decodes, retrains or writes a prediction back.
 
-Four things the picture is not allowed to imply:
+Five things the picture is not allowed to imply:
 
 * **A boundary is not a frame.** Overlapping windows remove the QUANTISATION of
   a transition to a multiple of the window length; they do not remove the BLUR
@@ -37,7 +40,15 @@ Four things the picture is not allowed to imply:
   fixed windows off a grid the predictor laid down itself; its edges are grid
   multiples and say nothing about the animal. It is drawn - it is still worth
   seeing - but captioned as what it is, and the boundary bands are omitted,
-  since there is no inferred boundary there to be uncertain about.
+  since there is no inferred boundary there to be uncertain about. It cannot be
+  corrected either: a corrected window is a clip label, and clip labels have a
+  file of their own.
+* **A correction is not evidence about the model.** It is drawn in a lane of its
+  own, below the model's, rather than replacing the bar it overrules - so the
+  two claims stay side by side on the same frame axis and a reviewer can never
+  read their own judgement back as the model agreeing with them. The model lane
+  keeps the numbers the run measured; the record lane carries no confidence at
+  all, because "what the record now says these frames are" is not a posterior.
 
 Which of the two a file is comes off the FILE, never off ``predict.decode``:
 the config can be edited between a run and this window opening, and a widget
@@ -45,12 +56,11 @@ that consulted it would caption the run somebody is about to do rather than the
 one whose rows are on screen. ``bout_id`` is the probe, exactly as in
 :func:`trackanno.render.prediction_unit` and :func:`trackanno.predict.summarise`.
 
-Not built, and why: editing. Correcting a bout means writing a label onto a
-half-open frame span, and every training set in this codebase is assembled from
-fixed-length clips keyed by ``clip_id`` - which a bout deliberately does not
-have (:func:`trackanno.predict._bout_id` explains why). "Which clips does a
-corrected 300-frame bout produce, and at what length" is a data-model question,
-not a widget one.
+"Which clips does a corrected 300-frame bout produce, and at what length" was
+the question that kept editing out of the first version of this file. It has an
+answer now and it is NOT taken here: :func:`trackanno.corrections.derive_window_labels`
+answers it, on demand, as a separate step, and this window only ever shows what
+that step WOULD produce. Saving a correction writes one file and one file only.
 """
 
 from __future__ import annotations
@@ -59,14 +69,19 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import QEvent, QPointF, QRectF, QSize, Qt
+from qtpy.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from qtpy.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QScrollArea,
-    QSizePolicy, QToolTip, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QToolTip, QVBoxLayout,
+    QWidget,
 )
 
 from ..config import Config
+from ..corrections import (
+    CorrectionStore, Partition, Span, apply_corrections, build_corrections,
+    corrections_path, derivation_report, derive_window_labels, manifest_windows,
+)
 from ..store import MULTI_SEP
 from .theme import tokens
 
@@ -146,6 +161,22 @@ class TrackPredictions:
     # frame_posteriors.parquet is absent. NaN where no window covered the frame.
     trace: dict = field(default_factory=dict)
 
+    # group -> the RECORD: the model's bouts with this reviewer's corrections
+    # laid over them. Kept apart from `lanes` rather than replacing it, because
+    # the two answer different questions - what the model said, and what is now
+    # asserted - and a reviewer who cannot see both at once will eventually read
+    # one as the other.
+    partitions: dict = field(default_factory=dict)   # group -> Partition
+    # Corrections that no longer land on any predicted frame, because the run
+    # that wrote these rows covered a different span. Reported, never dropped
+    # and never deleted: a machine running again must not erase a human's
+    # judgement, and hiding it would show the model's answer where theirs was.
+    orphans: list = field(default_factory=list)
+    # Why this track cannot be corrected, or "". Set rather than raised: this is
+    # a normal state (a windows file, a silent track) and a dialog that threw
+    # would take the review of everything else with it.
+    edit_problem: str = ""
+
     @property
     def empty(self) -> bool:
         return not any(self.lanes.values())
@@ -153,6 +184,10 @@ class TrackPredictions:
     @property
     def n_segments(self) -> int:
         return sum(len(v) for v in self.lanes.values())
+
+    @property
+    def n_corrected(self) -> int:
+        return sum(len(p.corrected_spans()) for p in self.partitions.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -300,9 +335,23 @@ class PredictionReader:
         self._posterior_read = False
         self._tracks: dict[str, list[tuple[int, int]]] = {}
         self.resolution = Resolution()
+        self.corrections: CorrectionStore | None = None
 
         from ..predict import load_predictions, staleness
         from ..render import prediction_unit
+
+        # Before the predictions, and fatal when it fails. A corrections file
+        # that will not parse must stop the window rather than be skipped: the
+        # timeline would then draw the model's bouts over frames a person has
+        # already overruled, and it would look exactly like a track nobody has
+        # corrected yet.
+        try:
+            self.corrections = CorrectionStore(
+                corrections_path(cfg), getattr(cfg.ui, "annotator", "")
+            )
+        except (OSError, ValueError) as exc:
+            self.problem = str(exc)
+            return
 
         try:
             self.frame = load_predictions(cfg)
@@ -397,7 +446,58 @@ class PredictionReader:
         for group in self.groups:
             out.lanes[group] = self._segments(rows, group)
         out.trace = self._traces(out)
+        self._record(out)
         return out
+
+    def _record(self, track: TrackPredictions) -> None:
+        """The model's bouts with this project's corrections laid over them.
+
+        Every way this can fail is a sentence on ``edit_problem`` rather than an
+        exception. The three that happen: the file holds windows off a grid and
+        not bouts, so there is no bout to correct and a corrected window would be
+        a clip label; the track has no rows at all; or the rows for one group
+        overlap or leave a hole, which ``runs_to_bouts`` cannot produce but a
+        hand-built or half-written file can - and a partition is refused rather
+        than patched, because patching would invent the frames the file is
+        missing.
+        """
+        if track.empty:
+            track.edit_problem = (
+                "this track has no predicted rows, so there is nothing to correct"
+            )
+            return
+        if not track.bouts:
+            track.edit_problem = (
+                "these rows are fixed windows off a grid, not decoded bouts. A "
+                "window's edges are multiples the predictor chose, so moving one "
+                "corrects nothing about the animal - and a window relabelled by "
+                "hand is a clip label, which belongs in annotations.csv. Set "
+                "predict.decode and label again to get bouts."
+            )
+            return
+        store = self.corrections
+        for group, segments in track.lanes.items():
+            if not segments:
+                continue
+            try:
+                model = Partition(
+                    [Span(s.f_start, s.f_end, s.label, False) for s in segments],
+                    segments[0].f_start, segments[-1].f_end,
+                )
+            except ValueError as exc:
+                track.edit_problem = (
+                    f"the {group} rows for this track are not a usable decode: {exc}"
+                )
+                return
+            saved = store.for_track(track.movie_id, track.track_id, group) \
+                if store is not None else []
+            try:
+                partition, orphans = apply_corrections(model, saved)
+            except ValueError as exc:
+                track.edit_problem = f"a saved correction cannot be applied: {exc}"
+                return
+            track.partitions[group] = partition
+            track.orphans.extend(orphans)
 
     def _segments(self, rows: pd.DataFrame, group: str) -> list[Segment]:
         """One group's spans out of one track's rows, in frame order.
@@ -586,6 +686,38 @@ def caption_lines(
             "single window's opinion rather than an average of several."
         )
 
+    if track.partitions:
+        corrected = track.n_corrected
+        lines.append(
+            "The lower lane of each pair is THE RECORD: the model's bouts with "
+            "your corrections laid over them. A corrected span is filled solid "
+            "and outlined; a span still the model's is faded and dashed. The "
+            "record lane carries no bar height, because what is now asserted "
+            "about a stretch of frames is not a posterior over it."
+        )
+        lines.append(
+            f"{corrected} span(s) on this track are yours." if corrected else
+            "Nothing on this track has been corrected, so the record is the "
+            "model's answer unchanged."
+        )
+        if corrected:
+            lines.append(
+                "A boundary you placed is drawn as a hairline and a boundary the "
+                "decode placed keeps its band: yours is exact to the frame you "
+                "chose, and only the decode's is uncertain to the window stride. "
+                "That is a statement about where the number came from, not about "
+                "whether you were right."
+            )
+    if track.orphans:
+        lines.append(
+            f"{len(track.orphans)} saved correction(s) cover frames these "
+            "predictions have no row for - the run that wrote them decoded a "
+            "different span. They are kept in bout_corrections.csv and are not "
+            "drawn; nothing has been deleted."
+        )
+    if track.edit_problem and not track.empty:
+        lines.append(f"Not correctable here: {track.edit_problem}")
+
     if min_confidence > 0 and track.bouts:
         lines.append(
             f"The dashed line is suggest.min_confidence ({min_confidence:g}), the "
@@ -614,10 +746,25 @@ class BoutTimeline(QWidget):
 
     LANE = 52
     BAR = 34
+    RECORD_LANE = 38
+    RECORD_BAR = 22
     GAP = 6
     TOP = 10
     AXIS = 26
     RIGHT = 12
+    # How near a boundary a press has to land to grab it rather than select the
+    # span. In PIXELS, not frames: the reviewer is aiming with a mouse, and at
+    # 300 frames across 900 px a frame-based tolerance would be unhittable on a
+    # long track and would swallow whole bouts on a short one.
+    GRAB_PX = 5.0
+
+    # (group, f_start, f_end) of the record span the reviewer clicked, so the
+    # panel's frame boxes can be filled from the picture rather than typed.
+    spanClicked = Signal(str, int, int)
+    # (group, boundary was at, boundary dragged to). The widget does not apply
+    # it: the partition is the thing that enforces the invariant, and a widget
+    # that edited its own copy would be a second place the rules live.
+    boundaryMoved = Signal(str, int, int)
 
     def __init__(self, cfg: Config | None = None, parent=None):
         super().__init__(parent)
@@ -625,7 +772,13 @@ class BoutTimeline(QWidget):
         self.track = TrackPredictions("", 0, False, "")
         self.resolution = Resolution()
         self.note = ""
-        self._hits: list[tuple[QRectF, str, Segment]] = []
+        self.selected: tuple[str, int, int] | None = None
+        self._hits: list[tuple[QRectF, str, object, str]] = []
+        # Set on every paint so the mouse handlers measure with the same ruler
+        # the picture was drawn with; a second computation could disagree by a
+        # pixel and put a drag on the wrong side of a boundary.
+        self._geom: tuple[float, float] = (0.0, 0.0)
+        self._drag: tuple[str, int, int] | None = None
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMinimumWidth(420)
         self.setMouseTracking(True)
@@ -635,21 +788,42 @@ class BoutTimeline(QWidget):
         self.track = track
         self.resolution = resolution
         self.note = note
+        self.selected = None
+        self._drag = None
         self.updateGeometry()
         self.update()
 
     def sizeHint(self) -> QSize:
         lanes = max(1, len(self.track.lanes))
-        return QSize(760, self.TOP + lanes * self.LANE + self.AXIS + 8)
+        records = len(self.track.partitions)
+        return QSize(760, self.TOP + lanes * self.LANE
+                     + records * self.RECORD_LANE + self.AXIS + 8)
 
     def minimumSizeHint(self) -> QSize:
         return self.sizeHint()
 
     # -- geometry ------------------------------------------------------------ #
-    def _gutter(self, metrics) -> float:
-        names = list(self.track.lanes) or [""]
+    def _lane_plan(self) -> list[tuple[str, str, float]]:
+        """``[(kind, group, y)]`` top to bottom, the model lane then its record.
+
+        One list, used by the painter and by the hit tests, so a lane cannot be
+        drawn at one height and clicked at another.
+        """
+        out: list[tuple[str, str, float]] = []
+        y = float(self.TOP)
+        for group in self.track.lanes:
+            out.append(("model", group, y))
+            y += self.LANE
+            if group in self.track.partitions:
+                out.append(("record", group, y))
+                y += self.RECORD_LANE
+        return out
+
+    def _gutter(self, metrics=None) -> float:
+        metrics = metrics if metrics is not None else self.fontMetrics()
+        names = list(self.track.lanes) + (["record"] if self.track.partitions else [])
         return min(
-            max(70.0, max(metrics.horizontalAdvance(n) for n in names) + 16.0),
+            max(70.0, max(metrics.horizontalAdvance(n) for n in names or [""]) + 16.0),
             max(80.0, self.width() * 0.28),
         )
 
@@ -659,6 +833,16 @@ class BoutTimeline(QWidget):
 
     def _x(self, frame: float, gutter: float, scale: float) -> float:
         return gutter + (frame - self.track.f_lo) * scale
+
+    def _frame_at(self, x: float) -> int:
+        """The frame under a pixel, clamped to the track. Rounded, not floored:
+        a boundary drawn at frame 100 is dragged to 100 from either side of the
+        line, which floor() would make an off-by-one that depends on approach."""
+        gutter, scale = self._geom
+        if scale <= 0:
+            return self.track.f_lo
+        frame = self.track.f_lo + (x - gutter) / scale
+        return int(min(max(round(frame), self.track.f_lo), self.track.f_hi))
 
     # -- painting ------------------------------------------------------------ #
     def paintEvent(self, event):  # noqa: N802 (Qt naming)
@@ -681,11 +865,18 @@ class BoutTimeline(QWidget):
         metrics = painter.fontMetrics()
         gutter = self._gutter(metrics)
         scale = self._scale(gutter)
-        y = float(self.TOP)
-        for group, segments in self.track.lanes.items():
-            self._paint_lane(painter, t, group, segments, y, gutter, scale)
-            y += self.LANE
-        self._paint_axis(painter, t, y, gutter, scale)
+        self._geom = (gutter, scale)
+        bottom = float(self.TOP)
+        for kind, group, y in self._lane_plan():
+            if kind == "model":
+                self._paint_lane(painter, t, group, self.track.lanes[group], y,
+                                 gutter, scale)
+                bottom = y + self.LANE
+            else:
+                self._paint_record(painter, t, group,
+                                   self.track.partitions[group], y, gutter, scale)
+                bottom = y + self.RECORD_LANE
+        self._paint_axis(painter, t, bottom, gutter, scale)
         painter.end()
 
     def _nothing_here(self) -> str:
@@ -753,11 +944,102 @@ class BoutTimeline(QWidget):
         colour = QColor(option.color) if option is not None else QColor(t["faint"])
         return colour if colour.isValid() else QColor(t["faint"])
 
+    def _paint_record(self, painter, t, group, partition, y, gutter, scale) -> None:
+        """The record lane: what is now asserted about every frame of this track.
+
+        Deliberately without a bar height. The model lane draws confidence as a
+        height because ``conf`` is a measurement over exactly those frames; the
+        record has no such number, and a correction cut out of a bout does not
+        inherit the bout's mean - that mean was taken over frames the correction
+        no longer covers. Drawing a height here would put a posterior on a
+        sentence a person said.
+        """
+        bar_top = y + (self.RECORD_LANE - self.RECORD_BAR) / 2
+        bar = QRectF(gutter, bar_top, max(0.0, self.width() - gutter - self.RIGHT),
+                     self.RECORD_BAR)
+
+        painter.setPen(QColor(t["muted"]))
+        painter.drawText(QRectF(2, bar_top, gutter - 8, self.RECORD_BAR),
+                         int(Qt.AlignVCenter | Qt.AlignRight), "record")
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(t["raised"]))
+        painter.drawRoundedRect(bar, 3, 3)
+
+        # A boundary the DECODE placed keeps the stride band; one a person placed
+        # does not. The band says "the transition is somewhere in here", which is
+        # true of an inferred boundary and false of a chosen one - and drawing it
+        # on both would tell a reviewer their own frame number is uncertain to
+        # half a window stride.
+        model_cuts = {s.f_start for s in self.track.lanes.get(group, [])[1:]}
+        if self.resolution.known:
+            half = max(1.0, self.resolution.worst_error * scale)
+            band = QColor(t["border_hi"])
+            band.setAlpha(90)
+            painter.setBrush(band)
+            painter.setPen(Qt.NoPen)
+            for cut in partition.boundaries():
+                if cut in model_cuts:
+                    x = self._x(cut, gutter, scale)
+                    painter.drawRect(QRectF(x - half, bar.top(), 2 * half,
+                                            self.RECORD_BAR))
+
+        metrics = painter.fontMetrics()
+        for span in partition.spans:
+            x0 = self._x(span.f_start, gutter, scale)
+            x1 = self._x(span.f_end, gutter, scale)
+            rect = QRectF(x0, bar.top(), max(1.0, x1 - x0), self.RECORD_BAR)
+            self._hits.append((rect, group, span, "record"))
+            if not span.label:
+                hatch = QColor(t["faint"])
+                hatch.setAlpha(70)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(hatch, Qt.FDiagPattern))
+                painter.drawRect(rect)
+                continue
+            colour = self._colour(group, span.label, t)
+            if not span.corrected:
+                # Faded and dashed, so a span still the model's cannot be
+                # mistaken for one somebody stood behind.
+                colour.setAlpha(90)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(colour)
+            painter.drawRect(rect)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(t["text"]), 2) if span.corrected
+                           else QPen(QColor(t["border"]), 1, Qt.DashLine))
+            painter.drawRect(rect)
+            text = span.label if span.corrected else f"({span.label})"
+            if rect.width() > metrics.horizontalAdvance(text) + 8:
+                painter.setPen(QColor(t["text"] if span.corrected else t["muted"]))
+                painter.drawText(rect, int(Qt.AlignCenter), text)
+
+        # A boundary a person placed, drawn as the hairline it is entitled to be.
+        painter.setPen(QPen(QColor(t["text"]), 1))
+        for cut in partition.boundaries():
+            if cut not in model_cuts:
+                x = self._x(cut, gutter, scale)
+                painter.drawLine(QPointF(x, bar.top() - 3),
+                                 QPointF(x, bar.bottom() + 3))
+
+        if self.selected is not None and self.selected[0] == group:
+            _, f_start, f_end = self.selected
+            x0 = self._x(f_start, gutter, scale)
+            x1 = self._x(f_end, gutter, scale)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(t["accent"]), 2))
+            painter.drawRect(QRectF(x0 - 1, bar.top() - 3, max(2.0, x1 - x0) + 2,
+                                    self.RECORD_BAR + 6))
+
+        if self._drag is not None and self._drag[0] == group:
+            x = self._x(self._drag[2], gutter, scale)
+            painter.setPen(QPen(QColor(t["accent"]), 2, Qt.DashLine))
+            painter.drawLine(QPointF(x, bar.top() - 6), QPointF(x, bar.bottom() + 6))
+
     def _paint_segment(self, painter, t, group, segment, bar, gutter, scale) -> None:
         x0 = self._x(segment.f_start, gutter, scale)
         x1 = self._x(segment.f_end, gutter, scale)
         rect = QRectF(x0, bar.top(), max(1.0, x1 - x0), self.BAR)
-        self._hits.append((rect, group, segment))
+        self._hits.append((rect, group, segment, "model"))
 
         if not segment.label:
             # A hole, drawn as one: no fill, a hatch, and the skip_reason in the
@@ -853,12 +1135,80 @@ class BoutTimeline(QWidget):
         return super().event(e)
 
     def _at(self, point):
-        for rect, group, segment in self._hits:
+        for rect, group, item, kind in self._hits:
             if rect.contains(QPointF(point)):
-                return group, segment
+                return group, item, kind
         return None
 
-    def _describe(self, group: str, segment: Segment) -> str:
+    # -- editing with the mouse ---------------------------------------------- #
+    def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
+        """Grab a boundary if the press is near one, otherwise select a span.
+
+        Only in the record lane. The model lane is a picture of what the run
+        produced and dragging it would suggest the run could be edited, which is
+        the one thing a correction file exists NOT to do.
+        """
+        hit = self._at(event.pos())
+        if event.button() != Qt.LeftButton or hit is None or hit[2] != "record":
+            super().mousePressEvent(event)
+            return
+        group, span, _ = hit
+        partition = self.track.partitions.get(group)
+        if partition is None:
+            return
+        gutter, scale = self._geom
+        near = [c for c in partition.boundaries()
+                if abs(self._x(c, gutter, scale) - event.pos().x()) <= self.GRAB_PX]
+        if near:
+            cut = min(near, key=lambda c: abs(self._x(c, gutter, scale)
+                                              - event.pos().x()))
+            self._drag = (group, cut, cut)
+            self.update()
+            return
+        self.selected = (group, span.f_start, span.f_end)
+        self.spanClicked.emit(group, span.f_start, span.f_end)
+        self.update()
+
+    def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
+        if self._drag is None:
+            super().mouseMoveEvent(event)
+            return
+        group, cut, _ = self._drag
+        self._drag = (group, cut, self._clamp_boundary(group, cut,
+                                                       self._frame_at(event.pos().x())))
+        self.update()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 (Qt naming)
+        if self._drag is None:
+            super().mouseReleaseEvent(event)
+            return
+        group, cut, moved = self._drag
+        self._drag = None
+        self.update()
+        if moved != cut:
+            self.boundaryMoved.emit(group, cut, moved)
+
+    def _clamp_boundary(self, group: str, cut: int, frame: int) -> int:
+        """Where a dragged boundary is allowed to end up.
+
+        Inside the two spans it separates and no further. A drag that ran past a
+        neighbour's far edge would DELETE that span - a real thing to want, and
+        not something a slipped mouse should do silently. Merging is a button,
+        where it says what it is.
+        """
+        partition = self.track.partitions.get(group)
+        if partition is None:
+            return cut
+        index = partition.index_at(cut)
+        if index <= 0:
+            return cut
+        left, right = partition.spans[index - 1], partition.spans[index]
+        return int(min(max(frame, left.f_start + 1), right.f_end - 1))
+
+    def _describe(self, group: str, item, kind: str = "model") -> str:
+        if kind == "record":
+            return self._describe_span(group, item)
+        segment = item
         noun = "bout" if self.track.bouts else "window"
         lines = [
             f"{group}: {segment.label or '(no prediction)'}",
@@ -893,6 +1243,37 @@ class BoutTimeline(QWidget):
             lines.append(segment.skip_reason)
         return "\n".join(lines)
 
+    def _describe_span(self, group: str, span) -> str:
+        """The record's own account of a stretch of frames.
+
+        It says who is claiming it and never how confident anyone is. A
+        corrected span has no posterior, and a model span cut down by a
+        correction no longer has the one its bout was measured with - so quoting
+        either number here would be quoting a measurement over different frames.
+        """
+        lines = [
+            f"{group}: {span.label or '(no prediction)'}",
+            f"frames {span.f_start}-{span.f_end} ({span.n_frames} frames)",
+        ]
+        if span.corrected:
+            lines.append(
+                "asserted by a person. This is not a measurement and carries no "
+                "confidence; the model's own answer for these frames is the lane "
+                "above, unchanged."
+            )
+        elif span.label:
+            lines.append(
+                "the model's, uncorrected. Where it has been cut short by a "
+                "correction beside it, the confidence in the lane above is still "
+                "the mean over the WHOLE bout it came from, not over this part."
+            )
+        else:
+            lines.append(
+                "no window over these frames could be featurised, so nothing has "
+                "scored them. A person may still say what they are."
+            )
+        return "\n".join(lines)
+
 
 def _axis_ticks(f_lo: int, f_hi: int, target: int = 6) -> list[int]:
     """Round frame numbers across the span - 1, 2 or 5 times a power of ten.
@@ -918,12 +1299,24 @@ def _axis_ticks(f_lo: int, f_hi: int, target: int = 6) -> list[int]:
 # the panel and its window
 # --------------------------------------------------------------------------- #
 class BoutReviewPanel(QWidget):
-    """Movie, track, timeline, captions. Opens against whatever is on disk.
+    """Movie, track, timeline, captions, and the controls that correct a bout.
 
     Every failure the files can present is a sentence in this panel rather than
     an exception: no predictions at all, a file of the wrong kind, a track with
-    nothing in it. The one thing it must never do is draw a picture that looks
-    fine over a file it could not read.
+    nothing in it, an edit that would leave a hole. The one thing it must never
+    do is draw a picture that looks fine over a file it could not read.
+
+    Every editing gesture goes through :meth:`assert_class`, which is
+    :meth:`trackanno.corrections.Partition.assert_class` plus a save. The buttons
+    are four names for it - set a class, merge left, merge right, drag a boundary
+    - because on a gapless run-length encoding those are four gestures over one
+    operation, and giving each its own code path would give each its own way to
+    break the invariant.
+
+    A save happens on every accepted edit, not on a Save button. The file is the
+    state, exactly as ``annotations.csv`` is: there is then no window in which a
+    reviewer's work exists only in a widget, and no way to close a dialog and
+    lose an hour. Undo is a stack of whole partitions, so an undo is a save too.
     """
 
     def __init__(self, cfg: Config | None = None, parent=None):
@@ -934,6 +1327,8 @@ class BoutReviewPanel(QWidget):
         # currentIndexChanged from addItems, so without it every load repaints
         # once per movie added and the last one wins by accident.
         self._loading = False
+        self._track: TrackPredictions | None = None
+        self._undo: list[tuple[str, Partition]] = []
 
         self.movie = QComboBox()
         self.movie.setMinimumWidth(160)
@@ -954,6 +1349,8 @@ class BoutReviewPanel(QWidget):
         top.addStretch(1)
 
         self.timeline = BoutTimeline(cfg)
+        self.timeline.spanClicked.connect(self._on_span_clicked)
+        self.timeline.boundaryMoved.connect(self._on_boundary_moved)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.timeline)
@@ -967,10 +1364,76 @@ class BoutReviewPanel(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.headline)
         layout.addWidget(scroll, 1)
+        layout.addLayout(self._build_edit_row())
+        layout.addWidget(self.status)
         layout.addWidget(self.caption)
 
         if cfg is not None:
             self.reload()
+
+    def _build_edit_row(self) -> QHBoxLayout:
+        """The correction controls, which are always present and never gated on a
+        config key: whether a project can be corrected is a property of the file
+        on disk, and a setting that could turn this off would only ever be found
+        by the person who did not need it."""
+        self.group = QComboBox()
+        self.group.setMinimumWidth(120)
+        self.group.currentIndexChanged.connect(self._on_group)
+        self.from_frame = QSpinBox()
+        self.to_frame = QSpinBox()
+        for box in (self.from_frame, self.to_frame):
+            box.setRange(0, 10_000_000)
+            box.setMinimumWidth(90)
+        self.klass = QComboBox()
+        self.klass.setMinimumWidth(120)
+
+        self.apply_button = QPushButton("Set class")
+        self.apply_button.setToolTip(
+            "Assert that these frames are this class. Every other gesture here - "
+            "moving a boundary, splitting a bout, merging two - is this same "
+            "assertion over a different range."
+        )
+        self.apply_button.clicked.connect(self._on_apply)
+        self.merge_left = QPushButton("Merge into previous")
+        self.merge_left.clicked.connect(lambda: self._on_merge(-1))
+        self.merge_right = QPushButton("Merge into next")
+        self.merge_right.clicked.connect(lambda: self._on_merge(1))
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.clicked.connect(self._on_undo)
+        self.revert_button = QPushButton("Revert track")
+        self.revert_button.setToolTip(
+            "Delete every correction on this track and group, restoring the "
+            "model's own bouts."
+        )
+        self.revert_button.clicked.connect(self._on_revert)
+        self.derive_button = QPushButton("Derived labels...")
+        self.derive_button.setToolTip(
+            "Show which annotation windows these corrections would label, and "
+            "which straddle a boundary and cannot be labelled at all. Writes "
+            "nothing."
+        )
+        self.derive_button.clicked.connect(self._on_derive)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("frames"))
+        row.addWidget(self.from_frame)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.to_frame)
+        row.addWidget(QLabel("are"))
+        row.addWidget(self.klass)
+        row.addWidget(QLabel("in"))
+        row.addWidget(self.group)
+        row.addWidget(self.apply_button)
+        row.addWidget(self.merge_left)
+        row.addWidget(self.merge_right)
+        row.addWidget(self.undo_button)
+        row.addWidget(self.revert_button)
+        row.addWidget(self.derive_button)
+        row.addStretch(1)
+        return row
 
     # -- loading -------------------------------------------------------------- #
     def set_config(self, cfg: Config | None) -> None:
@@ -1031,7 +1494,10 @@ class BoutReviewPanel(QWidget):
             return
 
         track = self.reader.track(movie_id, int(track_id))
+        self._track = track
+        self._undo.clear()
         self.timeline.set_track(track, self.reader.resolution)
+        self._fill_groups()
         t = tokens()
         head = (
             f"<b>{self.reader.unit}</b> over {len(self.reader.groups)} category "
@@ -1055,7 +1521,14 @@ class BoutReviewPanel(QWidget):
             )
         self.headline.setText(head)
 
-        floor = float(getattr(self.cfg.suggest, "min_confidence", 0.0) or 0.0)
+        self._caption()
+
+    def _caption(self) -> None:
+        track, floor = self._track, 0.0
+        if track is None or self.reader is None:
+            return
+        if self.cfg is not None:
+            floor = float(getattr(self.cfg.suggest, "min_confidence", 0.0) or 0.0)
         lines = caption_lines(
             track, self.reader.resolution, floor, has_trace=bool(track.trace)
         )
@@ -1064,9 +1537,342 @@ class BoutReviewPanel(QWidget):
     def _say(self, head: str, problem: str) -> None:
         self.headline.setText(head)
         self.caption.setText("")
+        self._track = None
         self.timeline.set_track(
             TrackPredictions("", 0, False, ""), Resolution(), note=problem
         )
+        self._refresh_edit_gate()
+
+    # -- correcting ----------------------------------------------------------- #
+    def current_group(self) -> str:
+        return str(self.group.currentText())
+
+    def _fill_groups(self) -> None:
+        """The groups this track can be corrected in, and their classes.
+
+        Rebuilt per track rather than per project: which groups have a partition
+        depends on the rows this track actually has, and a combo offering a group
+        with nothing in it would make the refusal below unreachable.
+        """
+        track = self._track
+        self._loading = True
+        try:
+            self.group.clear()
+            for group in (track.partitions if track is not None else {}):
+                self.group.addItem(group)
+        finally:
+            self._loading = False
+        self._on_group(0)
+
+    def _on_group(self, _index: int = 0) -> None:
+        if getattr(self, "_loading", False):
+            return
+        self._fill_classes()
+        self._refresh_edit_gate()
+
+    def _fill_classes(self) -> None:
+        """Only classes the config declares, and only for a single-choice group.
+
+        A class the config does not name cannot be coloured, cannot be trained on
+        and cannot be exported, so asserting one would file a judgement nothing
+        else in the project can read. A MULTI group's class is a combination of
+        options rather than one of them, and a control that offered the options
+        one at a time would let a reviewer assert something narrower than they
+        meant without saying so - so it refuses instead.
+        """
+        self.klass.clear()
+        spec = self.cfg.group(self.current_group()) if self.cfg is not None else None
+        if spec is None or spec.is_multi:
+            return
+        self.klass.addItems([o.name for o in spec.options])
+
+    def _group_problem(self, group: str | None = None) -> str:
+        """Why one group cannot be corrected, or "".
+
+        Takes the group rather than always reading the combo, because most of
+        these refusals are about one group and an edit arriving from the timeline
+        names its own: checking the combo instead would refuse an edit to a
+        perfectly correctable lane because a different lane is a multi group.
+        """
+        track = self._track
+        if track is None or self.reader is None:
+            return "no track is open"
+        if track.edit_problem:
+            return track.edit_problem
+        group = group or self.current_group()
+        if group not in track.partitions:
+            return "this track has no decoded bouts in that group"
+        spec = self.cfg.group(group) if self.cfg is not None else None
+        if spec is None:
+            return (
+                f"the config no longer declares a category group called {group!r}, "
+                "so there is no set of classes to correct these bouts to"
+            )
+        if spec.is_multi:
+            return (
+                f"{group} is a multi-select group: one of its predictions is a "
+                "COMBINATION of options, not one of them, and this control can "
+                "only assert a single class. Correcting a multi-select group is "
+                "not built rather than half built."
+            )
+        return ""
+
+    def _refresh_edit_gate(self) -> None:
+        problem = self._group_problem()
+        for button in (self.apply_button, self.merge_left, self.merge_right,
+                       self.revert_button, self.derive_button):
+            button.setEnabled(not problem)
+        for box in (self.from_frame, self.to_frame, self.klass):
+            box.setEnabled(not problem)
+        # The group combo stays live whatever the problem is: most of the
+        # refusals here are about ONE group, and disabling the control that
+        # changes group would trap the reviewer in the one that cannot be
+        # corrected.
+        self.group.setEnabled(self.group.count() > 1)
+        self.undo_button.setEnabled(bool(self._undo) and not problem)
+        if problem:
+            self.status.setText(problem)
+
+    def _on_span_clicked(self, group: str, f_start: int, f_end: int) -> None:
+        if self.group.currentText() != group:
+            self.group.setCurrentText(group)
+        self.from_frame.setValue(int(f_start))
+        self.to_frame.setValue(int(f_end))
+        partition = (self._track.partitions.get(group)
+                     if self._track is not None else None)
+        span = partition.at(f_start) if partition is not None else None
+        if span is not None and span.label:
+            index = self.klass.findText(span.label)
+            if index >= 0:
+                self.klass.setCurrentIndex(index)
+        self.status.setText("")
+
+    def _on_boundary_moved(self, group: str, was: int, now: int) -> None:
+        """A dragged boundary, as the assertion it is.
+
+        Which class gets asserted is decided by the DIRECTION: dragging right
+        extends the span on the left over the frames swept, dragging left extends
+        the one on the right. The frames a drag sweeps are exactly the frames
+        whose class the reviewer just changed, and nothing else on the track
+        moves - which is why a drag needs no separate operation.
+        """
+        track = self._track
+        partition = track.partitions.get(group) if track is not None else None
+        if partition is None:
+            return
+        index = partition.index_at(was)
+        if index <= 0:
+            return
+        left, right = partition.spans[index - 1], partition.spans[index]
+        source = left if now > was else right
+        f_start, f_end = (was, now) if now > was else (now, was)
+        if not source.label:
+            self.status.setText(
+                f"frames {source.f_start}-{source.f_end} have no class: no window "
+                "over them could be featurised. Dragging a boundary into them "
+                "would spread 'nothing scored this' over frames something did - "
+                "set a class over the range instead."
+            )
+            return
+        self.status.setText(self.assert_class(f_start, f_end, source.label, group))
+
+    def _on_apply(self) -> None:
+        self.status.setText(self.assert_class(
+            self.from_frame.value(), self.to_frame.value(), self.klass.currentText()
+        ))
+
+    def _on_merge(self, direction: int) -> None:
+        """Merge the selected span into a neighbour: assert the neighbour's class
+        over it. There is no separate merge in the data model, only this."""
+        track = self._track
+        group = self.current_group()
+        partition = track.partitions.get(group) if track is not None else None
+        if partition is None:
+            return
+        index = partition.index_at(self.from_frame.value())
+        if index < 0:
+            self.status.setText(
+                f"frame {self.from_frame.value()} is not on this track "
+                f"({partition.f_lo}-{partition.f_hi}); click a span to select it"
+            )
+            return
+        neighbour = index + direction
+        if not 0 <= neighbour < len(partition):
+            self.status.setText(
+                "there is no bout on that side to merge into - this one is at the "
+                "end of the track"
+            )
+            return
+        span, other = partition.spans[index], partition.spans[neighbour]
+        if not other.label:
+            self.status.setText(
+                f"frames {other.f_start}-{other.f_end} have no class: nothing could "
+                "score them, and merging into them would assert that nothing can"
+            )
+            return
+        self.status.setText(
+            self.assert_class(span.f_start, span.f_end, other.label, group)
+        )
+
+    def assert_class(self, f_start: int, f_end: int, label: str,
+                     group: str | None = None) -> str:
+        """Record that a person says these frames are this class. "" on success.
+
+        The refusal comes back as a sentence rather than an exception because it
+        is a normal outcome of a mouse in a hurry - a drag that ran backwards, a
+        range off the end of the track - and a traceback out of a Qt slot takes
+        the window down with the reviewer's other edits still unsaved.
+
+        The FILE IS WRITTEN FIRST and the partition on screen is advanced only
+        if the write succeeded. The other order leaves a reviewer editing a state
+        the disk does not hold, and they find out when they reopen the window.
+        """
+        group = group or self.current_group()
+        problem = self._group_problem(group)
+        if problem:
+            return problem
+        track = self._track
+        partition = track.partitions.get(group)
+        if partition is None:
+            return "this track has no decoded bouts in that group"
+        spec = self.cfg.group(group) if self.cfg is not None else None
+        if spec is not None and spec.option(str(label)) is None:
+            # Refused here and not on the way in, because the file must still
+            # LOAD a class the config has since dropped - that row records what a
+            # person judged, and a rename must not delete it. What it must not do
+            # is let a new judgement be filed under a name nothing else in the
+            # project can colour, train on or export.
+            return (
+                f"{group} declares no class called {str(label)!r}, so a correction "
+                "to it could not be coloured, trained on or exported. Add it to "
+                "config.yaml first, or pick one of: "
+                + ", ".join(o.name for o in spec.options)
+            )
+        try:
+            edited = partition.assert_class(f_start, f_end, label)
+        except ValueError as exc:
+            return str(exc)
+        return self._commit(group, partition, edited,
+                            f"frames {f_start}-{f_end} are {label}")
+
+    def _commit(self, group: str, before: Partition, after: Partition,
+                what: str, record_undo: bool = True) -> str:
+        track, reader = self._track, self.reader
+        if track is None or reader is None or reader.corrections is None:
+            return "no project open"
+        store = reader.corrections
+        try:
+            store.replace_track(track.movie_id, track.track_id, group, build_corrections(
+                after, track.movie_id, track.track_id, group,
+                getattr(self.cfg.ui, "annotator", "") if self.cfg else "",
+                model_bouts=self._model_bouts(group),
+                previous=store.for_track(track.movie_id, track.track_id, group),
+            ))
+        except (OSError, ValueError) as exc:
+            return f"the correction could not be saved, so it was not made: {exc}"
+        if record_undo:
+            self._undo.append((group, before))
+        track.partitions[group] = after
+        self.timeline.selected = None
+        self.timeline.update()
+        self.timeline.updateGeometry()
+        self._caption()
+        self._refresh_edit_gate()
+        return f"saved: {what}"
+
+    def _model_bouts(self, group: str) -> list[dict]:
+        """What the model said over this track, for the record of what a
+        correction overruled. Read off the drawn segments rather than re-read
+        from the file, so it is the same rows the reviewer was looking at."""
+        track = self._track
+        if track is None:
+            return []
+        return [
+            {"f_start": s.f_start, "f_end": s.f_end, "label": s.label, "conf": s.conf}
+            for s in track.lanes.get(group, [])
+        ]
+
+    def _on_undo(self) -> None:
+        if not self._undo:
+            self.status.setText("nothing to undo on this track")
+            return
+        group, previous = self._undo.pop()
+        current = self._track.partitions.get(group) if self._track else None
+        if current is None:
+            return
+        # An undo is not itself undoable: pushing the state it left would make
+        # the button ping-pong between two versions for ever instead of walking
+        # back through the edits.
+        message = self._commit(group, current, previous, "undone", record_undo=False)
+        self.status.setText(message)
+
+    def _on_revert(self) -> None:
+        """Drop every correction on this track and group.
+
+        Asked for explicitly and confirmed, because it is the one action here
+        that destroys a human judgement rather than recording one.
+        """
+        track, group = self._track, self.current_group()
+        if track is None or self.reader is None or self.reader.corrections is None:
+            return
+        saved = self.reader.corrections.for_track(track.movie_id, track.track_id, group)
+        if not saved:
+            self.status.setText("this track has no corrections in that group")
+            return
+        answer = QMessageBox.question(
+            self, "Delete corrections",
+            f"Delete all {len(saved)} correction(s) on track {track.track_id} of "
+            f"{track.movie_id} ({group})?\n\nThe model's own bouts come back. "
+            "Nothing else is changed and no prediction is rewritten.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        segments = track.lanes.get(group, [])
+        model = Partition(
+            [Span(s.f_start, s.f_end, s.label, False) for s in segments],
+            segments[0].f_start, segments[-1].f_end,
+        )
+        try:
+            self.reader.corrections.replace_track(
+                track.movie_id, track.track_id, group, []
+            )
+        except (OSError, ValueError) as exc:
+            self.status.setText(f"the corrections could not be deleted: {exc}")
+            return
+        self._undo.clear()
+        track.partitions[group] = model
+        track.orphans = [c for c in track.orphans
+                         if c.key != (track.movie_id, track.track_id, group)]
+        self.timeline.selected = None
+        self.timeline.update()
+        self._caption()
+        self._refresh_edit_gate()
+        self.status.setText(f"{len(saved)} correction(s) deleted")
+
+    # -- what the corrections would mean for the training set ------------------ #
+    def _on_derive(self) -> None:
+        QMessageBox.information(self, "Derived window labels", self.derivation_text())
+
+    def derivation_text(self) -> str:
+        """The derivation report for this movie, as prose. Writes nothing.
+
+        Kept as a method returning a string rather than as a dialog full of
+        labels so that the numbers in it can be checked by a test, which is the
+        only way a claim about what a correction implies stays true.
+        """
+        track, reader = self._track, self.reader
+        if track is None or reader is None or reader.corrections is None:
+            return "no project open"
+        windows = manifest_windows(self.cfg, track.movie_id)
+        if not windows:
+            return (
+                f"{track.movie_id} has no clip manifest, so there are no annotation "
+                "windows to derive anything for. The corrections are still recorded."
+            )
+        derivation = derive_window_labels(
+            reader.corrections.for_movie(track.movie_id), windows
+        )
+        return derivation_report(derivation)
 
 
 class BoutReviewDialog(QDialog):
@@ -1075,11 +1881,16 @@ class BoutReviewDialog(QDialog):
     A window rather than a fifth thing on the Model page: a timeline wants the
     width of the screen, and the page it is reached from is already carrying a
     task log and a cross-validation report.
+
+    It has a Close and no Save. Every accepted edit is already on disk by the
+    time the button could be pressed, so a Save would either be a no-op that
+    implies the others were not saved, or a second write path - and a dialog with
+    a Save button is a dialog somebody can close and lose an hour in.
     """
 
     def __init__(self, cfg: Config, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Review predictions")
+        self.setWindowTitle("Review and correct predictions")
         self.resize(1040, 560)
         self.panel = BoutReviewPanel(cfg, self)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)

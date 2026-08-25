@@ -1575,7 +1575,9 @@ class ModelPage(Page):
         self.review_button.setEnabled(False)
         self.review_button.setToolTip(
             "Draw one track's predicted spans along the frame axis - where each "
-            "begins and ends, which class, and how confident. Read-only."
+            "begins and ends, which class, and how confident - and correct them. "
+            "Corrections go to bout_corrections.csv; predictions.parquet and your "
+            "annotation CSV are never written to."
         )
         self.review_button.clicked.connect(self._review_predictions)
 
@@ -1850,11 +1852,13 @@ class ModelPage(Page):
 
     # -- looking at what came out -------------------------------------------- #
     def _review_predictions(self) -> None:
-        """Open the read-only timeline over predictions.parquet.
+        """Open the timeline over predictions.parquet.
 
         One dialog, reused: a second press on a window already open would leave
         two views of a file that can change under both, and the older one would
-        go on showing rows that are no longer on disk.
+        go on showing rows that are no longer on disk. That matters more now the
+        window can write - two open copies would each hold their own idea of a
+        track's corrections and each save would erase the other's.
         """
         if self.cfg is None:
             return
