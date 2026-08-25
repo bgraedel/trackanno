@@ -10,11 +10,18 @@ Rules:
 
 * No pixels. Features come from ``tracks.parquet``, ``instance_features.npy``
   and the frame rate in ``cache.json``, so a dense grid costs arithmetic.
-* The windows tile exactly: stride equals length, every detected frame in
-  exactly one window. Do not reproduce the annotation grid's one-frame overlap
-  (``frames: 51`` with ``stride: 50``) - the renderer paints
-  ``range(f_start, f_end)`` per track, so a shared frame means one prediction
-  silently overwrites the other and the colour depends on row order.
+* The windows TILE by default: ``predict.window_stride`` is the window length,
+  every detected frame lands in exactly one window, and one label per frame
+  falls out of ``predictions.parquet`` unaided. A SHORTER stride is permitted,
+  and only with a ``predict.decode``: overlapping windows pin a transition to
+  within one stride instead of one window, but then several windows speak for
+  the same frame, and the renderer paints ``range(f_start, f_end)`` per track -
+  so without a decode one prediction silently overwrites the other and the
+  colour depends on row order. The decode is what collapses the overlap into a
+  per-frame posterior and disjoint bouts before anything paints them, which is
+  why :func:`trackanno.config.load_config` refuses the pairing without it.
+  Never reproduce the annotation grid's one-frame overlap (``frames: 51`` with
+  ``stride: 50``) though: that is an off-by-one, not a decode.
 * Features come through :func:`trackanno.clipfeatures.window_features`, the
   same entry point that builds ``clip_features.parquet``: its spectral columns
   are measured over a window CENTRED on each clip rather than over the clip, so
@@ -44,8 +51,9 @@ from .clips import FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrite, clip_id
 from .config import Config
 
 __all__ = [
-    "DENSE_FEATURES_FILE", "DENSE_META_COLUMNS", "window_length", "window_grid",
-    "plan_dense_windows", "build_dense_features", "dense_features_path", "coverage",
+    "DENSE_FEATURES_FILE", "DENSE_META_COLUMNS", "window_length", "window_stride",
+    "window_grid", "plan_dense_windows", "build_dense_features",
+    "dense_features_path", "coverage",
 ]
 
 DENSE_FEATURES_FILE = "dense_clip_features.parquet"
@@ -67,12 +75,18 @@ def window_length(cfg: Config) -> int:
     """How many frames one dense window spans.
 
     ``auto`` resolves to ``min(clips.frames, clips.stride)``, the longest window
-    that is both a TILING (stride equals length here, so anything longer than
-    ``clips.stride`` lands between the annotation grid's own starts and stops
-    reproducing a coincident clip's ``clip_id``) and THE LENGTH THE MODEL WAS
-    FITTED ON (window length changes the feature values themselves - path
-    length, beat resolvability, present fraction). With the usual
-    ``stride == frames`` the ``min`` is a no-op.
+    that both LANDS ON THE ANNOTATION GRID (anything longer than ``clips.stride``
+    falls between that grid's own starts and stops reproducing a coincident
+    clip's ``clip_id``) and IS THE LENGTH THE MODEL WAS FITTED ON. The length is
+    no longer also the stride - that is :func:`window_stride` - but it is still
+    what the features are measured over, and most of them scale with it:
+    ``path_length``, ``net_displacement``, ``radius_gyration``, ``straightness``,
+    ``turn_n_valid``, every ``*_std``, ``speed_max``/``speed_p90`` and
+    ``present_frac``. Score a window of another length and the model reads those
+    values on a scale it was never fitted at. The spectral half (``beat_*``,
+    ``wave_*``) is the exception: since ``FEATURE_VERSION`` 2 it is measured over
+    ``cfg.spectral.window`` centred on the window, so it is length-invariant.
+    With the usual ``stride == frames`` the ``min`` is a no-op.
     """
     value = cfg.predict.window_frames
     if isinstance(value, str):
@@ -80,21 +94,77 @@ def window_length(cfg: Config) -> int:
     return max(1, int(value))
 
 
-def window_grid(n_frames: int, length: int) -> list[tuple[int, int]]:
-    """Windows tiling ``[0, n_frames)``: no gap, no overlap, tail included.
+def window_stride(cfg: Config) -> int:
+    """Frames between one dense window's start and the next.
 
-    The final window is short whenever the movie does not divide evenly and is
-    still emitted. ``clips._windows`` drops that tail because it needs
-    ``min_clip_frames`` to be watchable; a frame to be coloured does not.
+    ``auto`` is :func:`window_length`, the tiling grid this module was born with.
+    Anything shorter overlaps the windows, which is only reachable together with
+    a ``predict.decode``; ``load_config`` refuses a stride longer than the window
+    (it would leave holes the dense pass exists to close) and refuses an
+    overlapping one without a decode, so by the time a Config gets here the value
+    only has to be spelled out, never judged.
+    """
+    value = cfg.predict.window_stride
+    if isinstance(value, str):
+        return window_length(cfg)
+    return max(1, int(value))
+
+
+def window_grid(
+    n_frames: int, length: int, stride: int | None = None
+) -> list[tuple[int, int]]:
+    """Windows over ``[0, n_frames)``, ``length`` long and ``stride`` apart.
+
+    ``stride is None`` means ``stride = length``: the exact tiling - no gap, no
+    overlap - and the ONLY behaviour this function had until strides existed, so
+    it is reproduced window for window, short tail included. That tail is
+    emitted even though it is measured over fewer frames than the model was
+    fitted on (``clips._windows`` drops it because a clip has to be watchable; a
+    frame to be coloured does not), and it is a known wart: window length changes
+    the feature VALUES - ``path_length``, ``net_displacement``,
+    ``radius_gyration``, ``straightness``, ``turn_n_valid``, every ``*_std``,
+    ``speed_max``/``speed_p90`` and ``present_frac`` all scale with the span - so
+    a short window is scored by a model fitted at a different length. At
+    ``stride == length`` that is one miscalibrated row per track, older than this
+    argument and documented here rather than silently changed.
+
+    Under overlap (``stride < length``) it would be one such row per stride at
+    every track's end, feeding the per-frame posterior exactly where tracks
+    finish, so short windows are dropped: every window is full length. Nothing is
+    lost. A window flush with ``n_frames`` is added whenever the stride does not
+    land on one, so every frame is still inside a full window - without it the
+    last ``(n_frames - length) % stride`` frames of the movie would have no
+    window at all, which is the hole this module exists to close. That flush
+    window sits less than a stride from its neighbour, so the movie's last few
+    frames are in one window more than the interior's ``length // stride``. A
+    decode averages however many windows reach a frame, so that costs nothing;
+    a short window scored at the wrong length would not have been averaged, it
+    would have been wrong.
+
+    A movie SHORTER than one window has no full window to give, in either mode.
+    It gets the one short window anyway: a miscalibrated row says what it is
+    (``f_end - f_start``, ``n_present``, ``present_frac``) and can be filtered
+    downstream, while a missing row is indistinguishable from a model that
+    declined to label.
     """
     if n_frames <= 0 or length <= 0:
         return []
-    return [(start, min(start + length, n_frames))
-            for start in range(0, n_frames, length)]
+    step = length if stride is None else int(stride)
+    if step <= 0:
+        return []
+    if n_frames <= length:
+        return [(0, n_frames)]
+    if step >= length:
+        return [(start, min(start + length, n_frames))
+                for start in range(0, n_frames, step)]
+    starts = list(range(0, n_frames - length + 1, step))
+    if starts[-1] != n_frames - length:
+        starts.append(n_frames - length)
+    return [(start, start + length) for start in starts]
 
 
 def plan_dense_windows(
-    tracks: pd.DataFrame, n_frames: int, length: int
+    tracks: pd.DataFrame, n_frames: int, length: int, stride: int | None = None
 ) -> dict[int, list[tuple[int, int]]]:
     """``{track_id: windows}`` covering each track's whole detected lifetime.
 
@@ -103,18 +173,36 @@ def plan_dense_windows(
     Windows outside that span are not emitted. Every track is covered, including
     ones shorter than ``tracking.min_track_length``: that threshold is about
     annotation units, not about whether the animal was on screen.
+
+    The span is found by SEARCHING the grid, never by dividing a frame number by
+    ``length``. That division assumes ``grid[i]`` starts at ``i * length``, true
+    only while the grid tiles: under an overlapping stride the grid is longer,
+    both bounds name windows far short of the ones they meant to, and a track
+    quietly loses coverage at its tail - no exception, just rows that are not
+    there. Two ``searchsorted`` calls per track keep it O(n log n) instead of
+    walking the whole grid per track.
     """
-    grid = window_grid(n_frames, length)
+    grid = window_grid(n_frames, length, stride)
     out: dict[int, list[tuple[int, int]]] = {}
     if tracks.empty or not grid:
         return out
+    starts = np.array([w[0] for w in grid], dtype=np.int64)
+    ends = np.array([w[1] for w in grid], dtype=np.int64)
     for track_id, tdf in tracks.groupby("track_id", sort=True):
         frames = tdf["frame"].to_numpy(dtype=np.int64)
         if frames.size == 0:
             continue
-        lo = int(frames.min()) // length
-        hi = int(frames.max()) // length
-        out[int(track_id)] = grid[lo : hi + 1]
+        # The windows that INTERSECT [first, last]: the first whose end is past
+        # the first detection, through the last that starts at or before the
+        # last one. Both arrays are increasing, so this is the same contiguous
+        # slice the integer division used to name whenever the grid tiles.
+        lo = int(np.searchsorted(ends, int(frames.min()), side="right"))
+        hi = int(np.searchsorted(starts, int(frames.max()), side="right")) - 1
+        chosen = grid[lo : hi + 1]
+        # An empty slice can only mean detections outside [0, n_frames), and
+        # window_features cannot be handed an empty window list anyway.
+        if chosen:
+            out[int(track_id)] = chosen
     return out
 
 
@@ -183,6 +271,7 @@ def build_dense_features(
         raise FileNotFoundError(f"no prepared movies under {work}; run prepare.py first")
 
     length = window_length(cfg)
+    stride = window_stride(cfg)
     min_present = int(cfg.predict.min_frames)
     pca = _load_pca(cfg, reporter)
 
@@ -197,12 +286,24 @@ def build_dense_features(
         n_frames = int(header["movie"]["n_frames"])
         if not tracks.empty:
             n_frames = max(n_frames, int(tracks["frame"].max()) + 1)
-        windows = plan_dense_windows(tracks, n_frames, length)
+        windows = plan_dense_windows(tracks, n_frames, length, stride)
         total += sum(len(w) for w in windows.values())
         plans.append((d, tracks, header, windows))
 
+    # A track costs ~37 ms to lay out plus ~4 ms per window, so halving the
+    # stride roughly doubles the run. Say the count and the stride BEFORE
+    # spending them: a run five times slower than the last one is otherwise a
+    # mystery with nothing in the log to pin it on.
+    reporter.log(
+        f"planning {total} dense window(s) of {length} frame(s) at stride "
+        f"{stride} over {len(plans)} movie(s)"
+    )
     reporter.stage("dense clip features", total)
     rows: list[dict] = []
+    # DISTINCT detected frames a window reaches, and how many of them a window
+    # that could be featurised reaches. Accumulated here rather than summed out
+    # of n_present afterwards, which counts a frame once per window holding it.
+    covered = usable = 0
     for d, tracks, header, windows in plans:
         movie_id = d.name
         fps = float(header["movie"]["fps"])
@@ -236,11 +337,17 @@ def build_dense_features(
             # wavespectra directly would give the export a different feature
             # definition under identical column NAMES: the spectral columns are
             # measured over a window centred on the clip, not over the clip.
+            # A non-empty re-iterable Sequence, every f_end past its f_start:
+            # window_features is exact on overlapping windows (bit-identical to
+            # one window at a time, order-invariant) but it walks the list twice.
             measured = window_features(tdf, cfg, fps, windows[track_id])
+            reached = np.zeros(frames.size, dtype=bool)
+            featurised = np.zeros(frames.size, dtype=bool)
             for (f_start, f_end), features in zip(windows[track_id], measured):
                 reporter.raise_if_cancelled()
                 reporter.advance()
                 sel = (frames >= f_start) & (frames < f_end)
+                reached |= sel
                 n_present = int(sel.sum())
                 entry = {
                     "clip_id": clip_id_for(movie_id, track_id, f_start),
@@ -259,6 +366,7 @@ def build_dense_features(
                     rows.append(entry)
                     continue
 
+                featurised |= sel
                 sub = tdf.iloc[np.flatnonzero(sel)]
                 entry.update(features)
                 if pca is not None and feats is not None:
@@ -266,6 +374,8 @@ def build_dense_features(
                         _cnn_block(pca, feats[sub.index.to_numpy()].astype(np.float32))
                     )
                 rows.append(entry)
+            covered += int(reached.sum())
+            usable += int(featurised.sum())
 
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -293,7 +403,7 @@ def build_dense_features(
         raise
     staged.commit()
 
-    summary = _summary(out, length, min_present)
+    summary = _summary(out, length, stride, min_present, covered, usable)
     reporter.log(summary)
     if verbose:
         print(f"  {summary}")
@@ -330,13 +440,26 @@ def _align_to_reference(frame: pd.DataFrame, reference: Path, reporter) -> pd.Da
     return frame
 
 
-def _summary(frame: pd.DataFrame, length: int, min_present: int) -> str:
+def _summary(
+    frame: pd.DataFrame, length: int, stride: int, min_present: int,
+    covered: int, usable: int,
+) -> str:
+    """The line the run logs. ``covered`` and ``usable`` are DISTINCT detected
+    frames, counted while the rows were built.
+
+    They used to be ``n_present`` summed over the rows, which is the same number
+    only while the grid tiles. Under an overlapping stride a frame is counted
+    once per window holding it, so both sides of the ratio inflate by about
+    ``length / stride`` and the line claims more detected frames than the movie
+    has. The honest quantity under overlap is how many detected frames a
+    scorable window REACHES, whatever the number of windows that reach them.
+    """
     blank = frame["skip_reason"].astype(str) == ""
-    covered = int(frame["n_present"].sum())
-    usable = int(frame.loc[blank, "n_present"].sum())
     share = usable / covered if covered else float("nan")
+    span = (f"{length} frame(s)" if stride >= length
+            else f"{length} frame(s) at stride {stride}")
     return (
-        f"{len(frame)} dense windows of {length} frame(s) over "
+        f"{len(frame)} dense windows of {span} over "
         f"{frame['movie_id'].nunique()} movie(s); {int((~blank).sum())} of them "
         f"under predict.min_frames ({min_present}); {usable}/{covered} detected "
         f"frames ({share:.1%}) fall in a window that can be featurised"
@@ -347,12 +470,23 @@ def _summary(frame: pd.DataFrame, length: int, min_present: int) -> str:
 # checking it
 # --------------------------------------------------------------------------- #
 def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
-    """Per movie: detected frames, how many a window covers, and any overlap.
+    """Per movie: how many detected frames a dense window reaches, and how many
+    windows reach each of them.
 
-    The grid's claim is "exactly once", worth checking rather than asserting: a
-    frame covered twice is a prediction the renderer overwrites with whichever
-    row came last, and a frame covered zero times is the hole this module exists
-    to close.
+    The invariant is now MODE-DEPENDENT, so this reports the quantity rather than
+    asserting the old rule. ``uncovered`` is a bug either way: a detected frame
+    no window speaks for comes back unlabelled and unpainted, which is the hole
+    this module exists to close. Windows per frame is not a bug: it is exactly 1
+    while the grid tiles, and rises to about ``length / stride`` under an
+    overlapping stride, where several windows speaking for one frame is the whole
+    point and ``predict.decode`` is what turns them back into one label. Above 1
+    with ``decode: none`` it IS a bug - the renderer paints
+    ``range(f_start, f_end)`` per track, so the colour would follow row order -
+    and that is the pairing ``load_config`` refuses.
+
+    Kept called, by ``tests/test_dense_grid.py``, on purpose: it was dead code
+    while the grid changed under it, and a grid that quietly stops covering
+    everything shows up as a missing row rather than as an error.
     """
     out = []
     for movie_id, group in frame.groupby("movie_id", sort=True):
@@ -361,7 +495,7 @@ def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
             int(t): list(zip(g["f_start"].astype(int), g["f_end"].astype(int)))
             for t, g in group.groupby("track_id", sort=False)
         }
-        detected = missed = doubled = 0
+        detected = missed = once = total_hits = most = 0
         for track_id, tdf in tracks.groupby("track_id", sort=False):
             frames = tdf["frame"].to_numpy(dtype=np.int64)
             detected += frames.size
@@ -369,13 +503,19 @@ def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
             for f_start, f_end in spans.get(int(track_id), []):
                 hits += ((frames >= f_start) & (frames < f_end)).astype(np.int64)
             missed += int((hits == 0).sum())
-            doubled += int((hits > 1).sum())
+            once += int((hits == 1).sum())
+            total_hits += int(hits.sum())
+            most = max(most, int(hits.max()) if hits.size else 0)
         out.append({
             "movie_id": str(movie_id),
             "detected_frames": detected,
-            "covered_once": detected - missed - doubled,
             "uncovered": missed,
-            "covered_twice_or_more": doubled,
+            "covered_once": once,
             "coverage": (detected - missed) / detected if detected else float("nan"),
+            # Over every detected frame, uncovered ones included: a mean below 1
+            # is another way of seeing the hole, and the max is what a decode has
+            # to reconcile at the busiest frame.
+            "windows_per_frame_mean": total_hits / detected if detected else float("nan"),
+            "windows_per_frame_max": most,
         })
     return pd.DataFrame(out)

@@ -353,9 +353,33 @@ def window_features(
     range rather than over the range itself, and a second caller reimplementing
     that would emit columns with the same names and a different meaning.
 
-    The track is laid out once (:mod:`trackanno.trackseries`) and the beat
-    transformed once (:mod:`trackanno.wavespectra`), so overlapping windows cost
-    only the slicing (500-frame track: 2.7x for 10 windows, 6.7x at stride 10).
+    Overlapping windows are supported: nothing here assumes the windows are
+    ordered, adjacent, or a partition of the track, so a dense stride-1 grid and
+    the annotation tiling go through the same code and get the same answers.
+
+    They are NOT free, though. Only the `wave_*` STFT is genuinely amortised -
+    :func:`trackanno.wavespectra.track_spectral_series` transforms the track
+    once and each window is a slice of it, as is the
+    :mod:`trackanno.trackseries` layout. The `beat_*` block is amortised not at
+    all: :func:`_beat_on_window` pays a fresh O(N) boolean mask over the WHOLE
+    track and a fresh FFT for every window, and is the largest per-window term.
+
+    Measured (500-frame track, 8 keypoints, `spectral.window=75`): about 37 ms
+    fixed per track plus about 4 ms per window. Taking that track's exact tiling
+    as the baseline (50-frame windows at stride 50 = 10 windows, ~77 ms), 5x the
+    windows costs about 2.8x the wall time and 10x about 5.4x. Linear in the
+    window count over a substantial constant - not free. (The 2.7x/6.7x figures
+    this paragraph used to quote were `trackseries`-only numbers from
+    `tests/test_trackseries.py`, which measure the amortised half alone and are
+    not the cost of `window_features`. Do not reinstate them.)
+
+    Two cheap optimisations are available if this ever becomes hot, both inside
+    :func:`_beat_on_window` and neither done here - this branch is about
+    correctness, and an unmeasured optimisation in the same commit would
+    confound the numbers above. First, hoist `tdf["frame"].to_numpy(dtype=int)`
+    out of it; the caller below already has that array. Second, replace its
+    full-track boolean mask with a `searchsorted` slice - both callers sort
+    `tdf` by frame first, so the window is already a contiguous range.
     """
     from . import trackseries, wavespectra
 

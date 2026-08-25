@@ -35,6 +35,24 @@ from .config import Config, load_config
 MODEL_FILE = "suggest_model.joblib"
 REPORT_FILE = "suggest_report.json"
 
+# Columns whose VALUE depends on how many frames the window spans, named in the
+# mismatch message because "the features mean something else now" is not
+# actionable and "path_length is longer because the window is longer" is.
+#
+# Verified against trackseries/clipfeatures rather than guessed. Length-dependent
+# are the extensive quantities (`path_length`, `net_displacement`,
+# `radius_gyration`, the `body_*` equivalents), everything derived from them
+# (`straightness`, `body_straightness`, `body_displacement_per_len`), the
+# lag-based turn statistics through `turn_lag_frames`/`turn_n_valid`, every
+# dispersion (`*_std`, `flagellum_len_cv`, `tip_angle_std`), the order
+# statistics (`speed_max`, `speed_p90`) and `present_frac`.
+#
+# Length-INVARIANT, and so no reason to refuse on their own: every `beat_*` and
+# `wave_*` column, which are measured on a window pinned to `cfg.spectral.window`
+# and not on the requested range at all, plus the intensive means
+# (`speed_mean`, `area_mean`, `body_len_mean`, `immotile_frac`, ...).
+_LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
+
 
 def is_audit_clip(clip_id: str, cfg: Config) -> bool:
     """Deterministically hold a share of clips out of the suggestion loop.
@@ -634,9 +652,33 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     # The feature-schema version travels with the model: a model is meaningful
     # only against features that still mean what they meant when it was fitted,
     # which the column names cannot attest to.
+    #
+    # So does the WINDOW LENGTH, for the same reason and a second one: the
+    # version stamp catches a schema that changed, but the window length can
+    # change with the schema untouched - same version, same column names, values
+    # on a different scale. `Suggester.window_problem` is what reads it back.
+    #
+    # Why `cfg.clips.frames` and not something else: these rows come from
+    # clip_features.parquet, which is built over the ANNOTATION clip manifest
+    # (`build_clip_features` iterates the manifest's (f_start, f_end) pairs), and
+    # that manifest is laid out by `clips._windows`, whose window length is
+    # `cfg.clips.frames`. `cfg.clips.stride` only sets how far the grid advances,
+    # and `cfg.predict.resolved_window(cfg.clips)` belongs to the dense export
+    # grid, a different table this model was not fitted on.
+    #
+    # It is the NOMINAL length: `_windows` truncates the last window of a track
+    # against the movie end, and `clips.min_clip_frames` lets a partly-present
+    # window through. Those are per-row shortfalls within one grid, not a
+    # different grid, and they are exactly what `present_frac` is for.
+    trained_window = int(cfg.clips.frames)
     payload = {"columns": columns, "models": models,
-               "feature_version": FEATURE_VERSION}
+               "feature_version": FEATURE_VERSION,
+               "trained_window": trained_window}
     joblib.dump(payload, work / MODEL_FILE)
+    reporter.log(
+        f"model saved: fitted on {trained_window}-frame windows "
+        f"(clips.frames), feature version {FEATURE_VERSION}"
+    )
     (work / REPORT_FILE).write_text(json.dumps(reports, indent=2), encoding="utf-8")
     return reports
 
@@ -652,6 +694,10 @@ class Suggester:
         self.reports: dict = {}
         self.features: pd.DataFrame | None = None
         self.problem: str = ""
+        # Frames per window the training rows were measured over. None for a
+        # model saved before this was recorded - those still load; see
+        # `window_problem`.
+        self.trained_window: int | None = None
         self._by_clip: dict[str, np.ndarray] = {}
         self.load()
 
@@ -661,6 +707,7 @@ class Suggester:
         self.problem = ""
         self.columns, self.models, self.reports = [], {}, {}
         self.features, self._by_clip = None, {}
+        self.trained_window = None
 
         work = self.cfg.paths.work_dir
         model_path, feat_path = work / MODEL_FILE, work / CLIP_FEATURES_FILE
@@ -678,6 +725,17 @@ class Suggester:
         except Exception as exc:
             self.problem = f"could not read the model: {exc}"
             return False
+
+        # Read straight off the payload, and MISSING IS NOT AN ERROR: a model
+        # trained before this was recorded has to keep loading, or upgrading
+        # trackanno silently invalidates every model anyone already has. A
+        # length that will not parse is treated as absent for the same reason -
+        # `window_problem` reports "unrecorded" and the caller warns.
+        try:
+            recorded = payload.get("trained_window")
+            self.trained_window = None if recorded is None else int(recorded)
+        except (TypeError, ValueError):
+            self.trained_window = None
 
         # The model's input space is fixed at fit time, so a table missing a
         # column it was fitted on makes predicting meaningless, not degraded.
@@ -734,6 +792,50 @@ class Suggester:
     @property
     def ready(self) -> bool:
         return bool(self.models) and bool(self._by_clip)
+
+    def window_problem(self, length: int) -> str:
+        """'' if a feature table built at `length` is safe for this model, else why not.
+
+        The skew this closes is silent by construction: window length changes
+        what the features are worth, not what they are called, so a 50-frame
+        model handed 100-frame rows passes every check `load` makes - same
+        version, same columns - and predicts confidently on inputs whose scale
+        it has never seen.
+
+        Returns a sentence rather than raising, and returns one for the
+        unrecorded case too, so the caller can choose: a mismatch is worth
+        refusing over, "cannot be checked" only worth a warning.
+        """
+        examples = ", ".join(_LENGTH_DEPENDENT_EXAMPLES)
+        try:
+            length = int(length)
+        except (TypeError, ValueError):
+            return (
+                f"the window length to check against is {length!r}, which is not "
+                "a frame count, so this model's training window could not be "
+                "compared with it."
+            )
+        if self.trained_window is None:
+            return (
+                f"this model does not record the window length it was trained "
+                f"at, so the {length}-frame windows these features were built "
+                "over could not be checked against it. It was saved before that "
+                "length was recorded. Window length changes the feature VALUES "
+                f"and not their names ({examples} all scale with it), so if the "
+                "two differ nothing else here will notice. Retrain to record it."
+            )
+        if length == self.trained_window:
+            return ""
+        return (
+            f"this model was trained on {self.trained_window}-frame windows but "
+            f"these features were built over {length}-frame windows. Window "
+            "length changes the feature VALUES, not just how many rows there "
+            f"are: {examples} are all measured over the window, so they scale "
+            f"with it, and a model fitted at {self.trained_window} frames reads "
+            f"a {length}-frame row on the wrong scale while reporting normal "
+            f"confidence. Retrain the model at {length} frames, or restore the "
+            f"window length it was trained at ({self.trained_window} frames)."
+        )
 
     def is_audit_clip(self, clip_id: str) -> bool:
         return is_audit_clip(clip_id, self.cfg)

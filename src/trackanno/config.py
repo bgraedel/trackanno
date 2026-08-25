@@ -18,13 +18,24 @@ __all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption",
 
 # A category group becomes a CSV column, so a group named like a built-in column
 # silently overwrites it. Kept here rather than imported from store.py, which
-# imports this module.
+# imports this module - though only for an annotation that ``from __future__
+# import annotations`` never evaluates, so that cycle is soft and this set could
+# be derived from the store's lists instead.
+#
+# Until it is, this is a hand-maintained mirror of ``store.IDENTITY_COLUMNS`` and
+# ``store.TRAILING_COLUMNS`` and there is nothing in the language keeping the two
+# together: a column added there and forgotten here is not an error, it is a name
+# a user is then allowed to pick, after which ``AnnotationStore.record`` writes
+# the built-in and the category into the same key and the built-in is gone.
+# ``tests/test_store_provenance.py`` asserts the two sets are equal, which is the
+# only thing that catches the omission. Add to both, or to neither.
 RESERVED_GROUP_NAMES = frozenset({
     "clip_id", "movie_id", "source_file", "series", "channel",
     "track_id", "f_start", "f_end",
     "crop_x0", "crop_y0", "crop_w", "crop_h", "scale",
     "uncertain", "notes", "annotator", "timestamp_utc", "dwell_s",
     "suggested", "suggest_conf", "suggest_shown",
+    "selected_by",
 })
 
 
@@ -51,6 +62,15 @@ def _known(section: str, given: dict, allowed: Sequence[str]) -> None:
             f"ignoring unknown key(s) in config section '{section}': {sorted(unknown)}",
             stacklevel=3,
         )
+
+
+def _spelled_out(written: int | str, value: int) -> str:
+    """``50``, or ``50 (from 'auto')`` when the user never typed that number.
+
+    A complaint about two settings that disagree is unreadable if one of them
+    was written as ``auto`` and the message quotes only what it resolved to.
+    """
+    return f"{value}, from 'auto'" if isinstance(written, str) else str(value)
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -407,26 +427,96 @@ class Spectral:
 
 @dataclass
 class Predict:
-    """How much of each movie the bulk labelling pass covers.
+    """How much of each movie the bulk labelling pass covers, and how finely.
 
     ``manifest`` scores exactly the clips cut for annotation, a sampling chosen
     for a human's attention, so everything between two annotation windows comes
     out unlabelled and unpainted in the rendered movie. ``dense`` lays its own
     grid over every frame of every track - see :mod:`trackanno.densepredict`.
+
+    By default that grid TILES: the stride equals the window length, every frame
+    lands in exactly one window, and every change of behaviour is therefore
+    reported at a window boundary. A cell that stops swimming a third of the way
+    through a window is called one thing for the whole window, and the error is
+    up to a window long. A stride shorter than the window overlaps them and
+    pins a transition to within one stride instead - but then several windows
+    speak for the same frame, and something has to decide what that frame is.
+    That is what ``decode`` does, which is why the two settings are only valid
+    together.
     """
 
     coverage: str = "dense"
     window_frames: int | str = "auto"
+    # Frames between one window's start and the next. 'auto' is window_frames,
+    # an exact tiling: the historical behaviour, and the only stride whose rows
+    # can be painted straight out of predictions.parquet without a decode.
+    window_stride: int | str = "auto"
     # Detections a dense window needs before its features mean anything. Two is
     # the floor at which ANY motion feature can exist. Deliberately NOT
     # clips.min_clip_frames, which exists so an annotator gets a watchable video
     # and would punch the holes dense coverage removes back into the export.
     # Every row carries n_present and present_frac for a stricter downstream bar.
     min_frames: int = 2
+    # How the per-frame posterior becomes labels. 'none' keeps the one label a
+    # window already carries, which is all a tiling grid needs. 'min_bout'
+    # cuts the posterior into bouts and absorbs any bout shorter than
+    # min_bout_frames into its neighbours. 'viterbi' asks the different question
+    # - the most likely label SEQUENCE under a sticky transition prior - so a
+    # short bout survives when the evidence for it outweighs the cost of the two
+    # transitions it needs, instead of being deleted for being short.
+    decode: str = "none"
+    # The shortest bout worth believing, in frames. A statement about the
+    # ANIMAL, not about the model: the shortest episode of a behaviour you would
+    # accept as real. 0 means no such floor and disables the constraint.
+    min_bout_frames: int = 0
+    # viterbi only: the probability that a frame keeps the previous frame's
+    # label. 'auto' is 1 - 1/min_bout_frames, the stickiness whose average run
+    # is min_bout_frames long.
+    self_transition: float | str = "auto"
+    # Write the per-frame posterior beside the predictions. Off by default: it
+    # is one row per frame per track rather than one per window, so it dwarfs
+    # predictions.parquet, and it is mostly worth keeping while tuning a decode.
+    save_posteriors: bool = False
+
+    # -- 'auto' spelled out ------------------------------------------------- #
+    def resolved_window(self, clips: "Clips") -> int:
+        """``window_frames`` with ``auto`` filled in: min(frames, stride) of the clips.
+
+        The same number :func:`trackanno.densepredict.window_length` computes,
+        and that is still where the dense pipeline reads it. It is repeated here
+        because the stride check in :func:`load_config` has to compare two
+        numbers the user may never have typed, and loading a config must not
+        drag in the dense pipeline (and pandas behind it) to learn one integer.
+        """
+        if isinstance(self.window_frames, str):
+            return max(1, min(int(clips.frames), int(clips.stride)))
+        return max(1, int(self.window_frames))
+
+    def resolved_stride(self, clips: "Clips") -> int:
+        """``window_stride`` with ``auto`` filled in: the window length itself."""
+        if isinstance(self.window_stride, str):
+            return self.resolved_window(clips)
+        return max(1, int(self.window_stride))
+
+    def resolved_self_transition(self) -> float:
+        """``self_transition`` with ``auto`` filled in: 1 - 1/min_bout_frames.
+
+        A chain that stays put with probability p has an expected run of
+        1/(1 - p) frames, so the identity reads 'the prior whose average bout
+        lasts min_bout_frames'. Only defined under ``decode: viterbi``, which is
+        the only place ``parse`` guarantees ``min_bout_frames >= 2``.
+        """
+        if isinstance(self.self_transition, str):
+            return 1.0 - 1.0 / float(self.min_bout_frames)
+        return float(self.self_transition)
 
     @classmethod
     def parse(cls, d: dict) -> "Predict":
-        _known("predict", d, ["coverage", "window_frames", "min_frames"])
+        _known(
+            "predict", d,
+            ["coverage", "window_frames", "window_stride", "min_frames",
+             "decode", "min_bout_frames", "self_transition", "save_posteriors"],
+        )
         coverage = str(d.get("coverage", "dense"))
         if coverage not in ("dense", "manifest"):
             raise ConfigError(
@@ -443,7 +533,20 @@ class Predict:
         elif int(window) < 1:
             raise ConfigError(
                 f"predict.window_frames must be at least 1 (got {int(window)}); it is "
-                "both the window length and the stride, so 0 never terminates"
+                "how many frames one window spans, and a window spanning none of "
+                "them has nothing to measure"
+            )
+        stride = d.get("window_stride", "auto")
+        if isinstance(stride, str):
+            if stride != "auto":
+                raise ConfigError(
+                    "predict.window_stride must be a frame count or 'auto' (the same "
+                    "number as predict.window_frames, so the windows tile exactly)"
+                )
+        elif int(stride) < 1:
+            raise ConfigError(
+                f"predict.window_stride must be at least 1 (got {int(stride)}); it is "
+                "the step the window grid advances by, so 0 or less never terminates"
             )
         min_frames = int(d.get("min_frames", 2))
         if min_frames < 1:
@@ -451,10 +554,75 @@ class Predict:
                 f"predict.min_frames must be at least 1 (got {min_frames}); a window "
                 "with no detections in it has nothing to measure"
             )
+        decode = str(d.get("decode", "none"))
+        if decode not in ("none", "min_bout", "viterbi"):
+            raise ConfigError(
+                "predict.decode must be 'none' (one label per window, exactly as it "
+                "was predicted), 'min_bout' (cut the per-frame posterior into bouts, "
+                "then absorb any bout shorter than predict.min_bout_frames into its "
+                "neighbours) or 'viterbi' (the most likely label sequence under a "
+                "sticky transition prior, which keeps a short bout the evidence "
+                "really supports)"
+            )
+        min_bout = int(d.get("min_bout_frames", 0))
+        if min_bout < 0:
+            raise ConfigError(
+                f"predict.min_bout_frames must be 0 or more (got {min_bout}); it is a "
+                "length in frames, and 'no shortest bout at all' is written as 0, not "
+                "as a negative length"
+            )
+        if decode == "min_bout" and min_bout == 0:
+            raise ConfigError(
+                "predict.decode is 'min_bout' but predict.min_bout_frames is 0, so "
+                "the decode has no shortest bout to enforce and would hand back the "
+                "labels it was given, unchanged. Set predict.min_bout_frames to the "
+                "shortest episode you would accept as real (in frames), or set "
+                "predict.decode to 'none' and mean it"
+            )
+        stay = d.get("self_transition", "auto")
+        if isinstance(stay, str):
+            if stay != "auto":
+                raise ConfigError(
+                    "predict.self_transition must be a probability or 'auto' "
+                    "(1 - 1/predict.min_bout_frames)"
+                )
+        elif not 0.0 < float(stay) < 1.0:
+            raise ConfigError(
+                f"predict.self_transition must be strictly between 0 and 1 (got "
+                f"{float(stay)}); it is the probability that a frame keeps the "
+                "previous frame's label, so 1.0 never leaves the state it starts in "
+                "and labels the whole track with it, and 0.0 forbids staying, which "
+                "makes every bout one frame long"
+            )
+        if decode == "viterbi" and isinstance(stay, str) and min_bout < 2:
+            raise ConfigError(
+                "predict.decode is 'viterbi' with predict.self_transition: auto, "
+                "which stands for 1 - 1/predict.min_bout_frames and so needs "
+                f"predict.min_bout_frames to be at least 2 (got {min_bout}): at 0 the "
+                "identity divides by zero, and at 1 it gives 0.0, a prior that forbids "
+                "two consecutive frames ever sharing a label. Set "
+                "predict.min_bout_frames to the shortest bout you would believe, or "
+                "give predict.self_transition a probability of its own"
+            )
+        if decode != "none" and coverage != "dense":
+            raise ConfigError(
+                f"predict.decode is {decode!r}, which needs predict.coverage: dense "
+                f"(this config asks for {coverage!r}). A decode reads a posterior for "
+                "every frame and re-cuts it into bouts; 'manifest' coverage scores "
+                "only the clips that were cut for annotation, so most frames have no "
+                "posterior at all and the bouts would be drawn across the gaps "
+                "between clips. Set predict.coverage to 'dense', or predict.decode "
+                "to 'none'"
+            )
         return cls(
             coverage=coverage,
             window_frames=window if isinstance(window, str) else int(window),
+            window_stride=stride if isinstance(stride, str) else int(stride),
             min_frames=min_frames,
+            decode=decode,
+            min_bout_frames=min_bout,
+            self_transition=stay if isinstance(stay, str) else float(stay),
+            save_posteriors=bool(d.get("save_posteriors", False)),
         )
 
 
@@ -942,6 +1110,40 @@ def load_config(path: str | Path | None = None) -> Config:
     # not raise here: the count is readable from the checkpoint, and refusing to
     # load would make switching the task to 'pose' from the GUI impossible.
     # `Config.needs_keypoints` carries the state and TiledDetector fills it in.
+
+    # The dense window grid spans two sections: both `predict.window_frames` and
+    # `predict.window_stride` may say `auto`, and what `auto` means for the
+    # length is min(clips.frames, clips.stride), so the two numbers can only be
+    # compared once `clips` has been parsed as well.
+    length = cfg.predict.resolved_window(cfg.clips)
+    stride = cfg.predict.resolved_stride(cfg.clips)
+    length_txt = _spelled_out(cfg.predict.window_frames, length)
+    stride_txt = _spelled_out(cfg.predict.window_stride, stride)
+    if stride > length:
+        raise ConfigError(
+            f"predict.window_stride ({stride_txt}) is longer than "
+            f"predict.window_frames ({length_txt}), so the grid would step over "
+            f"{stride - length} frame(s) between the end of one window and the "
+            "start of the next. Those frames get no prediction and no colour in "
+            "the render - the very hole predict.coverage: dense exists to close. "
+            "Leave predict.window_stride at 'auto' to tile exactly, or take it "
+            "below predict.window_frames to overlap the windows, which needs a "
+            "predict.decode as well"
+        )
+    if stride < length and cfg.predict.decode == "none":
+        raise ConfigError(
+            f"predict.window_stride ({stride_txt}) is shorter than "
+            f"predict.window_frames ({length_txt}), so dense windows overlap, but "
+            "predict.decode is 'none' - these two keys conflict. Overlapping "
+            "windows written straight into predictions.parquet give one track "
+            "several rows painting the same range(f_start, f_end), and render.py "
+            "resolves that by letting whichever row came last win: the exported "
+            "colour of an overlapped frame would be decided by parquet row order "
+            "rather than by the model. A decode is what makes overlap safe - it "
+            "collapses the overlapping windows into one disjoint bout per stretch "
+            "of frames. Set predict.decode to 'min_bout' or 'viterbi', or put "
+            "predict.window_stride back to 'auto'"
+        )
 
     # Category keys must not collide with the navigation shortcuts.
     nav = {k.lower() for binds in keys.values() for k in binds}

@@ -217,22 +217,78 @@ suggest:
 #                features come from tracks.parquet and instance_features.npy,
 #                so nothing is re-cropped or re-detected.  (default)
 #   manifest  -> exactly the clips in clip_features.parquet, and nothing else.
-# Dense windows tile EXACTLY (stride == length), because the renderer paints
-# range(f_start, f_end) per track and two windows sharing a frame means one
-# prediction silently overwrites the other.
+# Out of the box the dense windows tile exactly - one window per frame, and the
+# renderer can paint every prediction as it stands. `window_stride` below buys
+# sharper behavioural boundaries by overlapping them instead, and `decode` is
+# what makes an overlapping grid safe to paint.
 predict:
   coverage: dense
-  # Length of one dense window, which is also its stride. auto =
-  # min(clips.frames, clips.stride): the longest window that both tiles and
-  # lands on the annotation grid's own starts, so a dense window coinciding
-  # with an annotated one keeps its clip_id and hand labels still join to it.
+  # Length of one dense window. auto = min(clips.frames, clips.stride): the
+  # longest window that both tiles and lands on the annotation grid's own
+  # starts, so a dense window coinciding with an annotated one keeps its
+  # clip_id and hand labels still join to it. Changing it also changes what the
+  # features MEAN (path length, straightness, every *_std, present fraction), so a
+  # window the model was not fitted at is train/serve skew. The beat and wave
+  # columns are the exception: they are measured over spectral.window, not over
+  # this one, so they alone survive a change of length.
   window_frames: auto
+
+  # Frames from one window's start to the next.
+  #   auto (= window_frames) -> the windows TILE: every frame sits in exactly
+  #              one window, so every row can be painted as it stands. The cost
+  #              is that a change of behaviour can only ever be reported at a
+  #              window boundary - a cell that stops swimming a third of the way
+  #              through a window is called one thing for the whole window, an
+  #              error of up to window_frames frames.  (default)
+  #   below window_frames -> the windows OVERLAP, and a transition is pinned to
+  #              within one stride rather than one window. The cost is that
+  #              several windows now speak for the same frame: the renderer
+  #              paints range(f_start, f_end) per track and lets whichever row
+  #              came last win, so with overlapping rows the exported colour of
+  #              a frame would be decided by row order in the parquet rather
+  #              than by the model. This is why an overlapping stride REQUIRES a
+  #              decode below - the decode is what collapses the overlap into
+  #              one disjoint bout per stretch of frames. The config refuses to
+  #              load if you overlap without one.
+  #   above window_frames -> refused: it leaves unscored gaps between windows,
+  #              which is the hole `coverage: dense` exists to close.
+  window_stride: auto
   # Detections a dense window needs before it is featurised. NOT
   # clips.min_clip_frames - that guarantees a watchable video clip, and nothing
   # here is watched. 2 is the floor at which any motion feature can exist.
   # Windows below it still get a ROW, with an empty prediction and a
   # skip_reason saying why.
   min_frames: 2
+
+  # How per-frame scores become behaviour. Needs coverage: dense - a decode
+  # reads a posterior for every frame, and manifest coverage has one only
+  # inside the clips that were cut for annotation.
+  #   none      -> keep the one label each window carries, exactly as it was
+  #                predicted. All an exactly-tiling grid needs.  (default)
+  #   min_bout  -> cut the per-frame posterior into bouts, then absorb every
+  #                bout shorter than min_bout_frames into its neighbours. Blunt:
+  #                a short bout is dropped for being short, however confident
+  #                the model was about it.
+  #   viterbi   -> the most likely label SEQUENCE under a sticky transition
+  #                prior. A brief bout survives when its evidence outweighs the
+  #                cost of the two transitions it needs, so real short events
+  #                are kept while frame-to-frame flicker is still smoothed out.
+  decode: none
+  # The shortest bout worth believing, in frames. A claim about the ANIMAL, not
+  # about the model: the briefest episode of a behaviour you would accept as
+  # real. 0 means no such floor, and is refused with decode: min_bout, where it
+  # would silently do nothing.
+  min_bout_frames: 0
+  # viterbi only: the probability a frame keeps the previous frame's label.
+  # auto = 1 - 1/min_bout_frames, the stickiness whose average run lasts
+  # min_bout_frames (so auto needs min_bout_frames of 2 or more). Higher is
+  # smoother. 1.0 and 0.0 are both refused: one never leaves the state it starts
+  # in, the other forbids staying in one for two frames running.
+  self_transition: auto
+  # Also write the per-frame posterior beside predictions.parquet. One row per
+  # frame per track instead of one per window, so it is by far the larger file -
+  # worth keeping while tuning a decode, rarely afterwards.
+  save_posteriors: false
 
 
 # --- Annotation categories ---------------------------------------------------

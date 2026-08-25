@@ -2304,7 +2304,7 @@ class ExportPage(Page):
             "Predicted movies" if source == "predictions" else "Annotated movies"
         )
         if source == "predictions":
-            counts, unit = self._predicted_movies(), "predicted clips"
+            counts, unit = self._predicted_movies()
         else:
             from ..render import annotated_movies
 
@@ -2317,16 +2317,25 @@ class ExportPage(Page):
             item.setData(Qt.UserRole, movie_id)
             self.movies.addItem(item)
 
-    def _predicted_movies(self) -> dict:
-        """{movie_id: predicted clip count}. Never raises, like annotated_movies."""
+    def _predicted_movies(self) -> tuple[dict, str]:
+        """({movie_id: row count}, what one row is). Never raises, like annotated_movies.
+
+        The unit comes back with the counts rather than being written beside the
+        call, because a prediction row is a dense WINDOW or a decoded BOUT
+        depending on the run that wrote the file, and only the file knows which -
+        see :func:`trackanno.render.prediction_unit`. Calling either of them a
+        clip was the old wording and was true of neither.
+        """
         from ..predict import load_predictions
+        from ..render import prediction_unit
 
         try:
             frame = load_predictions(self.cfg)
         except (FileNotFoundError, OSError, RuntimeError, ValueError):
-            return {}
+            return {}, "predicted windows"
         counts = frame["movie_id"].astype(str).value_counts()
-        return {str(k): int(v) for k, v in sorted(counts.items())}
+        return ({str(k): int(v) for k, v in sorted(counts.items())},
+                prediction_unit(frame))
 
     def _build_work(self):
         blocker = self.blocker()

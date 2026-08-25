@@ -78,7 +78,34 @@ def build_frame_marks(
     """frame -> {track_id: Mark}, from the labels, the predictions, or both.
 
     With ``both`` a hand label always wins the box - drawn solid, the model's
-    opinion appended to the caption; untouched tracks keep the dashed mark."""
+    opinion appended to the caption; untouched tracks keep the dashed mark.
+
+    TWO PREDICTION ROWS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this
+    function raises if they do. Every row is painted over ``range(f_start,
+    f_end)`` into one dict, so a second row covering a frame the first already
+    claimed simply replaces it: the exported colour of that frame would then be
+    decided by the order pandas handed the rows over, not by the model. The
+    invariant that keeps that from happening lives upstream, in two places, and
+    both are load-bearing rather than accidental:
+
+    * with ``predict.window_stride`` at ``auto`` the dense grid TILES, so each
+      frame of a track sits in exactly one window and each window is one row;
+    * with a shorter stride the windows overlap, and :func:`load_config` refuses
+      the config unless a ``predict.decode`` is set - the decode collapses the
+      overlap into BOUTS, which are disjoint by construction.
+
+    So a collision here is never a rendering problem to be smoothed over; it is
+    a report that one of those upstream guarantees has broken, and painting one
+    of the two competing values would hide it behind a picture that looks fine.
+
+    A hand label landing on a frame a prediction already claimed is a different
+    thing entirely and is NOT a collision: it is exactly what ``--source both``
+    is for, and the labels pass below deliberately overwrites the dashed mark
+    while keeping the model's answer in the caption. Two ANNOTATION rows
+    overlapping is legitimate too - ``clips.stride`` below ``clips.frames`` cuts
+    overlapping clips for annotation on purpose - so the labels pass keeps its
+    last-writer-wins behaviour and only the predictions pass is guarded.
+    """
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
     group = cfg.group(group_name)
@@ -95,6 +122,9 @@ def build_frame_marks(
     out: dict[int, dict[int, Mark]] = {}
     if source in ("predictions", "both") and predictions is not None:
         column, conf_column = f"{group_name}_pred", f"{group_name}_conf"
+        # One entry per painted ROW, not per painted frame, so the guard below can
+        # name the row it collided with without carrying a second frame-sized dict.
+        claimed: dict[int, list[tuple[int, int, str]]] = {}
         for row in predictions.to_dict("records"):
             value = _clean(row.get(column))
             if not value:
@@ -106,8 +136,14 @@ def build_frame_marks(
                 caption = f"~{value}"
             mark = Mark(colour_of(value), caption, True)
             track_id = int(row["track_id"])
-            for frame in range(int(row["f_start"]), int(row["f_end"])):
-                out.setdefault(frame, {})[track_id] = mark
+            f_start, f_end = int(row["f_start"]), int(row["f_end"])
+            for frame in range(f_start, f_end):
+                marks = out.setdefault(frame, {})
+                if track_id in marks:
+                    raise ValueError(_overlap_message(claimed, track_id, frame,
+                                                      f_start, f_end, value))
+                marks[track_id] = mark
+            claimed.setdefault(track_id, []).append((f_start, f_end, value))
 
     if source in ("labels", "both"):
         if group_name not in annotations.columns:
@@ -123,6 +159,10 @@ def build_frame_marks(
                 continue
             mark = Mark(colour_of(value), value, False)
             track_id = int(row["track_id"])
+            # No overlap guard on this pass, unlike the predictions above: a hand
+            # label overwriting a prediction is what 'both' means, and two
+            # annotation rows overlapping is what `clips.stride` below
+            # `clips.frames` asks for. Both are choices, not broken invariants.
             for frame in range(int(row["f_start"]), int(row["f_end"])):
                 existing = out.get(frame, {}).get(track_id)
                 text = value
@@ -130,6 +170,41 @@ def build_frame_marks(
                     text = f"{value}  |  {existing.text}"
                 out.setdefault(frame, {})[track_id] = Mark(mark.color, text, False)
     return out
+
+
+def _overlap_message(
+    claimed: dict[int, list[tuple[int, int, str]]],
+    track_id: int,
+    frame: int,
+    f_start: int,
+    f_end: int,
+    value: str,
+) -> str:
+    """Why two prediction rows meeting on one frame is fatal, in terms of the rows.
+
+    Names the frame, the track and BOTH values, because "predictions overlap" is
+    something to go and investigate whereas "frame 812, track 3: [800, 850) says
+    'immotile', [812, 862) says 'swimming'" is something to go and fix. The two
+    spans come from the rows themselves, so a duplicated row and a genuinely
+    overlapping pair - which want different fixes - do not read alike.
+    """
+    earlier = next(
+        (f"[{s}, {e}) says {v!r}" for s, e, v in claimed.get(track_id, [])
+         if s <= frame < e),
+        "an earlier row says something else",
+    )
+    return (
+        f"frame {frame}, track {track_id}: two prediction rows both cover it - "
+        f"{earlier} and [{f_start}, {f_end}) says {value!r}. Each track's frames "
+        "must belong to at most one row of predictions.parquet, or the colour "
+        "this frame is exported with comes from the order the rows happen to sit "
+        "in the file rather than from the model. Rows overlap when a dense grid "
+        "was written with predict.window_stride below predict.window_frames and "
+        "no predict.decode to collapse the overlap into bouts, or when "
+        "predict.coverage: manifest scored an annotation grid whose clips.stride "
+        "is shorter than clips.frames. Re-run predict.py after fixing whichever "
+        "it was; do not render this file as it stands"
+    )
 
 
 def _clean(value) -> str:
@@ -248,6 +323,25 @@ def render_movie(
 # --------------------------------------------------------------------------- #
 # batch driver - shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
+def prediction_unit(predictions: pd.DataFrame) -> str:
+    """What one row of ``predictions.parquet`` actually IS, for counting it aloud.
+
+    "predicted clips" was only ever true by coincidence: a dense row is a window
+    off a grid the predictor laid down itself, and it lined up with an annotation
+    clip because ``window_frames: auto`` picks min(clips.frames, clips.stride) so
+    that it would. Under a decode the rows stop being windows at all - they are
+    BOUTS, variable-length runs between inferred behavioural boundaries - and a
+    count of "clips" would then describe neither the grid nor the animal.
+
+    The answer is read off the FILE rather than off ``predict.decode``, because
+    the config can be edited after a prediction run and the count then names what
+    the next run would produce instead of what this one did. ``bout_id`` is the
+    column a decoded row carries in place of ``clip_id``; a row without one came
+    off a grid, whether that grid was the dense one or the annotation manifest.
+    """
+    return "predicted bouts" if "bout_id" in predictions.columns else "predicted windows"
+
+
 def annotated_movies(cfg: Config) -> dict[str, int]:
     """{movie_id: annotated clip count}, straight from the CSV. Never raises: a
     throw on the GUI's project-open path, which startup repeats, would lock the
@@ -349,7 +443,9 @@ def render_all(
         try:
             reporter.log(f"{movie_id}: {len(subset)} annotated clips -> {target}")
             if pred_subset is not None:
-                reporter.log(f"{movie_id}: {len(pred_subset)} predicted clips")
+                reporter.log(
+                    f"{movie_id}: {len(pred_subset)} {prediction_unit(pred_subset)}"
+                )
             render_movie(
                 cfg, movie, tracks, subset, group_name, target,
                 hide_unlabelled=hide_unlabelled or cfg.render.hide_unlabelled,

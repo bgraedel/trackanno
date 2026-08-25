@@ -182,7 +182,7 @@ def test_cancelled_rebuild_leaves_the_old_cache_intact(root: Path) -> None:
     check("the old cache still loads", len(ClipStore(cfg.paths.work_dir)) == before)
 
 
-def test_reserved_category_names_are_refused(root: Path) -> None:
+def test_reserved_category_names_are_refused(root: Path, app) -> None:
     """C2. A group named `notes` or `clip_id` overwrote that CSV column: the
     typed note vanished, and `clip_id` made every row unreadable on restart."""
     from trackanno.config import ConfigError, load_config
@@ -212,10 +212,13 @@ def test_reserved_category_names_are_refused(root: Path) -> None:
 
     check("the project still loads", load_config(path) is not None)
 
+    # Takes the session `app` fixture rather than building a QApplication here.
+    # A bare QApplication(sys.argv[:1]) is safe only when some earlier test has
+    # already made one, so this passed in a full run and ABORTED THE INTERPRETER
+    # when the file was run on its own - no traceback, three dots and silence.
+    # A test file that cannot be run by itself cannot be bisected.
     from trackanno.gui.configform import CategoryEditor
-    from qtpy.QtWidgets import QApplication
 
-    QApplication.instance() or QApplication(sys.argv[:1])
     editor = CategoryEditor()
     editor.load([{"name": "notes", "type": "single", "required": True,
                   "options": [{"name": "a", "key": "1", "color": "#4C9F70"}]}])

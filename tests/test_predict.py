@@ -7,6 +7,14 @@ of the exported movie. The rest guards the two ways a bulk run can quietly go
 wrong - labelling a whole project with a model the report gated off, and leaving
 a half-written parquet behind under the real name.
 
+One file, two kinds of row. With ``predict.decode: none`` - the shipped default -
+a row is a CLIP or a dense WINDOW and everything below the "what it writes"
+heading is a claim about that path, unchanged. With a decode a row is a BOUT,
+cut where the per-frame posterior says the behaviour changed, and the claims
+about those live under "decoded bouts". The two are deliberately not merged: the
+whole argument for the decode is that it is OPTIONAL, and the way to hold this
+code to that is a set of assertions the default has to keep passing verbatim.
+
 Nothing here needs a GPU, a display or the repository's own data: the project,
 the clip manifest and the "trained" model are all built by this file.
 """
@@ -33,6 +41,13 @@ atexit.register(shutil.rmtree, FIXTURES, True)
 
 GROUP = "behaviour"                       # the default project's single-choice group
 CLASSES = ("swimming", "immotile")
+
+# The planted movie the boundary claims are measured on: one track, one change of
+# behaviour, at a frame that is a multiple of neither the window length nor the
+# stride, so neither grid can land on it by luck.
+CUT, PLANTED_FRAMES = 137, 300
+BIG, SMALL = 20.0, 10.0                   # box side while moving, and once stopped
+LENGTH = 50                               # predict.window_frames in those cases
 
 
 def pump(app, predicate, timeout: float = 60.0) -> bool:
@@ -71,6 +86,51 @@ class StubModel:
         return np.column_stack([p, 1.0 - p])
 
 
+class AreaModel:
+    """A model that is EXACTLY right about the fixture built by `plant_transition`.
+
+    That fixture's animal fills a 20x20 box while it is moving and a 10x10 one
+    once it has stopped, and ``area_mean`` is the plain mean of the per-frame box
+    area over the window - no smoothing, no derivative - so a window's
+    ``area_mean`` is an affine function of the FRACTION of its frames spent
+    moving. Inverting that affine map is what this does, which makes it the
+    perfect classifier for that movie: any boundary error the test then measures
+    belongs to the window GRID and not to the model's noise. Same standard as
+    ``tests/test_bouts.py``, one layer further out.
+    """
+
+    classes_ = np.array(CLASSES)
+
+    def predict_proba(self, X):
+        area = np.asarray(X, dtype=float)[:, 1]        # area_mean, by position
+        moving = np.clip(
+            (area - SMALL ** 2) / (BIG ** 2 - SMALL ** 2), 0.001, 0.999
+        )
+        return np.column_stack([moving, 1.0 - moving])
+
+
+class Recorder:
+    """A reporter that keeps every line, for the claims about what a run SAYS."""
+
+    def __init__(self) -> None:
+        self.logged: list[tuple[str, str]] = []
+
+    def log(self, message, level="info"):
+        self.logged.append((str(message), str(level)))
+
+    def stage(self, label, total=None):
+        pass
+
+    def advance(self, n=1):
+        pass
+
+    def raise_if_cancelled(self):
+        pass
+
+    def said(self, *needles: str) -> bool:
+        return any(all(n in message for n in needles) for message, _ in self.logged)
+
+
 def _report_entry(group: str, reliable: bool) -> dict:
     """The fields of GroupReport that anything downstream actually reads."""
     return {
@@ -101,6 +161,8 @@ def build_case(
     groups: dict | None = None,
     labels: int = 0,
     coverage: str = "manifest",
+    model_class: type = StubModel,
+    trained_window: int | None = None,
 ):
     """A project with a clip manifest, clip features and a stubbed-in model.
 
@@ -112,6 +174,11 @@ def build_case(
     default, because most of the cases below are assertions about the manifest
     path specifically - how many rows there are, where f_end came from, which
     clip got which class. The dense path gets its own case.
+
+    ``trained_window`` defaults to None, which writes the payload a model saved
+    before the length was recorded has: no key at all. That is what most cases
+    below want, since none of them are about the skew guard and an unrecorded
+    length is only ever a warning.
     """
     import joblib
 
@@ -167,12 +234,12 @@ def build_case(
 
     wanted = groups if groups is not None else {GROUP: reliable}
     if model:
-        joblib.dump(
-            {"columns": ["speed_mean", "area_mean"],
-             "models": {g: StubModel() for g in wanted},
-             "feature_version": FEATURE_VERSION},
-            work / MODEL_FILE,
-        )
+        payload = {"columns": ["speed_mean", "area_mean"],
+                   "models": {g: model_class() for g in wanted},
+                   "feature_version": FEATURE_VERSION}
+        if trained_window is not None:
+            payload["trained_window"] = int(trained_window)
+        joblib.dump(payload, work / MODEL_FILE)
     if report:
         import json
 
@@ -186,6 +253,63 @@ def build_case(
         for i, row in enumerate(manifest.head(labels).to_dict("records")):
             store.record(row, {GROUP: CLASSES[i % len(CLASSES)]})
     return cfg, manifest
+
+
+def planted_case(root: Path, name: str, stride: int, **settings):
+    """A project whose one track changes behaviour at frame `CUT`, and nothing else.
+
+    The fixture movie is 120 frames of two tracks that never do anything
+    different, which is enough to check that bouts are well formed and useless
+    for checking WHERE a boundary lands. This replaces its ``tracks.parquet``
+    with a single 300-frame track whose box shrinks from 20x20 to 10x10 at
+    ``CUT``, so ``area_mean`` reports the fraction of each window spent moving
+    and :class:`AreaModel` reads that fraction back exactly.
+
+    The rest of the project is left alone. The dense pass reads
+    ``tracks.parquet`` and ``cache.json`` and nothing else - no pixels, no clip
+    cache - so a movie invented here is as real to it as a prepared one, and
+    ``cache.json``'s stale 120-frame count is harmless because
+    ``build_dense_features`` takes the larger of that and the last detected
+    frame.
+    """
+    import joblib
+
+    from trackanno.config import load_config
+    from trackanno.project import write_config
+    from trackanno.suggest import MODEL_FILE
+
+    cfg, _ = build_case(root, name, coverage="dense", model_class=AreaModel,
+                        trained_window=LENGTH)
+    work = cfg.paths.work_dir
+    movie = next(p for p in sorted(work.iterdir())
+                 if p.is_dir() and (p / "tracks.parquet").exists())
+    frames = np.arange(PLANTED_FRAMES)
+    side = np.where(frames < CUT, BIG, SMALL)
+    left = 20.0 + 0.5 * frames                      # drifting, so speed_* exist too
+    pd.DataFrame({
+        "frame": frames, "track_id": 1,
+        "x1": left, "y1": 40.0, "x2": left + side, "y2": 40.0 + side,
+        "conf": 0.9,
+    }).to_parquet(movie / "tracks.parquet", index=False)
+
+    payload = joblib.load(work / MODEL_FILE)
+    payload["models"] = {g: AreaModel() for g in payload["models"]}
+    joblib.dump(payload, work / MODEL_FILE)
+
+    write_config(cfg.path, {
+        "predict.window_frames": LENGTH,
+        "predict.window_stride": stride,
+        "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+        **settings,
+    })
+    return load_config(cfg.path), movie.name
+
+
+def bout_edge(frame: pd.DataFrame, label: str) -> int:
+    """The first frame the decode calls ``label``, or -1 if it never does."""
+    rows = frame[frame[f"{GROUP}_pred"] == label]
+    return int(rows["f_start"].min()) if len(rows) else -1
 
 
 # --------------------------------------------------------------------------- #
@@ -234,22 +358,10 @@ def test_an_unreliable_group_is_skipped_not_silently_predicted(root: Path) -> No
     from trackanno.predict import predict_all, verdict
 
     cfg, _ = build_case(root, "mixed", groups={GROUP: True, "shape": False})
-    logged: list[tuple[str, str]] = []
+    reporter = Recorder()
+    logged = reporter.logged
 
-    class Recorder:
-        def log(self, message, level="info"):
-            logged.append((message, level))
-
-        def stage(self, label, total=None):
-            pass
-
-        def advance(self, n=1):
-            pass
-
-        def raise_if_cancelled(self):
-            pass
-
-    frame = predict_all(cfg, reporter=Recorder())
+    frame = predict_all(cfg, reporter=reporter)
     check("the reliable group is predicted", f"{GROUP}_pred" in frame.columns)
     check("the gated-off group is not", "shape_pred" not in frame.columns,
           str(list(frame.columns)))
@@ -362,9 +474,18 @@ def test_dense_coverage_reaches_every_frame(root: Path) -> None:
     """The clip grid is a sampling chosen for a human's attention, so scoring
     only those clips leaves most of every movie unlabelled here and unpainted in
     the render. The dense pass covers every frame of every track instead - and
-    has to do it exactly once per frame, because the renderer paints
-    range(f_start, f_end) per track and a frame in two windows means one
-    prediction silently overwrites the other."""
+    in the SHIPPED DEFAULT it has to do it exactly once per frame, because the
+    renderer paints range(f_start, f_end) per track and a frame in two windows
+    means one prediction silently overwrites the other.
+
+    Every claim below belongs to that default - `window_stride: auto`, so the
+    windows tile, and `decode: none`, so a row is still a window. None of them
+    survives an overlapping stride: one frame is then in several windows, the
+    short tail window is dropped, and a row stops being a window at all. The
+    right response to that is NOT to loosen these into something both modes can
+    satisfy. Holding the default to the invariant it has always had is the
+    optionality guarantee; the other mode makes its own claims further down.
+    """
     from trackanno.clipfeatures import CLIP_FEATURES_FILE
     from trackanno.densepredict import DENSE_FEATURES_FILE
     from trackanno.predict import predict_all
@@ -461,6 +582,419 @@ def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path) -> None:
     check("the model's columns survived the all-skipped table",
           all(c in pd.read_parquet(cfg.paths.work_dir / "dense_clip_features.parquet").columns
               for c in ("speed_mean", "area_mean")))
+
+
+# --------------------------------------------------------------------------- #
+# decoded bouts
+# --------------------------------------------------------------------------- #
+def test_writing_the_default_stride_out_by_hand_changes_the_file_not_at_all(
+    root: Path,
+) -> None:
+    """`window_stride: auto` is documented as "the window length", and the whole
+    argument for adding the setting was that a project which never touches it
+    keeps the file it already had. So the two spellings must agree BYTE FOR BYTE,
+    not merely on the numbers: a window boundary that moved would move every
+    length-dependent feature value with it, silently, and a rewritten parquet is
+    the only place that would show."""
+    from trackanno.config import load_config
+    from trackanno.densepredict import window_length
+    from trackanno.predict import PREDICTIONS_FILE, predict_all
+    from trackanno.project import write_config
+
+    auto, _ = build_case(root, "stride-auto", coverage="dense")
+    spelled, _ = build_case(root, "stride-spelled", coverage="dense")
+    write_config(spelled.path, {"predict.window_stride": window_length(spelled)})
+    spelled = load_config(spelled.path)
+
+    check("the two configs really do resolve to the same grid",
+          (spelled.predict.window_stride, spelled.predict.resolved_stride(spelled.clips))
+          == (window_length(spelled), auto.predict.resolved_stride(auto.clips)),
+          f"{spelled.predict.window_stride!r} vs auto")
+
+    first = predict_all(auto)
+    other = predict_all(spelled)
+    check("spelling the stride out gives the same rows",
+          first.equals(other), f"{first.shape} vs {other.shape}")
+    check("...in the same columns, in the same order",
+          list(first.columns) == list(other.columns), str(list(other.columns)))
+    check("...and the same bytes on disk",
+          digest(auto.paths.work_dir / PREDICTIONS_FILE)
+          == digest(spelled.paths.work_dir / PREDICTIONS_FILE))
+
+    # Re-running is byte-identical too, so the check above is a claim about the
+    # inputs rather than about parquet happening to be deterministic today.
+    before = digest(auto.paths.work_dir / PREDICTIONS_FILE)
+    predict_all(auto)
+    check("a second identical run rewrites the same bytes",
+          digest(auto.paths.work_dir / PREDICTIONS_FILE) == before)
+
+    check("a tiling run still writes windows, not bouts",
+          "bout_id" not in first.columns and "clip_id" in first.columns,
+          str(list(first.columns)))
+    check("...and carries nothing a decode would have added",
+          not {"group", "human_overlap_frac", "n_covering_mean"} & set(first.columns),
+          str(list(first.columns)))
+
+
+def test_a_decode_writes_bouts_where_it_used_to_write_windows(root: Path) -> None:
+    """A bout is not a window: it starts where the behaviour started, runs as
+    long as the behaviour did, and is the row the renderer paints.
+
+    So the contract it has to keep is the renderer's - sorted, disjoint,
+    gapless over the frames the windows covered, per track - and the contract it
+    must NOT keep is the clip grid's. `clip_id` is derived from f_start alone, so
+    a bout beginning on an annotated clip's f_start would inherit that clip's
+    whole identity while spanning a different number of frames; the column is
+    absent rather than wrong, so a downstream merge on it raises instead of
+    quietly attributing a 300-frame bout to a 51-frame hand label.
+    """
+    from trackanno.config import load_config
+    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.predict import predict_all
+    from trackanno.project import write_config
+
+    cfg, _ = build_case(root, "bouts", coverage="dense")
+    windows = predict_all(cfg)
+    write_config(cfg.path, {
+        "predict.window_stride": 10,
+        "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+    })
+    cfg = load_config(cfg.path)
+    bouts = predict_all(cfg)
+
+    dense = pd.read_parquet(cfg.paths.work_dir / DENSE_FEATURES_FILE)
+    check("the overlapping grid really did score more windows than the tiling one",
+          len(dense) > len(windows), f"{len(dense)} windows vs {len(windows)} rows")
+    check("but a row of the answer is no longer one of them",
+          len(bouts) < len(dense), f"{len(bouts)} rows for {len(dense)} windows")
+
+    check("every bout carries a bout_id", "bout_id" in bouts.columns
+          and bouts["bout_id"].astype(str).ne("").all())
+    check("...naming both ends, so it cannot collide with a clip_id",
+          all(row["bout_id"].endswith(f"f{row['f_start']:06d}-{row['f_end']:06d}")
+              for row in bouts.to_dict("records")),
+          str(bouts["bout_id"].head(2).tolist()))
+    check("there is no clip_id column at all, so a join on one raises",
+          "clip_id" not in bouts.columns, str(list(bouts.columns)))
+    check("the row says which group's question it answers",
+          set(bouts["group"]) == {GROUP}, str(set(bouts["group"])))
+    check("n_frames is the span, not a nominal window length",
+          bool((bouts["n_frames"] == bouts["f_end"] - bouts["f_start"]).all()))
+
+    for track_id, group in bouts.groupby("track_id"):
+        spans = group.sort_values("f_start")[["f_start", "f_end"]].to_numpy()
+        covered = windows[windows["track_id"] == track_id]
+        check(f"track {track_id}: the bouts are sorted and disjoint",
+              bool((spans[:, 0] < spans[:, 1]).all())
+              and list(spans[1:, 0]) == list(spans[:-1, 1]), str(spans))
+        check(f"track {track_id}: ...and gapless over the frames the windows covered",
+              (int(spans[0, 0]), int(spans[-1, 1]))
+              == (int(covered["f_start"].min()), int(covered["f_end"].max())),
+              f"{spans[0, 0]}..{spans[-1, 1]} vs "
+              f"{covered['f_start'].min()}..{covered['f_end'].max()}")
+
+    # Both decoders, because 'viterbi' is a different function reached by the
+    # same branch and a bout table that only min_bout can produce is half tested.
+    write_config(cfg.path, {"predict.decode": "viterbi", "predict.self_transition": 0.98})
+    viterbi = predict_all(load_config(cfg.path))
+    check("viterbi produces bouts too, over the same frames",
+          "bout_id" in viterbi.columns
+          and viterbi.groupby("track_id")["f_end"].max().equals(
+              bouts.groupby("track_id")["f_end"].max()),
+          str(viterbi[["track_id", "f_start", "f_end"]].to_dict("records")))
+
+    # A decode at the TILING stride is a legal config and has to do what it says
+    # rather than being quietly ignored because the windows happen not to overlap.
+    write_config(cfg.path, {
+        "predict.window_stride": "auto", "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+    })
+    tiled = predict_all(load_config(cfg.path))
+    check("a decode at the tiling stride still cuts bouts rather than being ignored",
+          "bout_id" in tiled.columns and "clip_id" not in tiled.columns,
+          str(list(tiled.columns)))
+    check("...and every frame the windows covered is in exactly one of them",
+          int(tiled["n_frames"].sum()) == int((windows["f_end"] - windows["f_start"]).sum()),
+          f"{int(tiled['n_frames'].sum())} vs "
+          f"{int((windows['f_end'] - windows['f_start']).sum())}")
+
+
+def test_include_labelled_is_inert_under_a_decode_and_says_so(root: Path) -> None:
+    """Withholding a hand-labelled window from a decode does not withhold it.
+
+    Under an overlapping stride the neighbouring windows paint the same frames
+    from almost the same features, so the label leaks whatever the flag says; and
+    the hole it punches in the posterior re-cuts the bouts on BOTH sides of it,
+    so the flag changes frames nobody annotated. Suppressing every overlapping
+    window instead would punch a bigger hole. So the flag is inert here, and the
+    provenance moves onto the row as `human_overlap_frac` - which is the
+    fraction of the bout's frames a person actually decided, and is checkable
+    against the one clip this project has a label for.
+    """
+    from trackanno.config import load_config
+    from trackanno.predict import predict_all
+    from trackanno.project import write_config
+
+    cfg, _ = build_case(root, "inert", labels=1, coverage="dense")
+    write_config(cfg.path, {
+        "predict.window_stride": 10,
+        "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+    })
+    cfg = load_config(cfg.path)
+
+    quiet = Recorder()
+    withheld = predict_all(cfg, reporter=quiet)
+    loud = Recorder()
+    included = predict_all(cfg, reporter=loud, include_labelled=True)
+
+    check("the flag changes not one row", withheld.equals(included),
+          f"{withheld.shape} vs {included.shape}")
+    check("passing it says so, rather than looking like it worked",
+          loud.said("--include-labelled has no effect", "human_overlap_frac"),
+          str(loud.logged))
+    check("...and it says why, in terms of the posterior it would damage",
+          loud.said("no posterior") and loud.said("nearly the same features"),
+          str([m for m, _ in loud.logged if "include-labelled" in m]))
+    check("not passing it says nothing at all",
+          not quiet.said("--include-labelled"), str(quiet.logged))
+
+    labelled = pd.read_csv(cfg.paths.csv).iloc[0]
+    movie, track = str(labelled["movie_id"]), int(labelled["track_id"])
+    lo, hi = int(labelled["f_start"]), int(labelled["f_end"])
+    check("the fixture really does have exactly one hand-labelled clip",
+          len(pd.read_csv(cfg.paths.csv)) == 1 and hi > lo, f"{lo}..{hi}")
+
+    mine = withheld[(withheld["movie_id"] == movie) & (withheld["track_id"] == track)]
+    for row in mine.to_dict("records"):
+        overlap = max(0, min(row["f_end"], hi) - max(row["f_start"], lo))
+        check(f"human_overlap_frac is {overlap}/{row['n_frames']} on bout "
+              f"{row['f_start']}-{row['f_end']}",
+              abs(row["human_overlap_frac"] - overlap / row["n_frames"]) < 1e-12,
+              f"{row['human_overlap_frac']}")
+    share = mine["human_overlap_frac"]
+    check("at least one bout really does straddle the labelled clip, so the "
+          "fraction above is not a column of zeros and ones",
+          bool(((share > 0.0) & (share < 1.0)).any()), str(share.tolist()))
+    check("and no bout claims more of itself than it has",
+          bool(((share >= 0.0) & (share <= 1.0)).all()), str(share.tolist()))
+
+    others = withheld[withheld["track_id"] != track]
+    check("a track nobody labelled overlaps nothing",
+          bool((others["human_overlap_frac"] == 0.0).all())
+          and not bool(others["human_labelled"].any()),
+          str(others["human_overlap_frac"].unique()))
+    check("human_labelled is exactly 'the fraction is above zero'",
+          bool((withheld["human_labelled"]
+                == (withheld["human_overlap_frac"] > 0.0)).all()))
+
+
+def test_a_bout_boundary_lands_nearer_the_truth_than_a_tile_boundary(root: Path) -> None:
+    """The reason the whole feature exists, measured end to end.
+
+    One track that stops moving at frame 137, 50-frame windows, and a model that
+    is exactly right about every window it is shown. The tiling grid cannot
+    answer 137: every window is either wholly before or wholly after, and the one
+    straddling the change is 74% "moving" and votes that way for all fifty of its
+    frames, so the best it can say is 150. At stride 10 five windows speak for
+    each frame and their mean crosses over within one stride of the truth. The
+    model is the same in both runs, so the whole difference is the grid.
+    """
+    from trackanno.predict import predict_all
+
+    tiled_cfg, _ = planted_case(root, "planted-tiled", LENGTH)
+    dense_cfg, _ = planted_case(root, "planted-dense", 10)
+    tiled = predict_all(tiled_cfg)
+    dense = predict_all(dense_cfg)
+
+    check("the planted movie decodes into exactly two bouts either way",
+          len(tiled) == 2 and len(dense) == 2,
+          f"tiled {tiled[['f_start', 'f_end', f'{GROUP}_pred']].to_dict('records')}, "
+          f"dense {dense[['f_start', 'f_end', f'{GROUP}_pred']].to_dict('records')}")
+    check("...in the planted order, moving then still",
+          list(tiled[f"{GROUP}_pred"]) == list(dense[f"{GROUP}_pred"]) == list(CLASSES),
+          str(list(dense[f"{GROUP}_pred"])))
+
+    tiled_edge = bout_edge(tiled, CLASSES[1])
+    dense_edge = bout_edge(dense, CLASSES[1])
+    check("the tiling grid can only answer a multiple of the window length",
+          tiled_edge % LENGTH == 0, str(tiled_edge))
+    check("...so it puts the change at 150 when the truth is 137",
+          tiled_edge == 150, str(tiled_edge))
+    check("the overlapping grid places it within one stride of the truth",
+          abs(dense_edge - CUT) <= 10, f"{dense_edge} vs {CUT}")
+    check("which is closer than the tiling grid manages",
+          abs(dense_edge - CUT) < abs(tiled_edge - CUT),
+          f"dense {dense_edge}, tiled {tiled_edge}, truth {CUT}")
+    check("both cover the whole track, so the gain is not paid for in coverage",
+          int(tiled["n_frames"].sum()) == int(dense["n_frames"].sum()) == PLANTED_FRAMES,
+          f"{int(tiled['n_frames'].sum())} / {int(dense['n_frames'].sum())}")
+    check("a bout in the interior rests on more than one window, and says how many",
+          float(dense["n_covering_mean"].max()) > 1.0
+          and float(tiled["n_covering_mean"].max()) == 1.0,
+          f"{dense['n_covering_mean'].tolist()} vs {tiled['n_covering_mean'].tolist()}")
+
+
+def test_the_saved_posterior_round_trips(root: Path) -> None:
+    """`save_posteriors` is for arguing with a decode, which needs the numbers the
+    decode saw - so the file has to be the posterior the bouts were cut from, not
+    a recomputation of it.
+
+    One row per (movie, track, frame), wide over the classes: the posterior is a
+    function of the frame, so that is its natural key, and a long form would
+    repeat that key once per class and multiply an already-large file. Class
+    columns are namespaced by group (`{group}__p__{class}`), so two groups
+    sharing a class name cannot collide, and parquet being columnar means reading
+    one group's answer costs only that group's columns.
+    """
+    from trackanno.predict import POSTERIORS_FILE, predict_all
+
+    plain_cfg, _ = planted_case(root, "post-off", 10)
+    predict_all(plain_cfg)
+    check("nothing is written unless it is asked for",
+          not (plain_cfg.paths.work_dir / POSTERIORS_FILE).exists())
+
+    cfg, movie_id = planted_case(root, "post-on", 10,
+                                 **{"predict.save_posteriors": True})
+    bouts = predict_all(cfg)
+    post = pd.read_parquet(cfg.paths.work_dir / POSTERIORS_FILE)
+
+    check("the file is there under exactly that name",
+          (cfg.paths.work_dir / POSTERIORS_FILE).exists())
+    check("one row per (movie, track, frame) over the frames the windows covered",
+          len(post) == PLANTED_FRAMES
+          and list(post["frame"]) == list(range(PLANTED_FRAMES))
+          and set(post["movie_id"]) == {movie_id} and set(post["track_id"]) == {1},
+          f"{len(post)} rows, frames {post['frame'].min()}..{post['frame'].max()}")
+    columns = [f"{GROUP}__p__{name}" for name in CLASSES]
+    check("one column per class, namespaced by the group that owns it",
+          all(c in post.columns for c in columns), str(list(post.columns)))
+    check("a row of a posterior is still a posterior",
+          np.allclose(post[columns].to_numpy().sum(axis=1), 1.0, atol=1e-12))
+
+    # The closed form for this grid: a 50-frame window every 10 frames puts every
+    # interior frame in exactly five of them, and the first frame in one.
+    check("n_covering is length/stride in the interior",
+          bool((post["n_covering"].to_numpy()[LENGTH: PLANTED_FRAMES - LENGTH]
+                == LENGTH // 10).all()),
+          str(sorted(set(post["n_covering"].to_numpy()[LENGTH:PLANTED_FRAMES - LENGTH]))))
+    check("...and 1 at the very first frame, where only one window can reach",
+          int(post["n_covering"].iloc[0]) == 1)
+
+    # The round trip that matters: a bout's confidence is defined as the mean of
+    # its own class's posterior over its own frames, so the two files have to
+    # agree on that number or one of them is describing a different run.
+    for row in bouts.to_dict("records"):
+        column = f"{GROUP}__p__{row[f'{GROUP}_pred']}"
+        mean = float(post[column].to_numpy()[row["f_start"]: row["f_end"]].mean())
+        check(f"bout {row['f_start']}-{row['f_end']} carries the mean of the "
+              "posterior it was cut from",
+              abs(mean - row[f"{GROUP}_conf"]) < 1e-12,
+              f"{mean} vs {row[f'{GROUP}_conf']}")
+    edge = bout_edge(bouts, CLASSES[1])
+    check("the posterior crosses over exactly where the bouts were cut",
+          post[columns[0]].iloc[edge - 1] > 0.5 >= post[columns[0]].iloc[edge],
+          f"{post[columns[0]].iloc[edge - 1]} -> {post[columns[0]].iloc[edge]}")
+
+
+def test_the_summary_counts_a_frame_once_however_many_rows_cover_it(root: Path) -> None:
+    """"covering N track-frames" used to be `(f_end - f_start).sum()`, which is a
+    frame count only while the rows are disjoint.
+
+    A bout table carries one row per (group, bout), so a project asking two
+    questions of the same movie would claim twice the frames its movies contain -
+    and this is a number nobody can check, because it is only ever compared with
+    itself from one run to the next. It is now the union per (movie, track), so
+    two groups' answers over the same frames collapse to those frames.
+    """
+    from trackanno.config import load_config
+    from trackanno.predict import predict_all, summarise
+    from trackanno.project import write_config
+
+    cfg, _ = build_case(root, "counts", coverage="dense",
+                        groups={GROUP: True, "shape": True})
+    write_config(cfg.path, {
+        "predict.window_stride": 10,
+        "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+    })
+    cfg = load_config(cfg.path)
+    bouts = predict_all(cfg)
+
+    tracks = pd.concat([
+        pd.read_parquet(d / "tracks.parquet")
+        for d in sorted(cfg.paths.work_dir.iterdir())
+        if d.is_dir() and (d / "tracks.parquet").exists()
+    ])
+    detected = int(len(tracks))
+    naive = int((bouts["f_end"] - bouts["f_start"]).sum())
+
+    check("both groups really did get their own bouts over the same frames",
+          set(bouts["group"]) == {GROUP, "shape"} and naive == 2 * detected,
+          f"{sorted(set(bouts['group']))}, {naive} row-frames for {detected} detections")
+    summary = summarise(bouts)
+    check("the summary counts each of those frames once",
+          f"covering {detected} distinct track-frames" in summary, summary)
+    check("...which is not what summing the rows would have said",
+          f"covering {naive} " not in summary, summary)
+    check("and it says a row is a bout, over how many groups",
+          f"{len(bouts)} bouts over 2 category group(s)" in summary, summary)
+
+
+def test_a_model_fitted_at_another_window_length_is_refused(root: Path) -> None:
+    """Window length changes what the features are WORTH, not what they are
+    called, so a model fitted at 50 frames and handed 25-frame rows passes every
+    check the loader makes and then predicts confidently on a scale it has never
+    seen. That is worth refusing over. A model that never recorded its length is
+    a different case - every model saved before the stamp existed is one - and
+    refusing those would mean an upgrade silently invalidates them, so it is a
+    warning and the run goes on."""
+    from trackanno.config import load_config
+    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.predict import predict_all
+    from trackanno.project import write_config
+
+    cfg, _ = build_case(root, "skew-ok", trained_window=50)
+    reporter = Recorder()
+    predict_all(cfg, reporter=reporter)
+    check("a model asked for the length it was trained at says nothing",
+          not reporter.said("window"), str(reporter.logged))
+
+    cfg, _ = build_case(root, "skew-dense", coverage="dense", trained_window=50)
+    write_config(cfg.path, {"predict.window_frames": 25})
+    cfg = load_config(cfg.path)
+    try:
+        predict_all(cfg)
+        check("a mismatched window length is refused", False, "it ran anyway")
+    except RuntimeError as exc:
+        check("a mismatched window length is refused", "50" in str(exc), str(exc))
+        check("...naming the length the features would have been built at",
+              "25" in str(exc), str(exc))
+        check("...and the mechanism, not just the two numbers",
+              "window length changes" in str(exc).lower(), str(exc))
+    check("the refusal comes before the expensive part, so no dense table is built",
+          not (cfg.paths.work_dir / DENSE_FEATURES_FILE).exists())
+
+    # The dense grid's own window, not the clip length: a project whose annotation
+    # clips are 50 frames long can still export a 25-frame dense grid, and it is
+    # the grid the model is about to be shown that has to match.
+    cfg, _ = build_case(root, "skew-manifest", trained_window=50)
+    write_config(cfg.path, {"predict.window_frames": 25})
+    reporter = Recorder()
+    frame = predict_all(load_config(cfg.path), reporter=reporter)
+    check("the same setting on the manifest path is not a mismatch, because those "
+          "rows are clips.frames long whatever the dense grid says",
+          len(frame) > 0 and not reporter.said("window length"),
+          str(reporter.logged))
+
+    cfg, _ = build_case(root, "skew-legacy")
+    reporter = Recorder()
+    frame = predict_all(cfg, reporter=reporter)
+    check("a model that never recorded its window length still runs", len(frame) > 0)
+    check("...but the run says the check could not be made",
+          any("does not record" in m and level == "warning"
+              for m, level in reporter.logged), str(reporter.logged))
 
 
 def test_a_failed_write_leaves_no_part_file_and_no_damage(root: Path) -> None:

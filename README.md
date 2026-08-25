@@ -592,6 +592,91 @@ The Model page runs the same code with a progress bar. The CNN PCA is loaded
 from beside the model and never refitted, since a refit yields a different
 orthogonal basis silently, invalidating the model's input space.
 
+### Behavioural boundaries
+
+A dense window carries one label for every frame in it, and out of the box those
+windows tile, so a change of behaviour can only ever be reported at a window
+boundary. At `window_frames: 50` a cell that stops swimming at frame 137 is
+called swimming until 150, or immotile from 100, and nothing downstream recovers
+the 137. That is a bias in a bout duration, not noise around one. Five keys buy
+a sharper boundary, and **every one of their defaults reproduces today's output
+exactly** - `window_stride: auto` is `window_frames`, which is the tiling that
+has always been there - so an existing project is unchanged until it opts in.
+
+```yaml
+predict:
+  window_stride: auto     # = window_frames: the windows tile, one per frame
+  decode: none            # none | min_bout | viterbi
+  min_bout_frames: 0      # the shortest bout you would accept as real
+  self_transition: auto   # viterbi only; = 1 - 1/min_bout_frames
+  save_posteriors: false
+```
+
+**A `window_stride` below `window_frames` overlaps the windows.** Each frame is
+then scored by several of them, and averaging their class probabilities onto the
+frames they cover gives a posterior per frame instead of per window. That
+removes the *quantisation* of a boundary to a multiple of the window length. It
+does not remove the *blur*: a window straddling a transition genuinely contains
+both behaviours and its features are a blend of the two, and no stride fixes
+that. Boundary error against a planted transition, in frames:
+
+| `window_stride` | mean abs. error | max |
+|---|---|---|
+| 50 (tiling) | 12.24 | 24 |
+| 25 | 6.24 | 12 |
+| 10 | 2.23 | 4 |
+| 5 | 1.20 | 2 |
+
+That is `stride/4` on average and `stride/2` at worst: the quantisation limit
+with nothing left over. Worth stating, because it says exactly what a smaller
+stride buys - halve the stride, halve the error, down to wherever the cost stops
+being worth it.
+
+**The cost is windows, not pixels.** Featurising a track costs about 37 ms fixed
+plus about 4 ms per window (measured on a 500-frame track, 8 keypoints,
+`spectral.window: 75`). Against that track's exact tiling as the baseline, five
+times the windows costs about 2.8x the wall time and ten times about 5.4x. The
+dense stage reads no pixels and re-detects nothing, so this stays cheap in
+absolute terms - it is arithmetic over `tracks.parquet` and the saved
+embeddings, not another pass over the recording.
+
+**Overlapping windows need a `decode`, and the config refuses to load without
+one.** Several rows would otherwise cover the same frames of one track, and
+`render.py` paints `range(f_start, f_end)` per row: the exported colour of an
+overlapped frame would be decided by row order in the parquet rather than by the
+model. A decode collapses the overlap into **bouts** - disjoint, variable-length
+runs between inferred boundaries, one row each in `predictions.parquet`. It
+needs `coverage: dense` for the same reason: `manifest` has a posterior only
+inside the clips that were cut for annotation, so its bouts would be drawn
+across the gaps between them.
+
+**`min_bout` and `viterbi` are choosing different things**, which is worth
+knowing before the first test on easy data suggests one of them is redundant.
+`min_bout` is run-length post-processing: take the per-frame argmax, then absorb
+every run shorter than `min_bout_frames` into whichever neighbouring class the
+absorbed frames themselves score higher. `viterbi` picks the most likely label
+*sequence* under a sticky transition prior, so a short run survives when its
+evidence outweighs the cost of the two transitions it needs. On a clean
+posterior the two agree, and they will keep agreeing for as long as the evidence
+is clean. They diverge on noisy evidence, which is the case that matters:
+`min_bout` drops a brief episode for being brief however confident the model
+was, and `viterbi` keeps the ones the model was sure about while still smoothing
+frame-to-frame flicker.
+
+**`self_transition: auto` reads `min_bout_frames` as an average rather than a
+floor.** Under a constant self-transition `a` a chain's holding time is
+geometric, and a geometric holding time has expectation `1 / (1 - a)`. Setting
+that equal to `min_bout_frames` and inverting gives `a = 1 - 1/min_bout_frames`.
+So one number serves twice - a hard floor to `min_bout`, a mean bout length to
+`viterbi` - and `auto` needs `min_bout_frames` of 2 or more, since at 1 the
+identity returns a chain forbidden to stay anywhere and at 0 it divides by zero.
+
+**`save_posteriors: true`** writes `frame_posteriors.parquet` into
+`paths.work_dir`, beside `predictions.parquet`: the per-frame posterior the
+decode was run on, kept so a decode can be inspected and re-tuned without
+re-scoring the movie. Off by default because it is one row per frame per track
+rather than one per window, and so is much the larger file.
+
 ---
 
 ## 5 · Distribution
@@ -640,7 +725,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Eleven suites, 137 tests, 1040 named checks. `uv sync` installs pytest. Nothing is
+Eighteen suites, 213 tests, 1573 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
@@ -662,8 +747,15 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_wavespectra.py` | the sliding beat spectrum against a wave of known f, lambda, direction |
 | `test_kymograph.py` | curvature against shapes with analytically known curvature |
 | `test_predict.py` | provenance of a prediction at every stage |
+| `test_render.py` | which rows the overlay may paint over, and the one it refuses |
 | `test_reassociate.py` | label repair, largely the cases where it must decline |
 | `test_models.py` | the model registry, largely the cases where a fetch must be refused |
+| `test_bouts.py` | frame posteriors and the two decoders, against closed forms |
+| `test_dense_grid.py` | the window grid at every stride, and the frames a plan must reach |
+| `test_select.py` | which clip to annotate next, and what the audit draw must ignore |
+| `test_subcluster.py` | structure recovered where it was planted, and refused where it was not |
+| `test_store_provenance.py` | why a clip was chosen, surviving the CSV and its repairs |
+| `test_suggest_window.py` | the window length a model was trained at, and the skew it closes |
 
 `test_pipeline.py` asserts the reassociation contract directly, mapping cached
 clip coordinates back through `crop_x0 + cache_x / scale` and comparing against
