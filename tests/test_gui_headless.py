@@ -38,8 +38,19 @@ def cfg(root):
 
 @pytest.fixture(scope="module")
 def store(cfg):
-    """The clip cache, opened once: every test here reads the same pixels."""
-    return ClipStore(cfg.paths.work_dir)
+    """The clip cache, opened once: every test here reads the same pixels.
+
+    Closed on teardown rather than dropped. `make_project` hands every suite the
+    same generated project, so these memory maps are maps of the file a later
+    suite re-runs detection over - and on Windows a mapped file cannot be
+    overwritten at all. Leaving that to the collector makes whether the next
+    suite passes a matter of GC timing, which is how
+    `test_workflow.py::test_cache_is_released_before_detection` went
+    intermittently red.
+    """
+    store = ClipStore(cfg.paths.work_dir)
+    yield store
+    store.close()
 
 
 def test_a_warm_clip_loads_fast(store) -> None:

@@ -38,7 +38,7 @@ from qtpy.QtWidgets import (
 from ..clips import ClipStore
 from ..config import Config, load_config
 from ..overlay import FOLLOW_MODES, build_clip_view
-from ..store import AnnotationStore
+from ..store import AnnotationStore, encode_provenance
 from ..suggest import Suggester
 from .panels import CategoryPanel, MetadataPanel, MinimapWidget
 from .prefetch import Prefetcher
@@ -56,12 +56,28 @@ FOLLOW_LABELS = {
 }
 ZOOM_STEPS = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0)
 
+# The recorded reason for a clip the annotator reached under their own steam: an
+# arrow key back through the queue, a movie filter, a jump to the first unlabelled
+# clip. Deliberately NOT one of `select.py`'s rules - it is the negative space
+# around them, and it is the whole point of writing anything at all here. Once a
+# selector is running, "why is this row in the labelled set" has two possible
+# answers, and a set that cannot be split into the model's picks and the human's
+# own detours is a set on which no honest accuracy can be computed. Recording the
+# selector's rule on a clip it never chose would put the lie in the one column
+# that exists to prevent it.
+MANUAL_RULE = "annotator_navigated"
+
 
 class AnnotationWidget(QWidget):
     """Everything on the annotation screen. Hostable anywhere."""
 
     status_message = Signal(str, int)
     counts_changed = Signal(int, int)      # labelled, total in the current filter
+    # Emitted from the background retrain thread when a NEW model is loaded.
+    # `order` and every widget under this one belong to the UI thread, so a
+    # queued signal is the only safe way for that thread to say the ranking the
+    # queue was built from has been replaced.
+    model_refreshed = Signal()
 
     def __init__(self, cfg: Config, store: ClipStore, annotations: AnnotationStore, parent=None):
         super().__init__(parent)
@@ -89,6 +105,13 @@ class AnnotationWidget(QWidget):
         self._labels_since_train = 0
         self._retrain_thread = None
         self.suggester = Suggester(cfg) if cfg.suggest.enabled else None
+        # The last batch actually spliced into the queue, and the accumulated
+        # record of every clip the selector has put in front of this annotator.
+        # `_served` is keyed by clip_id and never by queue position, because
+        # `_shuffled_index` is permuted over the WHOLE manifest: adding a movie
+        # renumbers every position and would silently re-point every reason.
+        self._batch: list[dict] = []
+        self._served: dict[str, dict] = {}
 
         self.order: list[int] = list(range(len(store)))
         self.position = 0
@@ -105,6 +128,7 @@ class AnnotationWidget(QWidget):
         self._build_ui()
         self._bind_shortcuts()
         self._warm_spline_import()
+        self.model_refreshed.connect(self._refresh_selection)
 
         self.prefetcher = Prefetcher(store, cfg.ui.prefetch)
         self._apply_filters(initial=True)
@@ -351,11 +375,13 @@ class AnnotationWidget(QWidget):
             self._show_empty()
             return
 
+        index = self.store.index_of(current_id) if current_id is not None else None
+        anchor = index if index in selected else None
+        self.order = self._queue_with_batch(self.order, anchor)
+
         self.position = 0
-        if current_id is not None:
-            index = self.store.index_of(current_id)
-            if index in self.order:
-                self.position = self.order.index(index)
+        if anchor is not None:
+            self.position = self.order.index(anchor)
         elif initial:
             self.position = self._resume_position()
         self._load()
@@ -381,6 +407,157 @@ class AnnotationWidget(QWidget):
         self.counter.setText("no clips match the current filter")
         self.progress.setValue(0)
         self.kymo_view.clear()
+
+    # ------------------------------------------------------------ selection -- #
+    def _queue_with_batch(self, order: list[int], anchor: int | None) -> list[int]:
+        """``order`` with the selector's picks moved to just after ``anchor``.
+
+        **Behind the cursor is out of reach.** ``next_clip`` is ``position += 1``
+        and nothing in this widget ever walks backwards on its own -
+        ``goto_first_unannotated`` takes a ``wrap`` argument it does not read - so
+        a batch dropped at the front of a queue whose cursor already sits at
+        position 40 would never be seen at all. ``anchor``, the clip on screen,
+        therefore keeps its place and the picks go IMMEDIATELY AFTER it: the
+        earliest slot forward-only navigation can still reach, and the one that
+        leaves the clip being judged right now untouched. On a fresh build there
+        is no clip on screen, ``anchor`` is ``None``, and the splice point is the
+        front - so the top-ranked pick is what opens the session.
+
+        ``anchor`` is never moved into the batch even when the selector chose it.
+        It was already in front of the annotator, so the selector is not why it is
+        being judged, and that is the WEAKER of the two available claims: it keeps
+        whatever reason it already had, ``annotator_navigated`` if it had none.
+
+        Everything not picked keeps its existing relative order, so with an empty
+        batch this returns ``order`` unchanged and the queue is the seeded shuffle
+        it has always been.
+
+        Records into ``_served`` as it goes: the reason a clip was queued has to
+        be captured at the moment it is queued, because by the time it is labelled
+        the batch that chose it may have been replaced twice over.
+        """
+        batch = self._fresh_batch(order)
+        if not batch:
+            return order
+
+        index_of = {self._clip_ids[i]: i for i in order}
+        picked: list[int] = []
+        taken: set[int] = set()
+        served: list[dict] = []
+        for record in batch:
+            index = index_of.get(str(record["clip_id"]))
+            if index is None or index == anchor or index in taken:
+                continue
+            taken.add(index)
+            picked.append(index)
+            served.append(record)
+        if not picked:
+            return order
+
+        self._batch = served
+        for index, record in zip(picked, served):
+            self._served[self._clip_ids[index]] = record
+
+        rest = [i for i in order if i not in taken]
+        splice = rest.index(anchor) + 1 if anchor is not None else 0
+        return rest[:splice] + picked + rest[splice:]
+
+    def _fresh_batch(self, order: list[int]) -> list[dict]:
+        """The selector's next picks, or ``[]`` to leave the queue exactly as it is.
+
+        The pool handed over is the clips the current filter makes REACHABLE and
+        not the whole manifest: ``selection_batch`` ranks whatever pool it is
+        given, and a pick outside the movie filter could only be honoured by
+        changing that filter under the annotator, while dropping it afterwards
+        would shrink the batch without saying so.
+        """
+        if self.suggester is None or not order:
+            return []
+        try:
+            batch = list(self.suggester.selection_batch(
+                self.store.manifest.loc[order],
+                self.annotations.done_ids,
+                int(self.cfg.suggest.select_batch_size),
+            ))
+            for record in batch:
+                if not str(record.get("clip_id", "")).strip():
+                    raise ValueError(
+                        f"a selection record names no clip_id ({record!r}), so "
+                        "there is no clip to queue it against"
+                    )
+                # The same encoder `store.record` will use, run HERE, where a
+                # record it refuses costs one batch instead of aborting the save
+                # of a label somebody has just typed. `selection_batch` already
+                # translates the one non-finite float `select` produces today;
+                # this is what keeps the next rule's from reaching a keypress.
+                encode_provenance(record)
+        except Exception as exc:
+            # Said out loud and the annotator keeps working: shuffle order is a
+            # worse queue, not a broken one, while a selector that silently stops
+            # selecting is a selector nobody ever fixes - and every row written
+            # afterwards would carry a reason that was no longer true.
+            message = f"clip selection is off - {type(exc).__name__}: {exc}"
+            print(f"[trackanno] {message}")
+            self._status(message, 10000)
+            return []
+        return batch
+
+    def _provenance_for(self, clip_id: str) -> dict | None:
+        """Why this clip was in front of the annotator, or ``None`` for *not recorded*.
+
+        Three answers, kept apart because collapsing any two of them is the lie
+        ``selected_by`` was added to make impossible:
+
+        * the selector put this clip in the queue -> its own record, the rule and
+          score that chose it;
+        * a batch has been served and this clip is not in it -> the annotator
+          navigated here, which is a FACT about how the sample was drawn and not
+          the absence of one;
+        * no batch has ever been served in this session -> nothing, which the
+          store spells as *not recorded*.
+
+        The third case is deliberately the WEAKER claim, and it has to be:
+        ``selection_batch`` returns ``[]`` for "selection is switched off", "the
+        model is not ready" and "nothing left to choose" alike, so from here those
+        three are indistinguishable. Writing ``annotator_navigated`` on an empty
+        return would assert that a selector was running and was deviated from,
+        which is only one of the three - and it would also change what today's
+        default config writes into the CSV, which must stay byte-identical.
+        """
+        if not self._served:
+            return None
+        return self._served.get(clip_id) or {"rule": MANUAL_RULE}
+
+    def _refresh_selection(self) -> None:
+        """Re-queue after the model changed, without disturbing the clip on screen.
+
+        Hooked to a refit COMPLETING rather than to each label. Between refits the
+        ranking has nothing new to say - it is a function of the model - so
+        re-ranking per label would only shuffle the queue under an annotator who
+        is halfway through it, and every clip pushed behind the cursor by that
+        shuffle is unreachable.
+
+        Nothing here calls ``_load``: the clip on screen keeps its pixels, its
+        half-typed note and its dwell clock, and only what comes AFTER it moves.
+        """
+        if not self.order:
+            return
+        anchor = self.order[self.position]
+        before = self.order
+        self.order = self._queue_with_batch(self.order, anchor)
+        if self.order == before:
+            # Selection is off, the refit produced nothing to re-queue, or every
+            # pick was already where it needed to be. Saying "re-queued" here
+            # would report a move that did not happen.
+            return
+        self.position = self.order.index(anchor)
+        # The queue after the cursor is new, so the clips being read ahead are the
+        # wrong ones until this is re-aimed.
+        self.prefetcher.around(self.order, self.position)
+        self._status(
+            f"model updated - the queue's next {len(self._batch)} clip(s) were "
+            "re-selected", 6000
+        )
 
     # ----------------------------------------------------------- clip load -- #
     def _build_view(self, n_frames: int, size: int):
@@ -556,6 +733,7 @@ class AnnotationWidget(QWidget):
                 dwell_s=time.time() - self._loaded_at,
                 suggestion=primary[1] if primary else None,
                 suggestion_shown=bool(primary),
+                selected_by=self._provenance_for(str(meta["clip_id"])),
             )
         except OSError as exc:
             # The store rolls back and re-raises; escaping a Qt slot aborts.
@@ -593,6 +771,11 @@ class AnnotationWidget(QWidget):
                 cfg.paths.csv = snapshot
                 train(cfg, verbose=False)
                 self.suggester.load()
+                # AFTER load(), so the batch the slot goes on to ask for is
+                # ranked by the new model and not the one it replaced. Emitted
+                # rather than called: this is not the UI thread, and `order` and
+                # every widget below belong to it.
+                self.model_refreshed.emit()
             except Exception as exc:
                 print(f"[trackanno] background retrain failed: {exc}")
 
@@ -712,6 +895,10 @@ class AnnotationWidget(QWidget):
                 self.suggester.suggest(clip_id) if self.suggester.ready else {}
             )
             self.categories.set_suggestion(self._current_suggestion)
+        # A model trained from the Model page is the same event as a background
+        # refit finishing, so the queue is re-ranked the same way: already on the
+        # UI thread, so called rather than emitted.
+        self._refresh_selection()
         return self.suggester.status_line()
 
     def _clear_current(self) -> None:

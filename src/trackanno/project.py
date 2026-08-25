@@ -207,6 +207,61 @@ suggest:
                         # human-vs-model agreement stays measurable
   seed: 0
 
+  # -- Which clip you are asked about next -------------------------------------
+  # Off out of the box: clips arrive in the GUI's seeded shuffle, so the labelled
+  # set is a random sample of the project and every number computed over it - the
+  # class balance, the cross-validated F1 - is a statement about your data.
+  #
+  # Turn it on and the model chooses instead: it ranks the unlabelled clips by
+  # how unsure it is and hands you the ones a label would teach it most. That is
+  # a real saving of your time and it costs something specific - the labelled set
+  # is now a set assembled to be HARD, so accuracy measured on it reads lower
+  # than the truth, by an amount nobody can work out afterwards. Two things keep
+  # that honest: every row records why it was shown (the `selected_by` column of
+  # annotations.csv), and a share of each batch is still drawn by a coin from the
+  # audit holdout, which is why audit_fraction: 0 below is refused with a rule
+  # set rather than warned about.
+  #   off               -> manifest/shuffle order, exactly as before  (default)
+  #   margin            -> smallest gap between the model's top two answers. The
+  #                        gap is what your label actually settles, and its scale
+  #                        does not move with the number of classes.
+  #   least_confidence  -> weakest top answer. Reads only that one number, so it
+  #                        cannot tell one strong rival from four weak ones, and
+  #                        its scale shifts with the class count.
+  #   entropy           -> flattest posterior overall. Decided largely by the
+  #                        TAIL probabilities, which no boosted tree is
+  #                        calibrated to get right.
+  select_rule: "off"    # quote it: an unquoted `off` is a YAML boolean
+  # Clips per batch. Twice retrain_every, so a batch outlasts the model that
+  # produced it, and big enough that the audit share below is a whole slot.
+  select_batch_size: 20
+  # Share of each batch drawn at random from the audit holdout instead of being
+  # ranked. auto = audit_fraction, so the labelled audit set keeps growing at the
+  # same rate the project holds audit clips. Lower it and the one unbiased
+  # accuracy in the tool is computed on fewer and fewer clips; 0 stops it growing
+  # altogether, on a project where it is the only estimate left standing.
+  select_audit_share: auto
+  # Two clips of the same track must start this many frames apart before both can
+  # be in one batch. auto = clips.frames: closer than one clip length they
+  # overlap, which is the same footage judged twice. 0 turns it off. Windows
+  # exactly this far apart are kept, so auto suppresses overlap and nothing more.
+  select_frame_gap: auto
+  # Labels a class needs before batch slots go hunting for it. 0 = off, and off
+  # even with a rule set, because filling a rare class deliberately skews the
+  # label balance - and the reliability gate (Cohen's kappa, the majority
+  # baseline) is computed against that balance, so a targeted run can turn the
+  # suggester silent on a model that has not changed. Set it when a class is too
+  # rare to model and you would rather spend the batch than wait.
+  select_target_quota: 0
+  #   target_runner_up  -> clips where the starved class is the model's SECOND
+  #                        choice: the boundary between it and its rival, the
+  #                        only place a label moves the decision surface. Fills
+  #                        the class slowly - many come back as the other class.
+  #   target_confident  -> clips the model already calls that class, confidently.
+  #                        Fills the count fastest and only ever confirms what the
+  #                        model already believes; the boundary does not move.
+  select_target_rule: target_runner_up
+
 
 # --- Bulk labelling ----------------------------------------------------------
 # What `python -m trackanno.predict` scores when it writes predictions.parquet.

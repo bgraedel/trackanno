@@ -449,12 +449,64 @@ is appended and `fsync`ed immediately, so a crash costs at most the clip on
 screen. Annotated clips reopen with their labels loaded, and edits rewrite the
 CSV atomically.
 
+### Which clip comes next
+
+By default the queue is a seeded shuffle of the whole manifest, filtered by movie
+and by done-ness. Movie-by-movie order invites order effects, and the seed
+(`ui.shuffle_seed`) keeps the shuffle reproducible.
+
+**`suggest.select_rule` turns active selection on**, and `"off"` is the default:
+no ranking runs, the queue is the one every earlier version produced, and nothing
+about the screen or the CSV changes. Set it to a rule and, once a model has been
+trained and cleared its reliability gate, the clips that model is least sure
+about are moved to the front of the queue.
+
+| key | default | meaning |
+|---|---|---|
+| `suggest.select_rule` | `"off"` | `off`, `margin`, `least_confidence` or `entropy`. Quote it: an unquoted `off` is a YAML boolean |
+| `suggest.select_batch_size` | `20` | clips per batch, twice `retrain_every` so a batch outlasts the model that ranked it |
+| `suggest.select_audit_share` | `auto` | share of each batch drawn at random from the audit holdout; `auto` is `suggest.audit_fraction` |
+| `suggest.select_frame_gap` | `auto` | frames two ranked clips of one track must be apart; `auto` is `clips.frames`, which suppresses overlapping windows of one animal and nothing else |
+| `suggest.select_target_quota` | `0` | labels a class needs before slots are spent hunting for it; off by default, because targeting skews the label marginals the reliability gate is computed against |
+
+**What you will notice.** The session opens on the model's top pick rather than
+on the first clip of the shuffle. Clips the selector said nothing about keep
+their shuffle order behind the batch.
+
+A batch is recomputed when the model changes - `suggest.retrain_every` labels
+trigger a background refit, and the queue is re-ranked when that refit lands,
+never once per label. **The clip on screen when it lands does not move.** The
+fresh picks are spliced in immediately after it, which is the earliest place a
+forward-only cursor can still reach; anything put in front of the cursor would
+never be seen, because navigation only ever scans forward. The status line says
+how many were re-queued. If the selector fails - a model trained at a different
+window length, say - the status line says that instead and the queue falls back
+to the shuffle, so a broken selector costs the ordering and never the ability to
+annotate.
+
+**The labelled set stops being a random sample of the clips the moment this is
+on.** That is not a side effect to be managed, it is what selection is: the rows
+that end up in the CSV are the ones the model asked for, which is to say the hard
+ones, and an accuracy computed over them afterwards is an accuracy on a set
+assembled to be hard - lower than the truth by an amount the file alone cannot
+say.
+
+Two things keep an unbiased number alive. `suggest.select_audit_share` of every
+batch is drawn **uniformly at random** from the audit holdout
+(`suggest.audit_fraction`) instead of being ranked, so the labelled part of that
+holdout stays a random sample of it however good the selector gets - and that is
+the sample `audit_accuracy` in the model report is computed over. Those draws are
+spread through the batch rather than parked at its end, so stopping halfway
+through still leaves them in proportion. And every row now records why its clip
+was shown, which is what lets anyone separate the two groups later.
+
 ### The CSV
 
 ```
 clip_id, movie_id, source_file, series, channel, track_id, f_start, f_end,
 crop_x0, crop_y0, crop_w, crop_h, scale,
-<one column per category group>, uncertain, notes, annotator, timestamp_utc, dwell_s
+<one column per category group>, uncertain, notes, annotator, timestamp_utc,
+dwell_s, suggested, suggest_conf, suggest_shown, selected_by
 ```
 
 Multi-choice groups are `|`-joined. The identity and geometry columns, with
@@ -464,6 +516,34 @@ Multi-choice groups are `|`-joined. The identity and geometry columns, with
 original_x = crop_x0 + cache_x / scale
 original_y = crop_y0 + cache_y / scale
 ```
+
+`suggested` / `suggest_conf` / `suggest_shown` record the model's answer and
+whether the annotator could see it, because agreement is not influence unless the
+two are recorded apart.
+
+**`selected_by` records why the clip was put in front of a human**, as one line of
+JSON. It is the column that keeps the paragraph above computable. Four shapes,
+and they are four different facts:
+
+| cell | means |
+|---|---|
+| empty | **not recorded.** No selector had chosen anything in that session. This is *not* "chosen at random" and nothing may read it as such |
+| `{"rule":"margin","score":0.83,"rank":0,...}` | the selector chose this clip: the rule that chose it, the score that earned it, its rank in the batch, the pool it was drawn from and the model's own prediction at the time |
+| `{"rule":"audit_random",...}` | a reserved uniform draw from the audit holdout, carrying `"score": null` because a coin toss has no score and `0.0` would read as certainty |
+| `{"rule":"annotator_navigated"}` | a selector was running and did not choose this clip - a human navigated to it, with the arrow keys, `Tab`, or a filter change |
+
+```python
+from trackanno.store import decode_provenance
+
+why = labels["selected_by"].map(decode_provenance)
+unbiased = labels[why.map(lambda d: d.get("rule") == "audit_random")]
+```
+
+Keys are sorted and the encoding is ASCII, so re-recording the same decision is a
+no-op in a diff and no rule name can put a newline inside a row. Rows written
+before the column existed are empty; opening such a file says so once, out loud,
+because filling those blanks in with "random" is exactly the conflation the column
+was added to prevent.
 
 ---
 
@@ -476,8 +556,12 @@ uv run suggest.py --ablate     # kinematic vs CNN vs both
 ```
 
 Trains a classifier on the labels so far and displays its prediction on the next
-clip without pre-selecting it, so labels stay statistically independent of the
-model trained on them.
+clip. With `suggest.select_rule: "off"`, the default, it does not choose which
+clip comes next either, so the labelled set stays a random sample and every
+statistic computed over it is a statement about the data. Turning selection on
+(see *Which clip comes next*, above) spends that property to buy the model's
+attention, and writes the trade into every row rather than leaving it to be
+inferred.
 
 **CatBoost is the default**, and an ordinary dependency, for two properties of
 this data:
@@ -543,7 +627,9 @@ would score re-identification rather than behaviour. The model stays silent unti
 its chance-corrected agreement (Cohen's kappa) clears zero at the 5th bootstrap
 percentile and macro-F1 clears `suggest.min_macro_f1`. A share of clips
 (`suggest.audit_fraction`) is never suggested on and never trained on, keeping
-human-vs-model agreement measurable.
+human-vs-model agreement measurable. With selection on, the labelled part of that
+holdout also has to stay a random sample of it, which is what
+`suggest.select_audit_share` reserves slots in every batch for.
 
 Where no suggestion appears the cause is one of: a held-out audit clip,
 confidence below `suggest.min_confidence`, a group gated off by the report, or a

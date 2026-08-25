@@ -73,6 +73,64 @@ def _spelled_out(written: int | str, value: int) -> str:
     return f"{value}, from 'auto'" if isinstance(written, str) else str(value)
 
 
+def _optional_auto(value, where: str, expected: str):
+    """A setting that may say ``auto``: ``None`` for auto, the value otherwise.
+
+    ``None`` rather than the resolved number, because what ``auto`` stands for
+    is a fact about another section (``clips.frames``, ``audit_fraction``) that
+    this parse cannot see yet - and because a config that says ``auto`` should
+    keep saying it when the GUI writes the file back, instead of freezing
+    today's answer into the text.
+    """
+    if isinstance(value, str):
+        if value != "auto":
+            raise ConfigError(f"{where} must be {expected}, got {value!r}")
+        return None
+    return value
+
+
+def _selection_rules(d: dict) -> tuple[str, str]:
+    """``(select_rule, select_target_rule)``, or a refusal naming the choices.
+
+    Both names are validated against :mod:`trackanno.select` itself rather than
+    against a list copied into this file: a rule added there and forgotten here
+    would be refused as unknown while it works perfectly, and the copy would rot
+    silently in the other direction too.
+    """
+    from .select import TARGET_RULES, UNCERTAINTY_RULES
+
+    raw = d.get("select_rule", "off")
+    if isinstance(raw, bool):
+        # YAML reads a bare `off` (and `no`, and `false`) as a boolean, so the
+        # one value this key is most likely to be given is the one that arrives
+        # as the wrong type. Say which quotation mark fixes it.
+        raise ConfigError(
+            "suggest.select_rule came through as a YAML boolean, which is what an "
+            "unquoted `off`/`on` becomes. Quote it - select_rule: \"off\" - so it "
+            "stays the word it looks like on the page."
+        )
+    rule = str(raw)
+    if rule != "off" and rule not in UNCERTAINTY_RULES:
+        raise ConfigError(
+            f"suggest.select_rule must be \"off\" (clips reach the annotator in the "
+            f"GUI's own shuffled order, as they always have) or one of "
+            f"{sorted(UNCERTAINTY_RULES)}, got {rule!r}. They rank differently and "
+            "the difference is not cosmetic: least_confidence reads only the top "
+            "probability, margin the gap between the top two, entropy the whole "
+            "vector and so mostly its tail."
+        )
+    target_rule = str(d.get("select_target_rule", "target_runner_up"))
+    if target_rule not in TARGET_RULES:
+        raise ConfigError(
+            f"suggest.select_target_rule must be one of {sorted(TARGET_RULES)}, got "
+            f"{target_rule!r}. 'target_confident' fills a starved class fastest and "
+            "cannot move its boundary; 'target_runner_up' picks the clips sitting on "
+            "that boundary, which fills the count more slowly and is the only one of "
+            "the two whose labels move the decision surface."
+        )
+    return rule, target_rule
+
+
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     """'#4C9F70' -> (76, 159, 112). Everything downstream works in RGB."""
     s = color.lstrip("#")
@@ -321,6 +379,80 @@ class Suggest:
     feature_groups: list[str] = field(
         default_factory=lambda: ["kinematic", "pose", "waveform", "cnn"])
 
+    # -- which clips the annotator is handed next (:mod:`trackanno.select`) --- #
+    # Every key below is prefixed `select_` rather than living in a section of
+    # its own, because none of them mean anything without the model this section
+    # fits: a `select:` block would let someone configure a selector for a
+    # project whose suggester is switched off, and would sit far enough from
+    # `min_per_class` to hide that `select_target_quota` is a different bar over
+    # the same counts.
+    #
+    # 'off' is the default and reproduces the historical behaviour exactly: no
+    # ranking runs, the GUI keeps its seeded shuffle, and the annotation order is
+    # the one every earlier version produced. That is deliberate rather than
+    # cautious - selection stops the labelled set being a random sample of the
+    # clips, and every statistic computed over it changes meaning - so it is
+    # something a project opts into, never something an upgrade does to it.
+    select_rule: str = "off"
+    # Clips per batch. Twice `retrain_every` so a batch outlives the refit that
+    # produced it (an annotator who empties one is left with no order at all
+    # until the model next changes), and large enough that the reserved audit
+    # share is a whole slot: `int(share * n + 0.5)` rounds a batch of 4 at the
+    # 0.10 default down to no draw at all.
+    select_batch_size: int = 20
+    # Share of each batch drawn uniformly at random from the audit holdout.
+    # 'auto' is `audit_fraction`, DERIVED and not restated: draw audit clips at
+    # any other rate and the labelled audit subset stops being proportional to
+    # the audit set, so the one unbiased accuracy in the tool starts describing
+    # a differently-composed sample than the one it names.
+    select_audit_share: float | str = "auto"
+    # Frames two ranked clips of one track must be apart. 'auto' is
+    # `clips.frames`: closer than one clip length and two windows of a track
+    # literally share footage, so the second charges the annotator again for
+    # what the first already showed. Pairs exactly that far apart are kept, so
+    # 'auto' suppresses overlap and nothing else.
+    select_frame_gap: int | str = "auto"
+    # Labels a class needs before slots are spent hunting for it. 0 (off) even
+    # when selection is on, because targeting deliberately skews the label
+    # marginals and both `train_group`'s gates - Cohen's kappa and the majority
+    # baseline - are computed against those marginals: it can turn the suggester
+    # silent on a model that has not changed. Worth doing, not worth defaulting.
+    select_target_quota: int = 0
+    select_target_rule: str = "target_runner_up"
+
+    # -- what the selector actually runs with, 'auto' spelled out ----------- #
+    @property
+    def selection_on(self) -> bool:
+        return self.select_rule != "off"
+
+    def resolved_audit_share(self) -> float:
+        """``select_audit_share`` with ``auto`` filled in: ``audit_fraction``.
+
+        One number, two places it has to hold: `audit_fraction` decides which
+        clips are in the holdout, and this decides how often the batch draws
+        from it. Let them differ and the labelled audit subset drifts away from
+        the audit set's own share of the project - it is still a random sample,
+        so nothing raises, but it fills at the wrong rate and either stalls
+        (`audit_accuracy` computed on too few clips) or eats slots the ranking
+        was supposed to spend.
+        """
+        if isinstance(self.select_audit_share, str):
+            return float(self.audit_fraction)
+        return float(self.select_audit_share)
+
+    def resolved_frame_gap(self, clips: "Clips") -> int:
+        """``select_frame_gap`` with ``auto`` filled in: ``clips.frames``.
+
+        The one redundancy this codebase can assert rather than estimate: two
+        windows of one track less than a clip length apart overlap, so they are
+        partly the same footage and a human judging both judges some frames
+        twice. Anything wider is a claim about how fast behaviour changes, which
+        is a per-project number and so is left to be typed.
+        """
+        if isinstance(self.select_frame_gap, str):
+            return max(0, int(clips.frames))
+        return max(0, int(self.select_frame_gap))
+
     @classmethod
     def parse(cls, d: dict) -> "Suggest":
         _known(
@@ -329,7 +461,9 @@ class Suggest:
              "min_macro_f1", "audit_fraction", "audit_visible", "seed", "audit_seed",
              "min_confidence",
              "iterations", "depth", "learning_rate", "l2_leaf_reg", "balance_classes",
-             "feature_groups"],
+             "feature_groups",
+             "select_rule", "select_batch_size", "select_audit_share",
+             "select_frame_gap", "select_target_quota", "select_target_rule"],
         )
         model = str(d.get("model", "catboost"))
         if model not in ("hist", "catboost"):
@@ -359,8 +493,69 @@ class Suggest:
         audit = float(d.get("audit_fraction", 0.10))
         if not 0.0 <= audit < 1.0:
             raise ConfigError("suggest.audit_fraction must be in [0, 1)")
+        enabled = bool(d.get("enabled", True))
+        rule, target_rule = _selection_rules(d)
+        batch = int(d.get("select_batch_size", 20))
+        if batch < 1:
+            raise ConfigError(
+                f"suggest.select_batch_size must be at least 1 (got {batch}); it is "
+                "how many clips one batch hands the annotator, and a batch of none "
+                "is spelled by setting suggest.select_rule to 'off'"
+            )
+        share = _optional_auto(
+            d.get("select_audit_share", "auto"), "suggest.select_audit_share",
+            "a share of the batch or 'auto' (suggest.audit_fraction, so the batch "
+            "draws audit clips at the rate the project contains them)",
+        )
+        if share is not None and not 0.0 <= float(share) <= 1.0:
+            raise ConfigError(
+                f"suggest.select_audit_share must be in [0, 1], got {float(share)}; "
+                "it is the share of each batch drawn at random from the audit "
+                "holdout, and 1.0 - every slot a random draw - is already the "
+                "degenerate end of it"
+            )
+        gap = _optional_auto(
+            d.get("select_frame_gap", "auto"), "suggest.select_frame_gap",
+            "a number of frames or 'auto' (clips.frames, one clip length, which "
+            "is exactly the separation below which two windows of one track "
+            "share footage)",
+        )
+        if gap is not None and int(gap) < 0:
+            raise ConfigError(
+                f"suggest.select_frame_gap must be 0 or more (got {int(gap)}); 0 "
+                "turns the diversity rule off, and a negative separation is not a "
+                "thing to require"
+            )
+        quota = int(d.get("select_target_quota", 0))
+        if quota < 0:
+            raise ConfigError(
+                f"suggest.select_target_quota must be 0 or more (got {quota}); it is "
+                "the label count a class stops being starved at, and 'do not target "
+                "at all' is written as 0"
+            )
+        if rule != "off" and audit <= 0.0:
+            raise ConfigError(
+                f"suggest.select_rule is {rule!r} but suggest.audit_fraction is "
+                f"{audit:g}, so this project has no audit holdout. Selection hands "
+                "the annotator whichever clips the model is least sure about, which "
+                "makes the labelled set a sample assembled to be hard: every "
+                "accuracy computed over it afterwards is lower than the truth by an "
+                "amount nobody can estimate without knowing how the set was "
+                "assembled. The holdout is what keeps one unbiased estimate alive - "
+                "clips drawn by a coin, never ranked - and at audit_fraction 0 there "
+                "is no such clip to draw. Set suggest.audit_fraction above 0 (0.10 "
+                "holds out a tenth), or set suggest.select_rule to 'off'."
+            )
+        if rule != "off" and not enabled:
+            raise ConfigError(
+                f"suggest.select_rule is {rule!r} but suggest.enabled is false, so "
+                "no model is ever loaded and there is nothing to rank the clips "
+                "with. The order would silently stay the GUI's shuffle, which is "
+                "the setting quietly not applying. Set suggest.enabled to true, or "
+                "suggest.select_rule to 'off'."
+            )
         return cls(
-            enabled=bool(d.get("enabled", True)),
+            enabled=enabled,
             model=model,
             pca_components=max(2, int(d.get("pca_components", 32))),
             retrain_every=max(1, int(d.get("retrain_every", 10))),
@@ -379,6 +574,12 @@ class Suggest:
             l2_leaf_reg=float(d.get("l2_leaf_reg", 3.0)),
             balance_classes=bool(d.get("balance_classes", True)),
             feature_groups=groups,
+            select_rule=rule,
+            select_batch_size=batch,
+            select_audit_share="auto" if share is None else float(share),
+            select_frame_gap="auto" if gap is None else int(gap),
+            select_target_quota=quota,
+            select_target_rule=target_rule,
         )
 
 

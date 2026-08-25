@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from .clipfeatures import (
     feature_columns,
 )
 from .config import Config, load_config
+from .select import select_batch
 
 MODEL_FILE = "suggest_model.joblib"
 REPORT_FILE = "suggest_report.json"
@@ -72,6 +74,32 @@ def is_audit_clip(clip_id: str, cfg: Config) -> bool:
     return (int.from_bytes(digest, "big") % 10_000) < frac * 10_000
 
 __all__ = ["Suggester", "train", "main", "MODEL_FILE", "REPORT_FILE"]
+
+
+def _selection_slots(n: int, share: float, ranked: int, audit: int) -> int:
+    """The largest batch <= ``n`` that the two candidate pools can actually fill.
+
+    :func:`trackanno.select.select_batch` refuses a batch bigger than its pools
+    on the grounds that the caller built the mask and so knows the pool size
+    before it asks. This is that caller doing the knowing. A project simply runs
+    out of clips near the end, and an annotator who has labelled all but three
+    should be handed three, not an exception.
+
+    Both pools bind, and they bind separately: the ranked slots need ranked
+    candidates and the reserved slots need unannotated AUDIT candidates, and
+    topping one up from the other is exactly what the stratum exists to prevent.
+    The reserve is not linear in the batch size - it is ``int(share * n + 0.5)``,
+    a rounding - so this searches downward from ``n`` rather than solving for it,
+    over a batch size that is a screenful of clips.
+
+    Returns ``0`` when nothing fits, which is the "nothing left to choose" the
+    caller reports as an empty batch.
+    """
+    for size in range(int(n), 0, -1):
+        reserved = int(float(share) * size + 0.5) if audit else 0
+        if reserved <= audit and size - reserved <= ranked:
+            return size
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -699,11 +727,19 @@ class Suggester:
         # `window_problem`.
         self.trained_window: int | None = None
         self._by_clip: dict[str, np.ndarray] = {}
+        # Bumped by every `load`, and the only thing a caller needs in order to
+        # know that a batch from `selection_batch` is out of date. See that
+        # method on why the answer must NOT be recomputed per label.
+        self.model_epoch: int = 0
         self.load()
 
     def load(self) -> bool:
         import joblib
 
+        # Before anything can fail: a load replaces the model whether it
+        # succeeds or not, so a batch computed against the previous one is stale
+        # either way and must not look current.
+        self.model_epoch += 1
         self.problem = ""
         self.columns, self.models, self.reports = [], {}, {}
         self.features, self._by_clip = None, {}
@@ -839,6 +875,237 @@ class Suggester:
 
     def is_audit_clip(self, clip_id: str) -> bool:
         return is_audit_clip(clip_id, self.cfg)
+
+    # ---------------------------------------------------------- selection -- #
+    def selection_group(self) -> str:
+        """Which group's model ranks the clips, or ``""`` if none can.
+
+        The first single-choice group in config order that the model covers,
+        which is the same group the GUI already records as the primary
+        suggestion - so the ranking and the suggestion on screen come from one
+        model rather than two, and a project with several groups does not
+        silently rank on whichever one a dict happened to yield first.
+
+        Multi-select groups are not candidates: their label is a SET, and every
+        rule in :mod:`trackanno.select` reads a posterior over mutually
+        exclusive classes.
+        """
+        for group in self.cfg.categories:
+            if not group.is_multi and group.name in self.models:
+                return group.name
+        return ""
+
+    def _refuse_window_mismatch(self, length: int) -> None:
+        """Refuse a model fitted at another window length; only warn if it never said.
+
+        The same split :func:`trackanno.predict._check_trained_window` makes, for
+        the same reason. A MISMATCH means every clip in the batch is scored on a
+        scale the model has never seen, and the batch that comes back looks
+        exactly like a good one - the ordering is the whole output, so there is
+        nothing to notice afterwards. An UNRECORDED length is a model saved
+        before the stamp existed, and refusing those would mean upgrading
+        trackanno stops selection working on every project that already has a
+        model.
+        """
+        problem = self.window_problem(length)
+        if not problem:
+            return
+        if self.trained_window is None:
+            warnings.warn(problem, stacklevel=3)
+            return
+        raise RuntimeError(
+            f"{problem} The {length} frames are clips.frames, the length "
+            f"{CLIP_FEATURES_FILE} - the table every candidate in this batch is "
+            "scored from - was built over."
+        )
+
+    def selection_batch(
+        self, manifest: pd.DataFrame, done_ids: set[str], n: int
+    ) -> list[dict]:
+        """The next `n` clips to annotate, in order, each carrying its provenance.
+
+        Returns [] when selection is off, when the model is not ready, or when
+        there is nothing left to choose - the caller then keeps its existing
+        order untouched.
+
+        Each record is a :func:`trackanno.select.select_batch` record, passed
+        through unchanged and with the ``group`` whose model produced it added:
+        the store's provenance codec and ``select`` were designed against each
+        other, and a second shape here would be a translation nobody asked for.
+        ``index`` is a row of the probability matrix built below, NOT a position
+        in ``manifest``; ``clip_id`` is the join key.
+
+        WHEN TO CALL THIS, which matters as much as what it returns. Recompute
+        when the model changes - :attr:`model_epoch` counts that, and the GUI
+        refits every ``suggest.retrain_every`` labels - and NOT once per label.
+        Re-ranking after every label would re-order the queue under the
+        annotator mid-session: the cursor only moves forward, so a clip that
+        dropped a place is not revisited, and which clips get stranded depends
+        on the order the labels happened to arrive in. The staleness that buys:
+        within one batch every score is the model's opinion as of the last
+        refit, so the last clip of a batch is ranked by a model up to
+        ``retrain_every`` labels out of date. That is a bounded, stated error;
+        a queue that reshuffles under the person reading it is not.
+
+        The batch is a function of the pool's contents, the config and
+        ``suggest.audit_seed`` alone - never of the row order of ``manifest`` -
+        because :mod:`trackanno.select` breaks every tie on ``clip_id``.
+
+        Parameters
+        ----------
+        manifest
+            The clip manifest: ``clip_id``, plus ``movie_id``, ``track_id`` and
+            ``f_start`` when the diversity rule is on. Any subset of the project
+            (one movie, say) is a valid pool - it is the pool that is ranked.
+        done_ids
+            Clips already annotated. Excluded from the candidate mask, so a
+            batch never hands back work that is finished.
+        n
+            How many clips to ask for. The answer may be SHORTER: the diversity
+            rule can forbid the rest, and the request is sized down to what the
+            pools actually hold rather than refused, because this method built
+            those pools and so is the caller that ought to know.
+        """
+        cfg = self.cfg
+        if not cfg.suggest.enabled or not cfg.suggest.selection_on:
+            return []
+        if not self.ready or manifest is None or not len(manifest):
+            return []
+        group = self.selection_group()
+        if not group or int(n) <= 0:
+            return []
+
+        # Before any scoring: the features every candidate is scored from were
+        # built over the annotation clip grid, whose windows are clips.frames
+        # long, and a model fitted at another length ranks them on the wrong
+        # scale while reporting normal confidence.
+        self._refuse_window_mismatch(int(cfg.clips.frames))
+
+        gap = cfg.suggest.resolved_frame_gap(cfg.clips)
+        ids = manifest["clip_id"].astype(str).to_numpy()
+
+        # A clip with no feature row cannot be scored, so it is left OUT of the
+        # pool rather than imputed: an imputed row still ranks, and it would
+        # rank on numbers the clip does not have. This is the ordinary state
+        # after re-running detection - the manifest is rebuilt, the feature
+        # table is not - so it is a filter, not an error.
+        rows = [self._by_clip.get(clip_id) for clip_id in ids]
+        keep = np.array([row is not None for row in rows], dtype=bool)
+        if not keep.any():
+            return []
+        pool = np.flatnonzero(keep)
+        pool_ids = ids[pool]
+
+        done = {str(c) for c in (done_ids or ())}
+        candidates = np.array([c not in done for c in pool_ids], dtype=bool)
+        # Audit clips stay IN the pool and are flagged, never filtered out:
+        # `select_batch` removes them from the ranked pool itself and draws the
+        # reserved slots from them. Filtering them here would leave it with
+        # nothing to draw and silently turn the random stratum off.
+        audit = np.array([is_audit_clip(c, cfg) for c in pool_ids], dtype=bool)
+        n_audit = int((candidates & audit).sum())
+        n_ranked = int((candidates & ~audit).sum())
+
+        share = cfg.suggest.resolved_audit_share()
+        size = _selection_slots(int(n), share, n_ranked, n_audit)
+        if size <= 0:
+            return []
+
+        model = self.models[group]
+        matrix = np.vstack([rows[i] for i in pool])
+        proba = np.asarray(model.predict_proba(matrix), dtype=float)
+        classes = [str(c) for c in model.classes_]
+
+        records = select_batch(
+            proba, pool_ids, classes, size,
+            rule=cfg.suggest.select_rule,
+            candidates=candidates,
+            # An audit pool with nothing unannotated left in it is passed as
+            # None. That is not the "this project has no holdout" lie the
+            # parameter warns about: every audit clip is already labelled, so
+            # the two masks select the same rows, and the only difference is
+            # whether slots are reserved for a draw that has nothing to draw.
+            audit=audit if n_audit else None,
+            audit_share=share,
+            # The audit set's membership and its sampling are one mechanism, so
+            # they share one seed. `suggest.seed` is deliberately not used: it
+            # exists to be varied to check CV stability, and doing that must not
+            # change which clips a human is handed.
+            seed=cfg.suggest.audit_seed,
+            class_counts=self._label_counts(group, classes),
+            target_quota=cfg.suggest.select_target_quota,
+            target_rule=cfg.suggest.select_target_rule,
+            track_ids=self._track_keys(manifest, pool) if gap else None,
+            frames=manifest["f_start"].to_numpy()[pool] if gap else None,
+            min_frame_gap=gap,
+        )
+        for record in records:
+            # Which model scored the clip, which `predicted_class` is meaningless
+            # without on a project with more than one category group. The store's
+            # codec takes any extra key, precisely so a rule that needs to record
+            # one more thing does not force a schema migration.
+            record["group"] = group
+            # A record that cannot be written down is not provenance. `select`
+            # scores a random draw NaN - it has no score, and inventing 0.0 would
+            # read as "the model was certain" - but `store.encode_provenance`
+            # refuses NaN outright, on the grounds that JSON has no such value
+            # and it does not read back the same everywhere. So the one float
+            # that can be non-finite is translated here, at the seam, to the JSON
+            # value that means the same thing and survives the round trip. None
+            # is still not 0.0, which is the distinction that mattered.
+            for key, value in list(record.items()):
+                if isinstance(value, float) and not np.isfinite(value):
+                    record[key] = None
+        return records
+
+    def _label_counts(self, group: str, classes: list[str]) -> dict:
+        """Labels per class as of the last fit, for the starved-class quota.
+
+        Read off the training report rather than recounted from the CSV: these
+        are the counts the model was actually FITTED on, which is the right
+        denominator for "does it have enough examples of this class", and they
+        move only when the model does - so the quota cannot re-plan the batch
+        halfway through it.
+
+        Classes with no column in the probability matrix are dropped rather than
+        passed: `select_batch` refuses a count it cannot target, and a report
+        left behind by an earlier fit can legitimately name a class the current
+        model does not have. The consequence worth stating is that a class too
+        rare to be MODELLED at all (below ``suggest.min_per_class``) has no
+        column either, so targeting cannot reach the one class that is scarcest
+        of all - only more labels of it can, which is what min_per_class is
+        already saying.
+        """
+        if int(self.cfg.suggest.select_target_quota) <= 0:
+            return {}
+        report = self.reports.get(group) or {}
+        counts = report.get("per_class_counts") or {}
+        known = set(classes)
+        return {str(k): int(v) for k, v in counts.items() if str(k) in known}
+
+    @staticmethod
+    def _track_keys(manifest: pd.DataFrame, pool: np.ndarray) -> np.ndarray:
+        """``movie::track`` per pool row - the identity the diversity rule needs.
+
+        Track ids are numbered per MOVIE and so are ``f_start`` frames, so two
+        movies routinely hold a track 3 whose clips start at frame 250. Handed a
+        bare ``track_id`` the diversity rule would read those as the same animal
+        at the same moment and suppress one of them: a genuinely informative
+        clip dropped from the batch for a collision between two movies that
+        share nothing. The pair is unique because ``clip_id`` is built from it.
+        """
+        missing = [c for c in ("movie_id", "track_id", "f_start")
+                   if c not in manifest.columns]
+        if missing:
+            raise ValueError(
+                f"suggest.select_frame_gap is on but the manifest has no {missing} "
+                "column(s); the diversity rule needs to know which clips are "
+                "successive windows of one animal. Set suggest.select_frame_gap to "
+                "0 to turn it off deliberately."
+            )
+        movies = manifest["movie_id"].astype(str).to_numpy()[pool]
+        tracks = manifest["track_id"].astype(str).to_numpy()[pool]
+        return np.array([f"{m}::{t}" for m, t in zip(movies, tracks)], dtype=str)
 
     def suggest(self, clip_id: str) -> dict[str, tuple[str, float]]:
         """{group: (predicted_value, confidence)} for one clip; {} if unavailable."""
