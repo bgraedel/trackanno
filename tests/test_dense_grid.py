@@ -17,7 +17,7 @@ about the change itself rather than about either mode:
   dividing it by ``length``, which is only an index while the grid tiles. Under
   overlap both bounds land short, and the failure is missing rows rather than an
   exception, so the check is that a track's windows actually span its lifetime;
-* that :func:`trackanno.densepredict.coverage` has a caller at all. It is the
+* that :func:`trackanno.infer.densepredict.coverage` has a caller at all. It is the
   function that would have caught the index bug and it had been dead code
   through two changes of the grid.
 
@@ -33,7 +33,7 @@ import pandas as pd
 import pytest
 from harness import check
 from trackanno.config import load_config
-from trackanno.densepredict import (
+from trackanno.infer.densepredict import (
     coverage, plan_dense_windows, window_grid, window_length, window_stride,
 )
 

@@ -28,13 +28,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .clipfeatures import (
+from ..measure.clipfeatures import (
     CLIP_CNN_RAW_FILE, CLIP_FEATURES_FILE, FEATURE_VERSION, build_clip_features,
     feature_columns,
 )
-from .config import Config, load_config
+from ..config import Config, load_config
 from .select import select_batch
-from .store import AUDIT_COLUMN, decode_audit, read_audit_records
+from ..annotate.store import AUDIT_COLUMN, decode_audit, read_audit_records
 
 MODEL_FILE = "suggest_model.joblib"
 REPORT_FILE = "suggest_report.json"
@@ -63,7 +63,7 @@ _LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
 #   definition.
 # * An INTENSIVE reduction of a per-frame series - a mean, a median, or the mean
 #   of an indicator, which is what a ``_frac`` is. The reducer is legible in the
-#   suffix because :data:`trackanno.trackseries.SERIES_SPEC` names features
+#   suffix because :data:`trackanno.measure.trackseries.SERIES_SPEC` names features
 #   ``column + reducer``, so the dispersions and order statistics (``_std``,
 #   ``_p90``, ``_max``) are excluded by not being on this list.
 _LENGTH_INVARIANT_PREFIXES = ("beat_", "wave_")
@@ -72,7 +72,7 @@ _INTENSIVE_SUFFIXES = ("_mean", "_median", "_frac")
 # Named because the suffix rule would otherwise wave them through, and each is a
 # mean of something the window length itself changes: ``present_frac``'s
 # denominator IS the window, and ``turn_abs_mean`` averages turns measured over
-# the lag :func:`trackanno.clipfeatures._heading_lag` derives from the window
+# the lag :func:`trackanno.measure.clipfeatures._heading_lag` derives from the window
 # length.
 _LENGTH_DEPENDENT_DESPITE_SUFFIX = frozenset({"present_frac", "turn_abs_mean"})
 
@@ -121,7 +121,7 @@ def scoped_columns(columns, scope: str) -> list[str]:
     """``columns`` narrowed by ``suggest.feature_scope``.
 
     The second axis of feature selection, applied after
-    :func:`trackanno.clipfeatures.feature_columns` has applied the first: the
+    :func:`trackanno.measure.clipfeatures.feature_columns` has applied the first: the
     groups say which instrument a column came from, this says how it behaves
     when the window length changes. An unknown scope RAISES rather than falling
     through to "all", which would fit on more columns than were asked for and
@@ -248,7 +248,7 @@ __all__ = ["Suggester", "train", "main", "AuditHoldout",
 def _selection_slots(n: int, share: float, ranked: int, audit: int) -> int:
     """The largest batch <= ``n`` that the two candidate pools can actually fill.
 
-    :func:`trackanno.select.select_batch` refuses a batch bigger than its pools,
+    :func:`trackanno.learn.select.select_batch` refuses a batch bigger than its pools,
     so an annotator who has labelled all but three clips is sized down to three
     rather than handed an exception.
 
@@ -437,7 +437,7 @@ def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int, raw_cnn=No
     from sklearn.decomposition import PCA
     from sklearn.model_selection import StratifiedGroupKFold
 
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     pred = np.empty(len(y), dtype=object)
@@ -512,7 +512,7 @@ def train_group(
     single group gets: the holdout then comes from ``labels``, the table this
     call is already fitting.
     """
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     if holdout is None:
@@ -782,7 +782,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     """Build features, fit every category group, persist models + report."""
     import joblib
 
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir
@@ -837,7 +837,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
                 file=sys.stderr,
             )
 
-    from .clipfeatures import available_groups
+    from ..measure.clipfeatures import available_groups
 
     blocked = {g: why for g, why in available_groups(cfg).items()
                if why and g in cfg.suggest.feature_groups}
@@ -1243,7 +1243,7 @@ class Suggester:
         the ranking and the suggestion on screen come from one model.
 
         Multi-select groups are not candidates: their label is a SET, and every
-        rule in :mod:`trackanno.select` reads a posterior over mutually
+        rule in :mod:`trackanno.learn.select` reads a posterior over mutually
         exclusive classes.
         """
         for group in self.cfg.categories:
@@ -1260,7 +1260,7 @@ class Suggester:
         there is nothing left to choose - the caller then keeps its existing
         order untouched.
 
-        Each record is a :func:`trackanno.select.select_batch` record, passed
+        Each record is a :func:`trackanno.learn.select.select_batch` record, passed
         through unchanged with the ``group`` whose model produced it added.
         ``index`` is a row of the probability matrix built below, NOT a position
         in ``manifest``; ``clip_id`` is the join key.
@@ -1274,7 +1274,7 @@ class Suggester:
 
         The batch is a function of the pool's contents, the config and
         ``suggest.audit_seed`` alone, never of the row order of ``manifest``,
-        because :mod:`trackanno.select` breaks every tie on ``clip_id``.
+        because :mod:`trackanno.learn.select` breaks every tie on ``clip_id``.
 
         Parameters
         ----------
@@ -1568,7 +1568,7 @@ def ablate(cfg: Config) -> None:
     """
     features = build_clip_features(cfg, verbose=False)
     labels = pd.read_csv(cfg.paths.csv)
-    from .clipfeatures import FEATURE_GROUPS, available_groups
+    from ..measure.clipfeatures import FEATURE_GROUPS, available_groups
 
     # The same positional tag and fold-wise PCA that `train` sets up: without
     # `_row` the guard inside train_group never fires and every row is

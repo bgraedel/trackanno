@@ -23,12 +23,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .clips import NORM_FILE, TRACKS_FILE
-from .config import Config, load_config
-from .movies import MovieSource, Normalizer, open_movie
+from ..annotate.clips import NORM_FILE, TRACKS_FILE
+from ..config import Config, load_config
+from ..video.movies import MovieSource, Normalizer, open_movie
 from .overlay import draw_detections, gray_to_rgb, hex_to_rgb
-from .predict import row_kind
-from .store import MULTI_SEP
+from ..infer.predict import row_kind
+from ..annotate.store import MULTI_SEP
 
 SOURCES = ("labels", "predictions", "both")
 
@@ -91,7 +91,7 @@ def build_frame_marks(
     the labels pass's rule instead: whichever row comes later in the file wins
     the shared frames.
 
-    Which of the two a file holds comes from :func:`trackanno.predict.row_kind`.
+    Which of the two a file holds comes from :func:`trackanno.infer.predict.row_kind`.
 
     A hand label landing on a frame a prediction already claimed is NOT a
     collision: it is what ``--source both`` is for, and the labels pass below
@@ -228,7 +228,7 @@ def render_movie(
 ) -> Path:
     import imageio.v2 as imageio
 
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     n_frames = min(movie.n_frames, max_frames) if max_frames else movie.n_frames
@@ -321,7 +321,7 @@ def render_movie(
 # batch driver - shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
 def prediction_unit(predictions: pd.DataFrame) -> str:
-    """The noun the Export page counts rows in, from :func:`trackanno.predict.row_kind`.
+    """The noun the Export page counts rows in, from :func:`trackanno.infer.predict.row_kind`.
 
     Two words for three kinds: a clip and a dense window are both a fixed span
     the predictor was handed, and only a bout is a run between inferred
@@ -363,7 +363,7 @@ def render_all(
     ``source`` is ``labels`` (the CSV, default), ``predictions`` or ``both``; a
     missing predictions file raises rather than rendering an empty overlay,
     which looks exactly like "the model had no opinion"."""
-    from .progress import Cancelled, NullReporter
+    from ..progress import Cancelled, NullReporter
 
     reporter = reporter or NullReporter()
     if source not in SOURCES:
@@ -380,7 +380,7 @@ def render_all(
     group_name = group_name or default_group(cfg)
     predictions = None
     if source != "labels":
-        from .predict import load_predictions, staleness
+        from ..infer.predict import load_predictions, staleness
 
         predictions = load_predictions(cfg, group_name)
         stale = staleness(cfg)
@@ -488,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {movie_id:<45} {n:>5} annotated clips")
         return 0
 
-    from .progress import ConsoleReporter
+    from ..progress import ConsoleReporter
 
     try:
         render_all(

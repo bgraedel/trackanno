@@ -13,15 +13,15 @@ import numpy as np
 import pandas as pd
 import pytest
 from harness import check
-from trackanno.clips import (
+from trackanno.annotate.clips import (
     ClipStore, MANIFEST_FILE, build_box_table, choose_crop_size, finalise_geometry,
     plan_clips, specs_to_frame, write_clip_cache,
 )
 from trackanno.config import load_config
-from trackanno.movies import MovieSource, Normalizer
-from trackanno.overlay import build_clip_view, render_clip_rgb
-from trackanno.store import AnnotationStore
-from trackanno.tiling import tile_grid
+from trackanno.video.movies import MovieSource, Normalizer
+from trackanno.view.overlay import build_clip_view, render_clip_rgb
+from trackanno.annotate.store import AnnotationStore
+from trackanno.detect.tiling import tile_grid
 
 N_FRAMES, HEIGHT, WIDTH = 120, 512, 512
 CONFIG_TEXT = """
@@ -105,8 +105,8 @@ def test_tile_grid() -> None:
 
 def test_greedy_tracker(cfg) -> None:
     """The documented fallback when ultralytics' internals move under us."""
-    from trackanno.tiling import Detections
-    from trackanno.tracking import GreedyTracker
+    from trackanno.detect.tiling import Detections
+    from trackanno.detect.tracking import GreedyTracker
 
     tracker = GreedyTracker(cfg, fps=100.0)
     ids_over_time = []

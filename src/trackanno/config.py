@@ -130,11 +130,11 @@ def _window_scales(value) -> list[int]:
 def _selection_rules(d: dict) -> tuple[str, str]:
     """``(select_rule, select_target_rule)``, or a refusal naming the choices.
 
-    Both names are validated against :mod:`trackanno.select` itself rather than
+    Both names are validated against :mod:`trackanno.learn.select` itself rather than
     against a list copied into this file, which would rot silently in either
     direction.
     """
-    from .select import TARGET_RULES, UNCERTAINTY_RULES
+    from .learn.select import TARGET_RULES, UNCERTAINTY_RULES
 
     raw = d.get("select_rule", "off")
     if isinstance(raw, bool):
@@ -342,7 +342,7 @@ class Tracking:
 
     @classmethod
     def parse(cls, d: dict) -> "Tracking":
-        from .tracking import TRACKERS
+        from .detect.tracking import TRACKERS
 
         _known("tracking", d,
                ["backend", "tracker_cfg", "min_track_length", "greedy_max_dist_px", "overrides"])
@@ -424,7 +424,7 @@ class Suggest:
     # signal, so it is opted into, never a default.
     feature_scope: str = "all"
 
-    # -- which clips the annotator is handed next (:mod:`trackanno.select`) --- #
+    # -- which clips the annotator is handed next (:mod:`trackanno.learn.select`) --- #
     # Every key below is prefixed `select_` rather than living in a section of
     # its own, because none of them mean anything without the model this section
     # fits. 'off' is the default: no ranking runs and the GUI keeps its seeded
@@ -485,7 +485,7 @@ class Suggest:
 
         It lives on the config because two modules need it and neither can own
         it: the store stamps membership into the CSV at label time and
-        :mod:`trackanno.suggest` reads the stamp back.
+        :mod:`trackanno.learn.suggest` reads the stamp back.
 
         Its own seed, not ``seed``: ``seed`` exists to be varied to check CV
         stability, and doing that must not redraw the holdout.
@@ -532,7 +532,7 @@ class Suggest:
                 "alone sets the width (2**depth leaves) - past 6 it overfits a "
                 "hand-labelled set fast."
             )
-        from .clipfeatures import FEATURE_GROUPS
+        from .measure.clipfeatures import FEATURE_GROUPS
 
         groups = d.get("feature_groups")
         groups = list(FEATURE_GROUPS) if groups is None else [str(g) for g in groups]
@@ -690,7 +690,7 @@ class Predict:
     ``manifest`` scores exactly the clips cut for annotation, a sampling chosen
     for a human's attention, so everything between two annotation windows comes
     out unlabelled and unpainted in the rendered movie. ``dense`` lays its own
-    grid over every frame of every track - see :mod:`trackanno.densepredict`.
+    grid over every frame of every track - see :mod:`trackanno.infer.densepredict`.
 
     By default that grid TILES, so a change of behaviour can only be reported at
     a window boundary and the error is up to a window long. ``window_stride``
@@ -752,7 +752,7 @@ class Predict:
     def resolved_window(self, clips: "Clips") -> int:
         """``window_frames`` with ``auto`` filled in: min(frames, stride) of the clips.
 
-        The same number :func:`trackanno.densepredict.window_length` computes,
+        The same number :func:`trackanno.infer.densepredict.window_length` computes,
         repeated here because the stride check in :func:`load_config` compares
         two numbers the user may never have typed, and loading a config must not
         drag in the dense pipeline (and pandas behind it) to learn one integer.
@@ -764,7 +764,7 @@ class Predict:
         those apart. :func:`load_config` refuses ``auto`` there for a dense
         project rather than resolving it; a ``coverage: manifest`` project still
         resolves, and ``predict.py --coverage dense`` on one of those is caught
-        by :meth:`trackanno.suggest.Suggester.refuse_window_mismatch`.
+        by :meth:`trackanno.learn.suggest.Suggester.refuse_window_mismatch`.
         """
         if isinstance(self.window_frames, str):
             return max(1, min(int(clips.frames), int(clips.stride)))
@@ -797,13 +797,13 @@ class Predict:
     def resolved_self_transition(self) -> float:
         """``self_transition`` with ``auto`` filled in.
 
-        The identity itself lives in :func:`trackanno.bouts.self_transition_for`,
+        The identity itself lives in :func:`trackanno.infer.bouts.self_transition_for`,
         beside the decoder that consumes it, so the number and its guard cannot
         drift apart. ``auto`` is only reachable under ``decode: viterbi``, which
         is where ``parse`` guarantees ``min_bout_frames >= 2``.
         """
         if isinstance(self.self_transition, str):
-            from .bouts import self_transition_for
+            from .infer.bouts import self_transition_for
 
             return self_transition_for(self.min_bout_frames)
         return float(self.self_transition)
@@ -937,7 +937,7 @@ class Predict:
 class ModelSource:
     """Where the detection weights come from, when not a file on this disk.
 
-    ``source`` is a model id from the registry (see :mod:`trackanno.models`) or
+    ``source`` is a model id from the registry (see :mod:`trackanno.video.models`) or
     an ``https://`` URL to a ``.pt``. Empty means ``paths.model``, which is what
     a project made from a local file uses.
 
@@ -964,7 +964,7 @@ class ModelSource:
         _known("model", d, ["source", "version", "sha256"])
         source = str(d.get("source", "") or "").strip()
         if source.lower().startswith("http://"):
-            from .models import is_trusted_url
+            from .video.models import is_trusted_url
 
             if not is_trusted_url(source):
                 raise ConfigError(
@@ -1392,7 +1392,7 @@ def _refuse_unresolvable_window(cfg: Config) -> None:
 
     Only under ``coverage: dense``, the one coverage this key governs.
     ``predict.py --coverage dense`` can still push a manifest config down the
-    dense path, where :meth:`trackanno.suggest.Suggester.refuse_window_mismatch`
+    dense path, where :meth:`trackanno.learn.suggest.Suggester.refuse_window_mismatch`
     refuses the mismatch against the model's own recorded length.
     """
     if not isinstance(cfg.predict.window_frames, str):

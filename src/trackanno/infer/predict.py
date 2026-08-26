@@ -1,6 +1,6 @@
 """Label every clip with the trained model, into a file of its own.
 
-    python -m trackanno.predict --config config.yaml
+    python -m trackanno.infer.predict --config config.yaml
 
 The model scores every clip in one pass, so the whole dataset can be exported,
 plotted or compared against the hand labels. Three rules, all about provenance:
@@ -19,7 +19,7 @@ cut for annotation, leaving every frame between two windows unlabelled and
 unpainted, while ``dense`` (the default) lays its own grid over every frame of
 every track and adds ``n_present`` and ``skip_reason``, so a window the model
 could not be given is still a row that says so. See
-:mod:`trackanno.densepredict`.
+:mod:`trackanno.infer.densepredict`.
 
 ``predict.decode`` decides what a row IS. With the default ``none`` a row is a
 WINDOW. With a decode the dense windows are averaged onto the frames they cover,
@@ -34,7 +34,7 @@ Bouts go into ``predictions.parquet`` beside the windows rather than into a file
 of their own: they carry the same ``f_start``/``f_end``/``track_id``/
 ``<group>_pred``/``<group>_conf`` the renderer already reads and are disjoint by
 construction. What they do NOT carry is ``clip_id`` - see :func:`_bout_id`.
-:mod:`trackanno.bouts` holds the arithmetic.
+:mod:`trackanno.infer.bouts` holds the arithmetic.
 """
 
 from __future__ import annotations
@@ -50,10 +50,10 @@ import numpy as np
 import pandas as pd
 
 from .bouts import decode_min_bout, decode_viterbi, frame_posterior, runs_to_bouts
-from .clipfeatures import CLIP_FEATURES_FILE
-from .clips import MANIFEST_FILE, StagedWrite
-from .config import Config, load_config
-from .suggest import MODEL_FILE, REPORT_FILE, Suggester
+from ..measure.clipfeatures import CLIP_FEATURES_FILE
+from ..annotate.clips import MANIFEST_FILE, StagedWrite
+from ..config import Config, load_config
+from ..learn.suggest import MODEL_FILE, REPORT_FILE, Suggester
 
 __all__ = [
     "PREDICTIONS_FILE", "POSTERIORS_FILE", "RowKind", "row_kind", "Verdict",
@@ -447,8 +447,8 @@ def _bout_predictions(
     """One row per (group, decoded bout), and the posterior those bouts came from.
 
     The windows are read OFF THE FEATURE TABLE rather than re-planned with
-    :func:`trackanno.densepredict.plan_dense_windows`: the table's rows ARE that
-    plan, and :func:`trackanno.bouts.frame_posterior` matches windows to
+    :func:`trackanno.infer.densepredict.plan_dense_windows`: the table's rows ARE that
+    plan, and :func:`trackanno.infer.bouts.frame_posterior` matches windows to
     probability rows BY POSITION, so a second copy could disagree with the rows
     actually scored. That is also why ``predict.window_scales`` needs nothing
     here - windows of several LENGTHS are just more rows with different spans,
@@ -639,7 +639,7 @@ def _window_context(suggester, length: int, coverage: str) -> str:
     """Which config key ``length`` was read from, and the edit that resolves it.
 
     The actionable half of the refusal
-    :meth:`trackanno.suggest.Suggester.refuse_window_mismatch` raises, which
+    :meth:`trackanno.learn.suggest.Suggester.refuse_window_mismatch` raises, which
     owns the decision itself. The model cannot know which key the number came
     from, and the two coverages need different instructions: on the dense path
     the length is a setting of its own, while on the manifest path it IS the
@@ -759,7 +759,7 @@ def predict_all(
     re-cuts the bouts on both sides of it. Every window is scored instead and the
     provenance moves onto the row, as ``human_overlap_frac``.
     """
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     coverage = str(coverage or cfg.predict.coverage)
@@ -899,7 +899,7 @@ def load_predictions(cfg: Config, group_name: str | None = None) -> pd.DataFrame
     if not path.exists():
         raise FileNotFoundError(
             f"no predictions at {path}. Run 'Label all clips with the model' on "
-            "the Model page first (or `python -m trackanno.predict`)."
+            "the Model page first (or `python -m trackanno.infer.predict`)."
         )
     frame = pd.read_parquet(path)
     if frame.empty:
@@ -1046,7 +1046,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     cfg = load_config(args.config)
 
-    from .progress import ConsoleReporter
+    from ..progress import ConsoleReporter
 
     try:
         frame = predict_all(

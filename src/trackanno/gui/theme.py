@@ -547,7 +547,7 @@ def app_icon() -> "QIcon":
     from qtpy.QtCore import QLineF, QRectF
     from qtpy.QtGui import QIcon, QPainter, QPixmap
 
-    from ..overlay import TARGET_RGB
+    from ..view.overlay import TARGET_RGB
 
     icon = QIcon()
     for size in (16, 32, 64, 256):

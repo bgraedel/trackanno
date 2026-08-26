@@ -26,7 +26,7 @@ def test_curvature_matches_closed_form() -> None:
     """A circle of radius R has curvature 1/R everywhere, a straight line has
     zero, and a sine has -A(2pi/lam)^2 at its crest. If any of these drift the
     kymograph is drawing something that is not curvature."""
-    from trackanno.kymograph import resample_centreline
+    from trackanno.measure.kymograph import resample_centreline
 
     for radius in (20.0, 50.0, 120.0):
         theta = np.linspace(0, np.pi / 2, 9)
@@ -62,7 +62,7 @@ def test_curvature_is_invariant_to_where_the_cell_is() -> None:
     built in raw image space with no stabilisation, co-swimming frame or body
     axis. If this ever fails, the drawing depends on where the animal drifted
     to and the feature is worthless."""
-    from trackanno.kymograph import resample_centreline
+    from trackanno.measure.kymograph import resample_centreline
 
     theta = np.linspace(0, np.pi / 2, 9)
     x, y = 40.0 * np.cos(theta), 40.0 * np.sin(theta)
@@ -111,7 +111,7 @@ def test_the_chain_comes_from_the_skeleton_not_a_guess() -> None:
     sign of every value on the chart. It is read from the skeleton the project
     declares rather than assumed to be 'node 1 onwards', because that assumption
     is only true for one particular keypoint layout."""
-    from trackanno.kymograph import chain_from_edges
+    from trackanno.measure.kymograph import chain_from_edges
 
     # The layout this project actually uses: Head, Base, Flag1..Flag5, Tip, with
     # the head deliberately not wired into the flagellum chain.
@@ -142,7 +142,7 @@ def test_the_chain_comes_from_the_skeleton_not_a_guess() -> None:
 def test_the_chain_order_sets_the_sign() -> None:
     """Walking a bend from the other end negates its curvature. That is real
     geometry, so it has to be pinned by the skeleton rather than left to chance."""
-    from trackanno.kymograph import curvature_kymograph
+    from trackanno.measure.kymograph import curvature_kymograph
 
     kx, ky = _wave(20, 9, period=12.0, cycles=1.5)
     forward = curvature_kymograph(kx, ky, n_samples=32, smooth_px=0.0,
@@ -171,7 +171,7 @@ def test_the_tangent_angle_is_unwrapped_in_both_directions() -> None:
     wavespectra.spectral_series guards against the same bug for the same reason;
     when it was missing there, every measured amplitude came out near 2*pi
     regardless of the real beat."""
-    from trackanno.kymograph import curvature_kymograph
+    from trackanno.measure.kymograph import curvature_kymograph
 
     # A wave big enough that the tangent angle really does swing past +-pi.
     kymo = curvature_kymograph(*_wave(60, 13, period=14.0, cycles=2, length=60.0),
@@ -222,7 +222,7 @@ def test_the_mirror_ambiguity_is_decided_or_declined() -> None:
     one way and 9 the other. The sign can only be fixed by an ODD functional of
     curvature - every even one (amplitude, power, wave speed, direction) is
     mirror-invariant - and the physical odd one is the static mode."""
-    from trackanno.kymograph import canonical_sign, curvature_kymograph
+    from trackanno.measure.kymograph import canonical_sign, curvature_kymograph
 
     # A beater with a real static bend: the wave rides on a constant offset.
     def bent(offset, n_frames=60):
@@ -280,7 +280,7 @@ def test_a_travelling_wave_reads_as_travelling() -> None:
     """The point of a kymograph: a wave moving along the flagellum makes
     diagonal stripes, a standing one makes vertical stripes. Measured as the
     arclength shift that best lines up consecutive frames."""
-    from trackanno.kymograph import curvature_kymograph
+    from trackanno.measure.kymograph import curvature_kymograph
 
     # Read off the 2D spectrum, which is what "travelling" means: a wave moving
     # one way puts its power in one diagonal quadrant of the (time, arclength)
@@ -337,7 +337,7 @@ def test_untrackable_frames_stay_empty() -> None:
     """A gap must read as a gap. Filling it with zero would draw a straight
     flagellum where there was no measurement, which is the one lie a curvature
     plot must not tell."""
-    from trackanno.kymograph import MIN_NODES, curvature_kymograph, resample_centreline
+    from trackanno.measure.kymograph import MIN_NODES, curvature_kymograph, resample_centreline
 
     kx, ky = _wave(40, 9, period=12.0, cycles=1.5)
     kx[10:15] = np.nan
@@ -367,7 +367,7 @@ def test_untrackable_frames_stay_empty() -> None:
 def test_scale_and_normalisation() -> None:
     """kappa*L makes two cells at different magnifications comparable, and the
     colour limit must not be handed to a single bad frame."""
-    from trackanno.kymograph import curvature_kymograph
+    from trackanno.measure.kymograph import curvature_kymograph
 
     kymo = curvature_kymograph(*_wave(50, 9, 12.0, 1.5), n_samples=64, smooth_px=0.0)
     plain = kymo.scale()
@@ -394,7 +394,7 @@ def test_scale_and_normalisation() -> None:
 def test_it_reads_a_clip_box_table() -> None:
     """The GUI has keypoints as a box table: one row per (frame, track), the
     target track flagged, and missing frames simply absent."""
-    from trackanno.kymograph import kymograph_from_boxes
+    from trackanno.measure.kymograph import kymograph_from_boxes
 
     n_kpts, n_frames = 9, 30
     kx, ky = _wave(n_frames, n_kpts - 1, period=10.0, cycles=1.5)
@@ -447,7 +447,7 @@ def test_the_widget_draws_and_scrubs(app) -> None:
     from qtpy.QtGui import QMouseEvent
     from trackanno.gui.kymograph import KymographView, diverging_ramp
     from trackanno.gui.theme import apply_theme
-    from trackanno.kymograph import curvature_kymograph
+    from trackanno.measure.kymograph import curvature_kymograph
 
     for theme in ("dark", "light"):
         apply_theme(app, theme)
@@ -506,10 +506,10 @@ def test_the_panel_shows_it_only_for_pose(app, root: Path) -> None:
     """End to end: a real pose project, a real clip cache, the real widget."""
     from fixtures import N_KEYPOINTS, make_project
 
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
-    from trackanno.store import AnnotationStore
+    from trackanno.annotate.store import AnnotationStore
 
     n_kpts = N_KEYPOINTS
 

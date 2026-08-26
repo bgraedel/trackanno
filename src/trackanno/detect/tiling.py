@@ -15,7 +15,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .config import Config
+from ..config import Config
 
 __all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
            "default_node_names", "resolve_device", "describe_devices", "device_label",

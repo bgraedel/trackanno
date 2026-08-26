@@ -32,14 +32,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .clips import (
+from ..annotate.clips import (
     DONE_FILE, FEATURES_FILE, MANIFEST_FILE, NORM_FILE, TRACKS_FILE, BOXES_FILE,
     StagedWrite, build_box_table, choose_crop_size, finalise_geometry, plan_clips,
     specs_to_frame, write_clip_cache,
 )
-from .config import Config, load_config
-from .movies import MovieSource, Normalizer, discover_movies
-from .progress import Cancelled, ConsoleReporter, NullReporter, Reporter
+from ..config import Config, load_config
+from ..video.movies import MovieSource, Normalizer, discover_movies
+from ..progress import Cancelled, ConsoleReporter, NullReporter, Reporter
 from .tiling import TiledDetector
 from .tracking import build_tracker
 
@@ -254,7 +254,7 @@ def prepare_all(
     reporter = reporter or NullReporter()
     # Resolve a registry model to a cached file first, then carry on as if it had
     # always been local: nothing downstream needs to know a network was involved.
-    from .models import resolve_model
+    from ..video.models import resolve_model
 
     cfg.paths.model = resolve_model(cfg, reporter)
     if not cfg.paths.model.exists():

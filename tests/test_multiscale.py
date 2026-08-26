@@ -88,7 +88,7 @@ def test_a_fresh_project_scores_at_exactly_one_scale(root: Path) -> None:
     announce itself the way a broken feature does.
     """
     from trackanno.config import load_config
-    from trackanno.densepredict import scale_grid, window_length, window_stride
+    from trackanno.infer.densepredict import scale_grid, window_length, window_stride
     from trackanno.project import create_project
 
     cfg = load_config(create_project(Path(root) / "fresh"))
@@ -119,8 +119,8 @@ def test_writing_the_single_scale_out_by_hand_changes_the_file_not_at_all(
     Hence bytes, not shapes.
     """
     from trackanno.config import load_config
-    from trackanno.densepredict import DENSE_FEATURES_FILE
-    from trackanno.predict import PREDICTIONS_FILE, predict_all
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE, predict_all
     from trackanno.project import write_config
 
     absent = _scaled_case(root, "scales-absent", [], **{
@@ -197,8 +197,8 @@ def test_each_scale_carries_the_same_weight_in_the_posterior(root: Path) -> None
     blunt to see it. That failure is what the stride scaling exists to prevent,
     and it is quantified here rather than asserted.
     """
-    from trackanno.bouts import frame_posterior
-    from trackanno.densepredict import (
+    from trackanno.infer.bouts import frame_posterior
+    from trackanno.infer.densepredict import (
         plan_scaled_windows, scale_grid, window_grid,
     )
 
@@ -279,7 +279,7 @@ def test_the_stride_of_a_scale_follows_its_length(root: Path) -> None:
     the multiplication comes out whole, and the docstring says so rather than
     claiming exactness it does not have.
     """
-    from trackanno.densepredict import scale_stride
+    from trackanno.infer.densepredict import scale_stride
 
     check("a tiling base grid tiles at every scale",
           [scale_stride(n, 50, 50) for n in (25, 50, 100)] == [25, 50, 100])
@@ -309,8 +309,8 @@ def test_scales_of_different_lengths_still_cut_disjoint_gapless_bouts(
     bouts would show up as a mis-coloured frame in an exported movie rather than
     as an error.
     """
-    from trackanno.densepredict import DENSE_FEATURES_FILE
-    from trackanno.predict import predict_all
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.predict import predict_all
 
     cfg, _ = planted_case(root, "planted-scales", LENGTH, **{
         "predict.window_scales": [25, LENGTH, 100],
@@ -383,7 +383,7 @@ def test_an_event_shorter_than_the_window_is_invisible_until_a_shorter_scale_see
     ``predict.window_stride`` is the knob for WHERE; this is the knob for WHAT.
     """
     from trackanno.config import load_config
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     stop_lo, stop_hi = 130, 160                 # 30 frames, well inside one window
 
@@ -523,9 +523,9 @@ def test_a_model_fitted_on_length_dependent_columns_is_refused(root: Path) -> No
     """
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
-    from trackanno.predict import predict_all
-    from trackanno.suggest import MODEL_FILE, Suggester
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
+    from trackanno.infer.predict import predict_all
+    from trackanno.learn.suggest import MODEL_FILE, Suggester
 
     cfg = _scaled_case(root, "dependent", [25, LENGTH])
     work = cfg.paths.work_dir
@@ -589,8 +589,8 @@ def test_the_length_invariant_subset_selects_what_it_claims(root: Path) -> None:
     pattern, be scored at three lengths, and nothing would raise - which is the
     exact failure this whole mechanism exists to prevent.
     """
-    from trackanno.clipfeatures import feature_schema
-    from trackanno.suggest import (
+    from trackanno.measure.clipfeatures import feature_schema
+    from trackanno.learn.suggest import (
         is_length_invariant, length_dependent_columns, length_invariant_columns,
         scoped_columns,
     )
@@ -673,8 +673,8 @@ def test_fitting_on_the_subset_saves_a_model_that_can_be_multi_scaled(
     """
     from trackanno.config import load_config
     from trackanno.project import write_config
-    from trackanno.store import AnnotationStore
-    from trackanno.suggest import (
+    from trackanno.annotate.store import AnnotationStore
+    from trackanno.learn.suggest import (
         MODEL_FILE, Suggester, length_dependent_columns, train,
     )
 

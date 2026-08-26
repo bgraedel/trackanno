@@ -25,7 +25,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from ..config import Config
 
 __all__ = [
     "AnnotationStore", "MULTI_SEP", "PROVENANCE_COLUMN", "AUDIT_COLUMN",
@@ -91,7 +91,7 @@ def plain_json(value):
     * **A non-finite float becomes ``None``, written as ``null``.** NaN and
       Infinity are not JSON - ``json.dumps`` spells them as bare tokens a strict
       reader rejects - and ``null`` is the JSON spelling of "no value", which is
-      what a NaN here means: :mod:`trackanno.select` scores a uniform draw NaN
+      what a NaN here means: :mod:`trackanno.learn.select` scores a uniform draw NaN
       because it EARNED no score. ``null`` reads back as ``None``, which is
       still not ``0.0``, so "nobody measured this" stays distinguishable from
       "the model was certain".

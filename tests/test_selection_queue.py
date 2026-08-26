@@ -21,10 +21,10 @@ import random
 import pytest
 
 from harness import check
-from trackanno.clips import ClipStore
+from trackanno.annotate.clips import ClipStore
 from trackanno.config import load_config
-from trackanno.select import AUDIT_RULE
-from trackanno.store import (
+from trackanno.learn.select import AUDIT_RULE
+from trackanno.annotate.store import (
     PROVENANCE_COLUMN, AnnotationStore, decode_provenance, encode_provenance,
 )
 

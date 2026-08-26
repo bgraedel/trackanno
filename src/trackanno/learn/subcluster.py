@@ -36,7 +36,7 @@ __all__ = [
 ]
 
 # HDBSCAN's own label for a row in no cluster. Named rather than spelled -1 at
-# every use, because -1 also means "undefined" in `trackanno.bouts` and the two
+# every use, because -1 also means "undefined" in `trackanno.infer.bouts` and the two
 # are different statements about a row.
 NOISE = -1
 

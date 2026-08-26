@@ -1,9 +1,9 @@
-"""Checks for :mod:`trackanno.subcluster`, the sub-behaviour search inside one class.
+"""Checks for :mod:`trackanno.learn.subcluster`, the sub-behaviour search inside one class.
 
 Every matrix below is built by planting a structure and then asking whether the
 module finds THAT, so the expected answer is known before the clusterer runs and
 a disagreement is an error rather than two implementations differing. Nothing
-here compares :mod:`trackanno.subcluster` against another clustering.
+here compares :mod:`trackanno.learn.subcluster` against another clustering.
 
 The partition is judged by adjusted Rand index against the planted assignment,
 never by cluster id. Cluster ids are arbitrary - HDBSCAN numbers them in the
@@ -20,7 +20,7 @@ Six things are worth separating:
 * stability separates the two, at matched dimension, row count and settings -
   and the same suite states where it does not, because a reproducible split of a
   cloud with no groups in it is still reproducible;
-* the scaling decision is the one documented in :func:`trackanno.subcluster._scaled`:
+* the scaling decision is the one documented in :func:`trackanno.learn.subcluster._scaled`:
   a single column carrying a large unit destroys the answer without it, the
   answer is unchanged by per-column units with it, and the price it charges on
   nuisance columns is measured rather than hidden;
@@ -36,7 +36,7 @@ import numpy as np
 import pytest
 from harness import check
 from sklearn.metrics import adjusted_rand_score
-from trackanno.subcluster import (
+from trackanno.learn.subcluster import (
     DEFAULT_MIN_CLUSTER_SIZE, NOISE, STABLE, subcluster,
 )
 
@@ -289,7 +289,7 @@ def test_stability_does_not_certify_a_split_of_a_smooth_cloud() -> None:
     module defaults to, are enough to produce one. The point of the check is that
     this suite states the number instead of only stating the good one: a caller
     who reads :attr:`Cluster.stability` as "the group is real" is reading it
-    wrong, and :func:`trackanno.subcluster.subcluster` says so where it is
+    wrong, and :func:`trackanno.learn.subcluster.subcluster` says so where it is
     documented.
     """
     found = subcluster(unstructured(n_rows=300, n_columns=2, seed=406), named(300),
@@ -454,7 +454,7 @@ def test_per_column_scaling_charges_for_nuisance_columns() -> None:
 
     The mitigation is not another scaling. It is the caller passing the columns
     the split is expected to live in, which is exactly what
-    :func:`trackanno.subcluster.subcluster` tells them to do when it refuses an
+    :func:`trackanno.learn.subcluster.subcluster` tells them to do when it refuses an
     all-noise result - so it is worth knowing that it works.
     """
     rng = np.random.default_rng(5)

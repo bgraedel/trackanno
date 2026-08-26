@@ -1,4 +1,4 @@
-"""Checks for :mod:`trackanno.select`, which decides what a human annotates next.
+"""Checks for :mod:`trackanno.learn.select`, which decides what a human annotates next.
 
 Nothing here runs a model. Every probability matrix below is written out by hand
 so that the row each rule must choose is known BEFORE the rule is called - the
@@ -31,7 +31,7 @@ import json
 import numpy as np
 import pytest
 from harness import check
-from trackanno.select import (
+from trackanno.learn.select import (
     AUDIT_RULE, TARGET_RULES, UNCERTAINTY_RULES, entropy, least_confidence, margin,
     rank_by, select_batch, starved_classes, target_confident, target_runner_up,
 )
@@ -57,7 +57,7 @@ def hand_entropy(row) -> float:
 
 
 # Five classes, three rows, each of which one rule must rank first. See the
-# module docstring of trackanno.select for the argument; the numbers are checked
+# module docstring of trackanno.learn.select for the argument; the numbers are checked
 # below rather than asserted.
 #
 #   A  lowest maximum (0.30) but a clear leader          -> least_confidence

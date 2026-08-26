@@ -47,7 +47,7 @@ def pump(app, predicate, timeout: float = 20.0) -> bool:
 def test_interrupted_rebuild_cannot_mislabel(root: Path) -> None:
     """C1. A cancelled redo left a new cache beside the old manifest and a done
     marker still claiming success, so clips were labelled under the wrong id."""
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
 
     work = root / "work"
     movie = work / "movie_a"
@@ -110,7 +110,7 @@ def test_forced_rebuild_clears_the_done_marker(root: Path) -> None:
     reported the movie as prepared and was never retried."""
     import inspect
 
-    from trackanno import prepare
+    from trackanno.detect import prepare
 
     source = inspect.getsource(prepare.prepare_movie)
     body = source.split("if done_path.exists() and not force:")[1]
@@ -124,12 +124,12 @@ def test_cancelled_rebuild_leaves_the_old_cache_intact(root: Path) -> None:
     exactly as it was, not half-replaced."""
     from test_pipeline import CONFIG_TEXT, SyntheticMovie
 
-    from trackanno.clips import (
+    from trackanno.annotate.clips import (
         ClipStore, build_box_table, choose_crop_size, finalise_geometry,
         plan_clips, specs_to_frame, write_clip_cache,
     )
     from trackanno.config import load_config
-    from trackanno.movies import Normalizer
+    from trackanno.video.movies import Normalizer
 
     project = root / "atomic"
     project.mkdir()
@@ -381,10 +381,10 @@ def test_a_held_out_clip_can_say_so(app, root: Path) -> None:
     on screen said why, which reads as a broken suggester."""
     from fixtures import make_project
 
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
-    from trackanno.store import AnnotationStore
+    from trackanno.annotate.store import AnnotationStore
 
     cfg = load_config(make_project(FIXTURES))
     store = ClipStore(cfg.paths.work_dir)
@@ -543,12 +543,12 @@ def _stub_model_files(cfg, columns, extra_feature_columns=()):
     """A parquet plus a model payload, without training anything."""
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE
-    from trackanno.suggest import MODEL_FILE
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE
+    from trackanno.learn.suggest import MODEL_FILE
 
     work = cfg.paths.work_dir
     work.mkdir(parents=True, exist_ok=True)
-    from trackanno.clipfeatures import FEATURE_VERSION
+    from trackanno.measure.clipfeatures import FEATURE_VERSION
 
     frame = {"clip_id": ["a", "b"], "movie_id": ["m", "m"],
              "track_id": [1, 2], "f_start": [0, 0],
@@ -579,7 +579,7 @@ def test_a_stale_model_says_so_instead_of_going_quiet(root: Path) -> None:
     which sent people to retrain a model they had just retrained."""
     from trackanno.config import load_config
     from trackanno.project import create_project
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     cfg = load_config(create_project(root / "stale"))
     _stub_model_files(cfg, columns=["speed_mean", "wave_amp_asym"],
@@ -693,7 +693,7 @@ def test_checkpoint_probe_reads_the_ema_weights(root: Path) -> None:
         return
     from types import SimpleNamespace
 
-    from trackanno.tiling import read_model_info
+    from trackanno.detect.tiling import read_model_info
 
     box = root / "ckpts"
     box.mkdir(exist_ok=True)
@@ -964,10 +964,10 @@ def test_annotator_rename_reaches_the_csv(app) -> None:
 def test_minimap_keeps_uncommitted_input(app) -> None:
     """U2. Pressing m called _load(), which rewrites every widget from the CSV,
     silently discarding ticks and notes."""
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
-    from trackanno.store import AnnotationStore
+    from trackanno.annotate.store import AnnotationStore
 
     config_path = make_project(FIXTURES)
     repo = config_path.parent
@@ -1008,10 +1008,10 @@ def test_minimap_keeps_uncommitted_input(app) -> None:
 def test_write_failures_are_reported_not_fatal(app) -> None:
     """R2. The store re-raises on purpose; letting that escape a Qt slot aborted
     the process when the CSV was open in Excel."""
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
-    from trackanno.store import AnnotationStore
+    from trackanno.annotate.store import AnnotationStore
 
     config_path = make_project(FIXTURES)
     repo = config_path.parent
@@ -1080,7 +1080,7 @@ def test_broken_csv_does_not_kill_startup(root: Path) -> None:
     back in."""
     from trackanno.config import load_config
     from trackanno.project import create_project
-    from trackanno.render import annotated_movies
+    from trackanno.view.render import annotated_movies
 
     path = create_project(root / "badcsv")
     cfg = load_config(path)
@@ -1101,7 +1101,7 @@ def test_broken_csv_does_not_kill_startup(root: Path) -> None:
 def test_prefetcher_is_joined_before_the_cache_closes(app) -> None:
     """R3. stop() set a flag and returned; close() then unmapped memory the
     worker was still reading, which segfaults rather than raising."""
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.prefetch import Prefetcher
 
@@ -1168,10 +1168,10 @@ def test_small_buttons_actually_draw_their_label(app) -> None:
     apply_theme(app, "dark")
 
     # And the real ones in the running app, not just synthetic samples.
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
-    from trackanno.store import AnnotationStore
+    from trackanno.annotate.store import AnnotationStore
 
     config_path = make_project(FIXTURES)
     repo = config_path.parent
@@ -1226,7 +1226,7 @@ def test_shutdown_never_destroys_a_live_thread(app) -> None:
 
 def test_feature_groups_match_what_can_be_computed(root: Path) -> None:
     """The model may only be offered feature families this project can build."""
-    from trackanno.clipfeatures import FEATURE_GROUPS, available_groups, group_of
+    from trackanno.measure.clipfeatures import FEATURE_GROUPS, available_groups, group_of
     from trackanno.config import ConfigError, load_config
     from trackanno.project import create_project, write_config
 

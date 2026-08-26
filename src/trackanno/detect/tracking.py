@@ -2,7 +2,7 @@
 
 ``model.track()`` from ultralytics cannot be used here: it owns the inference
 stream, so with tiling it would track *tiles* rather than frames. Detection runs
-separately (see :mod:`trackanno.tiling`) and the tracker takes the merged
+separately (see :mod:`trackanno.detect.tiling`) and the tracker takes the merged
 full-frame boxes.
 
 Backends: any bundled ultralytics tracker, fed through a small results shim, or
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import Config
+from ..config import Config
 from .tiling import Detections
 
 __all__ = ["Tracker", "build_tracker"]

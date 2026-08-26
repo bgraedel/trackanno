@@ -3,7 +3,7 @@
 The annotation clip grid is a sampling *for annotation*, sparse on purpose:
 ``clips.window_mode``, a ``clips.stride`` past ``clips.frames`` and
 ``clips.min_clip_frames`` all leave holes, and frames in those holes come back
-unlabelled from :func:`trackanno.predict.predict_all` and unpainted in the
+unlabelled from :func:`trackanno.infer.predict.predict_all` and unpainted in the
 overlay. This module builds a second, DENSE feature table - one row per
 (track, window) over a grid tiling the whole movie - for the same models.
 Rules:
@@ -22,7 +22,7 @@ Rules:
   one table. It needs the same decode plus one condition overlap does not - the
   model must have been fitted on columns that do not scale with the window
   length. See :func:`scale_grid` for the weighting.
-* Features come through :func:`trackanno.clipfeatures.window_features`, the
+* Features come through :func:`trackanno.measure.clipfeatures.window_features`, the
   same entry point that builds ``clip_features.parquet``: its spectral columns
   are measured over a window CENTRED on each clip rather than over the clip, so
   any other route is train/serve skew no shape check could catch.
@@ -44,11 +44,11 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from .clipfeatures import (
+from ..measure.clipfeatures import (
     CLIP_FEATURES_FILE, FEATURE_VERSION, PCA_FILE, window_features,
 )
-from .clips import FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrite, clip_id_for
-from .config import Config
+from ..annotate.clips import FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrite, clip_id_for
+from ..config import Config
 
 __all__ = [
     "DENSE_FEATURES_FILE", "DENSE_META_COLUMNS", "window_length", "window_stride",
@@ -139,7 +139,7 @@ def scale_grid(cfg: Config) -> list[tuple[int, int]]:
 
     THE WEIGHTING DECISION. Each scale gets EQUAL WEIGHT in the per-frame
     posterior, and nothing new computes that:
-    :func:`trackanno.bouts.frame_posterior` takes the plain mean over the windows
+    :func:`trackanno.infer.bouts.frame_posterior` takes the plain mean over the windows
     covering a frame, so a scale's weight is however many of its windows reach
     that frame, and a stride proportional to the length makes that count
     ``length / stride`` - the same number at every scale. One stride for every
@@ -288,7 +288,7 @@ def _dense_clip_id(
 
     The BASE scale keeps the bare id because the dense grid is laid out so its
     windows collide with the annotation grid's ids deliberately (see
-    :func:`trackanno.predict._bout_id`), and that collision is what
+    :func:`trackanno.infer.predict._bout_id`), and that collision is what
     ``human_labelled`` and ``include_labelled`` are built on. Suffixing only the
     added scales leaves a single-scale table byte for byte what it was.
     """
@@ -348,7 +348,7 @@ def build_dense_features(
     movie plus the saved PCA, writes ``dense_clip_features.parquet``, and
     touches nothing in the annotation flow.
     """
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir

@@ -6,7 +6,7 @@ straightness, turn rate and beat frequency carry the signal. **CNN**
 (PCA-reduced ROI features): these encode individual identity almost perfectly,
 so a model can score well by recognising animals rather than behaviours. Fit the
 PCA on *per-instance* vectors, not on the handful of clip vectors, and judge the
-payoff by grouped cross-validation in :mod:`trackanno.suggest`.
+payoff by grouped cross-validation in :mod:`trackanno.learn.suggest`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from .clips import FEATURES_FILE, MANIFEST_FILE, TRACKS_FILE
-from .config import Config
+from ..annotate.clips import FEATURES_FILE, MANIFEST_FILE, TRACKS_FILE
+from ..config import Config
 
 __all__ = ["build_clip_features", "CLIP_FEATURES_FILE", "PCA_FILE"]
 
@@ -344,7 +344,7 @@ def window_features(
 
     The single entry point for turning a track into feature rows -
     :func:`build_clip_features` for the annotation manifest,
-    :mod:`trackanno.densepredict` for the dense export grid. Keep it that way:
+    :mod:`trackanno.infer.densepredict` for the dense export grid. Keep it that way:
     the spectral columns are measured over a window CENTRED on the requested
     range rather than over the range itself, and a second caller reimplementing
     that would emit columns with the same names and a different meaning.
@@ -353,7 +353,7 @@ def window_features(
     ordered, adjacent, or a partition of the track, so a dense stride-1 grid and
     the annotation tiling go through the same code and get the same answers.
 
-    They are not free. The `wave_*` STFT and the :mod:`trackanno.trackseries`
+    They are not free. The `wave_*` STFT and the :mod:`trackanno.measure.trackseries`
     layout are amortised over the track, each window being a slice, but the
     `beat_*` block is not: :func:`_beat_on_window` pays a fresh mask over the
     whole track and a fresh FFT per window, so cost is linear in the window
@@ -392,7 +392,7 @@ def window_features(
 # --------------------------------------------------------------------------- #
 def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.DataFrame:
     """Compute (and cache) one feature row per clip across every prepared movie."""
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir

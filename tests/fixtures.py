@@ -93,12 +93,12 @@ def make_project(root: Path, pose: bool = False, thumbnails: bool = False) -> Pa
 
     from test_pipeline import SyntheticMovie
 
-    from trackanno.clips import (
+    from trackanno.annotate.clips import (
         build_box_table, choose_crop_size, finalise_geometry, plan_clips,
         specs_to_frame, write_clip_cache,
     )
     from trackanno.config import load_config
-    from trackanno.movies import Normalizer
+    from trackanno.video.movies import Normalizer
     from trackanno.project import create_project, write_config
 
     project = Path(root) / f"fixture{'_pose' if pose else ''}{'_thumbs' if thumbnails else ''}"

@@ -37,12 +37,12 @@ import numpy as np
 import pandas as pd
 from harness import check
 from trackanno.config import RESERVED_GROUP_NAMES, load_config
-from trackanno.reassociate import apply_reassociation, plan_reassociation, write_labels
-from trackanno.store import (
+from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation, write_labels
+from trackanno.annotate.store import (
     AUDIT_COLUMN, IDENTITY_COLUMNS, PROVENANCE_COLUMN, TRAILING_COLUMNS,
     AnnotationStore, decode_audit, encode_audit, read_audit_records,
 )
-from trackanno.suggest import AuditHoldout, _print_report, train_group
+from trackanno.learn.suggest import AuditHoldout, _print_report, train_group
 
 CONFIG_TEXT = """
 paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
@@ -1056,7 +1056,7 @@ def test_no_path_can_reach_the_hash_for_a_clip_that_has_a_record(root: Path) -> 
     to the hash on a recorded value it does not like, raises here instead of
     returning a plausible wrong answer nothing downstream could question.
     """
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     cfg = _cfg(root, "no-hash")
     path = cfg.paths.csv

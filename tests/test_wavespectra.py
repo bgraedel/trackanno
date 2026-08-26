@@ -1,4 +1,4 @@
-"""Checks for :mod:`trackanno.wavespectra`, the sliding-window beat spectrum.
+"""Checks for :mod:`trackanno.measure.wavespectra`, the sliding-window beat spectrum.
 
 Everything here is generated from a travelling wave with known parameters -
 ``psi(s, t) = A sin(2 pi f t - k s)`` integrated into a keypoint chain - so the
@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import ShortTimeFFT
 from harness import check
-from trackanno.wavespectra import (
+from trackanno.measure.wavespectra import (
     DEFAULT_HOP, DEFAULT_WINDOW, SERIES_COLUMNS, _detrend_coeffs, spectral_series,
     track_spectral_series, window_values,
 )

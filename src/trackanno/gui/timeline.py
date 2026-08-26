@@ -3,7 +3,7 @@
 A row of ``predictions.parquet`` is either a fixed window off a grid or, under
 ``predict.decode``, a bout: a variable-length run between two inferred
 behavioural boundaries. Which of the two a file holds comes from
-:func:`trackanno.predict.row_kind`, which reads the file.
+:func:`trackanno.infer.predict.row_kind`, which reads the file.
 
 The footage sits beside the drawing, because whether a boundary is in the right
 place is a question about the animal at that frame and no timeline can answer
@@ -15,7 +15,7 @@ says out loud.
 Boundaries are drawn as bands the width of the measured error against a planted
 transition, a bout's mean posterior as a fill height, and a span overlapping
 hand-labelled frames is hatched. Corrections are recorded in
-``bout_corrections.csv`` (:mod:`trackanno.corrections`) and never in
+``bout_corrections.csv`` (:mod:`trackanno.annotate.corrections`) and never in
 ``predictions.parquet`` or ``annotations.csv``; nothing here re-decodes,
 retrains or writes a prediction back. The correction lane deliberately carries
 no bar height, because what is now asserted about a stretch of frames is not a
@@ -40,12 +40,12 @@ from qtpy.QtWidgets import (
 )
 
 from ..config import Config
-from ..corrections import (
+from ..annotate.corrections import (
     CorrectionStore, Partition, Span, apply_corrections, build_corrections,
     corrections_path, derivation_report, derive_window_labels, manifest_windows,
 )
-from ..overlay import build_clip_view
-from ..store import MULTI_SEP
+from ..view.overlay import build_clip_view
+from ..annotate.store import MULTI_SEP
 from .prefetch import Prefetcher
 from .theme import tokens
 from .viewer import SimpleViewer
@@ -200,8 +200,8 @@ def measure_stride(cfg: Config) -> Resolution:
     A dense table written after the predictions is still measured, but the
     provenance says so.
     """
-    from ..densepredict import dense_features_path
-    from ..predict import predictions_path
+    from ..infer.densepredict import dense_features_path
+    from ..infer.predict import predictions_path
 
     path = dense_features_path(cfg)
     if not path.exists():
@@ -289,8 +289,8 @@ class PredictionReader:
         self.resolution = Resolution()
         self.corrections: CorrectionStore | None = None
 
-        from ..predict import load_predictions, row_kind, staleness
-        from ..render import prediction_unit
+        from ..infer.predict import load_predictions, row_kind, staleness
+        from ..view.render import prediction_unit
 
         # Before the predictions, and fatal when it fails: a corrections file
         # that will not parse would leave the timeline drawing the model's bouts
@@ -356,7 +356,7 @@ class PredictionReader:
         Tolerant on purpose: this only ever ADDS silent tracks to a list the
         predictions already filled.
         """
-        from ..clips import TRACKS_FILE
+        from ..annotate.clips import TRACKS_FILE
 
         path = self.cfg.movie_dir(movie_id) / TRACKS_FILE
         if not path.exists():
@@ -504,7 +504,7 @@ class PredictionReader:
         if self._posterior_read:
             return self._posterior
         self._posterior_read = True
-        from ..predict import posteriors_path
+        from ..infer.predict import posteriors_path
 
         path = posteriors_path(self.cfg)
         if not path.exists():
@@ -896,7 +896,7 @@ class BoutTimeline(QWidget):
         """The class's own colour from the config, matching the exported movie.
 
         Falls back to the theme's faint grey for a value the config no longer
-        declares, as :func:`trackanno.render.build_frame_marks` does, so a
+        declares, as :func:`trackanno.view.render.build_frame_marks` does, so a
         renamed option looks orphaned here too.
         """
         spec = self.cfg.group(group) if self.cfg is not None else None
@@ -1332,8 +1332,8 @@ class MovieFrames(QObject):
     dense decode predicts over frames no annotation window was cut for, and a
     bout there would otherwise have no pixels at all.
 
-    The geometry is the one :func:`trackanno.clips.plan_clips` uses and the
-    padding is :func:`trackanno.clips._crop`, so a fallback frame is cut the way
+    The geometry is the one :func:`trackanno.annotate.clips.plan_clips` uses and the
+    padding is :func:`trackanno.annotate.clips._crop`, so a fallback frame is cut the way
     the cache's own frames were rather than by a second rule. What differs is
     stated where it shows: the crop is centred over THIS chunk instead of over
     an annotation window.
@@ -1421,8 +1421,8 @@ class MovieFrames(QObject):
                 pass
 
     def _open(self):
-        from ..clips import NORM_FILE, TRACKS_FILE, _hold_fill
-        from ..movies import Normalizer, open_movie
+        from ..annotate.clips import NORM_FILE, TRACKS_FILE, _hold_fill
+        from ..video.movies import Normalizer, open_movie
 
         if self._movie is not None:
             return self._movie
@@ -1489,7 +1489,7 @@ class MovieFrames(QObject):
     def _cut(self, first: int) -> tuple[np.ndarray, pd.DataFrame]:
         import cv2
 
-        from ..clips import _crop, _moving_average
+        from ..annotate.clips import _crop, _moving_average
 
         movie = self._open()
         n = min(self.chunk, max(0, int(len(movie)) - int(first)))
@@ -1609,7 +1609,7 @@ class TrackFootage(QWidget):
         """
         if self._store is not None or self._store_problem or self.cfg is None:
             return self._store
-        from ..clips import ClipStore
+        from ..annotate.clips import ClipStore
 
         try:
             self._store = ClipStore(self.cfg.paths.work_dir)
@@ -1961,7 +1961,7 @@ class BoutReviewPanel(QWidget):
 
     Every failure the files can present is a sentence in this panel rather than
     an exception. Every editing gesture goes through :meth:`assert_class`, which
-    is :meth:`trackanno.corrections.Partition.assert_class` plus a save: on a
+    is :meth:`trackanno.annotate.corrections.Partition.assert_class` plus a save: on a
     gapless run-length encoding, setting a class, merging either way and
     dragging a boundary are four gestures over one operation.
 

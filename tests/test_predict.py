@@ -182,11 +182,11 @@ def build_case(
     """
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
     from trackanno.config import load_config
     from trackanno.project import write_config
-    from trackanno.store import AnnotationStore
-    from trackanno.suggest import MODEL_FILE, REPORT_FILE
+    from trackanno.annotate.store import AnnotationStore
+    from trackanno.learn.suggest import MODEL_FILE, REPORT_FILE
 
     fixture = make_project(FIXTURES)
     project = Path(root) / name
@@ -276,7 +276,7 @@ def planted_case(root: Path, name: str, stride: int, **settings):
 
     from trackanno.config import load_config
     from trackanno.project import write_config
-    from trackanno.suggest import MODEL_FILE
+    from trackanno.learn.suggest import MODEL_FILE
 
     cfg, _ = build_case(root, name, coverage="dense", model_class=AreaModel,
                         trained_window=LENGTH)
@@ -319,7 +319,7 @@ def test_an_unusable_model_is_refused_with_a_reason(root: Path) -> None:
     """A bulk run is the suggester's mistake at 1000x scale: whatever the report
     gated off must not be labelled anyway, and the refusal has to say which of
     the several possible reasons applies or nobody can act on it."""
-    from trackanno.predict import PREDICTIONS_FILE, predict_all, prediction_blocker
+    from trackanno.infer.predict import PREDICTIONS_FILE, predict_all, prediction_blocker
 
     cfg, _ = build_case(root, "no-model", model=False, report=False)
     try:
@@ -355,7 +355,7 @@ def test_an_unreliable_group_is_skipped_not_silently_predicted(root: Path) -> No
     did not must get predictions for the first and nothing at all for the second
     - and be told which, because a missing column is otherwise indistinguishable
     from a group nobody configured."""
-    from trackanno.predict import predict_all, verdict
+    from trackanno.infer.predict import predict_all, verdict
 
     cfg, _ = build_case(root, "mixed", groups={GROUP: True, "shape": False})
     reporter = Recorder()
@@ -382,8 +382,8 @@ def test_one_row_per_clip_with_the_expected_columns(root: Path) -> None:
     """The file is meant to be joined on clip_id, so a clip the model had no
     opinion about still needs its row; the alternative is every consumer having
     to work out for itself which clips are missing and why."""
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE
-    from trackanno.predict import PREDICTIONS_FILE, predict_all
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE, predict_all
 
     cfg, manifest = build_case(root, "columns")
     frame = predict_all(cfg)
@@ -418,7 +418,7 @@ def test_predictions_never_reach_the_annotation_csv(root: Path) -> None:
     written into it is indistinguishable from a hand label on the next read, so
     the model would train on its own output and the truth would be gone with no
     way to recover it."""
-    from trackanno.predict import PREDICTIONS_FILE, predict_all
+    from trackanno.infer.predict import PREDICTIONS_FILE, predict_all
 
     cfg, _ = build_case(root, "provenance", labels=3)
     before = digest(cfg.paths.csv)
@@ -445,7 +445,7 @@ def test_predictions_never_reach_the_annotation_csv(root: Path) -> None:
 def test_human_labelled_marks_the_clips_a_person_judged(root: Path) -> None:
     """The one column that lets a consumer merge this file with the CSV without
     losing track of which values a person stands behind."""
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, manifest = build_case(root, "flags", labels=3)
     labelled = set(manifest["clip_id"].astype(str).head(3))
@@ -486,9 +486,9 @@ def test_dense_coverage_reaches_every_frame(root: Path) -> None:
     satisfy. Holding the default to the invariant it has always had is the
     optionality guarantee; the other mode makes its own claims further down.
     """
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE
-    from trackanno.densepredict import DENSE_FEATURES_FILE
-    from trackanno.predict import predict_all
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.predict import predict_all
 
     cfg, manifest = build_case(root, "dense", labels=1, coverage="dense")
     work = cfg.paths.work_dir
@@ -557,8 +557,8 @@ def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path) -> None:
     """A dropped row and a row the model declined to label look identical once
     the file is read back, so a window that cannot be featurised has to survive
     into the output carrying the reason."""
-    from trackanno.densepredict import build_dense_features
-    from trackanno.predict import predict_all
+    from trackanno.infer.densepredict import build_dense_features
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
     from trackanno.config import load_config
 
@@ -597,9 +597,9 @@ def test_a_predictions_table_says_which_of_three_things_a_row_is(root: Path) -> 
     not happened.
     """
     from trackanno.config import load_config
-    from trackanno.predict import RowKind, predict_all, row_kind, summarise
+    from trackanno.infer.predict import RowKind, predict_all, row_kind, summarise
     from trackanno.project import write_config
-    from trackanno.render import prediction_unit
+    from trackanno.view.render import prediction_unit
 
     manifest, _ = build_case(root, "kind-clips", coverage="manifest")
     clips = predict_all(manifest)
@@ -649,8 +649,8 @@ def test_only_one_function_asks_what_a_prediction_row_is() -> None:
     """
     import inspect
 
-    from trackanno.predict import row_kind
-    from trackanno.render import prediction_unit
+    from trackanno.infer.predict import row_kind
+    from trackanno.view.render import prediction_unit
 
     src = Path(__file__).resolve().parents[1] / "src" / "trackanno"
     hits = [
@@ -662,7 +662,7 @@ def test_only_one_function_asks_what_a_prediction_row_is() -> None:
     check("the sentinel column is tested in exactly one place", len(hits) == 1,
           str(hits))
     check("...which is predict.row_kind, in the module that writes the schema",
-          hits[0].startswith("predict.py:")
+          hits[0].startswith("infer/predict.py:")
           and '"bout_id" in' in inspect.getsource(row_kind), str(hits))
     check("...and render.prediction_unit formats that answer rather than "
           "re-deriving it", "row_kind" in inspect.getsource(prediction_unit))
@@ -681,8 +681,8 @@ def test_writing_the_default_stride_out_by_hand_changes_the_file_not_at_all(
     length-dependent feature value with it, silently, and a rewritten parquet is
     the only place that would show."""
     from trackanno.config import load_config
-    from trackanno.densepredict import window_length
-    from trackanno.predict import PREDICTIONS_FILE, predict_all
+    from trackanno.infer.densepredict import window_length
+    from trackanno.infer.predict import PREDICTIONS_FILE, predict_all
     from trackanno.project import write_config
 
     auto, _ = build_case(root, "stride-auto", coverage="dense")
@@ -733,8 +733,8 @@ def test_a_decode_writes_bouts_where_it_used_to_write_windows(root: Path) -> Non
     quietly attributing a 300-frame bout to a 51-frame hand label.
     """
     from trackanno.config import load_config
-    from trackanno.densepredict import DENSE_FEATURES_FILE
-    from trackanno.predict import predict_all
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
 
     cfg, _ = build_case(root, "bouts", coverage="dense")
@@ -817,7 +817,7 @@ def test_include_labelled_is_inert_under_a_decode_and_says_so(root: Path) -> Non
     against the one clip this project has a label for.
     """
     from trackanno.config import load_config
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
 
     cfg, _ = build_case(root, "inert", labels=1, coverage="dense")
@@ -885,7 +885,7 @@ def test_a_bout_boundary_lands_nearer_the_truth_than_a_tile_boundary(root: Path)
     each frame and their mean crosses over within one stride of the truth. The
     model is the same in both runs, so the whole difference is the grid.
     """
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     tiled_cfg, _ = planted_case(root, "planted-tiled", LENGTH)
     dense_cfg, _ = planted_case(root, "planted-dense", 10)
@@ -932,7 +932,7 @@ def test_the_saved_posterior_round_trips(root: Path) -> None:
     sharing a class name cannot collide, and parquet being columnar means reading
     one group's answer costs only that group's columns.
     """
-    from trackanno.predict import POSTERIORS_FILE, predict_all
+    from trackanno.infer.predict import POSTERIORS_FILE, predict_all
 
     plain_cfg, _ = planted_case(root, "post-off", 10)
     predict_all(plain_cfg)
@@ -993,7 +993,7 @@ def test_the_summary_counts_a_frame_once_however_many_rows_cover_it(root: Path) 
     two groups' answers over the same frames collapse to those frames.
     """
     from trackanno.config import load_config
-    from trackanno.predict import predict_all, summarise
+    from trackanno.infer.predict import predict_all, summarise
     from trackanno.project import write_config
 
     cfg, _ = build_case(root, "counts", coverage="dense",
@@ -1046,7 +1046,7 @@ def test_an_overlapping_annotation_grid_has_a_way_through(root: Path) -> None:
     anyone to relabel anything.
     """
     from trackanno.config import ConfigError, load_config
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
 
     FRAMES, STRIDE = 51, 50            # the one-frame overlap that started this
@@ -1114,7 +1114,7 @@ def test_an_overlapping_annotation_grid_has_a_way_through(root: Path) -> None:
     # which is the whole reason it asks rather than choosing. Read off the grid
     # function itself, so the claim does not depend on where the fixture's tracks
     # happen to start and stop.
-    from trackanno.densepredict import window_grid, window_length, window_stride
+    from trackanno.infer.densepredict import window_grid, window_length, window_stride
 
     long_movie = 10 * FRAMES
     tiled_starts = {s for s, _ in
@@ -1225,8 +1225,8 @@ def test_a_model_fitted_at_another_window_length_is_refused(root: Path) -> None:
     refusing those would mean an upgrade silently invalidates them, so it is a
     warning and the run goes on."""
     from trackanno.config import load_config
-    from trackanno.densepredict import DENSE_FEATURES_FILE
-    from trackanno.predict import predict_all
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
 
     cfg, _ = build_case(root, "skew-ok", trained_window=50)
@@ -1285,9 +1285,9 @@ def test_the_window_gate_makes_one_decision_for_both_entry_points(root: Path) ->
     import warnings
 
     from trackanno.config import load_config
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
     from trackanno.project import write_config
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     def selecting(name: str, trained_window: int | None):
         """A project both entry points can run over: a model on disk and a
@@ -1362,7 +1362,7 @@ def test_a_failed_write_leaves_no_part_file_and_no_damage(root: Path) -> None:
     a run that dies mid-write must leave the previous file intact rather than a
     truncated parquet under the real name - and must not litter the work dir
     with .part files that the next StagedWrite would have to clean up."""
-    from trackanno.predict import PREDICTIONS_FILE, _write_atomic, predict_all
+    from trackanno.infer.predict import PREDICTIONS_FILE, _write_atomic, predict_all
 
     cfg, _ = build_case(root, "atomic")
     good = predict_all(cfg)
@@ -1389,8 +1389,8 @@ def test_a_failed_write_leaves_no_part_file_and_no_damage(root: Path) -> None:
 def test_staleness_notices_a_retrain(root: Path) -> None:
     """Retraining and forgetting to re-label is the way these files go wrong, and
     nothing in an exported movie reveals which model drew the dashed boxes."""
-    from trackanno.predict import predict_all, staleness
-    from trackanno.suggest import MODEL_FILE
+    from trackanno.infer.predict import predict_all, staleness
+    from trackanno.learn.suggest import MODEL_FILE
 
     cfg, _ = build_case(root, "stale")
     predict_all(cfg)
@@ -1409,8 +1409,8 @@ def test_a_prediction_never_looks_like_a_hand_label(root: Path) -> None:
     colours. A predicted box is dashed and captioned with a ~ and its
     confidence, and where both exist the hand label wins the box while the
     model's answer stays visible in the caption."""
-    from trackanno.overlay import _draw_box, _draw_dashed_box
-    from trackanno.render import build_frame_marks
+    from trackanno.view.overlay import _draw_box, _draw_dashed_box
+    from trackanno.view.render import build_frame_marks
 
     cfg, manifest = build_case(root, "marks")
     row = manifest.iloc[0]
@@ -1467,8 +1467,8 @@ def test_the_exported_pixels_show_which_is_which(root: Path) -> None:
 
     from test_pipeline import SyntheticMovie
 
-    from trackanno.overlay import hex_to_rgb
-    from trackanno.render import render_movie
+    from trackanno.view.overlay import hex_to_rgb
+    from trackanno.view.render import render_movie
 
     cfg, _ = build_case(root, "pixels")
     # Captions off, so the comparison below is about the box and nothing else.
@@ -1502,8 +1502,8 @@ def test_the_export_refuses_a_missing_predictions_file(root: Path) -> None:
     """Rendering nothing is indistinguishable from "the model had no opinion
     about this movie", so an absent predictions file has to stop the export and
     say where the file comes from."""
-    from trackanno.predict import PREDICTIONS_FILE, load_predictions, predict_all
-    from trackanno.render import render_all
+    from trackanno.infer.predict import PREDICTIONS_FILE, load_predictions, predict_all
+    from trackanno.view.render import render_all
 
     cfg, _ = build_case(root, "no-predictions", labels=2)
     try:
@@ -1538,7 +1538,7 @@ def test_the_export_page_offers_the_three_sources(app, root: Path) -> None:
     from qtpy.QtWidgets import QMessageBox
 
     from trackanno.gui.hub import ExportPage, Hub
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "export-page", labels=2)
     hub = Hub(str(cfg.path))
@@ -1598,7 +1598,7 @@ def test_the_model_page_labels_every_clip(app, root: Path) -> None:
     reports what it did. It must never write to the annotation CSV, however
     many times it is pressed."""
     from trackanno.gui.hub import Hub, ModelPage
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     # First a project whose model the report gated off: the button must be dead.
     cfg, _ = build_case(root, "page-silent", reliable=False, labels=3)
@@ -1658,8 +1658,8 @@ def test_a_movie_with_no_detector_embeddings_is_refused_not_filled_with_nan(
     import joblib
     from sklearn.decomposition import PCA
 
-    from trackanno.clipfeatures import PCA_FILE
-    from trackanno.densepredict import FEATURES_FILE, build_dense_features
+    from trackanno.measure.clipfeatures import PCA_FILE
+    from trackanno.infer.densepredict import FEATURES_FILE, build_dense_features
 
     cfg, _ = build_case(root, "noembed", coverage="dense")
     work = cfg.paths.work_dir

@@ -14,10 +14,10 @@ import numpy as np
 import pytest
 
 from harness import check
-from trackanno.clips import ClipStore
+from trackanno.annotate.clips import ClipStore
 from trackanno.config import load_config
-from trackanno.overlay import build_clip_view, render_clip_rgb
-from trackanno.store import AnnotationStore
+from trackanno.view.overlay import build_clip_view, render_clip_rgb
+from trackanno.annotate.store import AnnotationStore
 
 
 @pytest.fixture(scope="module")
@@ -186,7 +186,7 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
               repr(window.statusBar().currentMessage()))
 
     # Toggles must not crash, and the marker must actually reach the screen.
-    from trackanno.overlay import FOLLOW_MODES
+    from trackanno.view.overlay import FOLLOW_MODES
 
     window.overlay_box.setChecked(False)
     app.processEvents()

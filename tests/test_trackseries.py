@@ -1,6 +1,6 @@
 """Checks for the per-frame series and its window reduction.
 
-The point of :mod:`trackanno.trackseries` is that a window's features can be
+The point of :mod:`trackanno.measure.trackseries` is that a window's features can be
 obtained by slicing a per-frame series instead of recomputing a clip, so what is
 worth testing is a mixture of KNOWN VALUES and an INVARIANCE:
 
@@ -36,7 +36,7 @@ import pytest
 from fixtures import make_project
 from harness import check
 from trackanno.config import load_config
-from trackanno.trackseries import (
+from trackanno.measure.trackseries import (
     SERIES_COLUMNS, SERIES_SPEC, WINDOW_FUNCTIONALS, aggregate_window, build_series,
     feature_names,
 )

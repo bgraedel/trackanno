@@ -159,7 +159,7 @@ def test_pose_is_resolvable(root: Path) -> None:
     """
     from trackanno.config import load_config
     from trackanno.project import create_project, write_config
-    from trackanno.tiling import default_node_names, read_keypoint_count
+    from trackanno.detect.tiling import default_node_names, read_keypoint_count
 
     project = root / "pose"
     path = create_project(project)
@@ -393,7 +393,7 @@ class StubDetector:
         return [(0, 0, width, height)]
 
     def detect(self, frame_rgb):
-        from trackanno.tiling import Detections
+        from trackanno.detect.tiling import Detections
 
         xyxy, conf = self.by_frame[self.calls % self.n_frames]
         self.calls += 1
@@ -407,7 +407,7 @@ def test_prepare_reports_and_cancels(root: Path) -> None:
     from test_pipeline import SyntheticMovie
 
     from trackanno.config import load_config
-    from trackanno.prepare import prepare_movie
+    from trackanno.detect.prepare import prepare_movie
     from trackanno.progress import CallbackReporter, Cancelled
 
     project = root / "prep"
@@ -440,7 +440,7 @@ def test_prepare_reports_and_cancels(root: Path) -> None:
     check("prepare reported per-frame progress", max(progress) > 1, str(max(progress or [0])))
     check("prepare wrote a resume marker", (cfg.movie_dir(movie.id) / "prepare_done.json").exists())
 
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
 
     store = ClipStore(cfg.paths.work_dir)
     check("the cache it wrote is readable", len(store) == info["n_clips"])
@@ -1009,7 +1009,7 @@ def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
     Configure page could offer no GPU while ``auto`` picked one regardless, which
     is a run landing somewhere nobody was ever shown.
     """
-    from trackanno import tiling
+    from trackanno.detect import tiling
 
     offered = {value for value, _label in tiling.describe_devices()}
     check("the list always offers auto and cpu", {"auto", "cpu"} <= offered, str(offered))
@@ -1033,7 +1033,7 @@ def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
 
 def test_describe_auto_says_why_it_landed_on_the_cpu() -> None:
     """"cpu" alone cannot be acted on; the reason is what tells you the fix."""
-    from trackanno import tiling
+    from trackanno.detect import tiling
 
     sentence = tiling.describe_auto()
     check("it is one sentence about auto", sentence.startswith("auto uses"), sentence)

@@ -62,7 +62,7 @@ def tiles(partition, f_lo: int, f_hi: int) -> bool:
 
 def model_partition():
     """Three bouts over 120 frames: A, B, A. Boundaries at 40 and 80."""
-    from trackanno.corrections import Partition, Span
+    from trackanno.annotate.corrections import Partition, Span
 
     return Partition([
         Span(0, 40, "swimming", False),
@@ -95,7 +95,7 @@ def project(root):
     the training set is actually built from rather than an invented grid."""
     from test_predict import build_case
 
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     cfg, manifest = build_case(root, "corrections", labels=2)
     movie = str(manifest["movie_id"].iat[0])
@@ -134,7 +134,7 @@ def panel(app, project):
 def clean_corrections(project):
     """No correction survives into the next test. The file is the state, so a
     leftover assertion would make a later test pass for the wrong reason."""
-    from trackanno.corrections import corrections_path
+    from trackanno.annotate.corrections import corrections_path
 
     cfg, _, _ = project
     path = corrections_path(cfg)
@@ -207,7 +207,7 @@ def test_an_edit_that_would_not_tile_the_track_is_refused() -> None:
     this file can hold and nothing downstream can read, so the only place to stop
     them is before they exist.
     """
-    from trackanno.corrections import Partition, Span
+    from trackanno.annotate.corrections import Partition, Span
 
     base = model_partition()
     for name, f_start, f_end, label in [
@@ -281,7 +281,7 @@ def test_the_file_states_its_own_schema(project, panel) -> None:
     somebody's whole corrections file. ``store.py`` learned that the hard way and
     this file follows the same rule.
     """
-    from trackanno.corrections import CORRECTION_COLUMNS, corrections_path
+    from trackanno.annotate.corrections import CORRECTION_COLUMNS, corrections_path
 
     cfg, movie, track_id = project
     check("the edit is accepted", "saved" in panel.assert_class(40, 60, "swimming"))
@@ -318,7 +318,7 @@ def test_the_row_records_what_the_model_said_at_the_time(project, panel) -> None
     predictions.parquet, and a decode is not reproducible once the training set
     has moved on.
     """
-    from trackanno.corrections import CorrectionStore, corrections_path
+    from trackanno.annotate.corrections import CorrectionStore, corrections_path
 
     cfg, movie, track_id = project
     panel.assert_class(30, 60, "unclear")
@@ -339,7 +339,7 @@ def test_two_corrections_over_one_frame_are_refused_out_loud(project) -> None:
     """A hand-edited or merged file can say two things about one frame. Applying
     them in some order and taking the last picks a winner nobody chose, and the
     reviewer is then shown a class no row on screen justifies."""
-    from trackanno.corrections import (
+    from trackanno.annotate.corrections import (
         CORRECTION_COLUMNS, CorrectionStore, corrections_path,
     )
     from trackanno.gui.timeline import PredictionReader
@@ -377,7 +377,7 @@ def test_a_correction_the_predictions_no_longer_reach_is_kept(project) -> None:
     destroy a judgement because a prediction ran, and dropping it silently would
     show the model's answer where the person's used to be.
     """
-    from trackanno.corrections import Correction, apply_corrections
+    from trackanno.annotate.corrections import Correction, apply_corrections
 
     outside = Correction("x", "m", 1, GROUP, 200, 260, "immotile")
     overhang = Correction("y", "m", 1, GROUP, 100, 200, "immotile")
@@ -415,7 +415,7 @@ def test_a_save_keeps_the_corrections_the_reviewer_was_never_shown(
     and truncate the second - a human judgement edited by a machine that ran
     again, with nothing on screen to say it happened.
     """
-    from trackanno.corrections import (
+    from trackanno.annotate.corrections import (
         Correction, CorrectionStore, correction_id, corrections_path,
     )
     from trackanno.gui.timeline import BoutReviewPanel
@@ -511,7 +511,7 @@ def test_two_corrections_drawn_as_one_span_stay_two_rows(app, project) -> None:
     Tuesday and credit it to whoever was on shift then. Six months later the
     timestamps are the only evidence of when a judgement was actually made.
     """
-    from trackanno.corrections import (
+    from trackanno.annotate.corrections import (
         Correction, CorrectionStore, correction_id, corrections_path,
     )
     from trackanno.gui.timeline import BoutReviewPanel
@@ -558,7 +558,7 @@ def test_a_column_this_build_does_not_know_survives_a_save(app, project) -> None
     opens an older build, moves one boundary, and a newer build's column is gone
     from every row of everybody's corrections.
     """
-    from trackanno.corrections import (
+    from trackanno.annotate.corrections import (
         CORRECTION_COLUMNS, CorrectionStore, corrections_path,
     )
     from trackanno.gui.timeline import BoutReviewPanel
@@ -618,7 +618,7 @@ def test_correcting_a_bout_writes_nothing_but_the_corrections_file(
     correction written back into predictions.parquet would destroy the model's
     own answer, which is the thing the correction is a record ABOUT.
     """
-    from trackanno.predict import predictions_path
+    from trackanno.infer.predict import predictions_path
 
     cfg, _, _ = project
     before = {p: digest(p) for p in (cfg.paths.csv, predictions_path(cfg))}
@@ -639,7 +639,7 @@ def test_a_windows_file_cannot_be_corrected(app, root) -> None:
     from test_predict import build_case
 
     from trackanno.gui.timeline import BoutReviewPanel, PredictionReader
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "corrections-windows", labels=2)
     predict_all(cfg)
@@ -724,7 +724,7 @@ def test_undo_and_revert_go_through_the_file_too(project, panel, monkeypatch) ->
     leave the disk holding an edit the reviewer has already taken back."""
     from qtpy.QtWidgets import QMessageBox
 
-    from trackanno.corrections import CorrectionStore, corrections_path
+    from trackanno.annotate.corrections import CorrectionStore, corrections_path
 
     cfg, movie, track_id = project
     panel.assert_class(40, 60, "unclear")
@@ -794,7 +794,7 @@ def test_a_multi_select_group_refuses_rather_than_half_works(app, root) -> None:
     from test_predict import build_case
 
     from trackanno.gui.timeline import BoutReviewPanel
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     cfg, manifest = build_case(root, "corrections-multi")
     movie, track_id = str(manifest["movie_id"].iat[0]), int(manifest["track_id"].iat[0])
@@ -836,7 +836,7 @@ def test_a_class_the_config_dropped_still_loads(project, panel) -> None:
     edit - so an unknown class comes back and is drawn orphaned, exactly as the
     renderer treats a colour it can no longer find.
     """
-    from trackanno.corrections import (
+    from trackanno.annotate.corrections import (
         Correction, CorrectionStore, correction_id, corrections_path,
     )
     from trackanno.gui.timeline import PredictionReader
@@ -971,7 +971,7 @@ def windows(*spans, movie="m", track=1):
 
 
 def corrections(*spans, movie="m", track=1, group=GROUP):
-    from trackanno.corrections import Correction, correction_id
+    from trackanno.annotate.corrections import Correction, correction_id
 
     return [
         Correction(correction_id(movie, track, group, f_start, f_end), movie, track,
@@ -990,7 +990,7 @@ def test_a_window_inside_a_correction_derives_and_a_straddler_does_not() -> None
     class, exactly at the transitions it is already worst at. A majority or
     midpoint rule would label the most misleading windows most confidently.
     """
-    from trackanno.corrections import derive_window_labels
+    from trackanno.annotate.corrections import derive_window_labels
 
     grid = windows((0, 50), (50, 100), (100, 150))
     result = derive_window_labels(corrections((0, 100, "swimming")), grid)
@@ -1036,7 +1036,7 @@ def test_nothing_is_derived_from_model_output(project, panel) -> None:
     """Only corrections derive. A label derived from a bout the model produced
     would feed the model its own answer, which is the rule predictions never
     touch the annotation CSV exists to enforce."""
-    from trackanno.corrections import derive_window_labels, manifest_windows
+    from trackanno.annotate.corrections import derive_window_labels, manifest_windows
 
     cfg, movie, track_id = project
     grid = manifest_windows(cfg, movie)
@@ -1065,7 +1065,7 @@ def test_the_derivation_is_per_group(project) -> None:
     """A window can be unambiguous in one category group and straddle a boundary
     in another; collapsing the two would let one group's ambiguity delete the
     other group's answer."""
-    from trackanno.corrections import derive_window_labels
+    from trackanno.annotate.corrections import derive_window_labels
 
     grid = windows((0, 50), (50, 100))
     result = derive_window_labels(

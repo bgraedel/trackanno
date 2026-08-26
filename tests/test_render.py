@@ -75,7 +75,7 @@ def test_two_decoded_bouts_on_one_frame_stop_the_render(cfg) -> None:
     runs between inferred boundaries, so two of them meeting is not a setting
     anyone can choose, it is the decode or the file being wrong.
     """
-    from trackanno.render import build_frame_marks
+    from trackanno.view.render import build_frame_marks
 
     predictions = pd.DataFrame([
         _bout(3, 800, 850, "immotile"),
@@ -123,7 +123,7 @@ def test_manifest_predictions_that_share_frames_render_rather_than_raising(cfg) 
     formed to collide with an annotation clip's - so the rule for windows is the
     labels pass's rule: the later row wins.
     """
-    from trackanno.render import build_frame_marks
+    from trackanno.view.render import build_frame_marks
 
     # clips.frames 50, clips.stride 25: the second clip of the track starts
     # halfway through the first, exactly as the clip cutter laid them out.
@@ -162,7 +162,7 @@ def test_disjoint_bouts_paint_without_complaint(cfg) -> None:
     whole point of the feature - so a suite that only ever fed the renderer a
     tiling grid would let a guard that secretly required one through.
     """
-    from trackanno.render import build_frame_marks
+    from trackanno.view.render import build_frame_marks
 
     predictions = pd.DataFrame([
         _prediction(3, 0, 137, "swimming"),
@@ -190,7 +190,7 @@ def test_a_hand_label_over_a_prediction_is_not_a_collision(cfg) -> None:
     hand label is meant to take the box and leave the model's answer in the
     caption.
     """
-    from trackanno.render import build_frame_marks
+    from trackanno.view.render import build_frame_marks
 
     labels = pd.DataFrame([_label(3, 100, 150, "swimming")])
     predictions = pd.DataFrame([_prediction(3, 100, 150, "immotile", 0.73)])
@@ -210,7 +210,7 @@ def test_overlapping_annotations_are_a_configuration_not_a_fault(cfg) -> None:
     frame, and the last one wins - arbitrary, but a pre-existing and deliberate
     arbitrariness about hand labels, not the invariant this module guards.
     """
-    from trackanno.render import build_frame_marks
+    from trackanno.view.render import build_frame_marks
 
     labels = pd.DataFrame([
         _label(3, 100, 150, "swimming"),
@@ -230,7 +230,7 @@ def test_a_prediction_row_is_counted_as_what_it_is(cfg) -> None:
     editing the config after a run cannot make the Export page describe a run
     that has not happened yet.
     """
-    from trackanno.render import prediction_unit
+    from trackanno.view.render import prediction_unit
 
     windows = pd.DataFrame([_prediction(3, 0, 50, "swimming")])
     check("a row off a grid is a window", prediction_unit(windows) == "predicted windows",

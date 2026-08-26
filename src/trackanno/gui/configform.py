@@ -43,19 +43,19 @@ __all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "GROUPS", "FIELDS",
 # form, and one removed there stays offered until somebody picks it and the
 # loader refuses the save.
 def _uncertainty_rules() -> list[str]:
-    from ..select import UNCERTAINTY_RULES
+    from ..learn.select import UNCERTAINTY_RULES
 
     return ["off"] + sorted(UNCERTAINTY_RULES)
 
 
 def _target_rules() -> list[str]:
-    from ..select import TARGET_RULES
+    from ..learn.select import TARGET_RULES
 
     return sorted(TARGET_RULES)
 
 
 def _trackers() -> list[str]:
-    from ..tracking import TRACKERS
+    from ..detect.tracking import TRACKERS
 
     return sorted(TRACKERS) + ["greedy"]
 
@@ -1098,7 +1098,7 @@ class _GroupPicker(QWidget):
 
     def __init__(self, changed_signal):
         super().__init__()
-        from ..clipfeatures import FEATURE_GROUPS
+        from ..measure.clipfeatures import FEATURE_GROUPS
 
         self._changed = changed_signal
         self._boxes: dict[str, QCheckBox] = {}
@@ -1160,7 +1160,7 @@ class _GroupPicker(QWidget):
             self.note.setVisible(False)
 
     def set_available(self, availability: dict) -> None:
-        from ..clipfeatures import FEATURE_GROUPS
+        from ..measure.clipfeatures import FEATURE_GROUPS
 
         self._available = dict(availability)
         for name, box in self._boxes.items():

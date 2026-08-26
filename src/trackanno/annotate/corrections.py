@@ -26,7 +26,7 @@ derived and is deleted and rebuilt whenever detection is re-run.
 
 CSV, like the annotation log: a small, human-authored file a person may want to
 read, diff or grep without pandas. Schema evolution follows the rule
-:mod:`trackanno.store` sets out - a column added later goes at the END, in the
+:mod:`trackanno.annotate.store` sets out - a column added later goes at the END, in the
 order it was added - and it is IMPLEMENTED here: a column this build does not
 know is carried on the row it was read from (:attr:`Correction.extra`) and
 written back where the file had it, because a save rewrites rows the reviewer
@@ -86,7 +86,7 @@ def corrections_path(cfg) -> Path:
 def correction_id(movie_id, track_id: int, group: str, f_start: int, f_end: int) -> str:
     """The identity of one asserted span.
 
-    Both ends are in it, like :func:`trackanno.predict._bout_id` and unlike
+    Both ends are in it, like :func:`trackanno.infer.predict._bout_id` and unlike
     ``clip_id``, so it cannot collide with a clip id by construction; the group
     is in it because two groups may assert the same frames and mean different
     things. Never parsed back apart - a group name with an underscore in it
@@ -108,7 +108,7 @@ def encode_overruled(bouts: Iterable[Mapping] | None) -> str:
     ``predictions.parquet``, and a decode is not reproducible once the training
     set has moved on.
 
-    :func:`trackanno.store.encode_cell` does the writing, the same codec the
+    :func:`trackanno.annotate.store.encode_cell` does the writing, the same codec the
     annotation log's ``selected_by`` cell uses, so a new key does not force a
     schema migration and a non-finite confidence is written as ``null`` here for
     the same reason it is there: an unscored bout genuinely has no confidence,
@@ -150,7 +150,7 @@ def decode_overruled(value) -> dict:
     Raises on a cell that will not parse rather than returning ``{}``: an
     unreadable record of what was overruled would read as "this correction
     agreed with nothing in particular", which is a claim the row is not making.
-    That policy is :func:`trackanno.store.decode_cell`'s and is shared rather
+    That policy is :func:`trackanno.annotate.store.decode_cell`'s and is shared rather
     than restated, so the two columns cannot come to disagree about it.
     """
     return decode_cell(
@@ -481,7 +481,7 @@ class CorrectionStore:
     """The corrections file, read whole and rewritten whole.
 
     No append path and no torn-append repair, unlike
-    :class:`trackanno.store.AnnotationStore`, because nothing here appends: a
+    :class:`trackanno.annotate.store.AnnotationStore`, because nothing here appends: a
     save replaces every row for one (movie, track, group) at once. One atomic
     ``os.replace`` per save gives the same guarantee an append and fsync gives
     there - a kill loses at most the edit in progress - without a second write
@@ -493,7 +493,7 @@ class CorrectionStore:
 
     ``columns`` is the header this store will write: the ones this build knows,
     then any it read off the file and does not, in the order the file had them.
-    Same reconstruction as :class:`trackanno.store.AnnotationStore`.
+    Same reconstruction as :class:`trackanno.annotate.store.AnnotationStore`.
     """
 
     def __init__(self, path: str | Path, annotator: str = ""):
@@ -907,7 +907,7 @@ def derive_window_labels(
 
     Containment and not majority, midpoint or nearest, because a window crossing
     a behavioural transition has features that are a BLEND of the two behaviours
-    (:mod:`trackanno.bouts`). Labelling it with either class teaches the next
+    (:mod:`trackanno.infer.bouts`). Labelling it with either class teaches the next
     model that a blend looks like a pure class, exactly at the transitions it is
     already worst at.
 

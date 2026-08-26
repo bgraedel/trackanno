@@ -20,7 +20,7 @@ import threading
 import pytest
 
 from harness import check
-from trackanno import models as M
+from trackanno.video import models as M
 from trackanno.config import ConfigError, load_config
 from trackanno.project import create_project, write_config
 

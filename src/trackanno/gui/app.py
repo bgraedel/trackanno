@@ -35,11 +35,11 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ..clips import ClipStore
+from ..annotate.clips import ClipStore
 from ..config import Config, load_config
-from ..overlay import FOLLOW_MODES, build_clip_view
-from ..store import AnnotationStore, encode_provenance
-from ..suggest import Suggester
+from ..view.overlay import FOLLOW_MODES, build_clip_view
+from ..annotate.store import AnnotationStore, encode_provenance
+from ..learn.suggest import Suggester
 from .panels import CategoryPanel, MetadataPanel, MinimapWidget
 from .prefetch import Prefetcher
 from .theme import app_icon, apply_theme, compact_button
@@ -729,7 +729,7 @@ class AnnotationWidget(QWidget):
             try:
                 from copy import copy
 
-                from ..suggest import train
+                from ..learn.suggest import train
 
                 # Snapshot, never the live CSV: on Windows an open handle makes
                 # the UI thread's atomic rewrite fail outright.
@@ -815,7 +815,7 @@ class AnnotationWidget(QWidget):
         """Recompute for the clip now on screen. Cheap enough to run inline."""
         if not self._kymograph_wanted():
             return
-        from ..kymograph import chain_from_edges, kymograph_from_boxes
+        from ..measure.kymograph import chain_from_edges, kymograph_from_boxes
 
         # Which points form the flagellum, and in which direction, comes from the
         # project's skeleton: the order sets the sign of every value on the chart.

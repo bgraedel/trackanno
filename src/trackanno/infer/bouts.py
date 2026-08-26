@@ -286,7 +286,7 @@ def decode_viterbi(posterior: np.ndarray, self_transition: float) -> np.ndarray:
     An HMM wants an emission LIKELIHOOD ``p(features | class)`` and a classifier
     gives a POSTERIOR ``p(class | features)``; the two differ by the class prior,
     so using the posterior directly is exact only if that prior is flat.
-    ``auto_class_weights="Balanced"`` in :mod:`trackanno.suggest` pushes the
+    ``auto_class_weights="Balanced"`` in :mod:`trackanno.learn.suggest` pushes the
     fitted model towards a balanced prior without guaranteeing one, and the
     mismatch is a constant per-class bias in the emissions, showing up as
     slightly displaced boundaries. A division by the empirical class frequencies
@@ -401,7 +401,7 @@ def runs_to_bouts(
     The bouts are sorted, disjoint and GAPLESS across
     ``[f_lo, f_lo + len(labels))``: an unscored stretch is a row with an empty
     label, never a hole. That mirrors the ``skip_reason`` convention in
-    :mod:`trackanno.densepredict`, and it is a contract downstream code may rely
+    :mod:`trackanno.infer.densepredict`, and it is a contract downstream code may rely
     on.
 
     ``classes`` must have one name per posterior column, a shorter list being

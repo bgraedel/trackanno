@@ -16,7 +16,7 @@ from qtpy.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from qtpy.QtGui import QColor, QFont, QImage, QPainter, QPen
 from qtpy.QtWidgets import QSizePolicy, QWidget
 
-from ..kymograph import Kymograph, canonical_sign
+from ..measure.kymograph import Kymograph, canonical_sign
 from .theme import current, tokens
 
 __all__ = ["KymographView", "diverging_ramp"]

@@ -29,13 +29,13 @@ from qtpy.QtWidgets import (
     QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from ..clips import MANIFEST_FILE, ClipStore
+from ..annotate.clips import MANIFEST_FILE, ClipStore
 from ..config import ConfigError, load_config
 from ..project import (
     CONFIG_NAME, _exists, config_path_for, create_project, project_status, recent_projects,
     remember_project, write_config,
 )
-from ..store import AnnotationStore
+from ..annotate.store import AnnotationStore
 from .app import AnnotationWidget
 from .configform import CategoryEditor, ConfigForm, KeypointEditor
 from .distribution import BarChart, summary_lines, tally_annotations
@@ -608,7 +608,7 @@ class ConfigPage(Page):
             field.edit.setEnabled(True)
             return
 
-        from ..models import cache_dir, find_model, local_model_path
+        from ..video.models import cache_dir, find_model, local_model_path
 
         entry = find_model(spec.source, spec.version)
         name = " ".join(b for b in (spec.source, spec.version) if b)
@@ -654,7 +654,7 @@ class ConfigPage(Page):
 
     def _pick_registry_model(self) -> None:
         """Choose shared weights, fetch them, and let them configure the project."""
-        from ..models import apply_manifest, fetch, mismatch_warnings
+        from ..video.models import apply_manifest, fetch, mismatch_warnings
 
         if self.cfg is None:
             QMessageBox.information(self, "From registry", "Open a project first.")
@@ -717,7 +717,7 @@ class ConfigPage(Page):
         self.keypoints.state.setText("reading the model file...")
 
         def work(reporter):
-            from ..tiling import read_model_info
+            from ..detect.tiling import read_model_info
 
             return read_model_info(path)
 
@@ -775,7 +775,7 @@ class ConfigPage(Page):
             self._device_probe = None
 
         def work(reporter):
-            from ..tiling import describe_auto, describe_devices
+            from ..detect.tiling import describe_auto, describe_devices
 
             # Both in one job: importing torch is what costs the seconds, and
             # asking a second question of it afterwards is free.
@@ -873,7 +873,7 @@ class ConfigPage(Page):
         self.advanced.mark(marks)
         picker = self.advanced._widgets.get("suggest.feature_groups")
         if picker is not None and self.cfg is not None:
-            from ..clipfeatures import available_groups
+            from ..measure.clipfeatures import available_groups
 
             picker.set_available(available_groups(self.cfg))
         self.pose_row.setVisible(bool(self.cfg and self.cfg.needs_keypoints))
@@ -884,7 +884,7 @@ class ConfigPage(Page):
         """Ask the checkpoint how many keypoints it predicts. Names stay yours."""
         if self.cfg is None or (self._keypoint_reader and self._keypoint_reader.isRunning()):
             return
-        from ..models import local_model_path
+        from ..video.models import local_model_path
 
         model_path = local_model_path(self.cfg)
         if not _exists(model_path, "file"):
@@ -895,7 +895,7 @@ class ConfigPage(Page):
         self.keypoints.state.setText("reading the model file...")
 
         def work(reporter):
-            from ..tiling import read_keypoint_count
+            from ..detect.tiling import read_keypoint_count
 
             return read_keypoint_count(model_path)
 
@@ -1020,7 +1020,7 @@ class ModelRegistryDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from ..models import registry_url
+        from ..video.models import registry_url
 
         self.setWindowTitle("Choose a shared model")
         self.setMinimumWidth(640)
@@ -1065,7 +1065,7 @@ class ModelRegistryDialog(QDialog):
         self._fill(refresh=False)
 
     def _refresh(self) -> None:
-        from ..models import RegistryError, set_registry_url
+        from ..video.models import RegistryError, set_registry_url
 
         try:
             set_registry_url(self.url.text())
@@ -1075,7 +1075,7 @@ class ModelRegistryDialog(QDialog):
         self._fill(refresh=True)
 
     def _fill(self, refresh: bool) -> None:
-        from ..models import RegistryError, cached_path, list_models, registry_url
+        from ..video.models import RegistryError, cached_path, list_models, registry_url
 
         self.list.clear()
         if not registry_url():
@@ -1275,7 +1275,7 @@ class PreparePage(Page):
         self.scan_state.setText("scanning... (ND2 files on a share can take a moment)")
 
         def work(reporter):
-            from ..movies import discover_movies
+            from ..video.movies import discover_movies
 
             out = []
             for movie in discover_movies(cfg):
@@ -1376,7 +1376,7 @@ class PreparePage(Page):
 
         from copy import copy
 
-        from ..prepare import prepare_all
+        from ..detect.prepare import prepare_all
 
         cfg = copy(self.cfg)
         if self.device.text().strip():
@@ -1663,7 +1663,7 @@ class ModelPage(Page):
             self._predict_blocker = "no project open"
             self._has_predictions = False
         else:
-            from ..predict import prediction_blocker, predictions_path, staleness
+            from ..infer.predict import prediction_blocker, predictions_path, staleness
 
             self._predict_blocker = prediction_blocker(self.cfg)
             self._has_predictions = predictions_path(self.cfg).exists()
@@ -1727,7 +1727,7 @@ class ModelPage(Page):
         def work(reporter):
             import pandas as pd
 
-            from ..reassociate import plan_reassociation
+            from ..annotate.reassociate import plan_reassociation
 
             reporter.stage("reading the clip manifest", None)
             store = ClipStore(cfg.paths.work_dir)
@@ -1816,7 +1816,7 @@ class ModelPage(Page):
         self._write_repair(labels, plan)
 
     def _write_repair(self, labels, plan) -> None:
-        from ..reassociate import apply_reassociation, backup_labels, write_labels
+        from ..annotate.reassociate import apply_reassociation, backup_labels, write_labels
 
         csv_path = self.cfg.paths.csv
         # The panel holds the CSV in memory and rewrites it on the next keystroke.
@@ -1859,7 +1859,7 @@ class ModelPage(Page):
         self._predict_summary = ""
 
         def work(reporter):
-            from ..predict import predict_all, summarise
+            from ..infer.predict import predict_all, summarise
 
             frame = predict_all(cfg, reporter=reporter)
             # Stashed for the status bar; the full tally is already in the log.
@@ -1896,7 +1896,7 @@ class ModelPage(Page):
         self._job = "train"
 
         def work(reporter):
-            from ..suggest import train
+            from ..learn.suggest import train
 
             return train(cfg, verbose=False, reporter=reporter)
 
@@ -2299,7 +2299,7 @@ class ExportPage(Page):
             return "no project open"
         if self.source_value() == "predictions":
             # A prediction-only export needs no hand labels, but it needs the file.
-            from ..predict import predictions_path
+            from ..infer.predict import predictions_path
 
             if not predictions_path(self.cfg).exists():
                 return ("no predictions yet - run 'Label all clips with the model' "
@@ -2345,7 +2345,7 @@ class ExportPage(Page):
             "so they cannot be mistaken for your labels"
         )
         if self.cfg is not None:
-            from ..predict import predictions_path, staleness
+            from ..infer.predict import predictions_path, staleness
 
             if predictions_path(self.cfg).exists():
                 stale = staleness(self.cfg)
@@ -2373,7 +2373,7 @@ class ExportPage(Page):
         if source == "predictions":
             counts, unit = self._predicted_movies()
         else:
-            from ..render import annotated_movies
+            from ..view.render import annotated_movies
 
             counts, unit = annotated_movies(self.cfg), "annotated clips"
 
@@ -2389,12 +2389,12 @@ class ExportPage(Page):
 
         The unit comes back with the counts because a prediction row is a dense
         WINDOW or a decoded BOUT depending on the run that wrote the file, and
-        only the file knows which (:func:`trackanno.render.prediction_unit`).
+        only the file knows which (:func:`trackanno.view.render.prediction_unit`).
         """
         import pandas as pd
 
-        from ..predict import load_predictions
-        from ..render import prediction_unit
+        from ..infer.predict import load_predictions
+        from ..view.render import prediction_unit
 
         try:
             frame = load_predictions(self.cfg)
@@ -2415,7 +2415,7 @@ class ExportPage(Page):
         group_name = self.group.currentText() or None
         if source != "labels":
             # Refuse before starting: an empty export looks like "nothing to say".
-            from ..predict import load_predictions
+            from ..infer.predict import load_predictions
 
             try:
                 load_predictions(self.cfg, group_name)
@@ -2439,7 +2439,7 @@ class ExportPage(Page):
         as_tif = self.as_tif.isChecked()
 
         def work(reporter):
-            from ..render import render_all
+            from ..view.render import render_all
 
             return render_all(
                 cfg, picked, group_name, hide_unlabelled=hide, max_frames=limit,

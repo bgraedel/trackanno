@@ -21,7 +21,7 @@ from pathlib import Path
 
 from harness import check
 from trackanno.config import RESERVED_GROUP_NAMES, ConfigError, load_config
-from trackanno.store import (
+from trackanno.annotate.store import (
     AUDIT_COLUMN, IDENTITY_COLUMNS, PROVENANCE_COLUMN, TRAILING_COLUMNS,
     AnnotationStore, decode_provenance, encode_provenance,
 )
@@ -222,7 +222,7 @@ def test_a_value_that_is_no_number_is_written_as_null_and_never_as_zero() -> Non
     # The same rule, reached through the other column that uses the codec: a
     # bout nothing could score has no confidence, and a correction over it is
     # not evidence that the model was confidently wrong.
-    from trackanno.corrections import decode_overruled, encode_overruled
+    from trackanno.annotate.corrections import decode_overruled, encode_overruled
 
     bouts = decode_overruled(encode_overruled([
         {"f_start": 0, "f_end": 40, "label": "swimming", "conf": 0.9},
@@ -484,7 +484,7 @@ def test_what_the_selector_actually_emits_goes_in_whole(root: Path) -> None:
     """
     import numpy as np
 
-    from trackanno.select import AUDIT_RULE, select_batch
+    from trackanno.learn.select import AUDIT_RULE, select_batch
 
     cfg = _cfg(root, "selector")
     store = AnnotationStore(cfg.paths.csv, cfg)
@@ -533,7 +533,7 @@ def test_the_other_readers_of_this_file_still_read_it(root: Path) -> None:
     """
     import pandas as pd
 
-    from trackanno.reassociate import write_labels
+    from trackanno.annotate.reassociate import write_labels
 
     cfg = _cfg(root, "readers")
     path = cfg.paths.csv

@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import Config
+from ..config import Config
 
 __all__ = [
     "ClipSpec", "clip_id_for", "plan_clips", "choose_crop_size", "finalise_geometry",
@@ -71,7 +71,7 @@ def clip_id_for(movie_id: str, track_id: int, f_start: int) -> str:
     Used by the annotation CSV, the manifest and the feature tables, so a grid
     built elsewhere must produce byte-identical ids. It embeds the track id, so
     re-running detection renumbers tracks and changes every id (see
-    :mod:`trackanno.reassociate`).
+    :mod:`trackanno.annotate.reassociate`).
     """
     return f"{movie_id}__t{int(track_id):04d}__f{int(f_start):06d}"
 

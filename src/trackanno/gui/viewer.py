@@ -3,7 +3,7 @@
 ``SimpleViewer`` is a self-contained player: canvas, QTimer and slider. The
 overlay is never rasterised, so the cached clip stays grayscale and the marker
 is vector graphics one hairline wide at any zoom. Centring and zoom are
-display-time transforms of a :class:`~trackanno.overlay.ClipView`, unclamped, so
+display-time transforms of a :class:`~trackanno.view.overlay.ClipView`, unclamped, so
 a clip cropped at the movie border still shows the animal dead centre.
 """
 
@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
-from ..overlay import CONTEXT_RGB, TARGET_RGB, ClipView
+from ..view.overlay import CONTEXT_RGB, TARGET_RGB, ClipView
 from .theme import tokens
 
 __all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas"]

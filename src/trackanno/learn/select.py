@@ -6,7 +6,7 @@ clip, which rule chose it, what it scored and where it ranked.
 
 Probabilities must be raw ``predict_proba`` output over the FULL candidate pool,
 one row per clip, and not
-:meth:`trackanno.suggest.Suggester.suggest` output: that returns ``{}`` for an
+:meth:`trackanno.learn.suggest.Suggester.suggest` output: that returns ``{}`` for an
 audit clip and drops anything under ``cfg.suggest.min_confidence``, which is the
 low-confidence end uncertainty sampling exists to find.
 
@@ -23,7 +23,7 @@ gate in ``suggest.train_group`` is computed against.
 out, ``min_frame_gap`` keeps near-duplicate windows of one track out, every tie
 is broken by ``clip_id`` so the answer does not depend on row order, and a
 reserved share of the slots is drawn uniformly at random from the audit holdout
-(:class:`trackanno.suggest.AuditHoldout`). That stratum keeps the labelled audit
+(:class:`trackanno.learn.suggest.AuditHoldout`). That stratum keeps the labelled audit
 subset a random sample of the audit set, which is what makes ``audit_accuracy``
 an unbiased estimate; a uniform draw carries no score, and is exempt from the
 diversity rule because a draw that can be suppressed is no longer uniform.
@@ -342,7 +342,7 @@ def select_batch(
     ``rule`` is a key of :data:`UNCERTAINTY_RULES`. ``candidates`` is an optional
     boolean mask of rows that may be selected, which is how already-annotated
     clips stay out. ``audit`` is an optional boolean mask of the audit holdout
-    (:class:`trackanno.suggest.AuditHoldout`); ``audit_share`` of the slots,
+    (:class:`trackanno.learn.suggest.AuditHoldout`); ``audit_share`` of the slots,
     rounded to ``int(audit_share * n + 0.5)``, are then drawn uniformly at random
     from it under ``seed`` while the rest of the audit clips stay out of the
     ranked pool. Passing ``audit=None`` asserts the project has no holdout rather

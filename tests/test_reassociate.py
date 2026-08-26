@@ -103,7 +103,7 @@ def moved(entry: dict, track: int, dx: int = 0, dy: int = 0, **changes) -> dict:
 def test_valid_ids_are_left_completely_alone() -> None:
     """The common case is that nothing is wrong. A repair that rewrites rows it
     did not need to touch is a repair nobody can safely run twice."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     clips = [manifest_row("MOVIE_A", 3, 0, 100, 100),
              manifest_row("MOVIE_A", 4, 0, 300, 300),
@@ -127,7 +127,7 @@ def test_a_retracked_movie_is_relinked() -> None:
     """The bug itself: same movie, same frame window, same animal, new track id.
     The crop centre drifts by a pixel or two because the tracker's boxes moved,
     which is precisely why the match is nearest-centre and not equality."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     old = [manifest_row("MOVIE_A", 2, 0, 100, 100),
            manifest_row("MOVIE_A", 5, 0, 400, 220),
@@ -171,7 +171,7 @@ def test_the_humans_columns_survive_untouched() -> None:
     """The reason the labels are worth rescuing at all. Everything the annotator
     typed or decided is copied through byte for byte; only the machine-generated
     identity moves."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     old = manifest_row("MOVIE_A", 7, 0, 250, 250)
     manifest = make_manifest([moved(old, 301, dx=1)])
@@ -199,7 +199,7 @@ def test_two_orphans_on_one_clip_are_both_refused() -> None:
     """Whichever one wins, the other is silently attached to an animal it never
     described. There is nothing in the CSV that says which is which, so the only
     honest answer is to refuse both and say so."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     survivor = manifest_row("MOVIE_A", 88, 0, 500, 500)
     manifest = make_manifest([manifest_row("MOVIE_A", 12, 0, 100, 100), survivor])
@@ -246,7 +246,7 @@ def test_a_clip_that_is_already_labelled_is_not_stolen() -> None:
     clip_id or overwrite the more recent judgement with the older one. This is
     not hypothetical: it accounted for 59 of the 145 orphans on the project that
     prompted the whole exercise."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     old = manifest_row("MOVIE_A", 9, 0, 200, 200)
     current = moved(old, 214, dx=1)
@@ -278,7 +278,7 @@ def test_the_distance_threshold_is_enforced() -> None:
     """A crop centre moves a pixel or two between runs. It does not move across
     the frame, so anything far away is a different animal - and the threshold is
     the only thing standing between a repair and a fabricated label."""
-    from trackanno.reassociate import plan_reassociation
+    from trackanno.annotate.reassociate import plan_reassociation
 
     old = manifest_row("MOVIE_A", 3, 0, 100, 100)
     for offset, expected in ((0, True), (5, True), (12, True), (13, False), (400, False)):
@@ -302,7 +302,7 @@ def test_unmatched_labels_are_reported_not_dropped() -> None:
     cut, the window moved, the movie was removed. The label cannot be repaired,
     and the one thing that must not happen is for it to disappear quietly a
     second time."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     gone_movie = manifest_row("MOVIE_GONE", 3, 0, 100, 100)
     gone_window = manifest_row("MOVIE_A", 3, 500, 100, 100)
@@ -339,7 +339,7 @@ def test_apply_does_not_mutate_its_input() -> None:
     """The caller still has to back the CSV up and write it. If the plan were
     applied in place there would be nothing left to compare against, and a write
     that failed half way would leave the frame in memory already rewritten."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     old = [manifest_row("MOVIE_A", 3, 0, 100, 100),
            manifest_row("MOVIE_A", 4, 0, 400, 400)]
@@ -372,7 +372,7 @@ def test_apply_does_not_mutate_its_input() -> None:
 def test_it_refuses_frames_it_cannot_match_on() -> None:
     """A CSV without the identity columns cannot be repaired by any means. Say
     so, rather than matching on whatever happens to be present."""
-    from trackanno.reassociate import plan_reassociation
+    from trackanno.annotate.reassociate import plan_reassociation
 
     manifest = make_manifest([manifest_row("MOVIE_A", 3, 0, 100, 100)])
     thin = pd.DataFrame([{"clip_id": "x", "behaviour": "swimming"}])
@@ -394,7 +394,7 @@ def test_it_survives_a_csv_read_as_text() -> None:
     """The GUI reads the CSV with ``dtype=str`` so that untouched values round
     trip byte for byte into the rewritten file. Every coordinate therefore
     arrives as a string, and the matcher has to cope."""
-    from trackanno.reassociate import apply_reassociation, plan_reassociation
+    from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation
 
     old = manifest_row("MOVIE_A", 3, 0, 100, 100)
     manifest = make_manifest([moved(old, 217, dx=1)])
@@ -418,7 +418,7 @@ def test_the_rewrite_is_backed_up_and_atomic(root: Path) -> None:
     """This overwrites the user's primary data - hours of judgement with no
     other copy - so the old file has to survive under a name of its own, and the
     new one has to appear whole or not at all."""
-    from trackanno.reassociate import (
+    from trackanno.annotate.reassociate import (
         apply_reassociation, backup_labels, plan_reassociation, write_labels,
     )
 
@@ -475,7 +475,7 @@ def test_the_trainer_says_how_many_it_ignored(root: Path) -> None:
     to drop orphaned labels in silence; the count and its per-class breakdown
     now ride in the report, because a loss concentrated in one class is what
     actually destroys that class."""
-    from trackanno.suggest import GroupReport
+    from trackanno.learn.suggest import GroupReport
 
     fields = GroupReport.__dataclass_fields__
     check("the report carries an orphan count", "n_orphaned" in fields)
@@ -500,7 +500,7 @@ def test_the_trainer_says_how_many_it_ignored(root: Path) -> None:
     # a suite that loads the developer's own config.yaml tests their data.
     from trackanno.config import load_config
     from trackanno.project import create_project
-    from trackanno.suggest import train_group
+    from trackanno.learn.suggest import train_group
 
     cfg = load_config(create_project(root / "trainer"))
     cfg.suggest.min_per_class = 2

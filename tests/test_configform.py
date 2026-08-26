@@ -325,8 +325,8 @@ def test_no_combo_offers_a_value_the_loader_refuses(app, root: Path) -> None:
     from trackanno.config import ConfigError
     from trackanno.gui.configform import FIELDS, _options
     from trackanno.project import create_project, write_config
-    from trackanno.select import TARGET_RULES, UNCERTAINTY_RULES
-    from trackanno.tracking import TRACKERS
+    from trackanno.learn.select import TARGET_RULES, UNCERTAINTY_RULES
+    from trackanno.detect.tracking import TRACKERS
 
     extras = {f"{section}.{key}": extra for section, key, _kind, _l, _t, extra in FIELDS}
     check("the selection rules are the registry itself",

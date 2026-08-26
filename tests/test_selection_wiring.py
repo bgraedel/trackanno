@@ -1,4 +1,4 @@
-"""Wiring :mod:`trackanno.select` into a project: the config, the pool, the batch.
+"""Wiring :mod:`trackanno.learn.select` into a project: the config, the pool, the batch.
 
 ``select.py`` decides HOW to rank and is tested on its own arithmetic in
 ``test_select.py``. Nothing there knows what a project is. These are the claims
@@ -123,8 +123,8 @@ def _install_model(cfg, manifest, certainty, trained_window: int | None = FRAMES
 
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
-    from trackanno.suggest import MODEL_FILE, REPORT_FILE
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
+    from trackanno.learn.suggest import MODEL_FILE, REPORT_FILE
 
     work = cfg.paths.work_dir
     ids = [c for c in manifest["clip_id"].astype(str) if c not in (missing or set())]
@@ -169,7 +169,7 @@ def spread_certainty(manifest, contested: str | None = None) -> dict:
 
 
 def _suggester(cfg):
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     suggester = Suggester(cfg)
     assert suggester.ready, suggester.problem
@@ -281,9 +281,9 @@ def test_a_rule_returns_a_full_ordered_batch_with_a_reason_per_clip(root: Path) 
     each carrying why it was chosen - and every one of those reasons has to
     survive the trip into annotations.csv, or the provenance is a crash rather
     than a record."""
-    from trackanno.select import AUDIT_RULE, UNCERTAINTY_RULES
-    from trackanno.store import decode_provenance, encode_provenance
-    from trackanno.suggest import AuditHoldout
+    from trackanno.learn.select import AUDIT_RULE, UNCERTAINTY_RULES
+    from trackanno.annotate.store import decode_provenance, encode_provenance
+    from trackanno.learn.suggest import AuditHoldout
 
     manifest = build_manifest()
     ids = manifest["clip_id"].astype(str).tolist()
@@ -376,8 +376,8 @@ def test_audit_clips_are_drawn_at_the_configured_share(root: Path) -> None:
     labelled with their own reason, and are never ranked - so the labelled audit
     subset stays a random sample of the audit set however good the selector
     gets."""
-    from trackanno.select import AUDIT_RULE
-    from trackanno.suggest import AuditHoldout
+    from trackanno.learn.select import AUDIT_RULE
+    from trackanno.learn.suggest import AuditHoldout
 
     manifest = build_manifest()
     certainty = spread_certainty(manifest)
@@ -763,7 +763,7 @@ def test_a_starved_class_is_targeted_only_when_a_quota_asks_for_it(
     spent it, so the skew is on the record rather than inferred later."""
     from trackanno.config import load_config
     from trackanno.project import write_config
-    from trackanno.select import AUDIT_RULE
+    from trackanno.learn.select import AUDIT_RULE
 
     manifest = build_manifest()
     certainty = spread_certainty(manifest)

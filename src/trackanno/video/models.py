@@ -174,7 +174,7 @@ class ModelEntry:
 # where models come from
 # --------------------------------------------------------------------------- #
 def _state_dir() -> Path:
-    from .project import _state_dir as state
+    from ..project import _state_dir as state
 
     return state()
 
@@ -288,7 +288,7 @@ def _release(owner: str, repo: str, tag: str = "") -> dict:
     except Exception as exc:
         hint = "" if token() else (
             "\nNo GitHub token is set on this machine, which a private "
-            "repository needs. Set one with `trackanno.models.set_token(...)` or "
+            "repository needs. Set one with `trackanno.video.models.set_token(...)` or "
             "the GH_TOKEN environment variable."
         )
         raise RegistryError(f"could not read the release at {url}: {exc}{hint}") from exc
@@ -435,7 +435,7 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     is the project's pin: when it disagrees with what arrives, nothing is cached
     and the mismatch is reported.
     """
-    from .progress import NullReporter
+    from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     wanted = (expect_sha256 or entry.sha256 or "").lower()
@@ -586,8 +586,8 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     Returned rather than logged, so the Configure page can report what a model
     decided in the same breath as applying it.
     """
-    from .config import load_config
-    from .project import write_config
+    from ..config import load_config
+    from ..project import write_config
 
     before = load_config(config_path)
     updates: dict[str, object] = {}
@@ -639,7 +639,7 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     try:
         write_config(config_path, updates, keypoints=keypoints)
     except Exception:
-        from .config import ConfigError
+        from ..config import ConfigError
 
         applied: dict[str, object] = {}
         refused: list[str] = []

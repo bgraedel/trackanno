@@ -1,4 +1,4 @@
-"""Checks for :mod:`trackanno.bouts`, the per-frame posterior and its decoders.
+"""Checks for :mod:`trackanno.infer.bouts`, the per-frame posterior and its decoders.
 
 Nothing here runs a model. Every posterior below is built from a KNOWN
 ground-truth label sequence by the definition of what a window measures - a
@@ -29,7 +29,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from harness import check
-from trackanno.bouts import (
+from trackanno.infer.bouts import (
     decode_min_bout, decode_viterbi, frame_posterior, runs_to_bouts,
     self_transition_for,
 )

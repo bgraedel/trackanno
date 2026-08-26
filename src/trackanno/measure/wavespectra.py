@@ -30,7 +30,7 @@ Rules, applied window by window:
   (``phaseLinearityRsq``) is what separates a wave from a random walk; condition
   on that rather than on excess.
 
-Shared primitives come from :mod:`trackanno.clipfeatures`.
+Shared primitives come from :mod:`trackanno.measure.clipfeatures`.
 """
 
 from __future__ import annotations

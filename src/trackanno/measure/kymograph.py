@@ -7,7 +7,7 @@ stabilisation or body-axis alignment. Being a second derivative it comes from a
 smoothing spline fitted through the chain once per frame and differentiated
 analytically; finite differences on seven noisy points are almost pure noise.
 
-Node convention, matching :mod:`trackanno.clipfeatures`: node 0 is Head, node 1
+Node convention, matching :mod:`trackanno.measure.clipfeatures`: node 0 is Head, node 1
 is Base, nodes 1..N the flagellum base to tip, arclength ``s`` 0 at the base to
 1 at the tip. Positive curvature bends anticlockwise in the image coordinate
 system walking base to tip - image y points *down*, so clockwise on screen. The
@@ -343,7 +343,7 @@ def curvature_kymograph(
     the keypoint indices along the flagellum, base first; pass the result of
     :func:`chain_from_edges` so the traversal comes from the project's own
     skeleton. Without it the fallback is nodes ``first_node..N``, only a
-    convention, matching Head/Base/... in :mod:`trackanno.clipfeatures`.
+    convention, matching Head/Base/... in :mod:`trackanno.measure.clipfeatures`.
     """
     kx = np.asarray(kx, dtype=np.float64)
     ky = np.asarray(ky, dtype=np.float64)

@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 from harness import check
 from trackanno.config import load_config
-from trackanno.movies import ND2Movie, _nd2_fps
+from trackanno.video.movies import ND2Movie, _nd2_fps
 
 HEIGHT, WIDTH = 8, 6
 

@@ -1,6 +1,6 @@
-"""Checks for :mod:`trackanno.discover`, the thing a person runs to look inside a class.
+"""Checks for :mod:`trackanno.learn.discover`, the thing a person runs to look inside a class.
 
-:mod:`trackanno.subcluster` is checked against planted structure in
+:mod:`trackanno.learn.subcluster` is checked against planted structure in
 `tests/test_subcluster.py`; nothing here re-checks the clustering. What is
 checked here is everything the caller is responsible for, which is where this
 technique actually goes wrong:
@@ -34,11 +34,11 @@ import pandas as pd
 import pytest
 from harness import check
 from sklearn.metrics import adjusted_rand_score
-from trackanno.discover import (
+from trackanno.learn.discover import (
     BATCH_FRACTION, DEFAULT_COLUMNS, SCHEMA, class_table, discover, format_report,
     load_report, main, report_path, resolve_columns, to_payload, write_report,
 )
-from trackanno.wavespectra import SERIES_COLUMNS
+from trackanno.measure.wavespectra import SERIES_COLUMNS
 
 # The 25 columns the default names, and the 40 that stand in for the rest of a
 # real feature table. Both are needed: the value of choosing columns is invisible
@@ -379,7 +379,7 @@ def test_a_cluster_drawn_from_one_movie_is_flagged_as_a_possible_batch_effect() 
     The third group here is real, tight, and comes almost entirely from one
     movie. Every number a clusterer can produce says it is a discovery - it is
     stable, it is large, its members do keep landing together - and it is the
-    recording. Nothing inside :mod:`trackanno.subcluster` can see that, because
+    recording. Nothing inside :mod:`trackanno.learn.subcluster` can see that, because
     it is handed a bare matrix; this module has the manifest beside it.
     """
     features, labels, truth = tables([
@@ -668,10 +668,10 @@ def test_the_written_report_round_trips_and_carries_what_a_later_step_needs(tmp_
     check("and 'nobody looked' does not read back as stable",
           not any(c["stable"] for c in unmeasured["clusters"]))
 
-    (tmp_path / "old.json").write_text('{"schema": "trackanno.discover/0"}', encoding="utf-8")
+    (tmp_path / "old.json").write_text('{"schema": "trackanno.learn.discover/0"}', encoding="utf-8")
     check("a report from another schema is refused, naming both versions",
           all(part in refused(load_report, tmp_path / "old.json")
-              for part in ("trackanno.discover/0", SCHEMA)),
+              for part in ("trackanno.learn.discover/0", SCHEMA)),
           refused(load_report, tmp_path / "old.json"))
     (tmp_path / "junk.json").write_text('{"clusters": []}', encoding="utf-8")
     check("and so is a file that carries no stamp at all",

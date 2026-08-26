@@ -293,7 +293,7 @@ suggest:
 
 
 # --- Bulk labelling ----------------------------------------------------------
-# What `python -m trackanno.predict` scores when it writes predictions.parquet.
+# What `python -m trackanno.infer.predict` scores when it writes predictions.parquet.
 #   dense     -> its OWN window grid, tiling every frame of every track. The
 #                clip grid above is a sampling chosen for a human's attention,
 #                so scoring only those clips leaves most of the movie
@@ -768,7 +768,7 @@ def project_status(cfg) -> ProjectStatus:
         except OSError:
             status.video_dir_ok = False
         status.n_videos = len(seen)
-    from .models import local_model_path
+    from .video.models import local_model_path
 
     status.model_ok = _exists(local_model_path(cfg), "file")
 

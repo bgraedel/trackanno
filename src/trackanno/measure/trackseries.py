@@ -15,7 +15,7 @@ anyway, and that NaN pattern is itself informative to a NaN-native model.
 ``beat_*`` and ``wave_*`` are ABSENT rather than NaN: they need the whole 2-D
 body-frame displacement matrix and a resolvability floor that is a function of
 window LENGTH, so they change meaning when the window does.
-:func:`trackanno.clipfeatures.window_features` joins them back on.
+:func:`trackanno.measure.clipfeatures.window_features` joins them back on.
 
 Frames are addressed by ABSOLUTE frame number: the table is indexed
 ``f_start .. f_start + n_frames - 1`` and ``aggregate_window`` takes absolute
@@ -38,7 +38,7 @@ from .clipfeatures import (
     _path_length,
     _safe,
 )
-from .config import Config
+from ..config import Config
 
 __all__ = [
     "build_series", "aggregate_window", "feature_names",
@@ -159,7 +159,7 @@ def build_series(
 
     ``sub`` is one track's rows; ``f_start`` and ``n_frames`` define the grid,
     normally the track's whole span. Rows outside it are ignored and frames with
-    no row become NaN, as in :func:`~trackanno.clipfeatures._on_grid`. Rates are
+    no row become NaN, as in :func:`~trackanno.measure.clipfeatures._on_grid`. Rates are
     per SECOND, so :func:`aggregate_window` must be handed the same ``fps``.
 
     ``present`` and ``flagellum_complete`` are 0.0/1.0, not NaN/1.0: a pose track

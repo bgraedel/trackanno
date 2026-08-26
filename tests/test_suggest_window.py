@@ -87,8 +87,8 @@ def _stub_model_project(root: Path, name: str, trained_window: int | None):
     """
     import joblib
 
-    from trackanno.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
-    from trackanno.suggest import MODEL_FILE
+    from trackanno.measure.clipfeatures import CLIP_FEATURES_FILE, FEATURE_VERSION
+    from trackanno.learn.suggest import MODEL_FILE
 
     cfg, manifest = _copy_project(root, name)
     work = cfg.paths.work_dir
@@ -122,8 +122,8 @@ def test_a_trained_model_records_the_window_it_was_trained_at(root: Path) -> Non
     the annotation clip manifest, whose windows are `clips.frames` long. That is
     the number the model has to carry, and asked about its own window length it
     must report no problem at all."""
-    from trackanno.store import AnnotationStore
-    from trackanno.suggest import Suggester, train
+    from trackanno.annotate.store import AnnotationStore
+    from trackanno.learn.suggest import Suggester, train
 
     cfg, manifest = _copy_project(root, "trained")
 
@@ -166,7 +166,7 @@ def test_the_recorded_length_survives_a_save_load_round_trip(root: Path) -> None
     import joblib
 
     from trackanno.config import load_config
-    from trackanno.suggest import MODEL_FILE, Suggester
+    from trackanno.learn.suggest import MODEL_FILE, Suggester
 
     cfg = _stub_model_project(root, "roundtrip", trained_window=87)
 
@@ -202,7 +202,7 @@ def test_a_mismatched_window_is_reported_with_both_numbers(root: Path) -> None:
     """The whole point is that neither number is visible anywhere else: the
     columns line up, the feature version matches, and only the message can say
     what was fitted and what is being predicted on."""
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     cfg = _stub_model_project(root, "mismatch", trained_window=50)
     suggester = Suggester(cfg)
@@ -250,7 +250,7 @@ def test_a_model_with_no_recorded_window_loads_and_says_so(root: Path) -> None:
     would mean a trackanno upgrade silently invalidates a project's model, so an
     unrecorded length is reported as unchecked - a warning the caller can pass
     on - and never raised."""
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     cfg = _stub_model_project(root, "legacy", trained_window=None)
 
@@ -297,7 +297,7 @@ def test_the_helper_answers_rather_than_raising(root: Path) -> None:
     Suggester that never loaded a model at all."""
     from trackanno.config import load_config
     from trackanno.project import create_project, write_config
-    from trackanno.suggest import Suggester
+    from trackanno.learn.suggest import Suggester
 
     project = Path(root) / "empty"
     config_path = create_project(project)

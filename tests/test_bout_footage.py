@@ -57,9 +57,9 @@ def filmed_project(root, name: str):
     from fixtures import make_project
     from test_predict import FIXTURES, build_case
 
-    from trackanno.clips import BOXES_FILE, CACHE_FILE, ORIGINS_FILE
+    from trackanno.annotate.clips import BOXES_FILE, CACHE_FILE, ORIGINS_FILE
     from trackanno.config import load_config
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     cfg, manifest = build_case(root, name)
     fixture = load_config(make_project(FIXTURES))
@@ -125,7 +125,7 @@ def cached_frame(cfg, movie_id: str, track_id: int, frame: int) -> np.ndarray:
     so "what is on screen" is compared against the file and not against the
     same object that put it there.
     """
-    from trackanno.clips import ClipStore
+    from trackanno.annotate.clips import ClipStore
 
     store = ClipStore(cfg.paths.work_dir)
     try:
@@ -332,7 +332,7 @@ def test_a_correction_still_round_trips_with_the_video_wired_in(app, panel, film
     unchanged, and nothing about a frame being on screen gets into what was
     asserted about it.
     """
-    from trackanno.corrections import corrections_path
+    from trackanno.annotate.corrections import corrections_path
     from trackanno.gui.timeline import BoutReviewPanel
 
     cfg, movie = filmed
@@ -376,7 +376,7 @@ def test_a_project_with_no_clip_cache_keeps_the_timeline_and_says_why(app, root)
     from test_predict import build_case
 
     from trackanno.gui.timeline import BoutReviewPanel
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     cfg, manifest = build_case(root, "footage-uncached")
     movie = str(manifest["movie_id"].iat[0])
@@ -459,9 +459,9 @@ def test_a_frame_cut_from_the_movie_is_the_frame_the_cache_would_have_held(
     import tifffile
     from test_pipeline import SyntheticMovie
 
-    from trackanno.clips import NORM_FILE
+    from trackanno.annotate.clips import NORM_FILE
     from trackanno.gui.timeline import MovieFrames
-    from trackanno.movies import Normalizer
+    from trackanno.video.movies import Normalizer
 
     cfg, movie_id = filmed_project(root, "footage-fallback")
     source = SyntheticMovie()
@@ -552,7 +552,7 @@ def test_closing_the_window_unmaps_the_clip_cache(app, root) -> None:
     round to it - turns 'run detection again' into an OSError about an invalid
     argument, days later and nowhere near this code.
     """
-    from trackanno.clips import CACHE_FILE
+    from trackanno.annotate.clips import CACHE_FILE
     from trackanno.gui.timeline import BoutReviewPanel
 
     cfg, movie = filmed_project(root, "footage-release")

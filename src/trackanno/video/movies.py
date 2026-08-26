@@ -24,7 +24,7 @@ from typing import Iterator
 
 import numpy as np
 
-from .config import Config
+from ..config import Config
 
 __all__ = [
     "MovieSource",
@@ -124,7 +124,7 @@ class Normalizer:
         Percentiles come from a strided pixel subsample: ample for a percentile,
         and cheap even on very large frames.
         """
-        from .config import Normalize
+        from ..config import Normalize
 
         opt = options or Normalize()
         n = min(movie.n_frames, n_frames) if n_frames else movie.n_frames

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .config import Config
+from ..config import Config
 
 __all__ = [
     "hex_to_rgb",

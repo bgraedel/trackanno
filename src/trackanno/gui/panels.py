@@ -12,7 +12,7 @@ from qtpy.QtWidgets import (
 
 from ..config import CategoryGroup, Config
 from .theme import RADIUS, tokens
-from ..store import AnnotationStore
+from ..annotate.store import AnnotationStore
 
 __all__ = ["CategoryPanel", "MetadataPanel", "MinimapWidget"]
 

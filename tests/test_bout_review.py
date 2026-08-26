@@ -63,7 +63,7 @@ def ink(frame: np.ndarray) -> int:
 
 def bout_row(f_start, f_end, label, conf, human=0.0, covering=5.0, reason="",
              movie="m", track=1, group=GROUP, groups=(GROUP,)) -> dict:
-    """One row of the bout schema :func:`trackanno.predict._bout_predictions`
+    """One row of the bout schema :func:`trackanno.infer.predict._bout_predictions`
     writes, including the columns of every OTHER group left empty - that shape
     is the thing the reader has to get right, so a hand-built row reproduces it
     rather than a convenient subset."""
@@ -89,7 +89,7 @@ def synthetic(root):
     worth reading, including the ones a happy path never produces."""
     from test_predict import build_case
 
-    from trackanno.predict import PREDICTIONS_FILE
+    from trackanno.infer.predict import PREDICTIONS_FILE
 
     cfg, _ = build_case(root, "review-synthetic")
     rows = [
@@ -218,7 +218,7 @@ def decoded(root):
     """
     from test_predict import planted_case
 
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, movie = planted_case(root, "review-decoded", 10,
                               **{"predict.save_posteriors": True})
@@ -325,7 +325,7 @@ def test_the_band_under_several_window_scales_is_the_coarsest_grid_s(root) -> No
     """
     from test_predict import build_case
 
-    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
     from trackanno.gui.timeline import measure_stride
 
     cfg, _ = build_case(root, "review-scales")
@@ -373,7 +373,7 @@ def test_a_window_clipped_against_the_end_of_a_movie_is_not_a_scale(root) -> Non
     """
     from test_predict import build_case
 
-    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
     from trackanno.gui.timeline import measure_stride
 
     cfg, _ = build_case(root, "review-tail")
@@ -441,7 +441,7 @@ def test_a_track_the_predictions_never_mention_is_still_selectable(decoded) -> N
     A combo filled only from the predictions makes the empty state unreachable,
     and then the reviewer cannot ask the one question a silent track raises.
     """
-    from trackanno.clips import TRACKS_FILE
+    from trackanno.annotate.clips import TRACKS_FILE
     from trackanno.gui.timeline import PredictionReader
 
     cfg, movie = decoded
@@ -475,7 +475,7 @@ def test_an_old_style_windows_file_is_named_as_such(app, root) -> None:
     from test_predict import build_case
 
     from trackanno.gui.timeline import BoutReviewPanel, PredictionReader, caption_lines
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, manifest = build_case(root, "review-windows", labels=2)
     predict_all(cfg)
@@ -553,7 +553,7 @@ def test_the_model_page_opens_the_review_window(app, root) -> None:
     from test_predict import build_case
 
     from trackanno.gui.hub import Hub, ModelPage
-    from trackanno.predict import predict_all
+    from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "review-page", labels=2)
     hub = Hub(str(cfg.path))

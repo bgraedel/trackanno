@@ -533,7 +533,7 @@ and they are four different facts:
 | `{"rule":"annotator_navigated"}` | a selector was running and did not choose this clip - a human navigated to it, with the arrow keys, `Tab`, or a filter change |
 
 ```python
-from trackanno.store import decode_provenance
+from trackanno.annotate.store import decode_provenance
 
 why = labels["selected_by"].map(decode_provenance)
 unbiased = labels[why.map(lambda d: d.get("rule") == "audit_random")]

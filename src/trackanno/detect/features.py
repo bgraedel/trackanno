@@ -7,7 +7,7 @@ and pooled to a vector.
 
 These vectors encode *identity* very well, and identity is not behaviour, so
 anything trained on them must be validated with cross-validation grouped by
-track (see :mod:`trackanno.suggest`).
+track (see :mod:`trackanno.learn.suggest`).
 """
 
 from __future__ import annotations

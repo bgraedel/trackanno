@@ -1,20 +1,20 @@
 """Is one of my classes really several behaviours, and which clips would show that?
 
-    uv run python -m trackanno.discover --list
-    uv run python -m trackanno.discover --class swimming
-    uv run python -m trackanno.discover --class swimming --columns wave_freq_hz,wave_amp_*
+    uv run python -m trackanno.learn.discover --list
+    uv run python -m trackanno.learn.discover --class swimming
+    uv run python -m trackanno.learn.discover --class swimming --columns wave_freq_hz,wave_amp_*
 
-:mod:`trackanno.subcluster` answers that question about a bare matrix. This
+:mod:`trackanno.learn.subcluster` answers that question about a bare matrix. This
 module is what a person runs: it chooses the rows (the clips of ONE class, from
 ``clip_features.parquet`` joined to the annotation CSV), chooses the columns,
-runs the clustering, makes the check :mod:`trackanno.subcluster` structurally
+runs the clustering, makes the check :mod:`trackanno.learn.subcluster` structurally
 cannot make for itself, and writes the answer where a later step can read it.
 
 The columns are the decision, so it is made explicitly and printed. Per-column
 scaling puts a column carrying the split on the same footing as one carrying
 noise, so passing every column in the table is close to the worst available
 choice. The default is the ``wave_*`` block
-(:data:`trackanno.wavespectra.SERIES_COLUMNS`), in which a sub-behaviour is a
+(:data:`trackanno.measure.wavespectra.SERIES_COLUMNS`), in which a sub-behaviour is a
 difference in BEATING rather than in framing, taken whole because the beat
 quantities are algebraically linked. ``--columns`` widens or narrows it, and
 narrowing is the mitigation when a run comes back all noise. Four of the block's
@@ -26,7 +26,7 @@ tracked clips.
 The batch-effect check is the reason this module is worth having. A cluster of
 clips from one movie, animal or session shares illumination, focus, cell density
 and body size; it is tight, reproducible under resampling, and
-:attr:`trackanno.subcluster.Cluster.stability` reports it as excellent. This
+:attr:`trackanno.learn.subcluster.Cluster.stability` reports it as excellent. This
 module has ``movie_id`` and ``track_id`` beside every row, so it computes each
 cluster's composition, prints it whether or not it looks bad, and says in words
 what a lopsided one means.
@@ -36,7 +36,7 @@ being something repeated interactively with the settings changed. The config is
 read only for the work directory, the annotation CSV and the seed
 (:attr:`trackanno.config.Suggest.seed`).
 
-Noise is an answer, as it is in :mod:`trackanno.subcluster`: the clips that
+Noise is an answer, as it is in :mod:`trackanno.learn.subcluster`: the clips that
 resemble nothing else in their class are reported and written out rather than
 tidied into the nearest group.
 """
@@ -55,9 +55,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .clipfeatures import CLIP_FEATURES_FILE, FEATURE_GROUPS, feature_columns
-from .config import Config, load_config
-from .store import IDENTITY_COLUMNS, TRAILING_COLUMNS, plain_json
+from ..measure.clipfeatures import CLIP_FEATURES_FILE, FEATURE_GROUPS, feature_columns
+from ..config import Config, load_config
+from ..annotate.store import IDENTITY_COLUMNS, TRAILING_COLUMNS, plain_json
 from .subcluster import (
     DEFAULT_MIN_CLUSTER_SIZE, SCALINGS, STABLE, SubClusters, subcluster,
 )
@@ -85,7 +85,7 @@ BATCH_FRACTION = 0.9
 
 # Stamped into the written report. The version has to travel INSIDE the artefact,
 # since a name or a folder can be renamed away from it.
-SCHEMA = "trackanno.discover/1"
+SCHEMA = "trackanno.learn.discover/1"
 
 # What a written report is called when `--out` does not say. One file per
 # (group, class), so a second run does not delete the first run's answer.
@@ -185,7 +185,7 @@ def resolve_columns(features: pd.DataFrame, spec: str) -> list[str]:
     A spec is a comma-separated list of tokens, each one of:
 
     * ``all`` - every feature column in the table.
-    * a feature-group name from :data:`trackanno.clipfeatures.FEATURE_GROUPS`
+    * a feature-group name from :data:`trackanno.measure.clipfeatures.FEATURE_GROUPS`
       (``kinematic``, ``pose``, ``waveform``, ``cnn``), the same vocabulary
       ``suggest.feature_groups`` uses.
     * a prefix glob such as ``wave_amp_*``.
@@ -257,7 +257,7 @@ def resolve_columns(features: pd.DataFrame, spec: str) -> list[str]:
 def _labelled(labels: pd.DataFrame, group: str) -> pd.DataFrame:
     """The non-empty values of one category column, as strings.
 
-    Through :func:`trackanno.suggest.labelled_rows`, so this report and the
+    Through :func:`trackanno.learn.suggest.labelled_rows`, so this report and the
     trainer cannot disagree about what counts as a class.
     """
     if group not in labels.columns:
@@ -435,7 +435,7 @@ def _finite_rows(
 ) -> tuple[pd.DataFrame, list[str], dict]:
     """Drop what cannot be clustered, and record exactly what that cost.
 
-    :func:`trackanno.subcluster.subcluster` refuses a non-finite value, so
+    :func:`trackanno.learn.subcluster.subcluster` refuses a non-finite value, so
     something has to be dropped and the choice is the caller's. Two steps: a
     column that is NaN for EVERY row of this class goes first, costing nothing;
     then any row still holding a NaN goes, and the columns responsible are
@@ -500,7 +500,7 @@ def _track_keys(rows: pd.DataFrame) -> np.ndarray:
 
     Track ids are numbered per MOVIE, so a bare ``track_id`` would read two
     movies' track 3 as one animal. The same key
-    :meth:`trackanno.suggest.Suggester._track_keys` builds.
+    :meth:`trackanno.learn.suggest.Suggester._track_keys` builds.
     """
     return np.array([
         f"{m}::{t}" for m, t in zip(rows["movie_id"].astype(str), rows["track_id"].astype(str))
@@ -622,7 +622,7 @@ def discover(
     ``exclude_audit`` leaves those clips out of the search instead, and is off by
     default because dropping 10% of a class would shrink the search and skew the
     composition the batch check reads. Everything else is passed through to
-    :func:`trackanno.subcluster.subcluster` and documented there.
+    :func:`trackanno.learn.subcluster.subcluster` and documented there.
 
     Returns a :class:`Discovery`. Refusals are :class:`ValueError` naming the
     number that triggered them. The two that are this function's own rather than
@@ -928,7 +928,7 @@ def to_payload(found: Discovery) -> dict:
     match, and ``composition`` travels with ``flagged`` written per cluster so a
     reader that only walks the clusters cannot lose the flag.
 
-    :func:`trackanno.store.plain_json` widens the numpy scalars this is full of
+    :func:`trackanno.annotate.store.plain_json` widens the numpy scalars this is full of
     and writes a non-finite float as ``null``, the same rule the annotation log
     writes its cells under: an unmeasured stability is absent, not 0.0.
     """
