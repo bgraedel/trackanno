@@ -795,15 +795,17 @@ class Predict:
         return [base] + sorted({int(s) for s in self.window_scales} - {base})
 
     def resolved_self_transition(self) -> float:
-        """``self_transition`` with ``auto`` filled in: 1 - 1/min_bout_frames.
+        """``self_transition`` with ``auto`` filled in.
 
-        A chain that stays put with probability p has an expected run of
-        1/(1 - p) frames, so the identity reads 'the prior whose average bout
-        lasts min_bout_frames'. Only defined under ``decode: viterbi``, which is
-        the only place ``parse`` guarantees ``min_bout_frames >= 2``.
+        The identity itself lives in :func:`trackanno.bouts.self_transition_for`,
+        beside the decoder that consumes it, so the number and its guard cannot
+        drift apart. ``auto`` is only reachable under ``decode: viterbi``, which
+        is where ``parse`` guarantees ``min_bout_frames >= 2``.
         """
         if isinstance(self.self_transition, str):
-            return 1.0 - 1.0 / float(self.min_bout_frames)
+            from .bouts import self_transition_for
+
+            return self_transition_for(self.min_bout_frames)
         return float(self.self_transition)
 
     @classmethod

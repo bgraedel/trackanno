@@ -357,7 +357,8 @@ def self_transition_for(min_bout_frames: int) -> float:
     expectation ``1 / (1 - a)``, so inverting gives ``a = 1 - 1/min_bout_frames``.
     The same number can therefore be handed to :func:`decode_min_bout` as a hard
     floor or to :func:`decode_viterbi` as a prior, one being a bound and the
-    other a mean.
+    other a mean. :meth:`trackanno.config.Predict.resolved_self_transition` is
+    what calls this for ``predict.self_transition: auto``.
 
     ``min_bout_frames < 2`` is refused: at 1 the identity returns ``a = 0``, a
     chain forbidden to stay in any state, and below that a negative probability.

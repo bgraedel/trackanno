@@ -181,8 +181,24 @@ def audit_records(labels: pd.DataFrame | None) -> dict[str, bool]:
     return out
 
 
+def labelled_rows(frame: pd.DataFrame, group: str) -> pd.DataFrame:
+    """``frame`` cut down to the rows carrying a label in ``group``, the cell
+    normalised to a trimmed string.
+
+    ONE definition, shared by the trainer and by the discovery report: two
+    readings would let a report describe a class the model never fits. An
+    unlabelled clip is an empty cell or a missing one depending on how the CSV
+    was written, and neither blank space nor ``NaN`` is a behaviour. Surrounding
+    whitespace is not part of a class name either, so ``" swimming "`` and
+    ``"swimming"`` are one class.
+    """
+    out = frame.dropna(subset=[group]).copy()
+    out[group] = out[group].astype(str).str.strip()
+    return out[out[group].str.len() > 0]
+
+
 __all__ = ["Suggester", "train", "main", "is_audit_clip", "audit_records",
-           "is_length_invariant", "length_invariant_columns",
+           "labelled_rows", "is_length_invariant", "length_invariant_columns",
            "length_dependent_columns", "scoped_columns",
            "MODEL_FILE", "REPORT_FILE"]
 
@@ -442,19 +458,41 @@ def train_group(
     features: pd.DataFrame, labels: pd.DataFrame, group_name: str, cfg: Config,
     columns: list[str] | None = None, verbose: bool = True,
     raw_cnn: np.ndarray | None = None, reporter=None,
+    recorded: Mapping[str, bool] | None = None,
+    have_features: set[str] | None = None,
+    audit_population: int | None = None,
 ) -> tuple[object | None, GroupReport]:
-    """Fit one category group. Returns (model, report); model is None if unusable."""
+    """Fit one category group. Returns (model, report); model is None if unusable.
+
+    ``recorded``, ``have_features`` and ``audit_population`` are project-wide and
+    identical for every group, so :func:`train` builds them once and passes them
+    down. Each is computed here when absent, which is what a caller fitting a
+    single group gets.
+    """
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
-    wanted = labels[["clip_id", group_name]].dropna(subset=[group_name])
-    wanted = wanted[wanted[group_name].astype(str).str.len() > 0]
+    if recorded is None:
+        recorded = audit_records(labels)
+    if have_features is None or audit_population is None:
+        feature_ids = features["clip_id"].astype(str)
+        if have_features is None:
+            have_features = set(feature_ids)
+        if audit_population is None:
+            # The DENOMINATOR for `audit_n`: audit clips this project has at
+            # all, not only the ones a human has reached. Counted over the
+            # feature table, since a clip with no features cannot be scored
+            # whether it is held out or not.
+            audit_population = int(sum(
+                is_audit_clip(c, cfg, recorded) for c in feature_ids
+            ))
+
+    wanted = labelled_rows(labels[["clip_id", group_name]], group_name)
     merged = features.merge(wanted, on="clip_id", how="inner")
 
     # The join above is where labels go to die: clip_id embeds the track id, so
     # re-running detection renumbers the tracks and every earlier label stops
     # resolving, dropped silently. reassociate.py is what gets them back.
-    have_features = set(features["clip_id"].astype(str))
     orphaned = wanted[~wanted["clip_id"].astype(str).isin(have_features)]
     orphaned_by_class = {
         str(k): int(v)
@@ -478,17 +516,10 @@ def train_group(
     # training on it makes the "unbiased" estimate circular. Read off the CSV
     # and not recomputed: after a re-detection a labelled clip's recorded
     # membership is no longer what its clip_id hashes to.
-    recorded = audit_records(labels)
     audit_mask = merged["clip_id"].astype(str).map(lambda c: is_audit_clip(c, cfg, recorded))
     audit_set = merged[audit_mask].copy()
     merged = merged[~audit_mask]
 
-    # The DENOMINATOR for `audit_n`: audit clips this project has at all, not
-    # only the ones a human has reached. Counted over the feature table, since a
-    # clip with no features cannot be scored whether it is held out or not.
-    audit_population = int(sum(
-        is_audit_clip(c, cfg, recorded) for c in features["clip_id"].astype(str)
-    ))
     if dropped:
         merged = merged[~merged[group_name].astype(str).isin(dropped)]
 
@@ -838,11 +869,19 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
             )
     reporter.log(f"features: {len(columns)} columns from {', '.join(usable)}")
 
+    # Project-wide and the same for every group, so they are built here and
+    # handed to `train_group`: the audit denominator hashes every clip id in the
+    # feature table, which is not work to repeat per category.
+    feature_ids = features["clip_id"].astype(str)
+    have_features = set(feature_ids)
+    audit_population = int(sum(
+        is_audit_clip(c, cfg, recorded) for c in feature_ids
+    ))
+
     # Said before any group is fitted: every score below is computed on whatever
     # survived this join, and a group whose rare class was mostly orphaned
     # reports a near-zero F1 for it, which reads as "hard" rather than "gone".
-    n_orphaned = int((~labels["clip_id"].astype(str)
-                      .isin(set(features["clip_id"].astype(str)))).sum())
+    n_orphaned = int((~labels["clip_id"].astype(str).isin(have_features)).sum())
     if n_orphaned:
         reporter.log(
             f"{n_orphaned} of {len(labels)} labels refer to clips that are not in the "
@@ -861,7 +900,8 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         reporter.raise_if_cancelled()
         model, report = train_group(
             features, labels, group.name, cfg, columns, verbose, raw_cnn=raw_cnn,
-            reporter=reporter,
+            reporter=reporter, recorded=recorded, have_features=have_features,
+            audit_population=audit_population,
         )
         reporter.advance()
         reports[group.name] = asdict(report)

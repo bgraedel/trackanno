@@ -457,7 +457,7 @@ def _bout_predictions(
         # every group at once until the decode below has walked every track, and
         # the rows a skip_reason withheld would be a NaN block nothing reads.
         # `rank` keeps the compact form addressable by row position.
-        scores = np.full((scored.size, len(classes)), np.nan)
+        scores = np.empty((0, len(classes)))
         if scored.size:
             proba = np.asarray(model.predict_proba(matrix), dtype=np.float64)
             if proba.ndim != 2 or len(proba) != scored.size:
@@ -484,7 +484,7 @@ def _bout_predictions(
                     "A decode averages probabilities across windows, so one of these "
                     "would spread over every frame the window touches"
                 )
-            scores[:] = proba
+            scores = proba
         proba_by_group[group] = scores
         classes_by_group[group] = classes
         reporter.log(

@@ -540,6 +540,10 @@ class PredictionReader:
 
         out: dict[str, np.ndarray] = {}
         n = max(track.f_hi - track.f_lo, 0)
+        index = frames - track.f_lo
+        # A posterior written by a different run need not span the same frames
+        # as the bouts. Neither this nor `index` depends on the segment.
+        in_span = (index >= 0) & (index < n)
         columns: dict[str, np.ndarray] = {}
         for group, segments in track.lanes.items():
             trace = np.full(n, np.nan)
@@ -551,12 +555,8 @@ class PredictionReader:
                     columns[column] = pd.to_numeric(
                         rows[column], errors="coerce"
                     ).to_numpy(dtype=float)[order]
-                index = frames - track.f_lo
                 inside = (
-                    (frames >= segment.f_start) & (frames < segment.f_end)
-                    # A posterior written by a different run need not span the
-                    # same frames as the bouts.
-                    & (index >= 0) & (index < n)
+                    (frames >= segment.f_start) & (frames < segment.f_end) & in_span
                 )
                 trace[index[inside]] = columns[column][inside]
             if np.isfinite(trace).any():

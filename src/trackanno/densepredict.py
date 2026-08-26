@@ -470,6 +470,12 @@ def build_dense_features(
             # only the per-window terms are paid again.
             spans = [(f_start, f_end) for f_start, f_end, _ in windows[track_id]]
             measured = window_features(tdf, cfg, fps, spans)
+            # Row positions into `feats`, which is aligned with tracks.parquet.
+            # Only where the cnn block is actually built.
+            rows_in_feats = (
+                tdf.index.to_numpy()
+                if pca is not None and feats is not None else None
+            )
             reached = np.zeros(frames.size, dtype=bool)
             featurised = np.zeros(frames.size, dtype=bool)
             for (f_start, f_end, scale), features in zip(windows[track_id], measured):
@@ -498,11 +504,10 @@ def build_dense_features(
                     continue
 
                 featurised |= sel
-                sub = tdf.iloc[np.flatnonzero(sel)]
                 entry.update(features)
-                if pca is not None and feats is not None:
+                if rows_in_feats is not None:
                     entry.update(
-                        _cnn_block(pca, feats[sub.index.to_numpy()].astype(np.float32))
+                        _cnn_block(pca, feats[rows_in_feats[sel]].astype(np.float32))
                     )
                 rows.append(entry)
             covered += int(reached.sum())

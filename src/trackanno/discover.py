@@ -61,7 +61,7 @@ from .store import IDENTITY_COLUMNS, TRAILING_COLUMNS
 from .subcluster import (
     DEFAULT_MIN_CLUSTER_SIZE, SCALINGS, STABLE, SubClusters, subcluster,
 )
-from .suggest import audit_records, is_audit_clip
+from .suggest import audit_records, is_audit_clip, labelled_rows
 
 __all__ = [
     "Composition", "DiscoveredCluster", "Discovery",
@@ -257,10 +257,8 @@ def resolve_columns(features: pd.DataFrame, spec: str) -> list[str]:
 def _labelled(labels: pd.DataFrame, group: str) -> pd.DataFrame:
     """The non-empty values of one category column, as strings.
 
-    The same normalisation :func:`trackanno.suggest.train_group` makes: an
-    unlabelled clip is an empty cell or a missing one depending on how the CSV
-    was written, and a class called ``"nan"`` or ``""`` would otherwise be
-    counted as a behaviour.
+    Through :func:`trackanno.suggest.labelled_rows`, so this report and the
+    trainer cannot disagree about what counts as a class.
     """
     if group not in labels.columns:
         category = [
@@ -277,9 +275,7 @@ def _labelled(labels: pd.DataFrame, group: str) -> pd.DataFrame:
     # :func:`class_table` compares against the feature table's own answer; a
     # projection down to the two columns would silently disable that check.
     keep = ["clip_id", group] + (["movie_id"] if "movie_id" in labels.columns else [])
-    values = labels[keep].dropna(subset=[group]).copy()
-    values[group] = values[group].astype(str).str.strip()
-    return values[values[group].str.len() > 0]
+    return labelled_rows(labels[keep], group)
 
 
 def _duplicate(ids) -> str | None:

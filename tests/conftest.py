@@ -15,6 +15,7 @@ window-independence checks against a real prepared project as well, pass
 from __future__ import annotations
 
 import os
+import contextlib
 import sys
 from pathlib import Path
 
@@ -54,6 +55,18 @@ def app():
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
     yield app
+    app.processEvents()
+
+    # Shut down anything a test left open before the QApplication goes. Pages
+    # own background QThreads that close() does not cancel, and a live QThread
+    # at interpreter exit kills the process after every test has passed, which
+    # reads as a crash with no failing test.
+    for widget in list(app.topLevelWidgets()):
+        for page in getattr(widget, "pages", ()) or ():
+            with contextlib.suppress(Exception):
+                page.shutdown()
+        with contextlib.suppress(Exception):
+            widget.close()
     app.processEvents()
 
 
