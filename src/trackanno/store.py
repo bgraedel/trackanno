@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -28,6 +29,7 @@ from .config import Config
 
 __all__ = [
     "AnnotationStore", "MULTI_SEP", "PROVENANCE_COLUMN", "AUDIT_COLUMN",
+    "plain_json", "encode_cell", "decode_cell",
     "encode_provenance", "decode_provenance",
     "encode_audit", "decode_audit", "read_audit_records",
     "IDENTITY_COLUMNS", "TRAILING_COLUMNS",
@@ -69,40 +71,120 @@ TRAILING_COLUMNS = [
 
 
 # --------------------------------------------------------------------------- #
-# selection provenance
+# one JSON object in one CSV cell
 # --------------------------------------------------------------------------- #
-def _plain(value):
-    """numpy scalars to Python scalars, exactly, so ``json`` will take them.
+# One codec, shared by `selected_by` here and by `overruled` in
+# bout_corrections.csv. A second implementation drifts on the value hardest to
+# reconcile afterwards - a non-finite float - and a file whose cells were written
+# under two rules cannot be read under either. What a column additionally
+# requires of its own payload is layered on top, not built in here.
+def plain_json(value):
+    """A value in the form ``json`` will take, exactly, and never rounded.
 
-    A score straight out of ``predict_proba`` is a ``numpy.float32``, which
-    ``json`` refuses, and the save it would abort is a label just typed.
-    ``.item()`` widens rather than rounds, so nothing is guessed; anything it
-    cannot convert is passed through to fail at ``dumps``.
+    Two rules, and they have to be the same in every column or a cell written by
+    one reads back differently from a cell written by another:
+
+    * **A numpy scalar widens to a Python scalar.** A score straight out of
+      ``predict_proba`` is a ``numpy.float32``, which ``json`` refuses, and the
+      save it would abort is a label just typed. ``.item()`` widens rather than
+      rounds, so nothing is guessed, and an array falls back to ``.tolist()``.
+    * **A non-finite float becomes ``None``, written as ``null``.** NaN and
+      Infinity are not JSON - ``json.dumps`` spells them as bare tokens a strict
+      reader rejects - and ``null`` is the JSON spelling of "no value", which is
+      what a NaN here means: :mod:`trackanno.select` scores a uniform draw NaN
+      because it EARNED no score. ``null`` reads back as ``None``, which is
+      still not ``0.0``, so "nobody measured this" stays distinguishable from
+      "the model was certain".
+
+    Anything else passes through to fail at ``dumps``. A value this cannot
+    convert is better refused than written as its ``repr``, which reads back as
+    a string nobody can turn into the thing it was.
     """
-    if isinstance(value, (str, bytes, bool, int, float, type(None))):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, bytes, bool, int, type(None))):
         return value
     if isinstance(value, Mapping):
-        return {str(k): _plain(v) for k, v in value.items()}
+        return {str(k): plain_json(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_plain(v) for v in value]
-    item = getattr(value, "item", None)
-    if callable(item):
+        return [plain_json(v) for v in value]
+    # A numpy scalar, then a numpy array: `.item()` raises on anything holding
+    # more than one element, and `.tolist()` on a scalar returns the same widened
+    # Python value. Recursed over, so a float inside an array meets both rules.
+    for name in ("item", "tolist"):
+        widen = getattr(value, name, None)
+        if not callable(widen):
+            continue
         try:
-            return item()
+            widened = widen()
         except (TypeError, ValueError):
-            return value
+            continue
+        return plain_json(widened) if widened is not value else value
     return value
 
 
+def encode_cell(payload: Mapping | None, what: str) -> str:
+    """Serialise one mapping into one CSV cell. ``None`` gives ``""``.
+
+    JSON, one line, keys sorted, rather than a fixed set of columns: a caller
+    can record one more thing without a schema migration, and re-recording the
+    same fact is a no-op in a diff. ASCII-only (the ``json.dumps`` default) is
+    what keeps a literal newline out of the cell -
+    :meth:`AnnotationStore._repair_torn_append` finds where a row ends by the
+    last newline *byte* and never by parsing.
+
+    ``""`` means *not recorded*, and every column using this codec keeps that as
+    a fact distinct from any value the cell can hold.
+    """
+    if payload is None:
+        return ""
+    plain = plain_json(payload)
+    try:
+        return json.dumps(plain, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{what} {plain!r} cannot be written to the CSV: {exc}. Use plain "
+            "strings, numbers and booleans; a non-finite number is written as "
+            "null, and a value json cannot spell at all is refused here rather "
+            "than written into a cell only some readers can parse"
+        ) from exc
+
+
+def decode_cell(value, column: str, shape: str, what: str = "") -> dict:
+    """Read such a cell back. ``{}`` means *the row does not say*.
+
+    An empty cell - an old file, or a caller that declined to say - decodes to
+    ``{}``. A cell that will not decode RAISES rather than returning ``{}``,
+    since reporting a damaged log as "not recorded" hides it behind a plausible
+    answer; that difference is why this is a codec and not a ``json.loads`` at
+    each call site.
+    """
+    if value is None or not str(value).strip():
+        return {}
+    # `what` names the thing the cell holds, so a column keeps its own wording
+    # without keeping its own copy of the policy.
+    noun = f" {what}" if what else ""
+    try:
+        out = json.loads(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{column}={value!r} is not readable{noun}: {exc}"
+        ) from exc
+    if not isinstance(out, dict):
+        raise ValueError(
+            f"{column}={value!r} decoded to a {type(out).__name__}, but {shape}"
+        )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# selection provenance
+# --------------------------------------------------------------------------- #
 def encode_provenance(decision: Mapping | str | None) -> str:
     """Serialise *why* a clip was put in front of a human, for one CSV cell.
 
-    JSON, one line, keys sorted, rather than a fixed pair of columns: a new
-    selection rule can then record one more thing without a schema migration,
-    and re-recording the same decision is a no-op in a diff. ASCII-only (the
-    ``json.dumps`` default) is what keeps a literal newline out of the cell -
-    :meth:`AnnotationStore._repair_torn_append` finds where a row ends by the
-    last newline *byte* and never by parsing.
+    :func:`encode_cell` does the writing; what this adds is the one thing this
+    column requires of its payload, a rule that NAMES what chose the clip.
 
     ``None`` encodes as ``""``, meaning *not recorded*, which is a different
     fact from *chosen at random*. A blank rule name is refused below, so the
@@ -127,40 +209,20 @@ def encode_provenance(decision: Mapping | str | None) -> str:
             f"(got {rule!r}). An empty cell already means 'not recorded', so a nameless "
             "rule would be indistinguishable from no rule at all"
         )
-    plain = {str(k): _plain(v) for k, v in decision.items()}
-    try:
-        return json.dumps(plain, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"selection provenance {plain!r} cannot be written to the CSV: {exc}. "
-            "Use plain strings, numbers and booleans; NaN and Infinity are refused "
-            "because they are not JSON and do not read back the same everywhere"
-        ) from exc
+    return encode_cell(decision, "selection provenance")
 
 
 def decode_provenance(value: str | None) -> dict:
     """Read a ``selected_by`` cell back. ``{}`` means *the row does not say*.
 
-    An empty cell - an old file, or a caller that declined to say - decodes to
-    ``{}``; a clip genuinely drawn at random decodes to a mapping whose ``rule``
-    says so, so the two are never conflated. A cell that will not decode raises
-    rather than returning ``{}``, since reporting a damaged log as "not
-    recorded" hides it behind a plausible answer.
+    An empty cell decodes to ``{}``; a clip genuinely drawn at random decodes to
+    a mapping whose ``rule`` says so, so the two are never conflated.
     """
-    if value is None or not str(value).strip():
-        return {}
-    try:
-        out = json.loads(value)
-    except ValueError as exc:
-        raise ValueError(
-            f"{PROVENANCE_COLUMN}={value!r} is not readable selection provenance: {exc}"
-        ) from exc
-    if not isinstance(out, dict):
-        raise ValueError(
-            f"{PROVENANCE_COLUMN}={value!r} decoded to a {type(out).__name__}, but "
-            "provenance is an object like {'rule': 'uncertainty', 'score': 0.42}"
-        )
-    return out
+    return decode_cell(
+        value, PROVENANCE_COLUMN,
+        "provenance is an object like {'rule': 'uncertainty', 'score': 0.42}",
+        "selection provenance",
+    )
 
 
 # --------------------------------------------------------------------------- #

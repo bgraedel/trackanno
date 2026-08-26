@@ -43,6 +43,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -55,9 +56,9 @@ from .config import Config, load_config
 from .suggest import MODEL_FILE, REPORT_FILE, Suggester
 
 __all__ = [
-    "PREDICTIONS_FILE", "POSTERIORS_FILE", "Verdict", "verdict", "prediction_blocker",
-    "predictions_path", "posteriors_path", "predict_all", "load_predictions",
-    "staleness", "summarise", "main",
+    "PREDICTIONS_FILE", "POSTERIORS_FILE", "RowKind", "row_kind", "Verdict",
+    "verdict", "prediction_blocker", "predictions_path", "posteriors_path",
+    "predict_all", "load_predictions", "staleness", "summarise", "main",
 ]
 
 PREDICTIONS_FILE = "predictions.parquet"
@@ -73,6 +74,48 @@ def predictions_path(cfg: Config) -> Path:
 
 def posteriors_path(cfg: Config) -> Path:
     return cfg.paths.work_dir / POSTERIORS_FILE
+
+
+# --------------------------------------------------------------------------- #
+# what one row is
+# --------------------------------------------------------------------------- #
+class RowKind(Enum):
+    """What one row of ``predictions.parquet`` IS.
+
+    Three kinds, because ``coverage`` and ``decode`` are two settings: a
+    manifest run writes one row per annotation CLIP, a dense run one row per
+    WINDOW off its own grid, and a decode re-cuts those windows into BOUTS.
+    """
+
+    BOUT = "bouts"
+    DENSE_WINDOW = "dense windows"
+    CLIP = "clips"
+
+    @property
+    def noun(self) -> str:
+        """Plural, for counting rows aloud."""
+        return self.value
+
+    @property
+    def bouts(self) -> bool:
+        """Whether these rows are disjoint by construction and correctable."""
+        return self is RowKind.BOUT
+
+
+def row_kind(frame: pd.DataFrame) -> RowKind:
+    """Which of the three a predictions table holds, read off the FILE.
+
+    Never off ``predict.decode`` or ``predict.coverage``: the config can be
+    edited after a run, so a consumer reading it would describe a run that has
+    not happened. ``bout_id`` is what a decoded row carries in place of
+    ``clip_id``, and ``skip_reason`` is what the dense grid adds to a window.
+
+    The only place either column is tested. Every consumer asks here instead, so
+    renaming one cannot leave several call sites quietly answering "no".
+    """
+    if "bout_id" in frame.columns:
+        return RowKind.BOUT
+    return RowKind.DENSE_WINDOW if "skip_reason" in frame.columns else RowKind.CLIP
 
 
 # --------------------------------------------------------------------------- #
@@ -960,17 +1003,12 @@ def _distinct_frames(frame: pd.DataFrame) -> int:
 def summarise(frame: pd.DataFrame) -> str:
     """Human-readable tally of a predictions frame, for the log and the GUI.
 
-    What one row IS is read off the FILE, never off the config: ``predict.decode``
-    can be changed after a run, so a summary consulting it would describe a
-    different run. ``bout_id`` is what a decoded row carries in place of
-    ``clip_id`` and ``skip_reason`` is what the dense grid adds to a window - the
-    same two probes :func:`trackanno.render.prediction_unit` makes.
+    What one row is called comes from :func:`row_kind`, which reads the file.
     """
+    kind = row_kind(frame)
+    bouts, noun = kind.bouts, kind.noun
     groups = [c[: -len("_pred")] for c in frame.columns if c.endswith("_pred")]
     n_human = int(frame["human_labelled"].sum()) if "human_labelled" in frame else 0
-    bouts = "bout_id" in frame.columns
-    noun = "bouts" if bouts else ("dense windows" if "skip_reason" in frame.columns
-                                  else "clips")
     lines = [
         f"{len(frame)} {noun}"
         # Spelled out because a bout table has one row per (group, bout): with

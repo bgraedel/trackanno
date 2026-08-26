@@ -1308,11 +1308,11 @@ class Suggester:
             # Which model scored the clip, without which `predicted_class` is
             # meaningless on a project with more than one category group.
             record["group"] = group
-            # `select` scores a random draw NaN - it has no score, and 0.0 would
-            # read as "the model was certain" - but `store.encode_provenance`
-            # refuses NaN, which JSON has no spelling for. So the one float that
-            # can be non-finite is translated here, at the seam, to null. None is
-            # still not 0.0, which is the distinction that mattered.
+            # `select` scores a random draw NaN: it has no score, and 0.0 would
+            # read as "the model was certain". `store.encode_cell` writes a
+            # non-finite float as null, so this only keeps the in-memory record
+            # agreeing with the cell. None is still not 0.0, which is the
+            # distinction that matters.
             for key, value in list(record.items()):
                 if isinstance(value, float) and not np.isfinite(value):
                     record[key] = None

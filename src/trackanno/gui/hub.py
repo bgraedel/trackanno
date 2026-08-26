@@ -2365,13 +2365,17 @@ class ExportPage(Page):
         WINDOW or a decoded BOUT depending on the run that wrote the file, and
         only the file knows which (:func:`trackanno.render.prediction_unit`).
         """
+        import pandas as pd
+
         from ..predict import load_predictions
         from ..render import prediction_unit
 
         try:
             frame = load_predictions(self.cfg)
         except (FileNotFoundError, OSError, RuntimeError, ValueError):
-            return {}, "predicted windows"
+            # There is no file to ask, so the noun an empty table gets, rather
+            # than a second copy of the literal prediction_unit owns.
+            return {}, prediction_unit(pd.DataFrame())
         counts = frame["movie_id"].astype(str).value_counts()
         return ({str(k): int(v) for k, v in sorted(counts.items())},
                 prediction_unit(frame))

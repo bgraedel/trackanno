@@ -187,12 +187,71 @@ def test_a_decision_carries_the_rule_and_the_score_that_earned_it() -> None:
     check("encoding an already-encoded decision is idempotent",
           encode_provenance(encode_provenance(future)) == encode_provenance(future))
 
-    # Refused rather than written: NaN is not JSON, and a log that only some
-    # readers can parse is worse than one that refused the row.
-    check("a NaN score is refused", "NaN" in _refusal(
-        encode_provenance, {"rule": "uncertainty", "score": float("nan")}))
     check("a non-mapping is refused with the shape it wanted",
           "'rule'" in _refusal(encode_provenance, ["uncertainty", 0.4]))
+
+
+# --------------------------------------------------------------------------- #
+# one codec, every column that puts JSON in a cell
+# --------------------------------------------------------------------------- #
+def test_a_value_that_is_no_number_is_written_as_null_and_never_as_zero() -> None:
+    """The non-finite rule, stated once because it is implemented once.
+
+    `select` scores a uniform audit draw NaN deliberately: that clip earned no
+    score, and 0.0 would read as "the model was certain it was wrong". NaN is
+    not JSON - `json.dumps` spells it as a bare token a strict reader rejects -
+    so the cell says `null`, which reads back as None and is still not zero.
+    """
+    scored = decode_provenance(encode_provenance({"rule": "margin", "score": 0.0}))
+    unscored = decode_provenance(
+        encode_provenance({"rule": "audit", "score": float("nan")})
+    )
+    check("a score nothing measured round-trips as no value at all",
+          unscored["score"] is None, str(unscored))
+    check("...which is not the score of a clip the model was certain about",
+          unscored["score"] != scored["score"] and scored["score"] == 0.0,
+          f"{unscored['score']!r} vs {scored['score']!r}")
+    check("the cell holds JSON's own spelling of it, not a bare NaN token",
+          "null" in encode_provenance({"rule": "audit", "score": float("nan")})
+          and "NaN" not in encode_provenance({"rule": "audit", "score": float("nan")}))
+    check("an infinite score goes the same way, being no more JSON than NaN",
+          decode_provenance(
+              encode_provenance({"rule": "margin", "score": float("inf")})
+          )["score"] is None)
+
+    # The same rule, reached through the other column that uses the codec: a
+    # bout nothing could score has no confidence, and a correction over it is
+    # not evidence that the model was confidently wrong.
+    from trackanno.corrections import decode_overruled, encode_overruled
+
+    bouts = decode_overruled(encode_overruled([
+        {"f_start": 0, "f_end": 40, "label": "swimming", "conf": 0.9},
+        {"f_start": 40, "f_end": 80, "label": "", "conf": float("nan")},
+    ]))["bouts"]
+    check("the overruled column answers non-finite the same way, being one codec",
+          bouts[1]["conf"] is None and bouts[0]["conf"] == 0.9, str(bouts))
+    check("...and refuses a quoted bout that will not say which frames it covers",
+          "both ends" in _refusal(encode_overruled, [{"label": "swimming"}]))
+
+
+def test_a_numpy_scalar_survives_the_cell_rather_than_aborting_the_save() -> None:
+    """A score straight out of `predict_proba` is a numpy.float32, which `json`
+    refuses outright - and the save it would abort is a label a person has just
+    typed. Widened, not rounded: `.item()` gives the float32's exact value."""
+    import numpy as np
+
+    encoded = encode_provenance({
+        "rule": "margin", "score": np.float32(0.25), "rank": np.int64(3),
+        "shown": np.bool_(True), "runners_up": np.array([0.5, np.nan]),
+    })
+    got = decode_provenance(encoded)
+    check("a float32 score is written, exactly", got["score"] == 0.25, encoded)
+    check("...an int64 rank as a number and not as its repr", got["rank"] == 3)
+    check("...a numpy bool as a boolean, so a reader need not parse 'True'",
+          got["shown"] is True, str(got["shown"]))
+    check("...and an array widens elementwise, the non-finite rule with it",
+          got["runners_up"] == [0.5, None], str(got["runners_up"]))
+    check("nothing in the cell is a numpy repr", "np." not in encoded, encoded)
 
 
 # --------------------------------------------------------------------------- #

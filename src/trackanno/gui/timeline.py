@@ -2,8 +2,8 @@
 
 A row of ``predictions.parquet`` is either a fixed window off a grid or, under
 ``predict.decode``, a bout: a variable-length run between two inferred
-behavioural boundaries. Which of the two a file holds is read off the file
-(``bout_id``) and never off the config, which describes the next run.
+behavioural boundaries. Which of the two a file holds comes from
+:func:`trackanno.predict.row_kind`, which reads the file.
 
 Boundaries are drawn as bands the width of the measured error against a planted
 transition, a bout's mean posterior as a fill height, and a span overlapping
@@ -46,19 +46,6 @@ __all__ = [
 # Divisors rather than frames, because the stride is a per-project setting.
 MEAN_ERROR_DIVISOR = 4.0
 WORST_ERROR_DIVISOR = 2.0
-
-
-# --------------------------------------------------------------------------- #
-# what a row is
-# --------------------------------------------------------------------------- #
-def _is_bouts(frame: pd.DataFrame) -> bool:
-    """Whether these rows are decoded bouts, asked of the FILE.
-
-    The same ``bout_id`` probe :func:`trackanno.render.prediction_unit` makes.
-    ``predict.decode`` describes the next run, not the one that wrote these
-    rows, so this may never become a config lookup.
-    """
-    return "bout_id" in frame.columns
 
 
 @dataclass(frozen=True)
@@ -288,7 +275,7 @@ class PredictionReader:
         self.resolution = Resolution()
         self.corrections: CorrectionStore | None = None
 
-        from ..predict import load_predictions, staleness
+        from ..predict import load_predictions, row_kind, staleness
         from ..render import prediction_unit
 
         # Before the predictions, and fatal when it fails: a corrections file
@@ -308,7 +295,7 @@ class PredictionReader:
             self.problem = str(exc)
             return
 
-        self.bouts = _is_bouts(self.frame)
+        self.bouts = row_kind(self.frame).bouts
         self.unit = prediction_unit(self.frame)
         self.stale = staleness(cfg)
         self.groups = sorted(

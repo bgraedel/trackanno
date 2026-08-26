@@ -36,8 +36,6 @@ was not editing.
 from __future__ import annotations
 
 import csv
-import json
-import math
 import os
 import tempfile
 import threading
@@ -46,6 +44,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .store import decode_cell, encode_cell
 
 __all__ = [
     "CORRECTIONS_FILE", "CORRECTION_COLUMNS", "corrections_path", "correction_id",
@@ -108,31 +108,40 @@ def encode_overruled(bouts: Iterable[Mapping] | None) -> str:
     ``predictions.parquet``, and a decode is not reproducible once the training
     set has moved on.
 
-    JSON in one cell, keys sorted, ASCII only - the encoding
-    :func:`trackanno.store.encode_provenance` established, so a new key does not
-    force a schema migration. A non-finite confidence is written as ``null``,
-    the JSON spelling of "no value", because an unscored bout genuinely has no
-    confidence and NaN does not survive a round trip.
+    :func:`trackanno.store.encode_cell` does the writing, the same codec the
+    annotation log's ``selected_by`` cell uses, so a new key does not force a
+    schema migration and a non-finite confidence is written as ``null`` here for
+    the same reason it is there: an unscored bout genuinely has no confidence,
+    and ``null`` stays distinguishable from a confidence of zero.
+
+    What this column requires of its own payload is the two ends: a quoted bout
+    that does not say which frames it covers records nothing about what was
+    overruled.
     """
     if not bouts:
         return ""
     out = []
     for bout in bouts:
-        conf = bout.get("conf", None)
         try:
-            conf = float(conf)
+            f_start, f_end = int(bout["f_start"]), int(bout["f_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "a bout being overruled must name both ends as frame numbers, "
+                f"got {bout!r}"
+            ) from exc
+        # Coerced here rather than in the codec: `conf` is one number, and a
+        # value that is not one at all is no confidence rather than a refusal.
+        try:
+            conf = float(bout.get("conf"))
         except (TypeError, ValueError):
             conf = None
-        if conf is not None and not math.isfinite(conf):
-            conf = None
         out.append({
-            "f_start": int(bout["f_start"]),
-            "f_end": int(bout["f_end"]),
+            "f_start": f_start,
+            "f_end": f_end,
             "label": str(bout.get("label", "")),
             "conf": conf,
         })
-    return json.dumps({"bouts": out}, sort_keys=True, separators=(",", ":"),
-                      allow_nan=False)
+    return encode_cell({"bouts": out}, "a record of what the model said")
 
 
 def decode_overruled(value) -> dict:
@@ -141,21 +150,13 @@ def decode_overruled(value) -> dict:
     Raises on a cell that will not parse rather than returning ``{}``: an
     unreadable record of what was overruled would read as "this correction
     agreed with nothing in particular", which is a claim the row is not making.
+    That policy is :func:`trackanno.store.decode_cell`'s and is shared rather
+    than restated, so the two columns cannot come to disagree about it.
     """
-    if value is None or not str(value).strip():
-        return {}
-    try:
-        out = json.loads(value)
-    except ValueError as exc:
-        raise ValueError(
-            f"overruled={value!r} is not readable: {exc}"
-        ) from exc
-    if not isinstance(out, dict):
-        raise ValueError(
-            f"overruled={value!r} decoded to a {type(out).__name__}, but it is an "
-            "object like {'bouts': [{'f_start': 0, 'f_end': 100, ...}]}"
-        )
-    return out
+    return decode_cell(
+        value, "overruled",
+        "it is an object like {'bouts': [{'f_start': 0, 'f_end': 100, ...}]}",
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -57,7 +57,7 @@ import pandas as pd
 
 from .clipfeatures import CLIP_FEATURES_FILE, FEATURE_GROUPS, feature_columns
 from .config import Config, load_config
-from .store import IDENTITY_COLUMNS, TRAILING_COLUMNS
+from .store import IDENTITY_COLUMNS, TRAILING_COLUMNS, plain_json
 from .subcluster import (
     DEFAULT_MIN_CLUSTER_SIZE, SCALINGS, STABLE, SubClusters, subcluster,
 )
@@ -918,27 +918,6 @@ def report_path(cfg: Config, group: str, class_name: str) -> Path:
     )
 
 
-def _plain(value):
-    """Python scalars ``json`` will take, with non-finite floats becoming ``null``.
-
-    The bare ``NaN`` token ``json.dumps`` would otherwise emit is not valid JSON
-    and does not read back the same everywhere; ``null`` survives the round trip
-    and keeps the distinction that an unmeasured stability is absent, not 0.0.
-    ``allow_nan=False`` at the dump makes anything this misses fail loudly.
-    """
-    if isinstance(value, (str, bool, type(None))):
-        return value
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        return float(value) if np.isfinite(value) else None
-    if isinstance(value, dict):
-        return {str(k): _plain(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return [_plain(v) for v in value]
-    return str(value)
-
-
 def to_payload(found: Discovery) -> dict:
     """The written form: everything a later step needs, and nothing it must guess.
 
@@ -948,8 +927,12 @@ def to_payload(found: Discovery) -> dict:
     travel with the answer because two reports are not comparable unless they
     match, and ``composition`` travels with ``flagged`` written per cluster so a
     reader that only walks the clusters cannot lose the flag.
+
+    :func:`trackanno.store.plain_json` widens the numpy scalars this is full of
+    and writes a non-finite float as ``null``, the same rule the annotation log
+    writes its cells under: an unmeasured stability is absent, not 0.0.
     """
-    return _plain({
+    return plain_json({
         "schema": SCHEMA,
         "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "group": found.group,

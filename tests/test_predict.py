@@ -585,6 +585,90 @@ def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# what one row is
+# --------------------------------------------------------------------------- #
+def test_a_predictions_table_says_which_of_three_things_a_row_is(root: Path) -> None:
+    """`coverage` and `decode` are two settings, so there are three schemas.
+
+    A manifest run writes one row per annotation CLIP, a dense run one row per
+    WINDOW off the predictor's own grid, and a decode re-cuts those windows into
+    BOUTS. Only the file can be asked which it holds: `predict.decode` can be
+    edited after a run, and a consumer reading it would describe a run that has
+    not happened.
+    """
+    from trackanno.config import load_config
+    from trackanno.predict import RowKind, predict_all, row_kind, summarise
+    from trackanno.project import write_config
+    from trackanno.render import prediction_unit
+
+    manifest, _ = build_case(root, "kind-clips", coverage="manifest")
+    clips = predict_all(manifest)
+
+    grid, _ = build_case(root, "kind-windows", coverage="dense")
+    windows = predict_all(grid)
+
+    decoded, _ = build_case(root, "kind-bouts", coverage="dense")
+    write_config(decoded.path, {
+        "predict.window_stride": 10,
+        "predict.decode": "min_bout",
+        "predict.min_bout_frames": 20,
+    })
+    bouts = predict_all(load_config(decoded.path))
+
+    check("a manifest run writes annotation clips",
+          row_kind(clips) is RowKind.CLIP, str(list(clips.columns)))
+    check("a dense run writes windows off the predictor's own grid",
+          row_kind(windows) is RowKind.DENSE_WINDOW, str(list(windows.columns)))
+    check("a decode writes bouts",
+          row_kind(bouts) is RowKind.BOUT, str(list(bouts.columns)))
+
+    for frame, noun in ((clips, "clips"), (windows, "dense windows"),
+                        (bouts, "bouts")):
+        summary = summarise(frame)
+        check(f"...and the summary counts them in {noun}",
+              summary.startswith(f"{len(frame)} {noun}"), summary)
+
+    # The third value is what the noun needs and the export's two words cannot
+    # give it: a clip and a dense window are both a fixed span the predictor was
+    # handed, so prediction_unit calls them the same thing.
+    check("the export separates only the bouts",
+          [prediction_unit(f) for f in (clips, windows, bouts)]
+          == ["predicted windows", "predicted windows", "predicted bouts"])
+    check("...and only the bouts are disjoint by construction",
+          [row_kind(f).bouts for f in (clips, windows, bouts)]
+          == [False, False, True])
+
+
+def test_only_one_function_asks_what_a_prediction_row_is() -> None:
+    """Four consumers used to probe `bout_id` for themselves.
+
+    Rename the column and `predict.row_kind` follows while the rest silently
+    answer "no": the timeline draws window lanes over bout data, the renderer
+    drops its disjointness guard, and the summary calls bouts clips. Nothing
+    raises, so the count of probes is the guard.
+    """
+    import inspect
+
+    from trackanno.predict import row_kind
+    from trackanno.render import prediction_unit
+
+    src = Path(__file__).resolve().parents[1] / "src" / "trackanno"
+    hits = [
+        f"{path.relative_to(src).as_posix()}:{n}"
+        for path in sorted(src.rglob("*.py"))
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if '"bout_id" in' in line or "'bout_id' in" in line
+    ]
+    check("the sentinel column is tested in exactly one place", len(hits) == 1,
+          str(hits))
+    check("...which is predict.row_kind, in the module that writes the schema",
+          hits[0].startswith("predict.py:")
+          and '"bout_id" in' in inspect.getsource(row_kind), str(hits))
+    check("...and render.prediction_unit formats that answer rather than "
+          "re-deriving it", "row_kind" in inspect.getsource(prediction_unit))
+
+
+# --------------------------------------------------------------------------- #
 # decoded bouts
 # --------------------------------------------------------------------------- #
 def test_writing_the_default_stride_out_by_hand_changes_the_file_not_at_all(

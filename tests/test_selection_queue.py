@@ -24,7 +24,9 @@ from harness import check
 from trackanno.clips import ClipStore
 from trackanno.config import load_config
 from trackanno.select import AUDIT_RULE
-from trackanno.store import PROVENANCE_COLUMN, AnnotationStore, decode_provenance
+from trackanno.store import (
+    PROVENANCE_COLUMN, AnnotationStore, decode_provenance, encode_provenance,
+)
 
 
 @pytest.fixture(scope="module")
@@ -427,14 +429,16 @@ def test_a_selector_that_raises_is_reported_and_the_shuffle_carries_on(
           widget._provenance_for(widget._clip_ids[widget.order[0]]) is None)
 
     # A record the CSV could never hold back is caught HERE, where it costs one
-    # batch, and not at the save of a label somebody has just typed.
+    # batch, and not at the save of a label somebody has just typed. A NaN score
+    # is not one of those: the codec writes it as `null`, because a clip drawn at
+    # random earned no score and 0.0 would say the model was certain.
     widget.suggester.selection_batch = StubSuggester.selection_batch.__get__(
         widget.suggester
     )
     for what, bad in (
         ("a nameless rule", {"clip_id": widget._clip_ids[baseline[0]], "rule": ""}),
-        ("a NaN score", selection(widget._clip_ids[baseline[0]], 0,
-                                  score=float("nan"))),
+        ("a score json cannot spell", selection(widget._clip_ids[baseline[0]], 0,
+                                                score=object())),
     ):
         said.clear()
         widget.suggester.batch = [bad]
@@ -443,6 +447,19 @@ def test_a_selector_that_raises_is_reported_and_the_shuffle_carries_on(
         check(f"{what} is refused before it can reach the log",
               widget.order == baseline
               and any("clip selection is off" in m for m in said), repr(said))
+
+    said.clear()
+    first = widget._clip_ids[baseline[0]]
+    widget.suggester.batch = [selection(first, 0, rule="audit", score=float("nan"))]
+    widget._apply_filters(initial=True)
+    app.processEvents()
+    check("a score nothing measured costs no batch, the cell being able to hold it",
+          not any("clip selection is off" in m for m in said), repr(said))
+    check("...and reaches the log as no value rather than as a score of zero",
+          decode_provenance(
+              encode_provenance(widget._provenance_for(first))
+          )["score"] is None,
+          str(widget._provenance_for(first)))
 
     widget.shutdown()
     path.unlink(missing_ok=True)

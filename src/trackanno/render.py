@@ -27,6 +27,7 @@ from .clips import NORM_FILE, TRACKS_FILE
 from .config import Config, load_config
 from .movies import MovieSource, Normalizer, open_movie
 from .overlay import draw_detections, gray_to_rgb, hex_to_rgb
+from .predict import row_kind
 from .store import MULTI_SEP
 
 SOURCES = ("labels", "predictions", "both")
@@ -90,9 +91,7 @@ def build_frame_marks(
     the labels pass's rule instead: whichever row comes later in the file wins
     the shared frames.
 
-    Which of the two a file holds is read off the FILE, as
-    :func:`prediction_unit` reads it: ``predict.decode`` can be edited after a
-    run, and ``bout_id`` is the column a decoded row carries.
+    Which of the two a file holds comes from :func:`trackanno.predict.row_kind`.
 
     A hand label landing on a frame a prediction already claimed is NOT a
     collision: it is what ``--source both`` is for, and the labels pass below
@@ -115,8 +114,8 @@ def build_frame_marks(
     if source in ("predictions", "both") and predictions is not None:
         column, conf_column = f"{group_name}_pred", f"{group_name}_conf"
         # Bouts are disjoint by construction and windows need not be; see the
-        # docstring. Probed once, off the file, not once per row.
-        disjoint = "bout_id" in predictions.columns
+        # docstring. Asked once, off the file, not once per row.
+        disjoint = row_kind(predictions).bouts
         # One entry per painted ROW, not per painted frame, so the guard below can
         # name the row it collided with without carrying a second frame-sized dict.
         claimed: dict[int, list[tuple[int, int, str]]] = {}
@@ -322,15 +321,13 @@ def render_movie(
 # batch driver - shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
 def prediction_unit(predictions: pd.DataFrame) -> str:
-    """What one row of ``predictions.parquet`` actually IS, for counting it aloud.
+    """The noun the Export page counts rows in, from :func:`trackanno.predict.row_kind`.
 
-    A decoded row is a BOUT, a variable-length run between inferred behavioural
-    boundaries; an undecoded one is a window off a grid. Read off the FILE
-    rather than off ``predict.decode``, because the config can be edited after a
-    run and the count would then name what the next run would produce.
-    ``bout_id`` is the column a decoded row carries in place of ``clip_id``.
+    Two words for three kinds: a clip and a dense window are both a fixed span
+    the predictor was handed, and only a bout is a run between inferred
+    boundaries. A caller that needs the third distinction asks ``row_kind``.
     """
-    return "predicted bouts" if "bout_id" in predictions.columns else "predicted windows"
+    return "predicted bouts" if row_kind(predictions).bouts else "predicted windows"
 
 
 def annotated_movies(cfg: Config) -> dict[str, int]:
