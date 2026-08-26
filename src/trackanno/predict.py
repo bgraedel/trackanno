@@ -476,8 +476,26 @@ def _bout_predictions(
     starts = features["f_start"].to_numpy(dtype=np.int64)
     stops = np.asarray(ends, dtype=np.int64)
     scorable = np.asarray(skip_reason).astype(str) == ""
-    matrix = features[suggester.columns].to_numpy(dtype=np.float32)
     scored = np.flatnonzero(scorable)
+    # THE SCORED ROWS ONLY, ONE COLUMN AT A TIME. `features[columns].to_numpy(
+    # dtype=np.float32)` builds two whole copies of the model's input space
+    # before a single row is predicted - pandas materialises the column subset at
+    # the table's own float64, then numpy casts that to float32 - and then
+    # `matrix[scored]` copies a third time for the model. The dense table is one
+    # row per window per track per SCALE, so on a multi-scale run over a real
+    # project those copies are the largest things in the process, and the rows a
+    # skip_reason withheld are never handed to a model at all. Same values in the
+    # same order, so the predictions are unchanged; the per-column transient is
+    # one column of the table.
+    matrix = np.empty((scored.size, len(suggester.columns)), dtype=np.float32)
+    for position, column in enumerate(suggester.columns):
+        matrix[:, position] = features[column].to_numpy(dtype=np.float32)[scored]
+
+    # Row of `features` -> its row in the compact posteriors below, -1 for a
+    # window that was never scored. Every position the decode slices with comes
+    # from `scorable`, so it never looks one of those up.
+    rank = np.full(len(features), -1, dtype=np.int64)
+    rank[scored] = np.arange(scored.size)
 
     proba_by_group: dict[str, np.ndarray] = {}
     classes_by_group: dict[str, list[str]] = {}
@@ -486,12 +504,14 @@ def _bout_predictions(
         reporter.raise_if_cancelled()
         model = suggester.models[group]
         classes = [str(c) for c in np.asarray(model.classes_)]
-        # NaN for the rows that were never scored, so a slice of this array is
-        # only ever taken alongside the same slice of `scorable`. Filled rather
-        # than kept sparse because the per-track slicing below is by position.
-        full = np.full((len(features), len(classes)), np.nan)
+        # (n_scored, n_classes), not (n_rows, n_classes): these are held for
+        # every group at once until the decode below has walked every track, and
+        # the rows a skip_reason withheld would be a NaN block per group that
+        # nothing ever reads - the slices taken below are all `scorable` rows.
+        # `rank` is what keeps the compact form addressable by row position.
+        scores = np.full((scored.size, len(classes)), np.nan)
         if scored.size:
-            proba = np.asarray(model.predict_proba(matrix[scored]), dtype=np.float64)
+            proba = np.asarray(model.predict_proba(matrix), dtype=np.float64)
             if proba.ndim != 2 or len(proba) != scored.size:
                 raise RuntimeError(
                     f"{group}: the model returned {proba.shape} probabilities for "
@@ -516,13 +536,18 @@ def _bout_predictions(
                     "A decode averages probabilities across windows, so one of these "
                     "would spread over every frame the window touches"
                 )
-            full[scored] = proba
-        proba_by_group[group] = full
+            scores[:] = proba
+        proba_by_group[group] = scores
         classes_by_group[group] = classes
         reporter.log(
             f"scoring {scored.size} of {len(features)} dense windows with {group}"
         )
         reporter.advance()
+
+    # The models have been asked everything they are going to be asked, and the
+    # decode below allocates per track. Dropped here rather than left to fall out
+    # of scope at the end of the function, which is after the expensive part.
+    del matrix
 
     labelled = _human_spans(cfg, groups)
     by_track = pd.DataFrame(
@@ -550,7 +575,7 @@ def _bout_predictions(
         block: dict[str, np.ndarray] = {}
         for group in groups:
             posterior, covering = frame_posterior(
-                spans, proba_by_group[group][usable], f_lo, f_hi
+                spans, proba_by_group[group][rank[usable]], f_lo, f_hi
             )
             n_covering = covering if n_covering is None else n_covering
             labels = _decode(cfg, posterior)
@@ -644,10 +669,28 @@ def _check_trained_window(suggester, length: int, coverage: str, reporter) -> No
     if suggester.trained_window is None:
         reporter.log(problem, "warning")
         return
-    raise RuntimeError(
-        f"{problem} The {length} frames are this run's {coverage}-coverage rows: "
-        "predict.window_frames on the dense grid, clips.frames on the manifest."
+    # `window_problem` says "retrain, or restore the window length it was trained
+    # at" without being able to say WHICH key that is - it is a method on the
+    # model and does not know which coverage asked. Naming the key here is the
+    # difference between a diagnosis and an instruction, and the two coverages
+    # need different instructions: on the dense path the length is a setting of
+    # its own and can simply be written down, while on the manifest path it IS
+    # the length the clip features were cut at, so there is nothing to write down
+    # that would not also have to re-cut them.
+    fix = (
+        f"The {length} frames are predict.window_frames, this run's dense grid. "
+        f"Writing predict.window_frames: {suggester.trained_window} is the edit "
+        "that resolves it - no retraining, and not one existing label changes, "
+        "because this decides what the predictor measures and not what anyone "
+        "annotated."
+        if coverage == "dense" else
+        f"The {length} frames are clips.frames, the length "
+        f"{CLIP_FEATURES_FILE} - the table manifest coverage scores - was cut at. "
+        f"It read {suggester.trained_window} when this model was fitted, so "
+        "either put clips.frames back and rebuild the clip features, or retrain "
+        "at the length it reads now."
     )
+    raise RuntimeError(f"{problem} {fix}")
 
 
 def _check_scales(suggester, scales: list[int]) -> None:

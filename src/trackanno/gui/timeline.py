@@ -25,7 +25,10 @@ Five things the picture is not allowed to imply:
   ``stride/4`` on average and ``stride/2`` at worst (README, "Boundary error
   against a planted transition"), so every boundary is drawn with a band that
   wide rather than as a crisp line. Drawing a hairline would claim a precision
-  nothing in the method has.
+  nothing in the method has. Where ``predict.window_scales`` put several grids
+  in the file the band is the COARSEST one's, since the decode averages every
+  window covering a frame and the bluntest of them sets how well a transition
+  can be placed (:func:`measure_stride`).
 * **A marginal bout must not look like a confident one.** ``conf`` is the MEAN
   posterior of the bout's own class over its own frames, so it is comparable
   between bouts and is drawn as a fill height, not as a colour wash that the
@@ -172,6 +175,11 @@ class TrackPredictions:
     # and never deleted: a machine running again must not erase a human's
     # judgement, and hiding it would show the model's answer where theirs was.
     orphans: list = field(default_factory=list)
+    # Corrections only PART of which lands on a predicted frame. Drawn short and
+    # saved long, so the same rule holds for them: what a shorter re-run costs is
+    # a picture. Listed separately because the reviewer is looking at a span with
+    # the wrong ends, and nothing else on screen would say so.
+    partly_shown: list = field(default_factory=list)
     # Why this track cannot be corrected, or "". Set rather than raised: this is
     # a normal state (a windows file, a silent track) and a dialog that threw
     # would take the review of everything else with it.
@@ -203,10 +211,17 @@ class Resolution:
     ``predict.decode`` is: the config describes the next run. Here it would be
     worse than a wrong caption, because the number sets the width of a band a
     reviewer reads as "the boundary is somewhere in here".
+
+    ``scales`` is ``(window length, that length's stride)`` for every grid found
+    in the dense table, narrowest first. Under ``predict.window_scales`` there
+    are several, and ``stride`` is then the COARSEST of them - see
+    :func:`measure_stride` for why the band must be the widest grid's and not the
+    narrowest or the base one's.
     """
 
     stride: int = 0
     provenance: str = ""        # where the stride came from, or why there is none
+    scales: tuple[tuple[int, int], ...] = ()
 
     @property
     def known(self) -> bool:
@@ -229,22 +244,59 @@ class Resolution:
                 "frames here and no band is drawn - the edges below are sharper "
                 "than the method is."
             )
-        return (
+        out = (
             f"Boundaries are resolved to the {self.stride}-frame window stride, "
             f"not to the frame: {self.mean_error:.1f} frames out on average and "
             f"{self.worst_error:.0f} at worst, measured against a planted "
             f"transition. The band at each edge is that worst case. {self.provenance}."
         )
+        if len(self.scales) > 1:
+            listed = ", ".join(f"{length} frames at stride {step}"
+                               for length, step in self.scales)
+            out += (
+                f" This run scored at {len(self.scales)} window lengths "
+                f"({listed}), and the band is the COARSEST grid's: a boundary is "
+                "no better placed than the widest window that voted on it, and a "
+                "band drawn at the finest grid would claim the short windows had "
+                "the long ones' agreement."
+            )
+        return out
 
 
 def measure_stride(cfg: Config) -> Resolution:
-    """The stride of the window grid on disk, measured, never read off the config.
+    """The window grids on disk, measured, never read off the config.
 
     ``dense_clip_features.parquet`` IS the plan the decode ran over - one row per
     (track, window) - so the gap between one window start and the next is the
     stride that produced the bouts, as a fact rather than as a setting. Modal
     rather than minimal: a track whose windows do not divide evenly leaves one
     short step at the end, and the minimum would report that.
+
+    PER WINDOW LENGTH, and that is the whole difference from taking one mode over
+    the file. Under ``predict.window_scales`` the table holds several grids at
+    once - lengths 25, 50 and 100 at strides 25, 50 and 100 - and their starts
+    INTERLEAVE (0, 0, 0, 25, 50, 50, 75, 100...). The modal gap over the union is
+    then the finest grid's, and the band would be drawn at half its true width on
+    exactly the files most likely to need it. Understating a band is worse than
+    drawing none: it is a claim, in pixels, that a boundary is somewhere it may
+    well not be. The window's own length is in the file (``f_end - f_start``), so
+    the grids can be separated and each one measured on its own rows.
+
+    THE BAND IS THE COARSEST GRID'S. The decode averages every window covering a
+    frame, whatever its length, so the transition it reports is no better placed
+    than the bluntest evidence that went into it - a 100-frame window is
+    quantised to 100 frames however many 25-frame ones agree with it. The base
+    grid (the length the model was fitted at) is recoverable too, from the
+    ``__w####`` suffix ``densepredict._dense_clip_id`` puts on every non-base
+    row, and is deliberately NOT used: it is the length the FEATURES mean
+    something at, which is a statement about training and not about where a
+    boundary is.
+
+    A length that appears once per track is not a grid and is skipped: it has no
+    gap to measure, and it is what a window clipped against the end of a movie,
+    or a movie shorter than one window, looks like. Only a length with a
+    measurable gap is reported as a scale - inventing a stride for the rest (from
+    the length, say) would put a band on the screen that no row on disk supports.
 
     A dense table written AFTER the predictions is still measured but says so.
     It is the only grid there is, and refusing to give a number would leave the
@@ -258,23 +310,35 @@ def measure_stride(cfg: Config) -> Resolution:
     if not path.exists():
         return Resolution(0, f"{path.name} is not in this project")
     try:
-        frame = pd.read_parquet(path, columns=["movie_id", "track_id", "f_start"])
+        frame = pd.read_parquet(
+            path, columns=["movie_id", "track_id", "f_start", "f_end"]
+        )
     except (OSError, ValueError, KeyError) as exc:
         return Resolution(0, f"{path.name} could not be read ({exc})")
     if frame.empty:
         return Resolution(0, f"{path.name} has no windows in it")
 
-    steps: list[int] = []
     starts = pd.to_numeric(frame["f_start"], errors="coerce").to_numpy(dtype=float)
+    ends = pd.to_numeric(frame["f_end"], errors="coerce").to_numpy(dtype=float)
+    lengths = ends - starts
     keys = frame[["movie_id", "track_id"]].astype({"movie_id": str})
-    for positions in keys.groupby(["movie_id", "track_id"], sort=False).indices.values():
-        run = np.sort(starts[np.asarray(positions)])
-        gaps = np.diff(run)
-        steps.extend(int(g) for g in gaps if np.isfinite(g) and g > 0)
-    if not steps:
+    grids: dict[int, int] = {}
+    for length in np.unique(lengths[np.isfinite(lengths) & (lengths > 0)]):
+        # Positions, not index labels: `starts` is a plain array off the column
+        # and a parquet read need not hand back a 0..n-1 index to align with it.
+        rows = np.flatnonzero(lengths == length)
+        steps: list[int] = []
+        for positions in keys.iloc[rows].groupby(
+            ["movie_id", "track_id"], sort=False
+        ).indices.values():
+            run = np.sort(starts[rows[np.asarray(positions)]])
+            steps.extend(int(g) for g in np.diff(run) if np.isfinite(g) and g > 0)
+        if steps:
+            grids[int(length)] = int(pd.Series(steps).mode().iat[0])
+    if not grids:
         return Resolution(0, f"every track in {path.name} has a single window")
 
-    stride = int(pd.Series(steps).mode().iat[0])
+    scales = tuple(sorted(grids.items()))
     predictions = predictions_path(cfg)
     rebuilt = (
         predictions.exists()
@@ -286,7 +350,7 @@ def measure_stride(cfg: Config) -> Resolution:
             ", which was rebuilt after these predictions were written - so it may "
             "not be the grid they came off"
         )
-    return Resolution(stride, where)
+    return Resolution(max(grids.values()), where, scales)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,12 +556,13 @@ class PredictionReader:
             saved = store.for_track(track.movie_id, track.track_id, group) \
                 if store is not None else []
             try:
-                partition, orphans = apply_corrections(model, saved)
+                partition, orphans, clipped = apply_corrections(model, saved)
             except ValueError as exc:
                 track.edit_problem = f"a saved correction cannot be applied: {exc}"
                 return
             track.partitions[group] = partition
             track.orphans.extend(orphans)
+            track.partly_shown.extend(clipped)
 
     def _segments(self, rows: pd.DataFrame, group: str) -> list[Segment]:
         """One group's spans out of one track's rows, in frame order.
@@ -714,6 +779,15 @@ def caption_lines(
             "predictions have no row for - the run that wrote them decoded a "
             "different span. They are kept in bout_corrections.csv and are not "
             "drawn; nothing has been deleted."
+        )
+    if track.partly_shown:
+        listed = ", ".join(f"{c.f_start}-{c.f_end}" for c in track.partly_shown[:4])
+        lines.append(
+            f"{len(track.partly_shown)} saved correction(s) reach past what these "
+            f"predictions cover ({listed}) and are drawn cut short at frame "
+            f"{track.f_lo} or {track.f_hi}. The file keeps their real ends: "
+            "clipping is how they are DRAWN, never how they are saved, so a "
+            "re-run over a shorter span costs a picture and not a judgement."
         )
     if track.edit_problem and not track.empty:
         lines.append(f"Not correctable here: {track.edit_problem}")
@@ -1819,11 +1893,20 @@ class BoutReviewPanel(QWidget):
         if not saved:
             self.status.setText("this track has no corrections in that group")
             return
+        key = (track.movie_id, track.track_id, group)
+        # The rows that are NOT on screen are named before they are destroyed.
+        # Everything else here refuses to delete a judgement a machine hid; this
+        # one deletes it on purpose, so the reviewer has to be told it is in the
+        # count they are confirming.
+        unseen = len([c for c in track.orphans + track.partly_shown if c.key == key])
         answer = QMessageBox.question(
             self, "Delete corrections",
             f"Delete all {len(saved)} correction(s) on track {track.track_id} of "
             f"{track.movie_id} ({group})?\n\nThe model's own bouts come back. "
-            "Nothing else is changed and no prediction is rewritten.",
+            "Nothing else is changed and no prediction is rewritten."
+            + (f"\n\n{unseen} of them cover frames these predictions have no row "
+               "for, so they are not on the timeline - they are deleted too."
+               if unseen else ""),
         )
         if answer != QMessageBox.Yes:
             return
@@ -1841,8 +1924,8 @@ class BoutReviewPanel(QWidget):
             return
         self._undo.clear()
         track.partitions[group] = model
-        track.orphans = [c for c in track.orphans
-                         if c.key != (track.movie_id, track.track_id, group)]
+        track.orphans = [c for c in track.orphans if c.key != key]
+        track.partly_shown = [c for c in track.partly_shown if c.key != key]
         self.timeline.selected = None
         self.timeline.update()
         self._caption()

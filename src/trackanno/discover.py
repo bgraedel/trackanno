@@ -384,8 +384,13 @@ def class_table(
             "is no class to look inside"
         )
 
+    # Computed ONCE and reused below. Written out twice, the tie rule could be
+    # changed in one place and not the other, and the census would then claim a
+    # run took the majority class when it did not - a caveat about sampling that
+    # is wrong is worse than no caveat.
+    majority = max(sorted(counts), key=lambda name: counts[name])
     if class_name is None:
-        class_name = max(sorted(counts), key=lambda name: counts[name])
+        class_name = majority
     class_name = str(class_name)
     if class_name not in counts:
         listed = ", ".join(f"{k} ({v})" for k, v in sorted(counts.items()))
@@ -467,7 +472,7 @@ def class_table(
         "n_excluded_movies": n_excluded,
         "excluded_movies": excluded,
         "class_counts": {str(k): int(v) for k, v in sorted(counts.items())},
-        "chose_majority": bool(class_name == max(sorted(counts), key=lambda n: counts[n])),
+        "chose_majority": bool(class_name == majority),
     }
     return merged.reset_index(drop=True), class_name, census
 

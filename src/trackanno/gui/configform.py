@@ -139,6 +139,24 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
     ("clips", "stride", "int", "stride",
      "Spacing between windows. Equal to the clip length means non-overlapping.",
      {"min": 1, "max": 10000}),
+    # -- predict --
+    # clips.frames and clips.stride are on this form, so the overlapping grid
+    # that load_config refuses can be reached from here. These are the fields
+    # that refusal names, and without them it points at nothing the form owns.
+    ("predict", "window_frames", "autonum", "dense window length",
+     "Frames per dense prediction window. 'auto' is min(clip length, stride), "
+     "which only resolves while the clips tile; with overlapping clips write "
+     "the clip length here.", {}),
+    ("predict", "window_stride", "autonum", "dense window stride",
+     "How far the dense grid advances. 'auto' follows the window length, which "
+     "tiles. Anything smaller overlaps and needs a decode.", {}),
+    ("predict", "decode", "choice", "turn windows into bouts",
+     "none: one row per window. min_bout: absorb runs shorter than the floor "
+     "below. viterbi: the most likely label sequence under a sticky prior.",
+     {"options": ["none", "min_bout", "viterbi"]}),
+    ("predict", "min_bout_frames", "int", "shortest bout",
+     "Frames a bout must reach under min_bout. Must be at least 2; 0 and 1 "
+     "exclude nothing.", {"min": 0, "max": 100000}),
     ("clips", "window_mode", "choice", "how much to cut",
      "first: only the movie's first window. first_per_track: the first full "
      "window of each track. all: every non-overlapping window of every track.",

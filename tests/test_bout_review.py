@@ -285,6 +285,9 @@ def test_the_boundary_band_is_measured_off_the_grid_not_read_off_the_config(
     check("the stride is measured from the window grid", resolution.known)
     check("...and it is the stride the run actually used",
           resolution.stride == 10, str(resolution.stride))
+    check("a single-scale run reports the one grid it has: 50-frame windows "
+          "every 10 frames",
+          resolution.scales == ((50, 10),), str(resolution.scales))
     check("the worst-case band is half a stride",
           resolution.worst_error == 5.0, str(resolution.worst_error))
     check("and the average error a quarter of one",
@@ -304,6 +307,88 @@ def test_the_boundary_band_is_measured_off_the_grid_not_read_off_the_config(
     check("...and the reader agrees",
           PredictionReader(edited).resolution.stride == 10)
     write_config(cfg.path, {"predict.window_stride": 10})
+
+
+def test_the_band_under_several_window_scales_is_the_coarsest_grid_s(root) -> None:
+    """A multi-scale file must not be read as a fine-grained single-scale one.
+
+    ``predict.window_scales`` puts several grids in one dense table and their
+    window starts INTERLEAVE - 0, 0, 0, 25, 50, 50, 75, 100 - so one mode over
+    the whole file returns the FINEST grid's stride and the band comes out at
+    half its true width, on exactly the files most likely to need it. A band that
+    understates is worse than no band: it is a claim, in pixels, that a boundary
+    is somewhere it may well not be.
+
+    The band is the coarsest grid's, because the decode averages every window
+    covering a frame whatever its length, and a transition is no better placed
+    than the bluntest evidence that went into it.
+    """
+    from test_predict import build_case
+
+    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.gui.timeline import measure_stride
+
+    cfg, _ = build_case(root, "review-scales")
+    rows = [
+        {"movie_id": "m", "track_id": track, "f_start": start,
+         "f_end": start + length, "clip_id": f"m__t{track:04d}__f{start:06d}"}
+        for track in (1, 2)
+        for length in (25, 50, 100)
+        for start in range(0, 400 - length + 1, length)
+    ]
+    pd.DataFrame(rows).to_parquet(
+        cfg.paths.work_dir / DENSE_FEATURES_FILE, index=False)
+
+    union = np.diff(np.sort(np.array([r["f_start"] for r in rows if r["track_id"] == 1])))
+    modal = int(pd.Series([g for g in union if g > 0]).mode().iat[0])
+    check("the failure this prevents is real: the modal gap over the whole file "
+          "is the finest grid's stride", modal == 25, str(modal))
+
+    resolution = measure_stride(cfg)
+    check("each grid is measured on its own rows, by the window length the file "
+          "records for them",
+          resolution.scales == ((25, 25), (50, 50), (100, 100)),
+          str(resolution.scales))
+    check("the stride reported is the coarsest grid's, not the modal one",
+          resolution.stride == 100, str(resolution.stride))
+    check("...so the band is 50 frames and not the 12 a mode would have drawn",
+          resolution.worst_error == 50.0, str(resolution.worst_error))
+    check("the sentence names every scale, so the number can be argued with",
+          "3 window lengths" in resolution.sentence()
+          and "25 frames at stride 25" in resolution.sentence()
+          and "100 frames at stride 100" in resolution.sentence(),
+          resolution.sentence())
+    check("...and says which of them the band came from",
+          "COARSEST" in resolution.sentence(), resolution.sentence())
+
+
+def test_a_window_clipped_against_the_end_of_a_movie_is_not_a_scale(root) -> None:
+    """A length that appears once per track is not a grid.
+
+    The dense grid emits one short window at the end of a tiling movie, so the
+    file holds spans of a length no scale ever asked for. It has no gap to
+    measure - there is only one of it per track - and it is skipped rather than
+    given a stride from its own length, which would put a band on the screen that
+    no row on disk supports.
+    """
+    from test_predict import build_case
+
+    from trackanno.densepredict import DENSE_FEATURES_FILE
+    from trackanno.gui.timeline import measure_stride
+
+    cfg, _ = build_case(root, "review-tail")
+    rows = [{"movie_id": "m", "track_id": 1, "f_start": start,
+             "f_end": min(start + 50, 320)} for start in range(0, 320, 50)]
+    check("the fixture really does end in a short window",
+          rows[-1]["f_end"] - rows[-1]["f_start"] == 20, str(rows[-1]))
+    pd.DataFrame(rows).to_parquet(
+        cfg.paths.work_dir / DENSE_FEATURES_FILE, index=False)
+
+    resolution = measure_stride(cfg)
+    check("the clipped tail is not reported as a second scale",
+          resolution.scales == ((50, 50),), str(resolution.scales))
+    check("...and the band is the real grid's", resolution.stride == 50,
+          str(resolution.stride))
 
 
 def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
@@ -499,6 +584,11 @@ def test_the_model_page_opens_the_review_window(app, root) -> None:
               len([w for w in app.topLevelWidgets()
                    if w.__class__.__name__ == "BoutReviewDialog"]) == 1)
     finally:
+        # shutdown() before close(): ModelPage keeps three background threads
+        # (keypoint reader, device probe, model probe) that close() does not
+        # cancel, and a live QThread at interpreter exit kills the process after
+        # the tests have already passed.
+        page.shutdown()
         hub.close()
         app.processEvents()
     check("closing the page takes the review window with it", page._review is None)

@@ -1649,7 +1649,7 @@ class ModelPage(Page):
 
             self._predict_blocker = prediction_blocker(self.cfg)
             self._has_predictions = predictions_path(self.cfg).exists()
-            if not self._predict_blocker and predictions_path(self.cfg).exists():
+            if not self._predict_blocker and self._has_predictions:
                 stale = staleness(self.cfg)
                 self.predict_note.setText(
                     f"predictions.parquet exists but {stale}" if stale

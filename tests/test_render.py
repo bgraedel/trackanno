@@ -2,18 +2,24 @@
 
 ``build_frame_marks`` collapses rows spanning frames into one mark per (frame,
 track), so anything that lands on a frame twice has to have a rule. There are
-three different rules here and they are easy to mistake for one another:
+four different rules here and they are easy to mistake for one another:
 
-* two PREDICTION rows on one frame is a broken upstream invariant and raises -
-  the dense grid tiles, and an overlapping grid is only allowed alongside a
-  decode that turns it into disjoint bouts, so nothing legitimate produces it;
+* two BOUTS on one frame is a broken upstream invariant and raises - a decode
+  cuts a track's frames into disjoint runs, so no setting can ask for it;
+* two prediction WINDOWS on one frame is a geometry, not a fault:
+  ``predict.coverage: manifest`` scores the annotation clips themselves, and
+  ``clips.stride`` below ``clips.frames`` makes consecutive clips of a track
+  share frames on purpose;
 * a hand label on a frame a prediction claims is what ``--source both`` IS, and
   must keep working;
-* two ANNOTATION rows on one frame is what ``clips.stride`` below
-  ``clips.frames`` asks for, and must keep working too.
+* two ANNOTATION rows on one frame is the same overlapping clip grid seen from
+  the labels side, and must keep working too.
 
-Only the first is an error, and the point of this suite is that the other two
-never become one.
+Only the first is an error, and the point of this suite is that the other three
+never become one. The guard used to fire on all prediction rows alike, which
+made every movie of a manifest-coverage project over an overlapping clip grid
+fail to render - the file permitted and refused identical geometry in two
+adjacent loops.
 """
 
 from __future__ import annotations
@@ -39,8 +45,17 @@ def cfg(root: Path):
 
 
 def _prediction(track_id: int, f_start: int, f_end: int, value: str, conf: float = 0.9):
+    """A row off a GRID: a dense window, or under manifest coverage a clip."""
     return {"movie_id": MOVIE, "track_id": track_id, "f_start": f_start,
             "f_end": f_end, f"{GROUP}_pred": value, f"{GROUP}_conf": conf}
+
+
+def _bout(track_id: int, f_start: int, f_end: int, value: str, conf: float = 0.9):
+    """A row a DECODE produced. ``bout_id`` is what says so, and it is what the
+    renderer probes: the file has to answer this, because ``predict.decode`` can
+    be edited after the run that wrote it."""
+    return dict(_prediction(track_id, f_start, f_end, value, conf),
+                bout_id=f"{MOVIE}__t{track_id:04d}__f{f_start:06d}-{f_end:06d}")
 
 
 def _label(track_id: int, f_start: int, f_end: int, value: str):
@@ -48,26 +63,30 @@ def _label(track_id: int, f_start: int, f_end: int, value: str):
             "track_id": track_id, "f_start": f_start, "f_end": f_end, GROUP: value}
 
 
-def test_two_prediction_rows_on_one_frame_stop_the_render(cfg) -> None:
+def test_two_decoded_bouts_on_one_frame_stop_the_render(cfg) -> None:
     """Painting one of the two would hide the fact that they exist.
 
     Whichever row pandas hands over last wins a plain dict assignment, so the
     exported colour of an overlapped frame comes from row order in the parquet
     rather than from the model - and the movie that comes out looks entirely
     normal. The only visible symptom is the one this guard makes.
+
+    A BOUT is where that reasoning holds: a decode cuts each track's frames into
+    runs between inferred boundaries, so two of them meeting is not a setting
+    anyone can choose, it is the decode or the file being wrong.
     """
     from trackanno.render import build_frame_marks
 
     predictions = pd.DataFrame([
-        _prediction(3, 800, 850, "immotile"),
-        _prediction(3, 812, 862, "swimming"),
+        _bout(3, 800, 850, "immotile"),
+        _bout(3, 812, 862, "swimming"),
     ])
     try:
         build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
-        check("overlapping prediction rows are refused", False, "it painted them")
+        check("overlapping bouts are refused", False, "it painted them")
     except ValueError as exc:
         message = str(exc)
-        check("overlapping prediction rows are refused", True)
+        check("overlapping bouts are refused", True)
         check("...naming the frame they met on", "frame 812" in message, message)
         check("...naming the track", "track 3" in message, message)
         check("...and BOTH competing values, not just the loser",
@@ -75,6 +94,8 @@ def test_two_prediction_rows_on_one_frame_stop_the_render(cfg) -> None:
         check("...with the two rows' spans, so a duplicate row reads differently "
               "from an overlapping one",
               "[800, 850)" in message and "[812, 862)" in message, message)
+        check("...and calls them bouts, since that is the only row this can be",
+              "bout" in message.lower(), message)
 
     # And through the 'both' path as well, where the labels pass would otherwise
     # paint over the evidence before anyone saw it.
@@ -86,6 +107,52 @@ def test_two_prediction_rows_on_one_frame_stop_the_render(cfg) -> None:
         check("...on the 'both' path too", False, "it painted them")
     except ValueError:
         check("...on the 'both' path too", True)
+
+
+def test_manifest_predictions_that_share_frames_render_rather_than_raising(cfg) -> None:
+    """The same overlap the labels pass calls a configuration, one loop earlier.
+
+    ``predict.coverage: manifest`` writes one prediction row per ANNOTATION clip,
+    so a project whose ``clips.stride`` is below ``clips.frames`` has consecutive
+    clips of a track sharing frames - by construction, not by accident. Guarding
+    that raised inside ``render_movie``, which ``render_all`` catches per movie
+    and logs as FAILED, so every movie of such a project produced no file at all.
+
+    Nothing in ``predictions.parquet`` can say a window came off the annotation
+    grid rather than the dense one - a dense window's ``clip_id`` is deliberately
+    formed to collide with an annotation clip's - so the rule for windows is the
+    labels pass's rule: the later row wins.
+    """
+    from trackanno.render import build_frame_marks
+
+    # clips.frames 50, clips.stride 25: the second clip of the track starts
+    # halfway through the first, exactly as the clip cutter laid them out.
+    predictions = pd.DataFrame([
+        _prediction(3, 0, 50, "swimming"),
+        _prediction(3, 25, 75, "immotile"),
+        _prediction(3, 50, 100, "swimming"),
+    ])
+    marks = build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
+
+    check("overlapping window rows paint instead of stopping the render",
+          len(marks) == 100, str(len(marks)))
+    check("...the frames only the first clip covers keep its answer",
+          marks[10][3].text.startswith("~swimming"), marks[10][3].text)
+    check("...the shared frames go to the later row, as the labels pass does",
+          marks[30][3].text.startswith("~immotile"), marks[30][3].text)
+    check("...and the last clip's own frames are its own",
+          marks[80][3].text.startswith("~swimming"), marks[80][3].text)
+    check("they are still drawn dashed, so an overlap resolved this way can "
+          "never read as a hand label", marks[30][3].predicted)
+
+    # The guard is a property of the ROW KIND, not of the geometry: the very same
+    # spans carrying a bout_id are refused.
+    as_bouts = pd.DataFrame([_bout(3, 0, 50, "swimming"), _bout(3, 25, 75, "immotile")])
+    try:
+        build_frame_marks(pd.DataFrame(), as_bouts, cfg, GROUP, "predictions")
+        check("...while the identical spans as bouts still raise", False, "it painted them")
+    except ValueError:
+        check("...while the identical spans as bouts still raise", True)
 
 
 def test_disjoint_bouts_paint_without_complaint(cfg) -> None:

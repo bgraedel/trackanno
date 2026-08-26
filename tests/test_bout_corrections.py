@@ -381,7 +381,9 @@ def test_a_correction_the_predictions_no_longer_reach_is_kept(project) -> None:
 
     outside = Correction("x", "m", 1, GROUP, 200, 260, "immotile")
     overhang = Correction("y", "m", 1, GROUP, 100, 200, "immotile")
-    partition, orphans = apply_corrections(model_partition(), [overhang, outside])
+    partition, orphans, clipped = apply_corrections(
+        model_partition(), [overhang, outside]
+    )
 
     check("a correction with no overlap at all is an orphan",
           [c.correction_id for c in orphans] == ["x"], str(orphans))
@@ -390,6 +392,216 @@ def test_a_correction_the_predictions_no_longer_reach_is_kept(project) -> None:
           == (100, 120, True), str(partition.spans))
     check("the track still tiles after an orphan was skipped",
           tiles(partition, 0, 120))
+    check("a correction drawn shorter than it was asserted is REPORTED as such, "
+          "so the picture can say it is showing less than the file holds",
+          [(c.correction_id, c.f_start, c.f_end) for c in clipped]
+          == [("y", 100, 200)], str(clipped))
+    check("...and it is reported apart from the orphans, because the two need "
+          "different sentences: one is not drawn at all, the other is drawn wrong",
+          not set(c.correction_id for c in clipped)
+          & set(c.correction_id for c in orphans))
+
+
+def test_a_save_keeps_the_corrections_the_reviewer_was_never_shown(
+    app, project
+) -> None:
+    """One edit must not delete the judgements that are off screen.
+
+    ``replace_track`` drops every row for a (movie, track, group) and writes back
+    what it is handed, and what a partition can hand back is only what could be
+    drawn. A correction over frames a later, shorter run no longer reaches is
+    drawn nowhere; a correction that overhangs is drawn short. If a save built
+    its rows from the picture alone, moving one boundary would delete the first
+    and truncate the second - a human judgement edited by a machine that ran
+    again, with nothing on screen to say it happened.
+    """
+    from trackanno.corrections import (
+        Correction, CorrectionStore, correction_id, corrections_path,
+    )
+    from trackanno.gui.timeline import BoutReviewPanel
+
+    cfg, movie, track_id = project
+    monday = "2026-01-05T09:00:00+00:00"
+
+    def row(f_start, f_end):
+        return Correction(
+            correction_id(movie, track_id, GROUP, f_start, f_end), movie, track_id,
+            GROUP, f_start, f_end, "immotile", "monday", monday,
+            {"bouts": [{"f_start": f_start, "f_end": f_end, "label": "swimming",
+                        "conf": 0.9}]},
+        )
+
+    # 100-160 overhangs the 0-120 the predictions cover; 200-300 is past them
+    # entirely. Both were judged when the decode was longer.
+    store = CorrectionStore(corrections_path(cfg))
+    store.replace_track(movie, track_id, GROUP, [row(100, 160), row(200, 300)])
+
+    panel = BoutReviewPanel(cfg)
+    select(panel, movie, track_id)
+    app.processEvents()
+    check("the correction past the predictions is not drawn, and is reported",
+          [(c.f_start, c.f_end) for c in panel.timeline.track.orphans]
+          == [(200, 300)], str(panel.timeline.track.orphans))
+    check("...and the one that overhangs is drawn short, and says so",
+          [(c.f_start, c.f_end) for c in panel.timeline.track.partly_shown]
+          == [(100, 160)], str(panel.timeline.track.partly_shown))
+
+    check("an unrelated edit is accepted", "saved" in panel.assert_class(
+        0, 20, "immotile"))
+
+    saved = CorrectionStore(corrections_path(cfg)).for_track(movie, track_id, GROUP)
+    check("the judgement the reviewer could not see survives the save",
+          (200, 300) in [(c.f_start, c.f_end) for c in saved], str(saved))
+    check("...with its own timestamp and annotator, not today's and not this "
+          "reviewer's - the file is the only evidence of when it was made",
+          [(c.annotator, c.timestamp_utc) for c in saved
+           if c.f_start == 200] == [("monday", monday)], str(saved))
+    check("the overhanging correction keeps ITS OWN ends: clipping is how it is "
+          "drawn, never how it is saved, so the frames past 120 are not lost",
+          (100, 160) in [(c.f_start, c.f_end) for c in saved], str(saved))
+    check("...and it too keeps its provenance rather than being re-made today",
+          [(c.annotator, c.timestamp_utc) for c in saved
+           if c.f_start == 100] == [("monday", monday)], str(saved))
+    check("...and what it recorded the model as having said, which the next "
+          "prediction run has already overwritten",
+          [c.overruled.get("bouts") for c in saved if c.f_start == 100]
+          == [[{"f_start": 100, "f_end": 160, "label": "swimming", "conf": 0.9}]],
+          str([c.overruled for c in saved if c.f_start == 100]))
+    check("and the new edit is in the file beside them",
+          [(c.f_start, c.f_end, c.annotator) for c in saved if c.f_start == 0]
+          == [(0, 20, "tester")], str(saved))
+    check("three rows, so nothing was merged into anything either",
+          len(saved) == 3, str(len(saved)))
+
+    before = digest(corrections_path(cfg))
+    check("re-asserting what the file already says is accepted",
+          "saved" in panel.assert_class(0, 20, "immotile"))
+    check("...and rewrites the file byte for byte, so a reviewer clicking twice "
+          "cannot re-stamp a judgement with today's date",
+          digest(corrections_path(cfg)) == before)
+
+    # The one case where an overhanging row DOES change: the reviewer overwrites
+    # the part of it they can see. Only that part is theirs to change.
+    check("re-judging the visible part of an overhanging correction is accepted",
+          "saved" in panel.assert_class(100, 120, "swimming"))
+    saved = CorrectionStore(corrections_path(cfg)).for_track(movie, track_id, GROUP)
+    check("the frames past the predictions keep the earlier judgement, because "
+          "the reviewer was never shown them and cannot have changed their mind",
+          [(c.f_start, c.f_end, c.annotator, c.timestamp_utc) for c in saved
+           if c.f_start == 120] == [(120, 160, "monday", monday)], str(saved))
+    check("...including what it recorded the model as saying, clipped to the "
+          "frames it still claims rather than left quoting frames it does not",
+          [c.overruled.get("bouts") for c in saved if c.f_start == 120]
+          == [[{"f_start": 120, "f_end": 160, "label": "swimming", "conf": 0.9}]],
+          str([c.overruled for c in saved if c.f_start == 120]))
+    check("and the frames they DID re-judge are a new row, in their name",
+          [(c.f_start, c.f_end, c.label, c.annotator) for c in saved
+           if c.f_start == 100] == [(100, 120, "swimming", "tester")], str(saved))
+    panel.close()
+    app.processEvents()
+
+
+def test_two_corrections_drawn_as_one_span_stay_two_rows(app, project) -> None:
+    """Monday's judgement and Tuesday's are drawn as one bar and filed as two.
+
+    Two adjacent corrections of the same class have no cut between them to draw,
+    so the picture merges them - that is a fact about the picture. The file must
+    not: one row cannot hold two timestamps, two annotators, or two records of
+    what the model said at the time, and a merged row would date Monday's work to
+    Tuesday and credit it to whoever was on shift then. Six months later the
+    timestamps are the only evidence of when a judgement was actually made.
+    """
+    from trackanno.corrections import (
+        Correction, CorrectionStore, correction_id, corrections_path,
+    )
+    from trackanno.gui.timeline import BoutReviewPanel
+
+    cfg, movie, track_id = project
+    days = {0: ("monday", "2026-01-05T09:00:00+00:00"),
+            40: ("tuesday", "2026-01-06T14:30:00+00:00")}
+    store = CorrectionStore(corrections_path(cfg))
+    store.replace_track(movie, track_id, GROUP, [
+        Correction(correction_id(movie, track_id, GROUP, f_start, f_start + 40),
+                   movie, track_id, GROUP, f_start, f_start + 40, "immotile",
+                   *days[f_start])
+        for f_start in (0, 40)
+    ])
+
+    panel = BoutReviewPanel(cfg)
+    select(panel, movie, track_id)
+    app.processEvents()
+    spans = panel.timeline.track.partitions[GROUP].corrected_spans()
+    check("the two are drawn as ONE span - there is no cut between them to draw",
+          [(s.f_start, s.f_end, s.label) for s in spans] == [(0, 80, "immotile")],
+          str(spans))
+
+    check("an unrelated edit elsewhere is accepted",
+          "saved" in panel.assert_class(100, 120, "immotile"))
+    saved = CorrectionStore(corrections_path(cfg)).for_track(movie, track_id, GROUP)
+    check("...and the file still holds both assertions, separately",
+          [(c.f_start, c.f_end, c.annotator, c.timestamp_utc) for c in saved][:2]
+          == [(0, 40) + days[0], (40, 80) + days[40]], str(saved))
+    check("neither was re-stamped with today's date by the merge",
+          all("2026-01-0" in c.timestamp_utc for c in saved if c.f_start < 80),
+          str([c.timestamp_utc for c in saved]))
+    panel.close()
+    app.processEvents()
+
+
+def test_a_column_this_build_does_not_know_survives_a_save(app, project) -> None:
+    """The file is shared by every track, so a strip is a loss everywhere.
+
+    ``store.py``'s rule is that a column added later goes at the END and an older
+    build reconstructs the header it read, leaves the file alone and keeps what
+    it cannot interpret. This file claims the same rule in its module docstring;
+    the check is that it actually holds, because the failure is silent: somebody
+    opens an older build, moves one boundary, and a newer build's column is gone
+    from every row of everybody's corrections.
+    """
+    from trackanno.corrections import (
+        CORRECTION_COLUMNS, CorrectionStore, corrections_path,
+    )
+    from trackanno.gui.timeline import BoutReviewPanel
+
+    cfg, movie, track_id = project
+    path = corrections_path(cfg)
+    header = CORRECTION_COLUMNS + ["confidence_in_self"]
+    # One row for the track under test and one for a track nobody is editing:
+    # the blast radius of a rewrite is the whole file, not the edited key.
+    path.write_text("\n".join([
+        ",".join(header),
+        f"keep-me,{movie},{track_id},{GROUP},40,60,immotile,monday,"
+        "2026-01-05T09:00:00+00:00,,quite sure",
+        f"other-track,{movie},77,{GROUP},0,10,swimming,monday,"
+        "2026-01-05T09:00:00+00:00,,not at all",
+    ]) + "\n", encoding="utf-8")
+
+    panel = BoutReviewPanel(cfg)
+    select(panel, movie, track_id)
+    app.processEvents()
+    check("a file with an unknown column still opens", panel.reader.problem == "",
+          panel.reader.problem)
+    check("the store rebuilds the header it read, in the file's own order",
+          panel.reader.corrections.columns == header,
+          str(panel.reader.corrections.columns))
+
+    check("an edit on one track is accepted", "saved" in panel.assert_class(
+        80, 100, "immotile"))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    check("the header on disk is unchanged, so the file is not churned",
+          lines[0].split(",") == header, lines[0])
+    rows = pd.read_csv(path).fillna("")
+    check("the row for the track nobody was editing keeps its unknown cell",
+          list(rows[rows["correction_id"] == "other-track"]["confidence_in_self"])
+          == ["not at all"], str(rows.to_dict("records")))
+    check("...and so does the one on the edited track that the edit did not touch",
+          list(rows[rows["f_start"] == 40]["confidence_in_self"]) == ["quite sure"],
+          str(rows.to_dict("records")))
+    check("a row this build wrote leaves the cell empty rather than inventing one",
+          list(rows[rows["f_start"] == 80]["confidence_in_self"]) == [""],
+          str(rows.to_dict("records")))
+    panel.close()
+    app.processEvents()
 
 
 # --------------------------------------------------------------------------- #

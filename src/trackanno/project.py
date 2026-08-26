@@ -144,7 +144,9 @@ keypoints:
 # --- Clip extraction ---------------------------------------------------------
 clips:
   frames: 50          # clip length -> "50 frames of a single track"
-  stride: 50          # == frames means non-overlapping windows
+  stride: 50          # == frames means non-overlapping windows. Below frames
+                      # the clips OVERLAP, which also makes predict.window_frames
+                      # below unresolvable - write it out, see the note there.
 
   # How much of each movie becomes clips:
   #   first           -> ONLY the movie's first `frames` frames
@@ -316,13 +318,25 @@ suggest:
 predict:
   coverage: dense
   # Length of one dense window. auto = min(clips.frames, clips.stride): the
-  # longest window that both tiles and lands on the annotation grid's own
-  # starts, so a dense window coinciding with an annotated one keeps its
+  # longest window that both is the length the model was fitted at
+  # (clips.frames) and lands on the annotation grid's own starts (a multiple of
+  # clips.stride), so a dense window coinciding with an annotated one keeps its
   # clip_id and hand labels still join to it. Changing it also changes what the
   # features MEAN (path length, straightness, every *_std, present fraction), so a
   # window the model was not fitted at is train/serve skew. The beat and wave
   # columns are the exception: they are measured over spectral.window, not over
   # this one, so they alone survive a change of length.
+  #
+  # Those two goals are the same number only while the annotation clips tile.
+  # If you set clips.stride BELOW clips.frames - overlapping clips, cut on
+  # purpose - `auto` has no answer and the config refuses to load rather than
+  # quietly keeping the landing and dropping the trained length. Write the
+  # number instead: `clips.frames` on its own tiles at the trained length (dense
+  # rows then stop sharing clip_ids with annotated clips, so `human_labelled`
+  # goes false on all of them), or `clips.frames` together with
+  # `window_stride: <clips.stride>` and a `decode` below keeps both, at the cost
+  # of overlapping windows - which is exactly what the decode is for. Neither
+  # touches a label you have already made.
   window_frames: auto
 
   # Frames from one window's start to the next.
@@ -414,8 +428,9 @@ predict:
   decode: none
   # The shortest bout worth believing, in frames. A claim about the ANIMAL, not
   # about the model: the briefest episode of a behaviour you would accept as
-  # real. 0 means no such floor, and is refused with decode: min_bout, where it
-  # would silently do nothing.
+  # real. 0 means no such floor; 1 is the same thing said differently, since the
+  # shortest bout a decode can produce is already one frame. Both are refused
+  # with decode: min_bout, where either would silently do nothing.
   min_bout_frames: 0
   # viterbi only: the probability a frame keeps the previous frame's label.
   # auto = 1 - 1/min_bout_frames, the stickiness whose average run lasts

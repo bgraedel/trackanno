@@ -1001,7 +1001,7 @@ uv run pytest tests/test_kymograph.py -v
 uv run pytest -k "prediction or orphan"
 ```
 
-Twenty-six suites, 306 tests, 2233 named checks. `uv sync` installs pytest. Nothing is
+Twenty-six suites, 315 tests, 2323 named checks. `uv sync` installs pytest. Nothing is
 skipped, and no test reads data this repository does not carry: every suite that
 needs a project generates one (config, synthetic movie, real clip cache) into a
 temporary directory and deletes it afterwards (`tests/fixtures.py`). Real

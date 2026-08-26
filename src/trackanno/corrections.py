@@ -48,6 +48,12 @@ readable without pandas. Schema evolution follows the rule
 :mod:`trackanno.store` sets out - a column added later goes at the END, in the
 order it was added - so an older build reading a newer file reconstructs the
 same header it sees on disk and leaves the file alone instead of churning it.
+That rule is IMPLEMENTED here and not merely asked for: a column this build does
+not know is carried on the row it was read from
+(:attr:`Correction.extra`) and written back in the position the file already had
+it. The file is shared by every track, so a save touches rows the reviewer was
+not editing - stripping an unknown column would lose it from all of them at
+once, silently, because somebody opened an older build and moved one boundary.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ import math
 import os
 import tempfile
 import threading
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -404,7 +411,14 @@ def _canonical(spans: list[Span]) -> list[Span]:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Correction:
-    """One row of the file: a person's assertion about a half-open frame range."""
+    """One row of the file: a person's assertion about a half-open frame range.
+
+    ``extra`` is every cell of that row this build has no column for, kept as
+    text under the name the file gave it. It is not a feature, it is the
+    downgrade path: this file is shared by every track, a save rewrites all of
+    it, and a build that dropped what it did not recognise would delete a newer
+    build's column from rows nobody was editing. See the module docstring.
+    """
 
     correction_id: str
     movie_id: str
@@ -416,6 +430,7 @@ class Correction:
     annotator: str = ""
     timestamp_utc: str = ""
     overruled: dict = field(default_factory=dict)
+    extra: dict = field(default_factory=dict)
 
     @property
     def n_frames(self) -> int:
@@ -426,7 +441,7 @@ class Correction:
         return (str(self.movie_id), int(self.track_id), str(self.group))
 
     def to_row(self) -> dict:
-        return {
+        row = {
             "correction_id": self.correction_id,
             "movie_id": str(self.movie_id),
             "track_id": int(self.track_id),
@@ -439,6 +454,12 @@ class Correction:
             "overruled": encode_overruled(self.overruled.get("bouts")
                                           if self.overruled else None),
         }
+        # After the known columns, never over them: a file whose header repeated
+        # a name would otherwise let an unparsed cell overwrite the value this
+        # build validated on the way in.
+        for column, value in self.extra.items():
+            row.setdefault(str(column), value)
+        return row
 
     @classmethod
     def from_row(cls, row: Mapping, where: str) -> Correction:
@@ -479,14 +500,29 @@ class Correction:
                 f"(got movie_id={movie_id!r}, group={group!r})"
             )
         track_id = integer("track_id")
+        # Kept as TEXT and never parsed: this build has no idea what a column it
+        # has never heard of means, and the only safe thing to do with a value
+        # you cannot interpret is to hand it back exactly as you got it. A
+        # ``None`` key is csv.DictReader's bucket for cells past the end of the
+        # header, and a row wider than its own header is a broken row, not a
+        # column - it is dropped rather than written back under no name at all.
+        extra = {
+            str(column): "" if value is None else str(value)
+            for column, value in row.items()
+            if column is not None and column not in CORRECTION_COLUMNS
+        }
         return cls(
             correction_id=str(row.get("correction_id", "")).strip()
             or correction_id(movie_id, track_id, group, f_start, f_end),
             movie_id=movie_id, track_id=track_id, group=group,
             f_start=f_start, f_end=f_end, label=label,
-            annotator=str(row.get("annotator", "")),
-            timestamp_utc=str(row.get("timestamp_utc", "")),
+            # `or ""` because csv.DictReader fills a row shorter than the header
+            # with None, and str(None) would record the annotator of a truncated
+            # row as a person called "None".
+            annotator=str(row.get("annotator", "") or ""),
+            timestamp_utc=str(row.get("timestamp_utc", "") or ""),
             overruled=decode_overruled(row.get("overruled")),
+            extra=extra,
         )
 
 
@@ -504,12 +540,20 @@ class CorrectionStore:
     Rows are written sorted by (movie, track, group, f_start), so the file is
     stable under re-saving and a diff shows the correction that changed rather
     than the order they were made in.
+
+    ``columns`` is the header this store will write: the ones this build knows,
+    then any it read off the file and does not, in the order the file had them.
+    Same reconstruction as :class:`trackanno.store.AnnotationStore`, for the same
+    reason - a save rewrites every row of a file shared by every track, so an
+    older build must put a newer build's column back where it found it rather
+    than delete it from work nobody was editing.
     """
 
     def __init__(self, path: str | Path, annotator: str = ""):
         self.path = Path(path)
         self.annotator = str(annotator or "")
         self.rows: list[Correction] = []
+        self.columns: list[str] = list(CORRECTION_COLUMNS)
         self._lock = threading.RLock()
         self._load()
 
@@ -519,12 +563,27 @@ class CorrectionStore:
             return
         with open(self.path, "r", encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh)
+            disk_columns = list(reader.fieldnames or [])
             for number, row in enumerate(reader, start=2):
-                if not any(str(v).strip() for v in row.values()):
+                if not any(str(v).strip() for v in row.values() if v is not None):
                     continue
                 self.rows.append(
                     Correction.from_row(row, f"{self.path.name} line {number}")
                 )
+        # dict.fromkeys and not a set: the ORDER is the whole point, since only a
+        # header rebuilt in the file's own order comes out identical to the one
+        # on disk and leaves the file unchurned.
+        extra = list(dict.fromkeys(
+            c for c in disk_columns if c and c not in self.columns
+        ))
+        if extra:
+            warnings.warn(
+                f"{self.path.name} has column(s) this build does not know: "
+                f"{extra}. They are kept on every row and written back where "
+                "they are, so a newer build's work is not lost by saving here.",
+                stacklevel=2,
+            )
+            self.columns = self.columns + extra
         self._refuse_overlaps()
 
     def _refuse_overlaps(self) -> None:
@@ -553,16 +612,35 @@ class CorrectionStore:
                         "one of the two rows."
                     )
 
+    def _header(self, rows: Iterable[Correction]) -> list[str]:
+        """The columns to write: this build's, then everything the rows carry.
+
+        Taken from the ROWS as well as from the header that was read, so a
+        correction carrying a column this store never saw cannot be dropped
+        without anyone noticing. ``extrasaction="ignore"`` would have done that
+        silently, which is the failure this whole ``extra`` path exists to
+        prevent - so the writer is given a header wide enough instead.
+        """
+        out = list(self.columns)
+        for row in rows:
+            for column in row.extra:
+                if str(column) not in out:
+                    out.append(str(column))
+        return out
+
     def _rewrite(self) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            rows = self.sorted_rows()
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".csv.tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                    writer = csv.DictWriter(fh, fieldnames=CORRECTION_COLUMNS,
-                                            extrasaction="ignore")
+                    # restval, so a row that predates a column the file has is
+                    # written with that cell empty rather than refused.
+                    writer = csv.DictWriter(fh, fieldnames=self._header(rows),
+                                            restval="")
                     writer.writeheader()
-                    for row in self.sorted_rows():
+                    for row in rows:
                         writer.writerow(row.to_row())
                     fh.flush()
                     os.fsync(fh.fileno())
@@ -599,6 +677,15 @@ class CorrectionStore:
         assertions they now hold about it is the set that stands. Merging would
         leave an assertion they had just deleted still in the file, and the next
         reload would put it back on screen.
+
+        THE ARGUMENT ONLY HOLDS FOR SPANS THE REVIEWER COULD SEE, and this method
+        cannot tell which those were. A correction over frames the current
+        predictions have no row for is drawn nowhere and is absent from the
+        partition, so a caller that passed only what is on screen would have this
+        method delete it - a human judgement destroyed because a model ran again
+        over a shorter span. :func:`build_corrections` is what puts those rows
+        back in the set, and it is the only supported way to build the argument
+        to this method.
         """
         key = (str(movie_id), int(track_id), str(group))
         kept = [c for c in self.rows if c.key != key]
@@ -623,79 +710,206 @@ class CorrectionStore:
                 raise
 
 
+def _bouts_over(bouts: Iterable[Mapping], f_start: int, f_end: int) -> list[dict]:
+    """What the model said over ``[f_start, f_end)``, clipped to it.
+
+    Clipped rather than whole, so a row's ``overruled`` record is a statement
+    about exactly the frames the row claims. A bout quoted past the correction's
+    own ends would say the person overruled frames they never mentioned.
+    """
+    return [
+        {"f_start": max(int(b["f_start"]), f_start),
+         "f_end": min(int(b["f_end"]), f_end),
+         "label": str(b.get("label", "")),
+         "conf": b.get("conf")}
+        for b in bouts
+        if int(b["f_end"]) > f_start and int(b["f_start"]) < f_end
+    ]
+
+
+def _coalesce(pieces: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sorted, with touching or overlapping pieces joined into one."""
+    out: list[tuple[int, int]] = []
+    for f_start, f_end in sorted(pieces):
+        if out and f_start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], f_end))
+        else:
+            out.append((f_start, f_end))
+    return out
+
+
+def _without(
+    span: tuple[int, int], taken: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """The parts of ``span`` no piece of ``taken`` already covers."""
+    cursor, out = span[0], []
+    for f_start, f_end in _coalesce([t for t in taken
+                                     if t[1] > span[0] and t[0] < span[1]]):
+        if f_start > cursor:
+            out.append((cursor, min(f_start, span[1])))
+        cursor = max(cursor, f_end)
+        if cursor >= span[1]:
+            return out
+    if cursor < span[1]:
+        out.append((cursor, span[1]))
+    return out
+
+
+def _still_stands(
+    stored: Correction, asserted: list[tuple[int, int]], f_lo: int, f_hi: int
+) -> list[tuple[int, int]]:
+    """Which frames of a stored correction the reviewer has left alone.
+
+    Two kinds, and they are joined into one list because they are the same
+    claim - "nothing has replaced this":
+
+    * frames OUTSIDE ``[f_lo, f_hi)``, the span the current predictions cover.
+      The reviewer was never shown them and so cannot have changed their mind
+      about them. This is the half that keeps a re-run from deleting a
+      judgement, and it is why a correction reaching past the predictions is
+      persisted at its FULL length even though it is drawn short.
+    * frames inside it that the partition still asserts under the same class -
+      whether as this correction's own span or as part of a longer one it was
+      merged into for drawing.
+
+    The two are coalesced, so a correction whose visible part is untouched comes
+    back as the single range it was stored at and is written back byte for byte.
+    """
+    pieces: list[tuple[int, int]] = []
+    if stored.f_start < f_lo:
+        pieces.append((stored.f_start, min(stored.f_end, f_lo)))
+    if stored.f_end > f_hi:
+        pieces.append((max(stored.f_start, f_hi), stored.f_end))
+    for f_start, f_end in asserted:
+        left, right = max(f_start, stored.f_start), min(f_end, stored.f_end)
+        if right > left:
+            pieces.append((left, right))
+    return _coalesce(pieces)
+
+
 def build_corrections(
     partition: Partition, movie_id, track_id: int, group: str, annotator: str,
     model_bouts: Iterable[Mapping] = (), previous: Iterable[Correction] = (),
 ) -> list[Correction]:
-    """The rows that record ``partition``'s human assertions, and only those.
+    """The whole set of rows this (track, group) should now hold.
 
-    ``previous`` is what the file already holds for this (track, group). A span
-    that is unchanged keeps its original timestamp, annotator and overruled
-    record: re-stamping every row on every edit would make the file say that a
-    person re-judged twenty spans when they moved one boundary, and the
-    timestamps are the only evidence of when a judgement was actually made.
+    THE WHOLE SET, not the spans on screen. :meth:`CorrectionStore.replace_track`
+    replaces every row under this key, so anything missing from what comes back
+    here is deleted - and the two spans easiest to leave out are the two it would
+    be worst to lose: a correction over frames the current predictions have no
+    row for, and the earlier half of two same-class corrections the partition
+    merged for drawing. Both are handled by starting from ``previous``, what the
+    file already holds, rather than from the partition alone.
 
-    ``model_bouts`` is what ``predictions.parquet`` says over these frames right
-    now, as mappings with ``f_start``, ``f_end``, ``label`` and ``conf``. It is
-    recorded on each NEW correction so that a correction which confirms the model
-    stays distinguishable from one that overrules it after the next prediction
-    run has overwritten the evidence.
+    **A stored row survives, unchanged, for as long as nothing has replaced it.**
+    Its frames outside the predicted span cannot have been replaced - nobody was
+    shown them (:func:`_still_stands`) - and its frames inside it are replaced
+    only where the reviewer asserted some other class over them. So:
+
+    * an edit somewhere else on the track leaves every other row byte for byte
+      as it was, including its timestamp, its annotator and what it overruled;
+    * a correction the predictions no longer reach keeps ITS OWN ends. Clipping
+      is for drawing only. Writing the clipped ends back would let a re-run that
+      decoded a shorter span quietly edit a human judgement, and the frames
+      outside would be gone for good, with nothing in the file to say they were
+      ever claimed;
+    * two same-class corrections asserted on different days stay TWO ROWS even
+      though they are drawn as one span. One row cannot hold two timestamps or
+      two annotators, and the timestamps are the only evidence of when a
+      judgement was actually made; a merged row would date Monday's work to
+      Tuesday and credit it to whoever was on shift then.
+
+    A stored row is narrowed only where the reviewer actually overwrote part of
+    it, and then it keeps its annotator, its timestamp and the part of its
+    ``overruled`` record that still covers the frames it claims. Its
+    ``correction_id`` is recomputed, because both ends are in that id and an id
+    naming frames the row no longer claims is worse than a new one.
+
+    Whatever the surviving rows do not account for is new: a fresh row, stamped
+    now, with ``model_bouts`` - what ``predictions.parquet`` says over these
+    frames right now, as mappings with ``f_start``, ``f_end``, ``label`` and
+    ``conf`` - recorded on it, so a correction that CONFIRMS the model stays
+    distinguishable from one that OVERRULES it after the next run has overwritten
+    the evidence.
     """
-    known = {(c.f_start, c.f_end, c.label): c for c in previous}
+    asserted: dict[str, list[tuple[int, int]]] = {}
+    for span in partition.corrected_spans():
+        asserted.setdefault(span.label, []).append((span.f_start, span.f_end))
+
+    out: list[Correction] = []
+    claimed: list[tuple[int, int]] = []
+    for stored in sorted(previous, key=lambda c: (c.f_start, c.f_end)):
+        for f_start, f_end in _still_stands(
+            stored, asserted.get(stored.label, []), partition.f_lo, partition.f_hi
+        ):
+            claimed.append((f_start, f_end))
+            if (f_start, f_end) == (stored.f_start, stored.f_end):
+                out.append(stored)
+                continue
+            kept = _bouts_over(stored.overruled.get("bouts", ()), f_start, f_end)
+            out.append(Correction(
+                correction_id=correction_id(movie_id, track_id, group,
+                                            f_start, f_end),
+                movie_id=stored.movie_id, track_id=stored.track_id,
+                group=stored.group, f_start=f_start, f_end=f_end,
+                label=stored.label, annotator=stored.annotator,
+                timestamp_utc=stored.timestamp_utc,
+                overruled={"bouts": kept} if kept else {},
+                extra=dict(stored.extra),
+            ))
+
     bouts = [dict(b) for b in model_bouts]
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out: list[Correction] = []
-    for span in partition.corrected_spans():
-        carried = known.get((span.f_start, span.f_end, span.label))
-        if carried is not None:
-            out.append(carried)
-            continue
-        covered = [
-            {"f_start": max(int(b["f_start"]), span.f_start),
-             "f_end": min(int(b["f_end"]), span.f_end),
-             "label": str(b.get("label", "")),
-             "conf": b.get("conf")}
-            for b in bouts
-            if int(b["f_end"]) > span.f_start and int(b["f_start"]) < span.f_end
-        ]
-        out.append(Correction(
-            correction_id=correction_id(movie_id, track_id, group,
-                                        span.f_start, span.f_end),
-            movie_id=str(movie_id), track_id=int(track_id), group=str(group),
-            f_start=span.f_start, f_end=span.f_end, label=span.label,
-            annotator=str(annotator), timestamp_utc=stamp,
-            overruled={"bouts": covered} if covered else {},
-        ))
-    return out
+    for label, spans in asserted.items():
+        for span in spans:
+            for f_start, f_end in _without(span, claimed):
+                covered = _bouts_over(bouts, f_start, f_end)
+                out.append(Correction(
+                    correction_id=correction_id(movie_id, track_id, group,
+                                                f_start, f_end),
+                    movie_id=str(movie_id), track_id=int(track_id),
+                    group=str(group), f_start=f_start, f_end=f_end, label=label,
+                    annotator=str(annotator), timestamp_utc=stamp,
+                    overruled={"bouts": covered} if covered else {},
+                ))
+    return sorted(out, key=lambda c: (c.f_start, c.f_end))
 
 
 def apply_corrections(
     model: Partition, corrections: Iterable[Correction]
-) -> tuple[Partition, list[Correction]]:
-    """Lay a track's corrections over the model's bouts.
+) -> tuple[Partition, list[Correction], list[Correction]]:
+    """Lay a track's corrections over the model's bouts, for DRAWING.
 
-    Returns the effective partition and the corrections that could NOT be laid
-    over it. The second half is the point: predictions get re-run, and a re-run
-    can shorten the span a track was decoded over, leaving an assertion about
-    frames the current file has no row for. Dropping those silently would show
-    the reviewer the model's answer where their own used to be; deleting them
-    would destroy a human judgement because a machine ran again. They stay in the
-    file, they are reported, and they are not drawn.
+    Returns the effective partition, the corrections that could not be laid over
+    it at all, and the ones that could only be laid over part of themselves. The
+    two lists are the point: predictions get re-run, and a re-run can shorten the
+    span a track was decoded over, leaving an assertion about frames the current
+    file has no row for. Dropping those silently would show the reviewer the
+    model's answer where their own used to be; deleting them would destroy a
+    human judgement because a machine ran again. They stay in the file, they are
+    reported, and they are not drawn.
 
     A correction that hangs off the end is CLIPPED to the frames the predictions
     do cover, because those frames really were judged, and only a correction with
-    no overlap at all is an orphan.
+    no overlap at all is an orphan. **The clipping is undone before anything is
+    written**: :func:`build_corrections` persists such a row at its own ends, so
+    what a shorter re-run costs is a picture, never a judgement. The clipped list
+    is returned rather than inferred by the caller so that the picture can say it
+    is showing less than the file holds.
     """
     out = model
     orphans: list[Correction] = []
+    clipped: list[Correction] = []
     for correction in sorted(corrections, key=lambda c: c.f_start):
         f_start = max(int(correction.f_start), model.f_lo)
         f_end = min(int(correction.f_end), model.f_hi)
         if f_end <= f_start:
             orphans.append(correction)
             continue
+        if (f_start, f_end) != (int(correction.f_start), int(correction.f_end)):
+            clipped.append(correction)
         out = out.assert_class(f_start, f_end, correction.label)
-    return out, orphans
+    return out, orphans, clipped
 
 
 # --------------------------------------------------------------------------- #

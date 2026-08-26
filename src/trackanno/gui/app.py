@@ -474,8 +474,14 @@ class AnnotationWidget(QWidget):
         if self.suggester is None or not order:
             return []
         try:
+            # `.iloc`, because `order` holds POSITIONS into the manifest, not
+            # labels. `ClipStore` happens to end with `reset_index(drop=True)`,
+            # so the two coincide today and `.loc` worked by luck; a manifest
+            # that is ever filtered or re-indexed without a reset would turn
+            # that into a KeyError, or worse into a silently misaligned pool
+            # scored against the wrong clip_ids.
             batch = list(self.suggester.selection_batch(
-                self.store.manifest.loc[order],
+                self.store.manifest.iloc[order],
                 self.annotations.done_ids,
                 int(self.cfg.suggest.select_batch_size),
             ))

@@ -87,7 +87,16 @@ def window_length(cfg: Config) -> int:
     ``auto`` resolves to ``min(clips.frames, clips.stride)``, the longest window
     that both LANDS ON THE ANNOTATION GRID (anything longer than ``clips.stride``
     falls between that grid's own starts and stops reproducing a coincident
-    clip's ``clip_id``) and IS THE LENGTH THE MODEL WAS FITTED ON. The length is
+    clip's ``clip_id``) and IS THE LENGTH THE MODEL WAS FITTED ON - two goals
+    that are one number only while ``clips.stride >= clips.frames``. Below that
+    the ``min`` would silently keep the landing and give up the trained length,
+    so :func:`trackanno.config.load_config` refuses ``auto`` for a dense project
+    whose annotation clips overlap rather than resolving it; see
+    :func:`trackanno.config._refuse_unresolvable_window` for the two ways out.
+    A ``coverage: manifest`` config still loads and can still be pushed down this
+    path by ``predict.py --coverage dense``, where
+    :func:`trackanno.predict._check_trained_window` refuses the mismatch against
+    the model's own recorded length. The length is
     no longer also the stride - that is :func:`window_stride` - but it is still
     what the features are measured over, and most of them scale with it:
     ``path_length``, ``net_displacement``, ``radius_gyration``, ``straightness``,
@@ -661,15 +670,15 @@ def _summary(
     """
     blank = frame["skip_reason"].astype(str) == ""
     share = usable / covered if covered else float("nan")
-    length, stride = grid[0]
-    span = (f"{length} frame(s)" if stride >= length
-            else f"{length} frame(s) at stride {stride}")
-    if len(grid) > 1:
-        span = " + ".join(
-            f"{scale} frame(s)" if step >= scale
-            else f"{scale} frame(s) at stride {step}"
-            for scale, step in grid
-        )
+    # One join over every scale, base grid included. A single-scale grid gives
+    # exactly the string the special case for it used to build - "50 frame(s)",
+    # or "50 frame(s) at stride 25" when it overlaps - so the branch it replaces
+    # only ever computed a value the multi-scale line then threw away.
+    span = " + ".join(
+        f"{scale} frame(s)" if step >= scale
+        else f"{scale} frame(s) at stride {step}"
+        for scale, step in grid
+    )
     return (
         f"{len(frame)} dense windows of {span} over "
         f"{frame['movie_id'].nunique()} movie(s); {int((~blank).sum())} of them "

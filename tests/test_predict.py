@@ -942,6 +942,196 @@ def test_the_summary_counts_a_frame_once_however_many_rows_cover_it(root: Path) 
           f"{len(bouts)} bouts over 2 category group(s)" in summary, summary)
 
 
+def test_an_overlapping_annotation_grid_has_a_way_through(root: Path) -> None:
+    """`predict.window_frames: auto` is two promises, and overlapping clips break
+    the tie between them.
+
+    `auto` is min(clips.frames, clips.stride): the longest dense window that is
+    BOTH the length the model was fitted at (clips.frames - clip_features.parquet
+    is cut over the annotation manifest) AND aligned with that manifest's own
+    starts (a multiple of clips.stride). Those are the same number only while the
+    clips tile. Set clips.stride below clips.frames and the `min` keeps the
+    alignment and drops the trained length, so every dense row is measured at
+    clips.stride frames and scored by a model fitted at clips.frames - silently
+    before the trained-window stamp existed, and as a mid-run refusal after it,
+    which left the project simply unable to run a dense pass at all.
+
+    So `auto` is refused at load and the number is asked for, with both coherent
+    answers named. The point of this test is that both of them WORK: an
+    overlapping annotation grid is a legitimate project, and neither route asks
+    anyone to relabel anything.
+    """
+    from trackanno.config import ConfigError, load_config
+    from trackanno.predict import predict_all
+    from trackanno.project import write_config
+
+    FRAMES, STRIDE = 51, 50            # the one-frame overlap that started this
+    cfg, _ = build_case(root, "overlap-auto", coverage="dense", labels=2,
+                        trained_window=FRAMES)
+    before = digest(cfg.paths.csv)
+    overlapping = {"clips.frames": FRAMES, "clips.stride": STRIDE}
+
+    try:
+        # write_config validates before it commits, so an unresolvable config
+        # cannot be written from the GUI either - the refusal arrives while the
+        # setting is being changed rather than at the next start-up.
+        write_config(cfg.path, dict(overlapping))
+        check("auto over an overlapping clip grid is refused", False, "it resolved")
+    except ConfigError as exc:
+        message = str(exc)
+        check("auto over an overlapping clip grid is refused", True)
+        check("...naming the key that fixes it, which is the whole complaint",
+              "predict.window_frames" in message, message)
+        check("...and both numbers that disagree, spelled out",
+              f"clips.stride is {STRIDE}" in message
+              and f"clips.frames is {FRAMES}" in message, message)
+        check("...and the number to write, not just that a number is wanted",
+              f"predict.window_frames: {FRAMES}" in message, message)
+        check("...saying labels are not at stake, since that is the fear a "
+              "refusal at load raises", "label" in message, message)
+    untouched = load_config(cfg.path)
+    check("...and the config that could not be resolved was never committed, so "
+          "the project on disk still tiles",
+          untouched.clips.stride == untouched.clips.frames,
+          f"{untouched.clips.frames}/{untouched.clips.stride}")
+
+    # Route 1: tile at the trained length.
+    write_config(cfg.path, dict(overlapping, **{"predict.window_frames": FRAMES}))
+    tiled = load_config(cfg.path)
+    check("writing the length out makes the project load again",
+          tiled.predict.resolved_window(tiled.clips) == FRAMES,
+          repr(tiled.predict.window_frames))
+    reporter = Recorder()
+    windows = predict_all(tiled, reporter=reporter)
+    check("...and a dense run completes", len(windows) > 0)
+    check("...with nothing said about a window length",
+          not reporter.said("window length"), str(reporter.logged))
+    check("...still writing windows, because the grid still tiles",
+          "bout_id" not in windows.columns, str(list(windows.columns)))
+
+    # Route 2: the trained length AND the annotation grid's starts, which is
+    # overlap, which is what a decode is for.
+    write_config(cfg.path, {"predict.window_stride": STRIDE,
+                            "predict.decode": "min_bout",
+                            "predict.min_bout_frames": 20})
+    overlapped = load_config(cfg.path)
+    check("the overlapping route loads too",
+          (overlapped.predict.resolved_window(overlapped.clips),
+           overlapped.predict.resolved_stride(overlapped.clips)) == (FRAMES, STRIDE))
+    bouts = predict_all(overlapped)
+    check("...and its run completes, as bouts", len(bouts) > 0
+          and "bout_id" in bouts.columns, str(list(bouts.columns)))
+    check("...whose provenance is the frame-based share, not a clip_id join",
+          "human_overlap_frac" in bouts.columns, str(list(bouts.columns)))
+
+    check("no route touched a single hand label", digest(cfg.paths.csv) == before)
+
+    # And the two routes really do trade the thing the refusal says they trade,
+    # which is the whole reason it asks rather than choosing. Read off the grid
+    # function itself, so the claim does not depend on where the fixture's tracks
+    # happen to start and stop.
+    from trackanno.densepredict import window_grid, window_length, window_stride
+
+    long_movie = 10 * FRAMES
+    tiled_starts = {s for s, _ in
+                    window_grid(long_movie, window_length(tiled), window_stride(tiled))}
+    over_starts = {s for s, _ in
+                   window_grid(long_movie, window_length(overlapped),
+                               window_stride(overlapped))}
+    check("route 1 gives up the annotation grid's starts, as the refusal says",
+          STRIDE not in tiled_starts, str(sorted(tiled_starts)))
+    check("route 2 keeps them, as the refusal says",
+          {0, STRIDE, 2 * STRIDE} <= over_starts, str(sorted(over_starts)))
+
+    # The number `auto` used to pick is still available, and still wrong - which
+    # is the evidence that the guard exposed a broken configuration rather than
+    # breaking a working one. The refusal now names the key to edit.
+    write_config(cfg.path, {"predict.window_frames": STRIDE,
+                            "predict.window_stride": "auto",
+                            "predict.decode": "none", "predict.min_bout_frames": 0})
+    try:
+        predict_all(load_config(cfg.path))
+        check("what auto used to resolve to is still train/serve skew", False, "it ran")
+    except RuntimeError as exc:
+        message = str(exc)
+        check("what auto used to resolve to is still train/serve skew", True)
+        check("...refused by the length the model recorded, naming the key",
+              "predict.window_frames" in message, message)
+        check("...and the number to write there",
+              f"predict.window_frames: {FRAMES}" in message, message)
+
+    # A project whose clips tile is untouched: `auto` still resolves, and to the
+    # same number it always did.
+    plain, _ = build_case(root, "overlap-none", coverage="dense")
+    check("a tiling clip grid still resolves auto, as every project on disk does",
+          plain.predict.window_frames == "auto"
+          and plain.predict.resolved_window(plain.clips) == plain.clips.frames,
+          repr(plain.predict.window_frames))
+
+    # And the refusal is scoped to the coverage the key governs: manifest
+    # coverage scores clip_features.parquet, whose length is clips.frames
+    # whatever the dense grid would have said.
+    manifest_cfg, _ = build_case(root, "overlap-manifest", coverage="manifest")
+    write_config(manifest_cfg.path, dict(overlapping))
+    check("a manifest-coverage project with overlapping clips still loads",
+          load_config(manifest_cfg.path).clips.stride == STRIDE)
+
+
+def test_a_min_bout_floor_that_cannot_bind_is_refused(root: Path) -> None:
+    """`min_bout_frames: 1` is `0` wearing a different number.
+
+    `bouts.decode_min_bout` returns the plain argmax whenever the floor is 1 or
+    less, because the shortest run a decode can produce is already one frame
+    long: a floor of 1 excludes nothing. 0 was refused under `decode: min_bout`
+    for exactly that reason - "the decode has no shortest bout to enforce and
+    would hand back the labels it was given, unchanged" - and 1 was accepted, so
+    the second spelling of "do nothing" got through under a decode that
+    announces it is doing something.
+    """
+    from trackanno.config import ConfigError, load_config
+    from trackanno.project import write_config
+
+    cfg, _ = build_case(root, "floor", coverage="dense")
+    # A floor that binds first, so the two spellings of "no floor" below are
+    # edits to a working project rather than its initial state - and so there is
+    # something for the refusal to leave intact.
+    write_config(cfg.path, {"predict.decode": "min_bout", "predict.min_bout_frames": 5})
+    check("a floor that can actually bind loads",
+          load_config(cfg.path).predict.min_bout_frames == 5)
+
+    for floor in (0, 1):
+        try:
+            # write_config validates before it commits, so this is the refusal a
+            # settings edit in the GUI gets, not only the one a hand-edited file
+            # gets on the next load.
+            write_config(cfg.path, {"predict.min_bout_frames": floor})
+            check(f"min_bout_frames {floor} is refused under decode: min_bout",
+                  False, "it loaded")
+        except ConfigError as exc:
+            message = str(exc)
+            check(f"min_bout_frames {floor} is refused under decode: min_bout", True)
+            check("...quoting the number that was written",
+                  f"is {floor}" in message, message)
+            check("...and saying what the decode would do instead of it",
+                  "unchanged" in message, message)
+        check("...leaving the working value in the file",
+              load_config(cfg.path).predict.min_bout_frames == 5)
+    check("...with the reason 1 is not different from 0 stated, since accepting "
+          "one and refusing the other is the bug",
+          "excludes nothing" in message, message)
+    check("...and the smallest floor that binds",
+          "2 or more" in message, message)
+
+    # viterbi is a different question and keeps its own answer: there the floor
+    # is only read to derive self_transition, so a floor of 1 with a probability
+    # written out by hand is unused rather than inert-but-pretending.
+    write_config(cfg.path, {"predict.decode": "viterbi",
+                            "predict.min_bout_frames": 1,
+                            "predict.self_transition": 0.95})
+    check("viterbi with its own self_transition does not need a binding floor",
+          load_config(cfg.path).predict.resolved_self_transition() == 0.95)
+
+
 def test_a_model_fitted_at_another_window_length_is_refused(root: Path) -> None:
     """Window length changes what the features are WORTH, not what they are
     called, so a model fitted at 50 frames and handed 25-frame rows passes every

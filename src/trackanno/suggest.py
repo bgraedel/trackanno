@@ -1518,21 +1518,48 @@ def _print_report(reports: dict) -> None:
         if rep.get("dropped_classes"):
             print(f"  NOT modelled (too few labels): {rep['dropped_classes']}")
         print(f"  scope: {rep.get('scope', '?')}")
-        # Against the POPULATION, always. "12 audit clips, all correct" and "12
-        # of 340 audit clips have been labelled" are the same 12 and different
-        # claims: the first reads as a result, the second as a result resting on
-        # 3.5% of the holdout. Printed even when nothing was scored, because
-        # "the holdout exists and is empty" is the more actionable of the two.
+        # Against the POPULATION where the report carries one. "12 audit clips,
+        # all correct" and "12 of 340 audit clips have been labelled" are the
+        # same 12 and different claims: the first reads as a result, the second
+        # as a result resting on 3.5% of the holdout. Printed even when nothing
+        # was scored, because "the holdout exists and is empty" is the more
+        # actionable of the two.
+        #
+        # THREE cases, and they are kept apart on purpose. `audit_population` is
+        # newer than `suggest_report.json` itself, so a report written before it
+        # existed has no such key - and gating the whole block on it deleted a
+        # kappa that had printed the day before, silently, from a file whose
+        # numbers were still perfectly real. A `.get` default cannot fix that
+        # either: 0 would then mean both "this report cannot say" and "this
+        # project holds nothing out", which are different facts with different
+        # answers (retrain / raise suggest.audit_fraction). So the missing key is
+        # read as missing.
         population = rep.get("audit_population")
         labelled = rep.get("audit_labelled", rep.get("audit_n", 0))
-        if population:
-            of_population = f"{labelled} of {population} audit clips labelled"
-            if rep.get("audit_n"):
-                ak, aa = rep.get("audit_kappa"), rep.get("audit_accuracy")
-                ak = "n/a" if ak is None or ak != ak else f"{ak:+.3f}"
-                aa = "n/a" if aa is None or aa != aa else f"{aa:.3f}"
+        scored = rep.get("audit_n") or 0
+        ak, aa = rep.get("audit_kappa"), rep.get("audit_accuracy")
+        ak = "n/a" if ak is None or ak != ak else f"{ak:+.3f}"
+        aa = "n/a" if aa is None or aa != aa else f"{aa:.3f}"
+        if population is None:
+            # An older report. It carries audit_n, which is what the audit line
+            # was gated on before the population was recorded, so that is what it
+            # is gated on here - the same line it printed then, with the missing
+            # denominator named rather than guessed at.
+            if scored:
                 print(
-                    f"  audit holdout ({of_population}, {rep['audit_n']} scored, "
+                    f"  audit holdout ({scored} scored, never suggested nor "
+                    f"trained on): kappa {ak}  accuracy {aa}"
+                )
+                print(
+                    "    this report predates the audit population count, so what "
+                    "share of the holdout those clips are is not recorded in it; "
+                    "retrain to get the denominator back"
+                )
+        elif population:
+            of_population = f"{labelled} of {population} audit clips labelled"
+            if scored:
+                print(
+                    f"  audit holdout ({of_population}, {scored} scored, "
                     f"never suggested nor trained on): kappa {ak}  accuracy {aa}"
                 )
                 if rep.get("audit_pca"):
@@ -1542,6 +1569,15 @@ def _print_report(reports: dict) -> None:
                     f"  audit holdout ({of_population}): too few to score, so there "
                     "is no unbiased estimate for this group yet"
                 )
+        else:
+            # The population was counted and came out 0: this project holds
+            # nothing out at all. Said rather than skipped, because a report with
+            # no audit line reads as one that forgot to compute it.
+            print(
+                "  audit holdout: none - no clip in this project is held out, so "
+                "every number below was computed on clips the model was fitted on "
+                "some fold of. suggest.audit_fraction is what creates a holdout"
+            )
         print(
             f"  kappa {rep.get('kappa', 0):+.3f} (5th pct {rep.get('kappa_lower', 0):+.3f})   "
             f"macro-F1 {rep['macro_f1']:.3f}   accuracy {rep['accuracy']:.3f}   "

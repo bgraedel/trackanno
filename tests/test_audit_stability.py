@@ -707,9 +707,72 @@ def test_the_audit_count_is_never_reported_without_its_population(root: Path) ->
     check("...and says what is missing, not just that it is missing",
           "no unbiased estimate" in text, text)
 
+    # A project that holds nothing out USED to print no audit line at all, which
+    # is the one shape a reader cannot interpret: a missing line reads exactly
+    # like a tool that forgot to compute one. Every other state of the holdout
+    # says what it is, including the empty one, so this one does too.
     none_at_all = dict(base, audit_n=0, audit_population=0, audit_labelled=0)
-    check("a project with no holdout prints no audit line at all",
-          "audit holdout" not in _printed({"behaviour": none_at_all}))
+    text = _printed({"behaviour": none_at_all})
+    check("a project with no holdout says so rather than going quiet",
+          "audit holdout: none" in text, text)
+    check("...and says what the other numbers therefore rest on",
+          "fitted on" in text, text)
+    check("...without claiming a kappa it does not have",
+          "kappa n/a" not in text and "audit" not in text.split("kappa")[-1], text)
+
+
+def test_a_report_older_than_the_population_count_still_prints_its_audit_line(
+    root: Path
+) -> None:
+    """`audit_population` is newer than `suggest_report.json`, and gating the
+    audit block on it deleted a result rather than qualifying one.
+
+    A report written before the field existed carries `audit_n`, `audit_kappa`
+    and `audit_accuracy` - real numbers, earned on clips the model never saw -
+    and a `.get` returning None made the line they printed yesterday vanish
+    today, with nothing anywhere saying it had. The unknown thing is the
+    DENOMINATOR, so that is the only thing the report is allowed to go quiet
+    about, and it says which retrain brings it back.
+
+    An old report and a project with no holdout must stay distinguishable: they
+    are "this file cannot say how much of the holdout that was" and "there is no
+    holdout", which want a retrain and a config change respectively.
+    """
+    old = {
+        "group": "behaviour", "n_labels": 180, "n_orphaned": 0, "orphaned_by_class": {},
+        "n_classes": 2, "classes": ["swimming", "tumbling"],
+        "per_class_counts": {"swimming": 120, "tumbling": 60}, "dropped_classes": {},
+        "macro_f1": 0.71, "accuracy": 0.78, "baseline_accuracy": 0.66,
+        "kappa": 0.44, "kappa_lower": 0.21, "n_groups": 4,
+        "scope": "leave-movie-out over 4 movies (4-fold)",
+        # No audit_population, no audit_labelled and no audit_pca: exactly the
+        # keys `train` wrote before this branch, and nothing it did not.
+        "audit_n": 10, "audit_accuracy": 0.80, "audit_kappa": 0.51,
+        "confusion": [], "top_features": [], "reliable": True, "reason": "ok",
+    }
+    text = _printed({"behaviour": old})
+    check("the audit line an older report earned still prints",
+          "audit holdout" in text, text)
+    check("...with its accuracy", "0.800" in text, text)
+    check("...and its kappa", "+0.510" in text, text)
+    check("...still saying those clips were never trained on, which is the whole "
+          "claim the number carries", "never suggested nor trained on" in text, text)
+    check("...and naming the one thing it cannot say, rather than the number "
+          "quietly standing in for a share of the holdout",
+          "predates the audit population count" in text, text)
+    check("...with the way to get the denominator back",
+          "retrain" in text, text)
+    check("no denominator is invented for it",
+          "of 0 audit clips" not in text and "0 audit clips labelled" not in text, text)
+
+    # And the two silent-looking cases do not read alike.
+    none_at_all = dict(old, audit_n=0, audit_population=0, audit_labelled=0,
+                       audit_accuracy=float("nan"), audit_kappa=float("nan"))
+    check("a project with no holdout does not claim to be an out-of-date report",
+          "predates" not in _printed({"behaviour": none_at_all}),
+          _printed({"behaviour": none_at_all}))
+    check("...and an out-of-date report does not claim to have no holdout",
+          "audit holdout: none" not in text, text)
 
 
 def test_the_report_counts_the_whole_holdout_not_only_the_labelled_part(

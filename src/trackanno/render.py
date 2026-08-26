@@ -80,31 +80,41 @@ def build_frame_marks(
     With ``both`` a hand label always wins the box - drawn solid, the model's
     opinion appended to the caption; untouched tracks keep the dashed mark.
 
-    TWO PREDICTION ROWS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this
-    function raises if they do. Every row is painted over ``range(f_start,
-    f_end)`` into one dict, so a second row covering a frame the first already
-    claimed simply replaces it: the exported colour of that frame would then be
-    decided by the order pandas handed the rows over, not by the model. The
-    invariant that keeps that from happening lives upstream, in two places, and
-    both are load-bearing rather than accidental:
+    TWO BOUTS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this function
+    raises if they do. Every row is painted over ``range(f_start, f_end)`` into
+    one dict, so a second row covering a frame the first already claimed simply
+    replaces it, and the exported colour of that frame is then decided by the
+    order pandas handed the rows over rather than by the model. For a BOUT that
+    is always a broken invariant: a decode cuts a track's frames into runs
+    between inferred boundaries, so within one group they are disjoint by
+    construction and a collision means the decode or the file is wrong. Painting
+    one of the two competing values would hide that behind a picture that looks
+    entirely normal.
 
-    * with ``predict.window_stride`` at ``auto`` the dense grid TILES, so each
-      frame of a track sits in exactly one window and each window is one row;
-    * with a shorter stride the windows overlap, and :func:`load_config` refuses
-      the config unless a ``predict.decode`` is set - the decode collapses the
-      overlap into BOUTS, which are disjoint by construction.
+    WINDOWS ARE NOT GUARDED, and the difference is geometry rather than
+    strictness. A window row is a row off a grid, and one of the grids that
+    produces them legitimately overlaps: ``predict.coverage: manifest`` scores
+    exactly the clips cut for annotation, so a project whose ``clips.stride`` is
+    below ``clips.frames`` has consecutive clips of one track sharing frames on
+    purpose - the same geometry the labels pass below calls a configuration
+    rather than a fault. Guarding it made every such movie fail to render at all.
+    The dense grid's windows do not overlap, but that rests on
+    :func:`trackanno.config.load_config` refusing an overlapping
+    ``predict.window_stride`` without a ``predict.decode`` (which turns the rows
+    into bouts, guarded above), and nothing in the FILE distinguishes a dense
+    window row from a manifest one - a dense window's ``clip_id`` is deliberately
+    formed to collide with an annotation clip's. So window rows get the labels
+    pass's rule: whichever row comes later in the file wins the shared frames.
 
-    So a collision here is never a rendering problem to be smoothed over; it is
-    a report that one of those upstream guarantees has broken, and painting one
-    of the two competing values would hide it behind a picture that looks fine.
+    Which of the two a file holds is read off the FILE, exactly as
+    :func:`prediction_unit` reads it and for the same reason: ``predict.decode``
+    can be edited after a run, and the config would then describe the run that
+    has not happened yet. ``bout_id`` is the column a decoded row carries.
 
     A hand label landing on a frame a prediction already claimed is a different
-    thing entirely and is NOT a collision: it is exactly what ``--source both``
+    thing again and is NOT a collision: it is exactly what ``--source both``
     is for, and the labels pass below deliberately overwrites the dashed mark
-    while keeping the model's answer in the caption. Two ANNOTATION rows
-    overlapping is legitimate too - ``clips.stride`` below ``clips.frames`` cuts
-    overlapping clips for annotation on purpose - so the labels pass keeps its
-    last-writer-wins behaviour and only the predictions pass is guarded.
+    while keeping the model's answer in the caption.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
@@ -122,6 +132,9 @@ def build_frame_marks(
     out: dict[int, dict[int, Mark]] = {}
     if source in ("predictions", "both") and predictions is not None:
         column, conf_column = f"{group_name}_pred", f"{group_name}_conf"
+        # Bouts are disjoint by construction and windows need not be; see the
+        # docstring. Probed once, off the file, not once per row.
+        disjoint = "bout_id" in predictions.columns
         # One entry per painted ROW, not per painted frame, so the guard below can
         # name the row it collided with without carrying a second frame-sized dict.
         claimed: dict[int, list[tuple[int, int, str]]] = {}
@@ -139,11 +152,12 @@ def build_frame_marks(
             f_start, f_end = int(row["f_start"]), int(row["f_end"])
             for frame in range(f_start, f_end):
                 marks = out.setdefault(frame, {})
-                if track_id in marks:
+                if disjoint and track_id in marks:
                     raise ValueError(_overlap_message(claimed, track_id, frame,
                                                       f_start, f_end, value))
                 marks[track_id] = mark
-            claimed.setdefault(track_id, []).append((f_start, f_end, value))
+            if disjoint:
+                claimed.setdefault(track_id, []).append((f_start, f_end, value))
 
     if source in ("labels", "both"):
         if group_name not in annotations.columns:
@@ -159,10 +173,12 @@ def build_frame_marks(
                 continue
             mark = Mark(colour_of(value), value, False)
             track_id = int(row["track_id"])
-            # No overlap guard on this pass, unlike the predictions above: a hand
-            # label overwriting a prediction is what 'both' means, and two
-            # annotation rows overlapping is what `clips.stride` below
-            # `clips.frames` asks for. Both are choices, not broken invariants.
+            # No overlap guard on this pass, and the same last-writer-wins rule
+            # the predictions pass above gives a WINDOW: a hand label overwriting
+            # a prediction is what 'both' means, and two annotation rows
+            # overlapping is what `clips.stride` below `clips.frames` asks for.
+            # Both are choices, not broken invariants. Only a bout is guarded,
+            # because only a bout is disjoint by construction.
             for frame in range(int(row["f_start"]), int(row["f_end"])):
                 existing = out.get(frame, {}).get(track_id)
                 text = value
@@ -180,13 +196,19 @@ def _overlap_message(
     f_end: int,
     value: str,
 ) -> str:
-    """Why two prediction rows meeting on one frame is fatal, in terms of the rows.
+    """Why two BOUTS meeting on one frame is fatal, in terms of the rows.
 
     Names the frame, the track and BOTH values, because "predictions overlap" is
     something to go and investigate whereas "frame 812, track 3: [800, 850) says
     'immotile', [812, 862) says 'swimming'" is something to go and fix. The two
     spans come from the rows themselves, so a duplicated row and a genuinely
     overlapping pair - which want different fixes - do not read alike.
+
+    Only reachable for rows carrying ``bout_id``; overlapping WINDOW rows are a
+    legitimate geometry and are painted, see :func:`build_frame_marks`. So this
+    is never a configuration to be corrected - a decode cuts each track's frames
+    into disjoint runs, and there is no setting that makes it produce two rows
+    for one frame of one track.
     """
     earlier = next(
         (f"[{s}, {e}) says {v!r}" for s, e, v in claimed.get(track_id, [])
@@ -194,16 +216,16 @@ def _overlap_message(
         "an earlier row says something else",
     )
     return (
-        f"frame {frame}, track {track_id}: two prediction rows both cover it - "
-        f"{earlier} and [{f_start}, {f_end}) says {value!r}. Each track's frames "
-        "must belong to at most one row of predictions.parquet, or the colour "
-        "this frame is exported with comes from the order the rows happen to sit "
-        "in the file rather than from the model. Rows overlap when a dense grid "
-        "was written with predict.window_stride below predict.window_frames and "
-        "no predict.decode to collapse the overlap into bouts, or when "
-        "predict.coverage: manifest scored an annotation grid whose clips.stride "
-        "is shorter than clips.frames. Re-run predict.py after fixing whichever "
-        "it was; do not render this file as it stands"
+        f"frame {frame}, track {track_id}: two decoded bouts both cover it - "
+        f"{earlier} and [{f_start}, {f_end}) says {value!r}. A decode cuts a "
+        "track's frames into runs between inferred boundaries, so within one "
+        "group its bouts are disjoint by construction and two of them meeting is "
+        "not something a setting can ask for. The colour this frame would be "
+        "exported with comes from the order the rows happen to sit in the file "
+        "rather than from the model, so the movie would look entirely normal and "
+        "be wrong. Either predictions.parquet was edited or concatenated from "
+        "two runs, or the decode itself is broken - re-run predict.py and, if it "
+        "happens again, report it. Do not render this file as it stands"
     )
 
 

@@ -810,7 +810,9 @@ class Predict:
     decode: str = "none"
     # The shortest bout worth believing, in frames. A statement about the
     # ANIMAL, not about the model: the shortest episode of a behaviour you would
-    # accept as real. 0 means no such floor and disables the constraint.
+    # accept as real. 0 means no such floor and disables the constraint, and so
+    # does 1 - a decode's shortest possible run is already one frame - which is
+    # why `decode: min_bout` refuses both rather than only the first.
     min_bout_frames: int = 0
     # viterbi only: the probability that a frame keeps the previous frame's
     # label. 'auto' is 1 - 1/min_bout_frames, the stickiness whose average run
@@ -830,6 +832,19 @@ class Predict:
         because the stride check in :func:`load_config` has to compare two
         numbers the user may never have typed, and loading a config must not
         drag in the dense pipeline (and pandas behind it) to learn one integer.
+
+        The ``min`` is only meaningful while the annotation clips do NOT overlap.
+        ``auto`` is trying to be two things at once - the length the model was
+        fitted at (``clips.frames``) and a start that lands on the annotation
+        grid (a multiple of ``clips.stride``) - and ``clips.stride < clips.frames``
+        pulls them apart, at which point the ``min`` silently picks landing over
+        the trained length. :func:`load_config` refuses ``auto`` there rather
+        than resolving it, so on the dense path this branch is only ever reached
+        with ``clips.stride >= clips.frames``, where the ``min`` is ``frames``
+        and the two goals agree. It still resolves for a ``coverage: manifest``
+        project, which never builds a dense grid; ``predict.py --coverage dense``
+        on one of those is the one route left to the mismatch, and
+        :func:`trackanno.predict._check_trained_window` catches it there.
         """
         if isinstance(self.window_frames, str):
             return max(1, min(int(clips.frames), int(clips.stride)))
@@ -943,13 +958,23 @@ class Predict:
                 "length in frames, and 'no shortest bout at all' is written as 0, not "
                 "as a negative length"
             )
-        if decode == "min_bout" and min_bout == 0:
+        # 1 is refused for exactly the reason 0 is, and it took a reading of
+        # `bouts.decode_min_bout` to see it: that function returns the plain
+        # argmax whenever the floor is `<= 1`, because the shortest run a decode
+        # can produce is already one frame long and a floor of 1 therefore
+        # excludes nothing. 0 and 1 are the same no-op wearing different numbers,
+        # so refusing one and accepting the other let the second spelling of "do
+        # nothing" through under a decode that announces it is doing something.
+        if decode == "min_bout" and min_bout <= 1:
             raise ConfigError(
-                "predict.decode is 'min_bout' but predict.min_bout_frames is 0, so "
-                "the decode has no shortest bout to enforce and would hand back the "
-                "labels it was given, unchanged. Set predict.min_bout_frames to the "
-                "shortest episode you would accept as real (in frames), or set "
-                "predict.decode to 'none' and mean it"
+                f"predict.decode is 'min_bout' but predict.min_bout_frames is "
+                f"{min_bout}, so the decode has no shortest bout to enforce and "
+                "would hand back the labels it was given, unchanged. 0 says there "
+                "is no floor at all; 1 sets the floor at the shortest bout that "
+                "can exist, which excludes nothing - both come back out of the "
+                "decode as the plain per-frame argmax. Set predict.min_bout_frames "
+                "to the shortest episode you would accept as real (in frames, so 2 "
+                "or more), or set predict.decode to 'none' and mean it"
             )
         stay = d.get("self_transition", "auto")
         if isinstance(stay, str):
@@ -1436,6 +1461,85 @@ class Config:
         return opt.color if opt else None
 
 
+def _refuse_unresolvable_window(cfg: Config) -> None:
+    """Refuse ``predict.window_frames: auto`` over an OVERLAPPING annotation grid.
+
+    ``auto`` promises two things at once and they are the same number only while
+    the annotation clips tile:
+
+    * the length the model was fitted at, which is ``clips.frames`` - that is
+      what ``clip_features.parquet`` is measured over and what ``train`` stamps
+      into the payload as ``trained_window``;
+    * a start that lands on the annotation grid, i.e. a multiple of
+      ``clips.stride``, so a dense window coinciding with an annotated one is
+      handed the same ``clip_id`` and hand labels join to it.
+
+    ``clips.stride < clips.frames`` - an annotation grid cut to overlap on
+    purpose - pulls them apart, and ``min(frames, stride)`` then picks landing
+    and drops the trained length. That is not a preference this file is entitled
+    to have: the run it produces is scored at ``clips.stride`` frames by a model
+    fitted at ``clips.frames``, every row at normal confidence and nothing in the
+    output saying so. Before the trained-window stamp existed that skew simply
+    happened; since it exists the dense pass raises mid-run instead, which is
+    louder but arrives after the feature build and still does not say which key
+    to write.
+
+    So ``auto`` is refused here and the number is asked for. The two coherent
+    answers are in the message, both of which leave every existing label alone -
+    this changes only which frames the PREDICTOR measures, never what anyone
+    annotated. A project whose clips tile (``stride >= frames``, the shipped
+    default and every project on disk that never touched the key) is untouched:
+    the two goals agree there and ``auto`` keeps meaning exactly what it meant.
+
+    Only under ``coverage: dense``, because that is the only coverage the key
+    governs - ``manifest`` scores ``clip_features.parquet``, whose length is
+    ``clips.frames`` whatever this says. ``predict.py --coverage dense`` can
+    still override a manifest config into the dense path, and
+    :func:`trackanno.predict._check_trained_window` refuses it there against the
+    model's own recorded length, which is the stronger check anyway.
+    """
+    if not isinstance(cfg.predict.window_frames, str):
+        return
+    if cfg.predict.coverage != "dense":
+        return
+    frames, stride = int(cfg.clips.frames), int(cfg.clips.stride)
+    if stride >= frames:
+        return
+    raise ConfigError(
+        f"predict.window_frames is 'auto', but this project's annotation clips "
+        f"overlap - clips.stride is {stride} and clips.frames is {frames} - so "
+        "'auto' has nothing to resolve to. It stands for "
+        f"min(clips.frames, clips.stride), which is the longest dense window "
+        "that is BOTH the length the model is fitted at (clips.frames, "
+        f"{frames} - clip_features.parquet is measured over the annotation clip "
+        "manifest) AND aligned with that manifest's own starts (every "
+        f"clips.stride, {stride} frames). Those are the same number only while "
+        f"the clips tile. Here 'auto' would give {min(frames, stride)}, and a "
+        f"model fitted at {frames} frames would read every dense row on the "
+        "wrong scale - path_length, straightness, every *_std and present_frac "
+        "all scale with the window - at unchanged confidence. Write the length "
+        "you want; neither answer touches a single existing label, because this "
+        "decides what the PREDICTOR measures and not what anyone annotated:\n"
+        f"  predict.window_frames: {frames}\n"
+        "      Windows of the trained length, still tiling. Their starts stop "
+        f"coinciding with the annotation clips' (every {frames} frames rather "
+        f"than every {stride}), so dense rows no longer join to hand labels by "
+        "clip_id: 'human_labelled' comes back false on all of them and "
+        "--include-labelled has nothing to withhold.\n"
+        f"  predict.window_frames: {frames} with predict.window_stride: {stride} "
+        "and a predict.decode\n"
+        "      The trained length AND the annotation grid's starts. The windows "
+        "then overlap, which is what the decode is for - it collapses them into "
+        "disjoint bouts, whose provenance is the frame-based "
+        "human_overlap_frac rather than a clip_id join, so nothing is lost there "
+        "either.\n"
+        "Raising clips.stride back to clips.frames would also silence this, and "
+        "is the one answer that does cost you something: it re-cuts the "
+        "annotation grid, so every clip_id moves and the labels already made "
+        "against the old ones stop matching anything."
+    )
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load and validate config.yaml. Relative paths resolve against its folder."""
     if path is None:
@@ -1488,6 +1592,7 @@ def load_config(path: str | Path | None = None) -> Config:
     # `predict.window_stride` may say `auto`, and what `auto` means for the
     # length is min(clips.frames, clips.stride), so the two numbers can only be
     # compared once `clips` has been parsed as well.
+    _refuse_unresolvable_window(cfg)
     length = cfg.predict.resolved_window(cfg.clips)
     stride = cfg.predict.resolved_stride(cfg.clips)
     length_txt = _spelled_out(cfg.predict.window_frames, length)
