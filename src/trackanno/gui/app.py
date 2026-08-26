@@ -37,23 +37,17 @@ from qtpy.QtWidgets import (
 
 from ..annotate.clips import ClipStore
 from ..config import Config, load_config
-from ..view.overlay import FOLLOW_MODES, build_clip_view
+from ..view.overlay import FOLLOW_LABELS, FOLLOW_MODES, build_clip_view
 from ..annotate.store import AnnotationStore, encode_provenance
 from ..learn.suggest import Suggester
 from .panels import CategoryPanel, MetadataPanel, MinimapWidget
 from .prefetch import Prefetcher
 from .theme import app_icon, apply_theme, compact_button
 from .kymograph import KymographView
-from .viewer import SimpleViewer
+from .viewer import SimpleViewer, follow_combo
 
 STATE_FILE = ".gui_state.json"
 
-# Short in the combo, long in the tooltip and the status line.
-FOLLOW_LABELS = {
-    "centred": "centred - one view on the track's median position, all motion visible",
-    "smooth": "smooth - the view follows a moving average: drift removed, beat kept",
-    "locked": "locked - re-centred every frame: best for shape, hides translation",
-}
 ZOOM_STEPS = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0)
 
 # The recorded reason for a clip the annotator reached under their own steam: an
@@ -168,20 +162,7 @@ class AnnotationWidget(QWidget):
         self.context_box.setFocusPolicy(Qt.NoFocus)
         self.context_box.stateChanged.connect(self._on_context_toggled)
 
-        self.follow_combo = QComboBox()
-        for mode in FOLLOW_MODES:
-            self.follow_combo.addItem(mode, mode)
-            self.follow_combo.setItemData(
-                FOLLOW_MODES.index(mode), FOLLOW_LABELS[mode], Qt.ToolTipRole
-            )
-        self.follow_combo.setCurrentIndex(FOLLOW_MODES.index(self.follow))
-        # Sized to its content: a fixed width below minimumSizeHint gets crushed.
-        self.follow_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.follow_combo.setFocusPolicy(Qt.NoFocus)
-        self.follow_combo.setToolTip(
-            "\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES)
-            + "\n\nAll three read the same cached pixels, so switching is free."
-        )
+        self.follow_combo = follow_combo(self.follow)
         self.follow_combo.currentIndexChanged.connect(self._on_follow_changed)
 
         self.zoom_label = QLabel("1.0x")

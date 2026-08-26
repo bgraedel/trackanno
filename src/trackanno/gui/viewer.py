@@ -13,13 +13,37 @@ import numpy as np
 from qtpy.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from qtpy.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget,
+    QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider,
+    QVBoxLayout, QWidget,
 )
 
-from ..view.overlay import CONTEXT_RGB, TARGET_RGB, ClipView
+from ..view.overlay import CONTEXT_RGB, FOLLOW_LABELS, FOLLOW_MODES, TARGET_RGB, ClipView
 from .theme import tokens
 
-__all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas"]
+__all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas", "follow_combo"]
+
+
+def follow_combo(mode: str = "centred") -> QComboBox:
+    """The selector for what the view follows, built once for every window.
+
+    Both the annotation window and the review window offer this choice, and a
+    mode has to mean the same thing in each: the same names, the same wording,
+    the same order to cycle through.
+    """
+    combo = QComboBox()
+    for i, name in enumerate(FOLLOW_MODES):
+        combo.addItem(name, name)
+        combo.setItemData(i, FOLLOW_LABELS[name], Qt.ToolTipRole)
+    combo.setCurrentIndex(FOLLOW_MODES.index(mode) if mode in FOLLOW_MODES else 0)
+    # Sized to its content: a fixed width below minimumSizeHint gets crushed.
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+    combo.setFocusPolicy(Qt.NoFocus)
+    combo.setToolTip(
+        "\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES)
+        + "\n\nAll three read the same cached pixels, so switching is free."
+    )
+    return combo
+
 
 def _background() -> QColor:
     """Deliberately darker than the window: the crop should read as film, not
@@ -257,7 +281,10 @@ class SimpleViewer(ClipViewer):
 
         self.canvas = ClipCanvas()
 
-        self._play_btn = QPushButton("Pause")
+        # A fresh viewer is not playing. The annotation window starts it when
+        # ui.autoplay says so and the label follows; the review window never
+        # does, and a "Pause" button over a still picture reads as a stall.
+        self._play_btn = QPushButton("Play")
         self._play_btn.setFixedWidth(70)
         self._play_btn.clicked.connect(self.toggle_play)
         self._play_btn.setFocusPolicy(Qt.NoFocus)

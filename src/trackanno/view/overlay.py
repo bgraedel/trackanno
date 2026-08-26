@@ -30,6 +30,7 @@ __all__ = [
     "TARGET_RGB",
     "CONTEXT_RGB",
     "FOLLOW_MODES",
+    "FOLLOW_LABELS",
 ]
 
 TARGET_RGB = (255, 196, 0)     # the track you are annotating
@@ -37,6 +38,14 @@ CONTEXT_RGB = (0, 168, 255)    # other tracks that happen to be in the crop
 
 # How the view centre is derived from the target's trajectory. Cycled with "s".
 FOLLOW_MODES = ("centred", "smooth", "locked")
+
+# What each mode does, beside the modes themselves: every window that offers the
+# choice says the same thing about it. Short in a combo, long in a tooltip.
+FOLLOW_LABELS = {
+    "centred": "centred - one view on the track's median position, all motion visible",
+    "smooth": "smooth - the view follows a moving average: drift removed, beat kept",
+    "locked": "locked - re-centred every frame: best for shape, hides translation",
+}
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:

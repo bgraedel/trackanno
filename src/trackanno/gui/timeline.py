@@ -34,9 +34,9 @@ from qtpy.QtCore import (
 )
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from qtpy.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QToolTip,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
+    QToolTip, QVBoxLayout, QWidget,
 )
 
 from ..config import Config
@@ -48,7 +48,7 @@ from ..view.overlay import build_clip_view
 from ..annotate.store import MULTI_SEP
 from .prefetch import Prefetcher
 from .theme import tokens
-from .viewer import SimpleViewer
+from .viewer import SimpleViewer, follow_combo
 
 __all__ = [
     "Segment", "TrackPredictions", "Resolution", "PredictionReader",
@@ -60,6 +60,12 @@ __all__ = [
 # Divisors rather than frames, because the stride is a per-project setting.
 MEAN_ERROR_DIVISOR = 4.0
 WORST_ERROR_DIVISOR = 2.0
+
+# What the review window opens on, rather than ui.follow. That setting is chosen
+# for one 25-frame clip, where a moving average removes drift and keeps the beat.
+# A bout runs for hundreds of frames, and over that long the average lags and the
+# animal walks out of the middle of the picture; `locked` re-centres every frame.
+REVIEW_FOLLOW = "locked"
 
 
 @dataclass(frozen=True)
@@ -1558,6 +1564,7 @@ class TrackFootage(QWidget):
         self.viewer = SimpleViewer(fps=int(getattr(getattr(cfg, "ui", None), "fps", 30)),
                                    loop=True)
         self.viewer.frame_changed.connect(self._on_viewer_frame)
+        self._set_edges()
         # Smaller than the annotation window asks for: there the crop IS the
         # window, here it shares one with the lanes and the captions under them,
         # and a 320 px floor takes the room out of the video rather than giving
@@ -1571,11 +1578,38 @@ class TrackFootage(QWidget):
         self.source.setWordWrap(True)
         self.source.setProperty("role", "muted")
 
+        # The annotation window's own two controls over the same rendering. Both
+        # are display-time transforms of one cached array, so either can change
+        # mid-review without re-reading a pixel.
+        self.follow_combo = follow_combo(REVIEW_FOLLOW)
+        self.follow_combo.currentIndexChanged.connect(lambda _: self._refresh_view())
+        self.marker_box = QCheckBox("marker")
+        self.marker_box.setToolTip("outline the animal this track is about")
+        self.marker_box.setChecked(bool(getattr(getattr(cfg, "ui", None),
+                                                "show_overlay", True)))
+        self.marker_box.setFocusPolicy(Qt.NoFocus)
+        self.marker_box.toggled.connect(lambda _: self._refresh_view())
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("view"))
+        row.addWidget(self.follow_combo)
+        row.addWidget(self.marker_box)
+        row.addStretch(1)
+        # Kept together so they can go away with the picture: controls over a
+        # video that is not there are three widgets that do nothing.
+        self.controls = QWidget()
+        self.controls.setLayout(row)
+        self.controls.setVisible(False)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.viewer, 1)
+        layout.addWidget(self.controls)
         layout.addWidget(self.source)
 
+        self._boxes = None                         # the marks of the array shown
+        self._shape = (0, 0)                       # its (n_frames, side)
         self._store = None
         self._store_problem = ""
         self._prefetcher: Prefetcher | None = None
@@ -1600,6 +1634,7 @@ class TrackFootage(QWidget):
         self.release()
         self.cfg = cfg
         self.viewer.set_fps(int(getattr(getattr(cfg, "ui", None), "fps", 30)))
+        self._set_edges()
 
     def _open_store(self):
         """The clip cache, opened once per project and closed with the panel.
@@ -1643,6 +1678,8 @@ class TrackFootage(QWidget):
         self._clips = None
         self._loaded = ("", -1)
         self._length = 0
+        # Rows of the store that is going away, and nothing left to draw them on.
+        self._boxes = None
 
     def _release_movie(self) -> None:
         movie, self._movie = self._movie, None
@@ -1712,8 +1749,9 @@ class TrackFootage(QWidget):
                            int(meta["f_end"]) - int(meta["f_start"])))
             clip = clip[:real]
             self.viewer.set_clip(clip, self._view(store.clip_boxes(index), clip))
-            self.viewer.set_overlay(True)
+            self._mark()
             self.viewer.setVisible(True)
+            self.controls.setVisible(True)
             self._loaded = ("cache", int(index))
             self._first = int(meta["f_start"])
             self._length = real
@@ -1722,13 +1760,58 @@ class TrackFootage(QWidget):
         self.source.setText(self._cache_note())
 
     def _view(self, boxes, clip: np.ndarray):
+        """The geometry for a newly loaded array, remembered so the controls can
+        rebuild it without going back to the store."""
+        self._boxes = boxes
+        self._shape = (int(clip.shape[0]), int(clip.shape[1]))
+        return self._build_view()
+
+    def _build_view(self):
+        """Everything the annotation window passes, so the same animal is marked
+        the same way in both windows - a boundary judged against a rendering
+        nobody labelled in is judged against something else.
+
+        Only the follow mode differs, and deliberately: see ``REVIEW_FOLLOW``.
+        """
         ui = getattr(self.cfg, "ui", None)
         return build_clip_view(
-            boxes, int(clip.shape[0]), int(clip.shape[1]),
-            mode=getattr(ui, "follow", "centred"),
+            self._boxes, self._shape[0], self._shape[1],
+            mode=self.follow,
             zoom=float(getattr(ui, "view_zoom", 1.0)),
             smooth_window=int(getattr(ui, "smooth_window", 15)),
+            with_context=bool(getattr(ui, "show_context_tracks", False)),
+            n_kpts=(int(getattr(self.cfg, "n_keypoints", 0))
+                    if getattr(ui, "show_skeleton", False) else 0),
         )
+
+    @property
+    def follow(self) -> str:
+        """What the view follows, off the control that offers the choice."""
+        return str(self.follow_combo.currentData() or REVIEW_FOLLOW)
+
+    def _set_edges(self) -> None:
+        """The skeleton's connectivity, as the annotation window sets it. Without
+        it a pose project's keypoints draw as loose dots."""
+        self.viewer.set_edges(
+            self.cfg.keypoints.edge_idx if getattr(self.cfg, "is_pose", False) else []
+        )
+
+    def _mark(self) -> None:
+        """Turn the marker on as the config asks and the checkbox allows."""
+        ui = getattr(self.cfg, "ui", None)
+        self.viewer.set_overlay(
+            bool(self.marker_box.isChecked()),
+            bool(getattr(ui, "show_context_tracks", False)),
+            bool(getattr(ui, "show_skeleton", False)),
+        )
+
+    def _refresh_view(self) -> None:
+        """Re-centre and re-mark the array already on screen. Reads no pixels:
+        the follow mode and the marker are display-time decisions."""
+        if self._boxes is None or not self._length:
+            return
+        self.viewer.set_view(self._build_view())
+        self._mark()
 
     def _warm(self, index: int) -> None:
         """Read the clips either side of this one ahead, on the prefetch thread.
@@ -1832,8 +1915,9 @@ class TrackFootage(QWidget):
         self._awaiting = -1
         frame = int(min(max(self._pending[1], first), first + len(array) - 1))
         self.viewer.set_clip(array, self._view(marks, array))
-        self.viewer.set_overlay(True)
+        self._mark()
         self.viewer.setVisible(True)
+        self.controls.setVisible(True)
         self._loaded = ("movie", int(first))
         self._first = int(first)
         self._length = int(len(array))
@@ -1942,8 +2026,10 @@ class TrackFootage(QWidget):
         self.viewer.pause()
         self.viewer.clear()
         self.viewer.setVisible(False)
+        self.controls.setVisible(False)
         self._loaded = ("", -1)
         self._length = 0
+        self._boxes = None
         text = f"No video. {reason.strip().rstrip('.')}."
         if self._span[1] > self._span[0]:
             text += (

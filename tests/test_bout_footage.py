@@ -14,6 +14,8 @@ the drawing and the footage, not about whether a video plays:
   one that holds the next frame;
 * a frame the cache never covered says so and is cut from the movie instead -
   at the same crop, which is checked here against the cached frame beside it;
+* the animal is marked the way the annotation window marks it, and the view
+  re-centres for a span of hundreds of frames rather than for a 25-frame clip;
 * a project with no cache and no movie loses the video and keeps the timeline,
   with a sentence, and never a black rectangle;
 * the window lets go of the cache when it closes, because a mapped clips.dat on
@@ -141,6 +143,38 @@ def cached_frame(cfg, movie_id: str, track_id: int, frame: int) -> np.ndarray:
         return np.array(store.clip(int(mine.index[0]))[frame - int(row["f_start"])])
     finally:
         store.close()
+
+
+def marks(n_frames: int, n_kpts: int, x=None) -> pd.DataFrame:
+    """A clip's box table as the cache stores one: the target on every frame
+    with its keypoints hung off it, and a neighbour that is in the crop but is
+    not the track. ``x`` is the target's path, which is what the view follows."""
+    t = np.arange(n_frames)
+    cx = t.astype(float) if x is None else np.asarray(x, dtype=float)
+    out = []
+    for is_target, centre in ((True, cx), (False, cx + 40.0)):
+        block = {"t": t, "is_target": is_target,
+                 "x1": centre - 10.0, "y1": 22.0, "x2": centre + 10.0, "y2": 42.0}
+        for k in range(n_kpts):
+            block[f"kp_x_{k}"] = centre + k if is_target else np.nan
+            block[f"kp_y_{k}"] = 32.0 if is_target else np.nan
+            block[f"kp_c_{k}"] = 0.9
+        out.append(pd.DataFrame(block))
+    return pd.concat(out, ignore_index=True)
+
+
+@pytest.fixture
+def posed(root):
+    """A pose project's config, and no store opened against it.
+
+    The cache is shared between suites and this one only needs the settings, so
+    nothing here maps a clips.dat that another suite would then fail to rewrite.
+    """
+    from fixtures import make_project
+
+    from trackanno.config import load_config
+
+    return load_config(make_project(root / "pose", pose=True))
 
 
 @pytest.fixture(scope="module")
@@ -364,6 +398,143 @@ def test_a_correction_still_round_trips_with_the_video_wired_in(app, panel, film
 
 
 # --------------------------------------------------------------------------- #
+# what the picture shows
+# --------------------------------------------------------------------------- #
+def test_the_review_window_marks_the_animal_the_annotation_window_marked(
+    app, posed,
+) -> None:
+    """Same pixels, same crop, and the same marking on top of them.
+
+    A reviewer moving a boundary is checking a label somebody applied in the
+    annotation window. If that window outlines the animal and draws its skeleton
+    and this one shows a bare crop, the two are pictures of different things,
+    and on a crop with a second animal in it there is nothing to say which one
+    the bout is even about.
+    """
+    from trackanno.gui.timeline import TrackFootage
+
+    cfg = posed
+    cfg.ui.show_skeleton = True
+    cfg.ui.show_context_tracks = False
+    footage = TrackFootage(cfg)
+    try:
+        clip = np.zeros((12, 64, 64), np.uint8)
+        boxes = marks(12, cfg.n_keypoints)
+
+        view = footage._view(boxes, clip)
+        check("the review view is built with the keypoint count the project has "
+              "when the skeleton is on",
+              view.kpts is not None and view.kpts.shape[1] == cfg.n_keypoints,
+              "none at all" if view.kpts is None else str(view.kpts.shape))
+        check("...and they are the target's own, on every frame",
+              np.isfinite(view.kpts).all())
+        footage._mark()
+        check("...and the canvas is told to draw them, not merely handed them",
+              footage.viewer.canvas.show_skeleton)
+        check("...with the edges that say which keypoint joins which, or the "
+              "skeleton draws as loose dots",
+              footage.viewer.canvas._edges == cfg.keypoints.edge_idx,
+              str(footage.viewer.canvas._edges))
+        check("the marker is on to begin with: an unmarked crop cannot say "
+              "which animal the bout is about",
+              footage.marker_box.isChecked() and footage.viewer.canvas.show_overlay)
+        check("the neighbour in the crop is left alone while the config leaves "
+              "it alone", len(view.context) == 0, str(len(view.context)))
+
+        cfg.ui.show_context_tracks = True
+        footage._mark()
+        check("...and outlined when the config asks for it, as in the annotation "
+              "window",
+              len(footage._view(boxes, clip).context) == 12
+              and footage.viewer.canvas.show_context)
+
+        cfg.ui.show_skeleton = False
+        check("with the skeleton off nothing is computed for a marker nobody "
+              "draws", footage._view(boxes, clip).kpts is None)
+    finally:
+        footage.release()
+
+
+def test_the_review_window_opens_on_a_view_that_re_centres_every_frame(
+    app, posed,
+) -> None:
+    """``ui.follow`` is chosen for one 25-frame clip, and a bout is not one.
+
+    A moving average removes drift and keeps the beat, which is what an
+    annotator watching a single window wants. Scrubbed across the hundreds of
+    frames a bout runs for, that average lags the animal and it walks out of the
+    middle of the picture - so the reviewer chases the cell instead of reading
+    the boundary.
+    """
+    from trackanno.gui.timeline import REVIEW_FOLLOW, TrackFootage
+    from trackanno.view.overlay import build_clip_view
+
+    cfg = posed
+    cfg.ui.follow = "smooth"                 # what the annotation window is on
+    n = 60
+    path = 32.0 + 14.0 * np.sin(2 * np.pi * np.arange(n) / 22.0)
+    boxes = marks(n, cfg.n_keypoints, path)
+    clip = np.zeros((n, 64, 64), np.uint8)
+
+    footage = TrackFootage(cfg)
+    try:
+        check("the review window opens on the view that re-centres every frame, "
+              "rather than inheriting the annotation window's average",
+              footage.follow == REVIEW_FOLLOW == "locked",
+              f"{footage.follow}, with ui.follow {cfg.ui.follow!r}")
+        view = footage._view(boxes, clip)
+        check("...so the animal is in the middle of the picture on every frame "
+              "of the span",
+              np.allclose(view.centre[:, 0], path),
+              str(float(np.abs(view.centre[:, 0] - path).max())))
+
+        lagged = build_clip_view(boxes, n, int(clip.shape[1]), mode=cfg.ui.follow,
+                                 smooth_window=cfg.ui.smooth_window)
+        check("...which is the whole difference: the project's own setting "
+              "leaves it off centre by a good part of a crop's width",
+              np.abs(lagged.centre[:, 0] - path).max() > 5.0,
+              str(float(np.abs(lagged.centre[:, 0] - path).max())))
+
+        footage.follow_combo.setCurrentText("centred")
+        check("and the reviewer can still ask for either of the other two, "
+              "which is what the selector is for",
+              footage.follow == "centred"
+              and float(np.ptp(footage._build_view().centre[:, 0])) == 0.0)
+    finally:
+        footage.release()
+
+
+def test_changing_the_view_mid_review_re_renders_rather_than_re_reads(
+    app, panel,
+) -> None:
+    """Both controls are display-time transforms, and have to stay that way.
+
+    Every mode reads the same cached array through a different transform, so
+    switching one costs a repaint. A control that dropped the clip and went back
+    to the store would stall on cold pages mid-review, which is the one thing
+    the prefetcher is there to prevent.
+    """
+    footage = panel.footage
+    before = footage.viewer.canvas._view
+    pixels, pixmaps = footage.frame_image(), footage.viewer.canvas._pixmaps
+    check("the controls are on screen with the picture",
+          footage.controls.isVisible())
+
+    footage.follow_combo.setCurrentText("centred")
+    check("choosing another view rebuilds the geometry",
+          footage.viewer.canvas._view is not before and footage.follow == "centred")
+    check("...off the frames already on screen: not one pixel was read again",
+          np.array_equal(footage.frame_image(), pixels)
+          and footage.viewer.canvas._pixmaps is pixmaps)
+
+    footage.marker_box.setChecked(False)
+    check("turning the marker off stops it being drawn",
+          not footage.viewer.canvas.show_overlay)
+    footage.marker_box.setChecked(True)
+    check("...and back on brings it back", footage.viewer.canvas.show_overlay)
+
+
+# --------------------------------------------------------------------------- #
 # when there are no pixels
 # --------------------------------------------------------------------------- #
 def test_a_project_with_no_clip_cache_keeps_the_timeline_and_says_why(app, root) -> None:
@@ -399,6 +570,8 @@ def test_a_project_with_no_clip_cache_keeps_the_timeline_and_says_why(app, root)
         note = widget.footage.source.text()
         check("nothing is on screen where the video would be",
               not widget.footage.viewer.isVisible(), note)
+        check("...and no controls over a video that is not there",
+              not widget.footage.controls.isVisible())
         check("...and it says there is no video", note.startswith("No video"), note)
         check("...and why: this project has no cache to read", "cache" in note, note)
         check("...and that the timeline is unaffected", "timeline still" in note, note)
