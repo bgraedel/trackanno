@@ -29,6 +29,8 @@ table rather than being tidied away.
 
 from __future__ import annotations
 
+import heapq
+
 import numpy as np
 
 __all__ = [
@@ -198,37 +200,67 @@ def decode_min_bout(posterior: np.ndarray, min_bout_frames: int) -> np.ndarray:
     if floor <= 1 or labels.size == 0:
         return labels
 
-    runs = _runs(labels)
-    for _ in range(len(runs)):
-        target = _shortest_absorbable(runs, floor)
-        if target is None:
-            break
-        start, end = runs[target][0], runs[target][1]
-        runs[target] = (start, end, _absorbing_class(runs, target, posterior))
-        runs = _merge(runs)
+    spans = _runs(labels)
+    n = len(spans)
+    start = np.array([s for s, _, _ in spans], dtype=np.int64)
+    end = np.array([e for _, e, _ in spans], dtype=np.int64)
+    lab = np.array([v for _, _, v in spans], dtype=np.int64)
+    # A doubly-linked list over the runs plus a shortest-first heap. Rescanning
+    # every run to find the next target, and rebuilding the list to merge it,
+    # makes this quadratic in the run count, and the run count is what an
+    # overlapping stride and several window scales both increase.
+    prev = np.arange(-1, n - 1)
+    nxt = np.arange(1, n + 1)
+    nxt[n - 1] = -1
+    alive = np.ones(n, dtype=bool)
+
+    def neighbours(i: int) -> list[int]:
+        out = []
+        if prev[i] >= 0 and lab[prev[i]] >= 0:
+            out.append(int(prev[i]))
+        if nxt[i] >= 0 and lab[nxt[i]] >= 0:
+            out.append(int(nxt[i]))
+        return out
+
+    def absorbing(i: int) -> int:
+        best, best_key = int(lab[i]), None
+        for offset, j in enumerate(neighbours(i)):
+            key = (-float(posterior[start[i]:end[i], lab[j]].mean()),
+                   -(int(end[j]) - int(start[j])), offset)
+            if best_key is None or key < best_key:
+                best, best_key = int(lab[j]), key
+        return best
+
+    heap = [(int(end[i] - start[i]), int(start[i]), i)
+            for i in range(n) if lab[i] >= 0 and end[i] - start[i] < floor]
+    heapq.heapify(heap)
+    while heap:
+        length, at, i = heapq.heappop(heap)
+        # Lazily deleted: an entry whose run has since been merged or grown is
+        # stale, and cheaper to skip here than to find and remove on merging.
+        if not alive[i] or start[i] != at or end[i] - start[i] != length:
+            continue
+        if lab[i] < 0 or end[i] - start[i] >= floor or not neighbours(i):
+            continue
+        lab[i] = absorbing(i)
+        for j in (int(prev[i]), int(nxt[i])):
+            if j >= 0 and alive[j] and lab[j] == lab[i]:
+                a, b = (j, i) if start[j] < start[i] else (i, j)
+                end[a] = end[b]
+                alive[b] = False
+                nxt[a] = nxt[b]
+                if nxt[b] >= 0:
+                    prev[nxt[b]] = a
+                i = a
+        if end[i] - start[i] < floor and neighbours(i):
+            heapq.heappush(heap, (int(end[i] - start[i]), int(start[i]), i))
 
     out = np.full(labels.size, -1, dtype=np.int64)
-    for start, end, label in runs:
-        out[start:end] = label
+    for i in range(n):
+        if alive[i]:
+            out[start[i]:end[i]] = lab[i]
     return out
 
-
-def _shortest_absorbable(runs: list[tuple[int, int, int]], floor: int) -> int | None:
-    """Index of the shortest too-short run that has somewhere to go, or None.
-
-    Shortest first so the least-supported claim gives way, ties to the earliest.
-    """
-    best, best_length = None, floor
-    for i, (start, end, label) in enumerate(runs):
-        if label < 0:
-            continue
-        length = end - start
-        if length >= best_length:
-            continue
-        if not _neighbours(runs, i):
-            continue
-        best, best_length = i, length
-    return best
 
 
 def _neighbours(runs: list[tuple[int, int, int]], i: int) -> list[tuple[int, int, int]]:
@@ -240,24 +272,6 @@ def _neighbours(runs: list[tuple[int, int, int]], i: int) -> list[tuple[int, int
         out.append(runs[i + 1])
     return out
 
-
-def _absorbing_class(
-    runs: list[tuple[int, int, int]], i: int, posterior: np.ndarray
-) -> int:
-    """Which neighbour's class ``runs[i]`` becomes. See :func:`decode_min_bout`.
-
-    Falls back to the run's OWN label, so a run with no defined neighbour is a
-    no-op.
-    """
-    start, end, own = runs[i]
-    best, best_key = own, None
-    for offset, (n_start, n_end, n_label) in enumerate(_neighbours(runs, i)):
-        # Negated so a plain "greater is better" ordering covers all three rules:
-        # higher mean posterior, then longer neighbour, then earlier one.
-        key = (-float(posterior[start:end, n_label].mean()), -(n_end - n_start), offset)
-        if best_key is None or key < best_key:
-            best, best_key = n_label, key
-    return best
 
 
 def decode_viterbi(posterior: np.ndarray, self_transition: float) -> np.ndarray:
