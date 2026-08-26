@@ -764,7 +764,7 @@ class Predict:
         those apart. :func:`load_config` refuses ``auto`` there for a dense
         project rather than resolving it; a ``coverage: manifest`` project still
         resolves, and ``predict.py --coverage dense`` on one of those is caught
-        by :func:`trackanno.predict._check_trained_window`.
+        by :meth:`trackanno.suggest.Suggester.refuse_window_mismatch`.
         """
         if isinstance(self.window_frames, str):
             return max(1, min(int(clips.frames), int(clips.stride)))
@@ -1392,8 +1392,8 @@ def _refuse_unresolvable_window(cfg: Config) -> None:
 
     Only under ``coverage: dense``, the one coverage this key governs.
     ``predict.py --coverage dense`` can still push a manifest config down the
-    dense path, where :func:`trackanno.predict._check_trained_window` refuses the
-    mismatch against the model's own recorded length.
+    dense path, where :meth:`trackanno.suggest.Suggester.refuse_window_mismatch`
+    refuses the mismatch against the model's own recorded length.
     """
     if not isinstance(cfg.predict.window_frames, str):
         return

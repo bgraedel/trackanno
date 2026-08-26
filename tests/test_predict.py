@@ -1271,6 +1271,92 @@ def test_a_model_fitted_at_another_window_length_is_refused(root: Path) -> None:
               for m, level in reporter.logged), str(reporter.logged))
 
 
+def test_the_window_gate_makes_one_decision_for_both_entry_points(root: Path) -> None:
+    """A labelling run and the annotation queue ask the same question about the
+    same model file, and they must not be able to answer it differently.
+
+    This is a train/serve-skew gate. Two copies of the three-way decision agree
+    only until one of them is edited: tighten the bulk path alone and selection
+    keeps ranking every candidate on a scale the model never saw, at normal
+    confidence, with an ORDER as its only output and nothing in it to look
+    wrong. So both go through ``Suggester.refuse_window_mismatch``, and what the
+    caller supplies is the trailing sentence naming its own numbers.
+    """
+    import warnings
+
+    from trackanno.config import load_config
+    from trackanno.predict import predict_all
+    from trackanno.project import write_config
+    from trackanno.suggest import Suggester
+
+    def selecting(name: str, trained_window: int | None):
+        """A project both entry points can run over: a model on disk and a
+        selection rule, so `selection_batch` does not return [] before it asks."""
+        case, manifest = build_case(root, name, trained_window=trained_window)
+        write_config(case.path, {"suggest.select_rule": "margin"})
+        return load_config(case.path), manifest
+
+    def refusal(fn, *args) -> str:
+        try:
+            fn(*args)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    # A model fitted at 25 frames in a project whose clips are 50 long. Manifest
+    # coverage scores clip_features.parquet, so both entry points are reading
+    # the SAME length off the same project - only the sentence about where that
+    # number came from is the caller's.
+    cfg, manifest = selecting("one-gate", 25)
+    suggester = Suggester(cfg)
+    problem = suggester.window_problem(int(cfg.clips.frames))
+    check("the model and the project really do disagree", problem != "", problem)
+
+    predicting = refusal(predict_all, cfg)
+    ranking = refusal(suggester.selection_batch, manifest, set(), 10)
+    check("a labelling run refuses the mismatch", predicting != "")
+    check("...and so does a selection batch, off the same model file", ranking != "")
+    check("...both saying the same thing about the model",
+          predicting.startswith(problem) and ranking.startswith(problem),
+          f"{predicting}\n--\n{ranking}")
+    check("...and differing only in the numbers each one owns",
+          predicting != ranking
+          and "manifest coverage scores" in predicting
+          and "every candidate in this batch" in ranking,
+          f"{predicting}\n--\n{ranking}")
+
+    # The other two states of the same decision, which is where a second copy
+    # would drift: a model that never recorded its length is a warning on both
+    # paths, and a matching one is silent on both.
+    legacy, legacy_manifest = selecting("one-gate-legacy", None)
+    quiet = Suggester(legacy)
+    reporter = Recorder()
+    rows = predict_all(legacy, reporter=reporter)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        batch = quiet.selection_batch(legacy_manifest, set(), 5)
+
+    warned = [m for m, level in reporter.logged if level == "warning"
+              and "does not record" in m]
+    check("an unrecorded length stops neither path",
+          len(rows) > 0 and len(batch) > 0, f"{len(rows)} rows, {len(batch)} clips")
+    check("...and both warn about it", len(warned) == 1 and len(caught) == 1,
+          f"{warned} / {[str(w.message) for w in caught]}")
+    check("...in the same words, because it is one sentence with two channels",
+          warned[0] == str(caught[0].message), warned[0])
+
+    matched, matched_manifest = selecting("one-gate-matched", int(legacy.clips.frames))
+    agreeing = Suggester(matched)
+    reporter = Recorder()
+    predict_all(matched, reporter=reporter)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        batch = agreeing.selection_batch(matched_manifest, set(), 5)
+    check("and a model asked for the length it was trained at is silent on both",
+          not reporter.said("window") and not caught and len(batch) > 0,
+          f"{reporter.logged} / {[str(w.message) for w in caught]}")
+
+
 def test_a_failed_write_leaves_no_part_file_and_no_damage(root: Path) -> None:
     """predictions.parquet is read as authoritative by everything downstream, so
     a run that dies mid-write must leave the previous file intact rather than a

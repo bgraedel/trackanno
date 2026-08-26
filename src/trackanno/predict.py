@@ -635,69 +635,30 @@ def _bout_predictions(
 # --------------------------------------------------------------------------- #
 # the run
 # --------------------------------------------------------------------------- #
-def _check_trained_window(suggester, length: int, coverage: str, reporter) -> None:
-    """Refuse a model fitted at another window length; only warn if it never said.
+def _window_context(suggester, length: int, coverage: str) -> str:
+    """Which config key ``length`` was read from, and the edit that resolves it.
 
-    Window length changes what the features are WORTH, not what they are called,
-    so a model fitted on 50-frame rows and handed 25-frame ones passes every
-    check ``Suggester.load`` makes and then predicts confidently on a scale it
-    has never seen.
-
-    A MISMATCH is refused: every row would be scored on the wrong scale and
-    nothing in the file would show it. An UNRECORDED length is a model saved
-    before the stamp existed, so it is only a warning and the run continues.
-    ``window_problem`` returns a sentence in both cases, and ``trained_window``
-    is what tells them apart.
+    The actionable half of the refusal
+    :meth:`trackanno.suggest.Suggester.refuse_window_mismatch` raises, which
+    owns the decision itself. The model cannot know which key the number came
+    from, and the two coverages need different instructions: on the dense path
+    the length is a setting of its own, while on the manifest path it IS the
+    length the clip features were cut at.
     """
-    problem = suggester.window_problem(length)
-    if not problem:
-        return
-    if suggester.trained_window is None:
-        reporter.log(problem, "warning")
-        return
-    # `window_problem` is a method on the model and cannot know WHICH key the
-    # length came from, so the instruction is added here. The two coverages need
-    # different ones: on the dense path the length is a setting of its own, while
-    # on the manifest path it IS the length the clip features were cut at.
-    fix = (
-        f"The {length} frames are predict.window_frames, this run's dense grid. "
-        f"Writing predict.window_frames: {suggester.trained_window} is the edit "
-        "that resolves it - no retraining, and not one existing label changes, "
-        "because this decides what the predictor measures and not what anyone "
-        "annotated."
-        if coverage == "dense" else
+    if coverage == "dense":
+        return (
+            f"The {length} frames are predict.window_frames, this run's dense grid. "
+            f"Writing predict.window_frames: {suggester.trained_window} is the edit "
+            "that resolves it - no retraining, and not one existing label changes, "
+            "because this decides what the predictor measures and not what anyone "
+            "annotated."
+        )
+    return (
         f"The {length} frames are clips.frames, the length "
         f"{CLIP_FEATURES_FILE} - the table manifest coverage scores - was cut at. "
         f"It read {suggester.trained_window} when this model was fitted, so "
         "either put clips.frames back and rebuild the clip features, or retrain "
         "at the length it reads now."
-    )
-    raise RuntimeError(f"{problem} {fix}")
-
-
-def _check_scales(suggester, scales: list[int]) -> None:
-    """Refuse a model that cannot be scored at several window lengths at once.
-
-    ``_check_trained_window`` above has already established that the BASE scale
-    is the one the model was fitted at, so the question here is whether the model
-    reads features that survive the difference - answered by the column names in
-    its own payload.
-
-    Never a warning: a project only reaches here by typing
-    ``predict.window_scales`` into its config, and every scale's rows would be
-    averaged into the same per-frame posterior at unchanged confidence.
-
-    ``load_config`` refuses the same combination against
-    ``suggest.feature_scope``, which is about the model this project will fit
-    next; this is about the model on disk, so retraining is what moves a project
-    from failing this to passing it and a config edit alone must not.
-    """
-    problem = suggester.scale_problem(scales)
-    if not problem:
-        return
-    raise RuntimeError(
-        f"{problem} The scales are predict.window_scales, resolved against "
-        f"predict.window_frames: {', '.join(str(s) for s in scales)} frames."
     )
 
 
@@ -838,13 +799,23 @@ def predict_all(
     # Checked before the features are built, which is the expensive part.
     length = (cfg.predict.resolved_window(cfg.clips) if coverage == "dense"
               else int(cfg.clips.frames))
-    _check_trained_window(suggester, length, coverage, reporter)
+    suggester.refuse_window_mismatch(
+        length, _window_context(suggester, length, coverage), reporter)
 
     # The other window-length skew, and it only exists on the dense path: the
     # manifest path scores clip_features.parquet, one table built at one length.
     # Checked before the feature build, for the same reason as the base length.
+    # The base scale is already known to be the one the model was fitted at, so
+    # the question here is whether the model reads columns that survive the
+    # difference. `load_config` refuses the same combination against
+    # `suggest.feature_scope`, which is about the model this project will fit
+    # next; this is about the model on disk, so retraining is what moves a
+    # project from failing it to passing it and a config edit alone must not.
     scales = cfg.predict.resolved_scales(cfg.clips) if coverage == "dense" else [length]
-    _check_scales(suggester, scales)
+    suggester.refuse_scale_mismatch(
+        scales,
+        "The scales are predict.window_scales, resolved against "
+        f"predict.window_frames: {', '.join(str(s) for s in scales)} frames.")
     if len(scales) > 1:
         reporter.log(
             f"scoring at {len(scales)} window lengths "

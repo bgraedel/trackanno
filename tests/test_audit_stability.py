@@ -42,7 +42,7 @@ from trackanno.store import (
     AUDIT_COLUMN, IDENTITY_COLUMNS, PROVENANCE_COLUMN, TRAILING_COLUMNS,
     AnnotationStore, decode_audit, encode_audit, read_audit_records,
 )
-from trackanno.suggest import _print_report, audit_records, is_audit_clip, train_group
+from trackanno.suggest import AuditHoldout, _print_report, train_group
 
 CONFIG_TEXT = """
 paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
@@ -149,9 +149,14 @@ def _refusal(fn, *args, **kwargs) -> str:
     return ""
 
 
-def _held_out(cfg, clip_ids, records=None) -> set[str]:
-    """The holdout as the program would compute it, as a plain set of ids."""
-    return {c for c in clip_ids if is_audit_clip(c, cfg, records)}
+def _held_out(holdout, clip_ids) -> set[str]:
+    """The holdout as the program would compute it, as a plain set of ids.
+
+    ``holdout`` is named by the caller rather than defaulted here, because
+    "resolved from the CSV" and "hashed from the ids" are the two answers this
+    suite exists to keep apart.
+    """
+    return {c for c in clip_ids if c in holdout}
 
 
 def _renumbered_manifest(metas: list[dict]) -> pd.DataFrame:
@@ -200,14 +205,14 @@ def test_upgrading_an_existing_project_moves_no_clip_into_or_out_of_the_holdout(
 
     ids = [m["clip_id"] for m in metas]
     before_rows = _read_csv(path)
-    before = _held_out(cfg, ids)
+    before = _held_out(AuditHoldout.by_hash(cfg), ids)
     check("the fixture predates the column", AUDIT_COLUMN not in _header(path))
     check("...and has a holdout worth preserving", 0 < len(before) < len(ids),
           f"{len(before)} of {len(ids)}")
 
     store, said = _load_quietly(path, cfg)
     records = read_audit_records(path)
-    after = _held_out(cfg, ids, records)
+    after = _held_out(AuditHoldout.from_csv(cfg, path), ids)
 
     check("every row still loads", len(store) == len(metas), str(len(store)))
     check("every labelled clip now records a membership",
@@ -236,7 +241,7 @@ def test_upgrading_an_existing_project_moves_no_clip_into_or_out_of_the_holdout(
     check("re-opening the upgraded file says nothing about the audit column",
           not any(AUDIT_COLUMN in m for m in said_again), str(said_again))
     check("...and reports the same holdout a third time",
-          _held_out(cfg, ids, read_audit_records(path)) == before)
+          _held_out(AuditHoldout.from_csv(cfg, path), ids) == before)
     check("...from a store that agrees row for row",
           all(decode_audit(again.get(c)[AUDIT_COLUMN]) == (c in before) for c in ids))
 
@@ -269,9 +274,9 @@ def test_a_project_with_no_holdout_records_that_too_rather_than_leaving_it_open(
     ids = [m["clip_id"] for m in metas]
     check("raising audit_fraction would have hashed some of them in",
           any(later.suggest.audit_by_hash(c) for c in ids))
+    holdout = AuditHoldout.from_csv(later, path)
     check("...but the record keeps every already-judged clip out of the holdout",
-          _held_out(later, ids, records) == set(),
-          str(_held_out(later, ids, records)))
+          _held_out(holdout, ids) == set(), str(_held_out(holdout, ids)))
 
 
 # --------------------------------------------------------------------------- #
@@ -295,7 +300,7 @@ def test_a_labelled_clip_keeps_its_membership_across_a_real_reassociation(
     _load_quietly(path, cfg)                      # the upgrade freezes membership
 
     old_ids = [m["clip_id"] for m in metas]
-    frozen = _held_out(cfg, old_ids, read_audit_records(path))
+    frozen = _held_out(AuditHoldout.from_csv(cfg, path), old_ids)
 
     manifest = _renumbered_manifest(metas)
     n_matched, moved_to = _redetect(path, manifest)
@@ -314,8 +319,7 @@ def test_a_labelled_clip_keeps_its_membership_across_a_real_reassociation(
           f"{flipped} of {len(old_ids)} = {flipped / len(old_ids):.1%} would move")
 
     store, said = _load_quietly(path, cfg)
-    records = read_audit_records(path)
-    now = {c for c in new_ids if is_audit_clip(c, cfg, records)}
+    now = _held_out(AuditHoldout.from_csv(cfg, path), new_ids)
 
     check("the repair re-linked every row and lost none",
           len(store) == len(metas), str(len(store)))
@@ -418,13 +422,14 @@ def test_an_unlabelled_clip_is_still_free_to_change_sides(root: Path) -> None:
     manifest = _renumbered_manifest(metas)
     _redetect(path, manifest)
     records = read_audit_records(path)
+    holdout = AuditHoldout.from_csv(cfg, path)
     moved = {m["clip_id"]: _clip_id(m["track_id"] + RENUMBER_BY, m["f_start"])
              for m in metas}
 
     check("no unlabelled clip carries a record", not any(
         moved[m["clip_id"]] in records or m["clip_id"] in records for m in untouched))
     check("...so each is answered by the hash on its CURRENT id",
-          all(is_audit_clip(moved[m["clip_id"]], cfg, records)
+          all((moved[m["clip_id"]] in holdout)
               == cfg.suggest.audit_by_hash(moved[m["clip_id"]]) for m in untouched))
 
     changed = [m for m in untouched
@@ -433,7 +438,7 @@ def test_an_unlabelled_clip_is_still_free_to_change_sides(root: Path) -> None:
     check("and some of them really did change side, which is allowed",
           len(changed) > 0, f"{len(changed)} of {len(untouched)}")
     check("...while every LABELLED clip in the same file did not",
-          all(is_audit_clip(moved[m["clip_id"]], cfg, records)
+          all((moved[m["clip_id"]] in holdout)
               == cfg.suggest.audit_by_hash(m["clip_id"]) for m in labelled))
 
     # The moment one of them is labelled, it stops moving.
@@ -939,32 +944,174 @@ def test_a_scored_audit_report_states_how_much_of_the_holdout_it_rests_on(
 def test_train_reads_the_membership_it_is_handed_rather_than_deriving_it(
     root: Path
 ) -> None:
-    """``audit_records`` and ``store.read_audit_records`` are two readings of one
-    file - one from a DataFrame, one from the CSV. They must agree exactly: a
-    disagreement about a single cell would put a clip in the training set for
-    the fit and in the holdout for the GUI, and the two would each be internally
-    consistent."""
+    """``AuditHoldout.from_labels`` and ``AuditHoldout.from_csv`` are two
+    readings of one file - one from a DataFrame, one from the CSV. They must
+    agree exactly: a disagreement about a single cell would put a clip in the
+    training set for the fit and in the holdout for the GUI, and the two would
+    each be internally consistent."""
     cfg = _cfg(root, "readers")
     path = cfg.paths.csv
     metas = _population(50)
     _write_csv(path, _old_schema(cfg), [_row(m) for m in metas])
     _load_quietly(path, cfg)
 
-    from_file = read_audit_records(path)
-    from_frame = audit_records(pd.read_csv(path))
-    check("the two readings agree cell for cell", from_file == from_frame,
-          str(set(from_file.items()) ^ set(from_frame.items())))
-    check("...and both found the whole file", len(from_file) == len(metas))
+    from_file = AuditHoldout.from_csv(cfg, path)
+    from_frame = AuditHoldout.from_labels(cfg, pd.read_csv(path))
+    check("the two readings agree cell for cell",
+          from_file.recorded == from_frame.recorded,
+          str(set(from_file.recorded.items()) ^ set(from_frame.recorded.items())))
+    check("...and both found the whole file", from_file.n_recorded == len(metas))
+    check("...and the store's own reading is the same mapping again",
+          read_audit_records(path) == from_file.recorded)
 
-    exact = audit_records(pd.read_csv(path, dtype=str, keep_default_na=False))
-    check("...as does the dtype=str reading the repair path uses", exact == from_file)
+    exact = AuditHoldout.from_labels(
+        cfg, pd.read_csv(path, dtype=str, keep_default_na=False))
+    check("...as does the dtype=str reading the repair path uses",
+          exact.recorded == from_file.recorded)
 
     check("a table without the column yields no records rather than guessing",
-          audit_records(pd.read_csv(path).drop(columns=[AUDIT_COLUMN])) == {})
-    check("...and so does no table at all", audit_records(None) == {})
+          AuditHoldout.from_labels(
+              cfg, pd.read_csv(path).drop(columns=[AUDIT_COLUMN])).recorded == {})
+    check("...and so does no table at all",
+          AuditHoldout.from_labels(cfg, None).recorded == {})
     check("a clip that is not in the mapping falls back to the hash",
-          is_audit_clip("MOVIE__t9999__f999999", cfg, from_file)
+          ("MOVIE__t9999__f999999" in from_file)
           == cfg.suggest.audit_by_hash("MOVIE__t9999__f999999"))
-    check("...and the two-argument form is still the hash, unchanged",
-          all(is_audit_clip(m["clip_id"], cfg)
+    check("...and a holdout with nothing recorded is still the hash, unchanged",
+          all((m["clip_id"] in AuditHoldout.by_hash(cfg))
               == cfg.suggest.audit_by_hash(m["clip_id"]) for m in metas))
+    check("...but a holdout that HAS the record never reaches the hash for it",
+          all((m["clip_id"] in from_file) == from_file.recorded[m["clip_id"]]
+              for m in metas))
+
+
+# --------------------------------------------------------------------------- #
+# one resolved holdout
+# --------------------------------------------------------------------------- #
+class _HashConsulted(Exception):
+    """Raised by the trap below when the hash is asked about a recorded clip."""
+
+
+def test_a_re_detected_project_holds_out_exactly_what_its_csv_records(
+    root: Path
+) -> None:
+    """Every clip_id in the project is different and the holdout is unchanged.
+
+    The state a real project is in after detection is re-run: the ids the
+    holdout was drawn from no longer exist, so hashing the new ones answers a
+    different question and answers it confidently. Both ways of resolving the
+    holdout - from the labels frame the trainer holds, from the CSV the GUI
+    holds - have to agree with the record and with each other, or the fit trains
+    on part of its own audit set while the GUI still calls those clips held out.
+    """
+    cfg = _cfg(root, "resolved-redetect")
+    path = cfg.paths.csv
+    metas = _population()
+    _write_csv(path, _old_schema(cfg), [_row(m) for m in metas])
+    _load_quietly(path, cfg)                      # freezes membership as it stands
+
+    old_ids = [m["clip_id"] for m in metas]
+    frozen = _held_out(AuditHoldout.from_csv(cfg, path), old_ids)
+
+    n_matched, moved_to = _redetect(path, _renumbered_manifest(metas))
+    new_ids = [moved_to[c] for c in old_ids]
+    check("the re-detection changed every clip_id",
+          n_matched == len(metas) and not set(old_ids) & set(new_ids), str(n_matched))
+
+    from_file = AuditHoldout.from_csv(cfg, path)
+    from_frame = AuditHoldout.from_labels(cfg, pd.read_csv(path))
+    expected = {moved_to[c] for c in frozen}
+
+    check("the CSV reading holds out exactly the clips the file records",
+          _held_out(from_file, new_ids) == expected,
+          f"{len(_held_out(from_file, new_ids) ^ expected)} clip(s) changed side")
+    check("...and the labels-frame reading is the same set again",
+          _held_out(from_frame, new_ids) == expected)
+    check("...and neither is the empty answer", 0 < len(expected) < len(new_ids),
+          f"{len(expected)} of {len(new_ids)}")
+    check("...and both count it the same way",
+          from_file.count(new_ids) == from_frame.count(new_ids) == len(expected),
+          f"{from_file.count(new_ids)} vs {len(expected)}")
+
+    # Not vacuous: the ids these clips carry now hash to a different holdout,
+    # which is the answer the object exists to stop anyone getting by accident.
+    by_hash = _held_out(AuditHoldout.by_hash(cfg), new_ids)
+    check("hashing the new ids would have answered differently",
+          by_hash != expected,
+          "the renumbering happened to be a no-op; widen RENUMBER_BY")
+    check("...and the object says how many records the hash now disagrees with",
+          from_file.n_moved() == len(by_hash ^ expected),
+          f"{from_file.n_moved()} vs {len(by_hash ^ expected)}")
+    check("...counted over the clips that carry a record, which is all of them",
+          from_file.n_recorded == len(metas), str(from_file.n_recorded))
+
+
+def test_no_path_can_reach_the_hash_for_a_clip_that_has_a_record(root: Path) -> None:
+    """"The record wins" has to hold on every path, not on the paths that
+    remembered to pass one.
+
+    Stated by taking the hash away: ``audit_by_hash`` is replaced with a trap
+    that raises for any clip the CSV records, and the paths that decide
+    membership are driven over it. A path that hashes first, or that falls back
+    to the hash on a recorded value it does not like, raises here instead of
+    returning a plausible wrong answer nothing downstream could question.
+    """
+    from trackanno.suggest import Suggester
+
+    cfg = _cfg(root, "no-hash")
+    path = cfg.paths.csv
+    metas = _population(40)
+    ids = [m["clip_id"] for m in metas]
+    _write_csv(path, _old_schema(cfg), [_row(m) for m in metas])
+    _load_quietly(path, cfg)
+
+    recorded = read_audit_records(path)
+    check("every clip under test carries a record to be answered from",
+          len(recorded) == len(metas), str(len(recorded)))
+
+    honest = cfg.suggest.audit_by_hash
+
+    def trap(clip_id: str) -> bool:
+        if str(clip_id) in recorded:
+            raise _HashConsulted(f"the hash was asked about {clip_id}, which is recorded")
+        return honest(clip_id)
+
+    cfg.suggest.audit_by_hash = trap
+
+    try:
+        AuditHoldout.by_hash(cfg).count(ids[:1])
+        check("the trap is live, so the checks below are not vacuous", False,
+              "hashing a recorded clip did not raise")
+    except _HashConsulted:
+        check("the trap is live, so the checks below are not vacuous", True)
+
+    from_file = AuditHoldout.from_csv(cfg, path)
+    from_frame = AuditHoldout.from_labels(cfg, pd.read_csv(path))
+    check("the GUI's reading answers every recorded clip without hashing",
+          all((c in from_file) == recorded[c] for c in ids))
+    check("...and so does the trainer's",
+          all((c in from_frame) == recorded[c] for c in ids))
+
+    # The GUI asks through the Suggester, whose copy is resolved by `load` -
+    # before the early return a project with no model takes.
+    suggester = Suggester(cfg)
+    check("...and so does the Suggester, model or no model",
+          all(suggester.is_audit_clip(c) == recorded[c] for c in ids))
+
+    # The fit's own mask, which is the one that decides what is trained on.
+    labels = pd.read_csv(path)
+    features = pd.DataFrame({"clip_id": ids, "movie_id": "MOVIE",
+                             "speed_mean": range(len(ids))})
+    _, report = train_group(features, labels, "behaviour", cfg,
+                            columns=["speed_mean"], verbose=False)
+    check("...and so does the audit mask train_group builds for itself",
+          report.audit_labelled == sum(recorded.values()),
+          f"{report.audit_labelled} vs {sum(recorded.values())}")
+    check("...and the population it reports beside it",
+          report.audit_population == sum(recorded.values()),
+          f"{report.audit_population} vs {sum(recorded.values())}")
+
+    # An UNLABELLED clip has no record, and the hash is still the answer there.
+    fresh = _clip_id(9999, 123456)
+    check("a clip with no record is still answered by the hash",
+          (fresh in from_file) == honest(fresh))

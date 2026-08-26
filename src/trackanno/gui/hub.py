@@ -483,7 +483,8 @@ class ConfigPage(Page):
         self.tabs.setTabToolTip(0, "What this project points at and how long a clip is")
         self.tabs.setTabToolTip(1, "The buttons you will press while annotating")
         self.tabs.setTabToolTip(2, "Only used when the task is 'pose'")
-        self.tabs.setTabToolTip(3, "Detector, tracker and cropping knobs - defaults are fine")
+        self.tabs.setTabToolTip(3, "Detector, tracker, cropping and bulk labelling - "
+                                   "defaults are fine until they are not")
         tabs = self.tabs
         self.KEYPOINT_TAB = 2
 
@@ -815,9 +816,21 @@ class ConfigPage(Page):
     def _mark_dirty(self) -> None:
         if self._loading:
             return
+        self._refresh_auto()
         self._dirty = True
         self.state.setText("saving...")
         self._save_timer.start()
+
+    def _refresh_auto(self) -> None:
+        """Tell both tabs what every 'auto' currently stands for.
+
+        Here rather than inside a form because the answer spans the file and
+        usually the tabs: predict.window_frames: auto is min(clips.frames,
+        clips.stride), and those two live on Basics while it lives on Advanced.
+        """
+        values = {**self.form.values(), **self.advanced.values()}
+        self.form.show_resolved(values)
+        self.advanced.show_resolved(values)
 
     def on_project(self) -> None:
         if self.cfg is None:
@@ -841,6 +854,7 @@ class ConfigPage(Page):
         self.banner.setVisible(False)
         self.state.setText("")
         self._sync_model_status()
+        self._refresh_auto()
         self._show_warnings()
 
     def _show_warnings(self) -> None:
@@ -852,8 +866,11 @@ class ConfigPage(Page):
         spec = getattr(self.cfg, "model", None) if self.cfg else None
         if spec is not None and spec.is_remote:
             warnings.pop("paths.model", None)
-        self.form.mark(warnings)
-        self.advanced.mark(warnings)
+        # Outlined together, counted apart: a warning still saves and a problem
+        # does not, so only the warnings reach the "saved - but..." line below.
+        marks = {**warnings, **self.form.problems(), **self.advanced.problems()}
+        self.form.mark(marks)
+        self.advanced.mark(marks)
         picker = self.advanced._widgets.get("suggest.feature_groups")
         if picker is not None and self.cfg is not None:
             from ..clipfeatures import available_groups
@@ -924,6 +941,15 @@ class ConfigPage(Page):
                 "These labels are not usable yet, so nothing was saved:",
                 problems,
             )
+            return False
+        # A field whose text is not the shape the key takes at all. Refused
+        # here, naming the field: handing it to the loader would refuse the
+        # whole file over one stray character, on the keystroke that typed it.
+        malformed = {**self.form.problems(), **self.advanced.problems()}
+        if malformed:
+            self._show_warnings()
+            self._fail("These settings are not usable yet, so nothing was saved:",
+                       [f"{key}: {why}" for key, why in malformed.items()])
             return False
         # EVERY tab: one file, so writing only the visible one drops the others.
         updates = {**self.form.values(), **self.advanced.values()}

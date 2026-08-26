@@ -137,10 +137,10 @@ def scoped_columns(columns, scope: str) -> list[str]:
     )
 
 
-def is_audit_clip(clip_id: str, cfg: Config,
-                  recorded: Mapping[str, bool] | None = None) -> bool:
-    """Hold a share of clips out of the suggestion loop: never suggested on,
-    never trained on, so agreement measured there is unbiased.
+@dataclass(frozen=True)
+class AuditHoldout:
+    """The clips held out of the suggestion loop: never suggested on, never
+    trained on, so agreement measured there is unbiased.
 
     THE RECORD WINS, and the hash is only consulted where there is none:
     ``clip_id`` embeds the track id, so re-running detection renumbers the
@@ -150,35 +150,77 @@ def is_audit_clip(clip_id: str, cfg: Config,
     disagrees with the hash is the normal state of a re-detected project and is
     not reported per clip.
 
-    ``recorded`` maps ``clip_id`` to its recorded membership, holding only the
-    clips that HAVE one; absent (the default) means no records were available,
-    so a caller that only ever asks about unlabelled clips needs none.
+    An object rather than a function taking an optional mapping, because the
+    mapping IS the answer and a call site that omits it reads exactly like one
+    that cannot: every way in names its source, and reaching the hash where a
+    record exists takes writing :meth:`by_hash` down. ``recorded`` holds only
+    the clips that HAVE a record; the hash answers for the rest, under its own
+    seed - see :meth:`trackanno.config.Suggest.audit_by_hash`.
 
-    Uses its OWN seed - see :meth:`trackanno.config.Suggest.audit_by_hash`.
+    Resolve it once per project and pass it down: the constructors read a file
+    or walk a frame, and membership itself is a dict lookup.
     """
-    if recorded:
-        member = recorded.get(str(clip_id))
+
+    cfg: Config
+    recorded: Mapping[str, bool]
+
+    @classmethod
+    def from_labels(cls, cfg: Config, labels: pd.DataFrame | None) -> "AuditHoldout":
+        """From an annotation table already in memory.
+
+        The same records :meth:`from_csv` reads off the file, for the callers
+        that have the frame instead. Both share one codec, so the two readings
+        cannot disagree about a cell and put a clip in the training set for one
+        group and the holdout for another.
+        """
+        recorded: dict[str, bool] = {}
+        if labels is not None and AUDIT_COLUMN in getattr(labels, "columns", ()):
+            for clip_id, cell in zip(labels["clip_id"].astype(str),
+                                     labels[AUDIT_COLUMN]):
+                member = decode_audit(cell)
+                if member is not None:
+                    recorded[str(clip_id)] = member
+        return cls(cfg, recorded)
+
+    @classmethod
+    def from_csv(cls, cfg: Config, path: str | Path) -> "AuditHoldout":
+        """From the annotation CSV, for the callers holding no frame."""
+        return cls(cfg, read_audit_records(path))
+
+    @classmethod
+    def by_hash(cls, cfg: Config) -> "AuditHoldout":
+        """With NOTHING recorded: every clip answered by its id alone.
+
+        Right only where no record can exist - a project with no annotations, or
+        a question asked about clips nobody has labelled. Spelled out because on
+        a re-detected project this draws a different holdout from the one the
+        model was trained against.
+        """
+        return cls(cfg, {})
+
+    def __contains__(self, clip_id: object) -> bool:
+        member = self.recorded.get(str(clip_id))
         if member is not None:
             return bool(member)
-    return cfg.suggest.audit_by_hash(str(clip_id))
+        return self.cfg.suggest.audit_by_hash(str(clip_id))
 
+    def count(self, clip_ids) -> int:
+        """How many of ``clip_ids`` are held out."""
+        return int(sum(1 for clip_id in clip_ids if clip_id in self))
 
-def audit_records(labels: pd.DataFrame | None) -> dict[str, bool]:
-    """``{clip_id: was_held_out}`` from an annotation table already in memory.
+    @property
+    def n_recorded(self) -> int:
+        """Clips carrying a record, which is the clips that are labelled."""
+        return len(self.recorded)
 
-    The same mapping :func:`trackanno.store.read_audit_records` builds from the
-    file, for the callers that have the frame instead. Both share one codec, so
-    the two readings cannot disagree about a cell and put a clip in the training
-    set for one group and the holdout for another.
-    """
-    if labels is None or AUDIT_COLUMN not in getattr(labels, "columns", ()):
-        return {}
-    out: dict[str, bool] = {}
-    for clip_id, cell in zip(labels["clip_id"].astype(str), labels[AUDIT_COLUMN]):
-        member = decode_audit(cell)
-        if member is not None:
-            out[clip_id] = member
-    return out
+    def n_moved(self) -> int:
+        """Records that are no longer what their clip_id hashes to.
+
+        Zero on a project detection has only ever run once on, so a non-zero
+        count is how someone finds out theirs was re-run.
+        """
+        return int(sum(1 for clip_id, member in self.recorded.items()
+                       if member != self.cfg.suggest.audit_by_hash(clip_id)))
 
 
 def labelled_rows(frame: pd.DataFrame, group: str) -> pd.DataFrame:
@@ -197,7 +239,7 @@ def labelled_rows(frame: pd.DataFrame, group: str) -> pd.DataFrame:
     return out[out[group].str.len() > 0]
 
 
-__all__ = ["Suggester", "train", "main", "is_audit_clip", "audit_records",
+__all__ = ["Suggester", "train", "main", "AuditHoldout",
            "labelled_rows", "is_length_invariant", "length_invariant_columns",
            "length_dependent_columns", "scoped_columns",
            "MODEL_FILE", "REPORT_FILE"]
@@ -458,22 +500,23 @@ def train_group(
     features: pd.DataFrame, labels: pd.DataFrame, group_name: str, cfg: Config,
     columns: list[str] | None = None, verbose: bool = True,
     raw_cnn: np.ndarray | None = None, reporter=None,
-    recorded: Mapping[str, bool] | None = None,
+    holdout: AuditHoldout | None = None,
     have_features: set[str] | None = None,
     audit_population: int | None = None,
 ) -> tuple[object | None, GroupReport]:
     """Fit one category group. Returns (model, report); model is None if unusable.
 
-    ``recorded``, ``have_features`` and ``audit_population`` are project-wide and
+    ``holdout``, ``have_features`` and ``audit_population`` are project-wide and
     identical for every group, so :func:`train` builds them once and passes them
     down. Each is computed here when absent, which is what a caller fitting a
-    single group gets.
+    single group gets: the holdout then comes from ``labels``, the table this
+    call is already fitting.
     """
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
-    if recorded is None:
-        recorded = audit_records(labels)
+    if holdout is None:
+        holdout = AuditHoldout.from_labels(cfg, labels)
     if have_features is None or audit_population is None:
         feature_ids = features["clip_id"].astype(str)
         if have_features is None:
@@ -483,9 +526,7 @@ def train_group(
             # all, not only the ones a human has reached. Counted over the
             # feature table, since a clip with no features cannot be scored
             # whether it is held out or not.
-            audit_population = int(sum(
-                is_audit_clip(c, cfg, recorded) for c in feature_ids
-            ))
+            audit_population = holdout.count(feature_ids)
 
     wanted = labelled_rows(labels[["clip_id", group_name]], group_name)
     merged = features.merge(wanted, on="clip_id", how="inner")
@@ -516,7 +557,7 @@ def train_group(
     # training on it makes the "unbiased" estimate circular. Read off the CSV
     # and not recomputed: after a re-detection a labelled clip's recorded
     # membership is no longer what its clip_id hashes to.
-    audit_mask = merged["clip_id"].astype(str).map(lambda c: is_audit_clip(c, cfg, recorded))
+    audit_mask = merged["clip_id"].astype(str).map(lambda c: c in holdout)
     audit_set = merged[audit_mask].copy()
     merged = merged[~audit_mask]
 
@@ -761,17 +802,16 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     # non-zero: on a project detection has only ever run once the count is zero,
     # so a non-zero one is how someone finds out theirs was re-run, and that the
     # holdout below is the original rather than a fresh draw.
-    recorded = audit_records(labels)
-    moved = sum(1 for clip_id, member in recorded.items()
-                if member != cfg.suggest.audit_by_hash(clip_id))
+    holdout = AuditHoldout.from_labels(cfg, labels)
+    moved = holdout.n_moved()
     if moved:
         reporter.log(
-            f"{moved} of {len(recorded)} labelled clip(s) are held to the audit "
+            f"{moved} of {holdout.n_recorded} labelled clip(s) are held to the audit "
             "membership recorded when they were labelled, which is no longer what "
             "their clip_id hashes to - detection has been re-run since. The recorded "
             "value is what keeps the holdout from being redrawn under the model."
         )
-    elif not recorded and len(labels):
+    elif not holdout.n_recorded and len(labels):
         reporter.log(
             f"no labelled clip in {cfg.paths.csv.name} records its audit membership, "
             "so the holdout below is derived from the clip_ids alone and will be "
@@ -874,9 +914,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     # feature table, which is not work to repeat per category.
     feature_ids = features["clip_id"].astype(str)
     have_features = set(feature_ids)
-    audit_population = int(sum(
-        is_audit_clip(c, cfg, recorded) for c in feature_ids
-    ))
+    audit_population = holdout.count(feature_ids)
 
     # Said before any group is fitted: every score below is computed on whatever
     # survived this join, and a group whose rare class was mostly orphaned
@@ -900,7 +938,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         reporter.raise_if_cancelled()
         model, report = train_group(
             features, labels, group.name, cfg, columns, verbose, raw_cnn=raw_cnn,
-            reporter=reporter, recorded=recorded, have_features=have_features,
+            reporter=reporter, holdout=holdout, have_features=have_features,
             audit_population=audit_population,
         )
         reporter.advance()
@@ -952,6 +990,12 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
 class Suggester:
     """Loads the trained models and produces per-clip suggestions for the GUI."""
 
+    # Resolved from the annotation CSV by `load`, which runs before anything can
+    # ask. Kept here because this object is what the GUI asks "is this clip held
+    # out", and re-reading the file per question would read it on every page
+    # turn.
+    audit: AuditHoldout
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.columns: list[str] = []
@@ -959,10 +1003,6 @@ class Suggester:
         self.reports: dict = {}
         self.features: pd.DataFrame | None = None
         self.problem: str = ""
-        # Audit membership as recorded in the annotation CSV, for the clips that
-        # record one. Kept here because this object is what the GUI asks "is
-        # this clip held out"; see `load` for why it is refreshed there only.
-        self._audit_records: dict[str, bool] = {}
         # Frames per window the training rows were measured over. None for a
         # model saved before this was recorded - those still load; see
         # `window_problem`.
@@ -985,11 +1025,11 @@ class Suggester:
         self.features, self._by_clip = None, {}
         self.trained_window = None
 
-        # Before every early return below, because `is_audit_clip` is asked on
-        # clips whether or not a model exists. Refreshed HERE and not per
+        # Before every early return below, because membership is asked about
+        # clips whether or not a model exists. Resolved HERE and not per
         # question, so turning a page does not read the CSV. An unreadable flag
         # is allowed to raise: nobody could then say which clips are held out.
-        self._audit_records = read_audit_records(self.cfg.paths.csv)
+        self.audit = AuditHoldout.from_csv(self.cfg, self.cfg.paths.csv)
 
         work = self.cfg.paths.work_dir
         model_path, feat_path = work / MODEL_FILE, work / CLIP_FEATURES_FILE
@@ -1113,6 +1153,34 @@ class Suggester:
             f"window length it was trained at ({self.trained_window} frames)."
         )
 
+    def refuse_window_mismatch(self, length: int, context: str, reporter=None) -> None:
+        """Act on :meth:`window_problem`: refuse a mismatch, warn about silence.
+
+        ONE decision for every caller, because this is a train/serve-skew gate:
+        a second copy tightened on its own would let bulk prediction and
+        selection disagree about the same model file, and the looser path would
+        score on the wrong scale. A MISMATCH scores every row on a scale the
+        model has never seen and nothing downstream shows it, so it raises. An
+        UNRECORDED length is a model saved before the stamp existed, and
+        refusing those would invalidate every model anyone already has, so it
+        warns and the caller carries on.
+
+        ``context`` is the caller's trailing sentence, which is the actionable
+        half: this method is on the model and cannot know WHICH config key the
+        length was read from. ``reporter`` takes the warning where there is one,
+        :mod:`warnings` where there is not.
+        """
+        problem = self.window_problem(length)
+        if not problem:
+            return
+        if self.trained_window is None:
+            if reporter is None:
+                warnings.warn(problem, stacklevel=3)
+            else:
+                reporter.log(problem, "warning")
+            return
+        raise RuntimeError(f"{problem} {context}")
+
     def scale_problem(self, scales) -> str:
         """'' if this model may be scored at all of ``scales``, else why not.
 
@@ -1151,8 +1219,20 @@ class Suggester:
             "predict.window_scales."
         )
 
+    def refuse_scale_mismatch(self, scales, context: str) -> None:
+        """Act on :meth:`scale_problem`, the same shape as the window pair above.
+
+        Never a warning: a project only reaches here by typing
+        ``predict.window_scales`` into its config, and every scale's rows would
+        be averaged into the same per-frame posterior at unchanged confidence.
+        """
+        problem = self.scale_problem(scales)
+        if not problem:
+            return
+        raise RuntimeError(f"{problem} {context}")
+
     def is_audit_clip(self, clip_id: str) -> bool:
-        return is_audit_clip(clip_id, self.cfg, self._audit_records)
+        return clip_id in self.audit
 
     # ---------------------------------------------------------- selection -- #
     def selection_group(self) -> str:
@@ -1170,28 +1250,6 @@ class Suggester:
             if not group.is_multi and group.name in self.models:
                 return group.name
         return ""
-
-    def _refuse_window_mismatch(self, length: int) -> None:
-        """Refuse a model fitted at another window length; only warn if it never said.
-
-        The same split :func:`trackanno.predict._check_trained_window` makes. A
-        MISMATCH scores every clip in the batch on a scale the model has never
-        seen, and the ordering is the whole output, so there is nothing to
-        notice afterwards. An UNRECORDED length is a model saved before the
-        stamp existed, and refusing those would stop selection working on every
-        project that already has a model.
-        """
-        problem = self.window_problem(length)
-        if not problem:
-            return
-        if self.trained_window is None:
-            warnings.warn(problem, stacklevel=3)
-            return
-        raise RuntimeError(
-            f"{problem} The {length} frames are clips.frames, the length "
-            f"{CLIP_FEATURES_FILE} - the table every candidate in this batch is "
-            "scored from - was built over."
-        )
 
     def selection_batch(
         self, manifest: pd.DataFrame, done_ids: set[str], n: int
@@ -1244,8 +1302,14 @@ class Suggester:
         # Before any scoring: the features every candidate is scored from were
         # built over the annotation clip grid, whose windows are clips.frames
         # long, and a model fitted at another length ranks them on the wrong
-        # scale while reporting normal confidence.
-        self._refuse_window_mismatch(int(cfg.clips.frames))
+        # scale while reporting normal confidence. An ORDER carries no
+        # confidence number, so there is nothing to notice afterwards.
+        self.refuse_window_mismatch(
+            int(cfg.clips.frames),
+            f"The {int(cfg.clips.frames)} frames are clips.frames, the length "
+            f"{CLIP_FEATURES_FILE} - the table every candidate in this batch is "
+            "scored from - was built over.",
+        )
 
         gap = cfg.suggest.resolved_frame_gap(cfg.clips)
         ids = manifest["clip_id"].astype(str).to_numpy()
@@ -1267,8 +1331,7 @@ class Suggester:
         # `select_batch` removes them from the ranked pool itself and draws the
         # reserved slots from them. Filtering them here would leave it with
         # nothing to draw and silently turn the random stratum off.
-        audit = np.array([is_audit_clip(c, cfg, self._audit_records) for c in pool_ids],
-                         dtype=bool)
+        audit = np.array([c in self.audit for c in pool_ids], dtype=bool)
         n_audit = int((candidates & audit).sum())
         n_ranked = int((candidates & ~audit).sum())
 

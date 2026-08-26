@@ -283,7 +283,7 @@ def test_a_rule_returns_a_full_ordered_batch_with_a_reason_per_clip(root: Path) 
     than a record."""
     from trackanno.select import AUDIT_RULE, UNCERTAINTY_RULES
     from trackanno.store import decode_provenance, encode_provenance
-    from trackanno.suggest import is_audit_clip
+    from trackanno.suggest import AuditHoldout
 
     manifest = build_manifest()
     ids = manifest["clip_id"].astype(str).tolist()
@@ -338,8 +338,11 @@ def test_a_rule_returns_a_full_ordered_batch_with_a_reason_per_clip(root: Path) 
     # a plausible-looking n. Audit clips are excluded from the ranked pool by
     # design, and the diversity rule cannot bite on a non-overlapping grid.
     chosen = {r["clip_id"] for r in batch}
+    # Nothing is labelled in this project, so nothing records a membership and
+    # the ids are the whole answer - which is what the suggester read too.
+    holdout = AuditHoldout.by_hash(cfg)
     rest = [hand_margin(certainty[c]) for c in ids
-            if c not in chosen and c not in done and not is_audit_clip(c, cfg)]
+            if c not in chosen and c not in done and c not in holdout]
     check("no unselected candidate was more contested than a selected one",
           min(r["score"] for r in ranked) >= max(rest),
           f"{min(r['score'] for r in ranked)} vs {max(rest)}")
@@ -374,7 +377,7 @@ def test_audit_clips_are_drawn_at_the_configured_share(root: Path) -> None:
     subset stays a random sample of the audit set however good the selector
     gets."""
     from trackanno.select import AUDIT_RULE
-    from trackanno.suggest import is_audit_clip
+    from trackanno.suggest import AuditHoldout
 
     manifest = build_manifest()
     certainty = spread_certainty(manifest)
@@ -391,10 +394,13 @@ def test_audit_clips_are_drawn_at_the_configured_share(root: Path) -> None:
     check("which is the share of clips the project holds out",
           abs(len(drawn) / 20 - cfg.suggest.audit_fraction) < 1e-9,
           f"{len(drawn) / 20} vs {cfg.suggest.audit_fraction}")
+    # Nothing is labelled here, so nothing records a membership and the ids are
+    # the whole answer - which is what the suggester read too.
+    holdout = AuditHoldout.by_hash(cfg)
     check("every draw really is an audit clip",
-          all(is_audit_clip(r["clip_id"], cfg) for r in drawn))
+          all(r["clip_id"] in holdout for r in drawn))
     check("no audit clip reached the batch by being ranked",
-          not any(is_audit_clip(r["clip_id"], cfg) for r in batch
+          not any(r["clip_id"] in holdout for r in batch
                   if r["rule"] != AUDIT_RULE))
     check("a draw carries no score, because it was not scored",
           all(r["score"] is None for r in drawn), str([r["score"] for r in drawn]))
@@ -470,7 +476,7 @@ def test_a_batch_near_the_end_of_a_project_shrinks_instead_of_refusing(
 # track identity is per movie
 # --------------------------------------------------------------------------- #
 def _is_audit(clip_id: str, audit_seed: int = 12345, fraction: float = 0.10) -> bool:
-    """`suggest.is_audit_clip` for the default seeds, without a Config to hand."""
+    """`AuditHoldout` for the default seeds, without a Config to hand."""
     import hashlib
 
     digest = hashlib.blake2b(f"{audit_seed}:{clip_id}".encode(), digest_size=8).digest()

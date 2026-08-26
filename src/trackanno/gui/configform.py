@@ -4,7 +4,14 @@ The file stays the source of truth: saving goes through
 :func:`trackanno.project.write_config`, which rewrites values in place and keeps
 every comment. Each field's tooltip repeats the comment in the file, so the two
 cannot drift apart. Only settings a person actually turns are listed; anything
-absent from :data:`FIELDS` is left untouched rather than dropped.
+absent from :data:`GROUPS` is left untouched rather than dropped.
+
+The rows are grouped by what someone is trying to DO - set a project up, cut
+clips, annotate, train, predict, export - and not by the config section a key
+happens to live in. Several of the refusals in :func:`trackanno.config.load_config`
+span sections precisely because the settings do, so a layout that follows the
+sections shows coupled keys as independent rows and leaves the person to work
+out which of them the refusal is really about.
 """
 
 from __future__ import annotations
@@ -24,23 +31,478 @@ from qtpy.QtWidgets import (
 from ..project import _exists
 from .theme import compact_button
 
-__all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "FIELDS", "BASIC",
-           "NEEDS_REPREPARE", "HAS_STATUS"]
+__all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "GROUPS", "FIELDS",
+           "BASIC", "NEEDS_REPREPARE", "HAS_STATUS"]
+
+
+# --------------------------------------------------------------------------- #
+# options that belong to another module
+# --------------------------------------------------------------------------- #
+# Read from the registry that DEFINES them, never copied here: a copied list
+# rots silently in either direction - a rule added there never appears in the
+# form, and one removed there stays offered until somebody picks it and the
+# loader refuses the save.
+def _uncertainty_rules() -> list[str]:
+    from ..select import UNCERTAINTY_RULES
+
+    return ["off"] + sorted(UNCERTAINTY_RULES)
+
+
+def _target_rules() -> list[str]:
+    from ..select import TARGET_RULES
+
+    return sorted(TARGET_RULES)
+
+
+def _trackers() -> list[str]:
+    from ..tracking import TRACKERS
+
+    return sorted(TRACKERS) + ["greedy"]
+
+
+def _options(extra: dict) -> list[str]:
+    """A combo's items: from a registry where one exists, else the list given."""
+    source = extra.get("options_from")
+    return list(source()) if source is not None else list(extra.get("options", []))
+
+
+# --------------------------------------------------------------------------- #
+# the fields, grouped by what they are for
+# --------------------------------------------------------------------------- #
+# (title, what the group as a whole produces, [(section, key, kind, label,
+#  tooltip, extra), ...])
+GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
+    # -- setting a project up ----------------------------------------------- #
+    ("Project",
+     "Where the movies are, and where everything this project makes is written.",
+     [
+         ("paths", "video_dir", "dir", "video folder",
+          "Folder containing the movies. .tif/.tiff and .nd2 are both read natively.", {}),
+         ("paths", "model", "file", "detection model",
+          "YOLO weights used for detection (and pose, if detection.task is 'pose').",
+          {"filter": "PyTorch weights (*.pt);;All files (*)"}),
+         ("paths", "work_dir", "dir", "clip cache",
+          "Clip cache and per-movie tables. Keep this on a LOCAL disk: the GUI does "
+          "~1 MB random reads per clip and network latency is what you feel.", {}),
+         ("paths", "csv", "file", "annotation csv",
+          "The annotation log; one row per annotated clip. This file is the state - "
+          "any clip whose id appears in it is done.",
+          {"filter": "CSV (*.csv);;All files (*)", "save": True}),
+         ("paths", "patterns", "strlist", "file patterns",
+          "Which files in the video folder count as movies.", {}),
+     ]),
+
+    ("Finding the animals",
+     "One detector pass per frame, and what it runs on.",
+     [
+         ("detection", "task", "choice", "task",
+          "'pose' if the model predicts keypoints, 'detect' if it only gives boxes. "
+          "Choosing 'pose' needs the keypoint names below; the button fills them in "
+          "from the model file.",
+          {"options": ["detect", "pose"]}),
+         ("detection", "device", "choice", "compute device",
+          "'auto' picks the best available and falls back to the CPU if there is no "
+          "GPU here, which is what makes a project portable between machines. The "
+          "list is filled in from this computer.",
+          {"options": ["auto", "cpu"]}),
+         ("detection", "imgsz", "int", "inference size",
+          "The resolution each tile is seen at. Match what the model was trained "
+          "for - changing it changes what the model detects.",
+          {"min": 64, "max": 4096, "step": 32}),
+         ("detection", "conf", "float", "confidence",
+          "Minimum detection confidence.", {"min": 0.0, "max": 1.0, "step": 0.05}),
+         ("detection", "iou", "float", "NMS IoU",
+          "Per-tile non-maximum-suppression threshold.", {"min": 0.0, "max": 1.0, "step": 0.05}),
+         ("detection", "batch", "int", "batch",
+          "Tiles per forward pass. Lower this first if CUDA runs out of memory.",
+          {"min": 1, "max": 64}),
+         ("detection", "max_det", "int", "max detections",
+          "Cap on detections per tile.", {"min": 1, "max": 5000, "step": 50}),
+         ("detection", "half", "bool", "fp16 inference",
+          "Half-precision inference. Faster on most GPUs, unsupported on CPU.", {}),
+     ]),
+
+    ("Frames larger than the model",
+     "A frame wider than one tile is cut up, run as a batch and merged back "
+     "together. 'tile size' is how the frame is CUT; 'inference size' above is "
+     "the resolution each tile is SEEN at.",
+     [
+         ("tiling", "enabled", "tristate", "tiling",
+          "'auto' tiles only frames larger than one tile; on and off force it.", {}),
+         ("tiling", "tile", "int", "tile size",
+          "How the frame is cut. Keep the ratio to the inference size that the "
+          "model was trained for.", {"min": 64, "max": 4096, "step": 32}),
+         ("tiling", "overlap", "float", "tile overlap",
+          "Fraction of a tile shared with its neighbour.",
+          {"min": 0.0, "max": 0.89, "step": 0.05}),
+         ("tiling", "merge_iou", "float", "merge IoU",
+          "Global NMS threshold when merging tiles back together.",
+          {"min": 0.0, "max": 1.0, "step": 0.05}),
+     ]),
+
+    ("Joining detections into tracks",
+     "One track is one animal followed through the movie. Every clip is cut "
+     "from a single track, so a tracker that swaps two animals cuts a clip of "
+     "both.",
+     [
+         ("tracking", "backend", "choice", "tracker",
+          "tracktrack is built for crowded scenes with frequent occlusion; greedy is "
+          "a nearest-centroid fallback that is adequate at high frame rates.",
+          {"options_from": _trackers}),
+         ("tracking", "min_track_length", "int", "min track length",
+          "Drop tracks seen in fewer frames than this. Must not exceed the number of "
+          "frames actually processed.", {"min": 1, "max": 100000}),
+         ("tracking", "greedy_max_dist_px", "float", "greedy max distance",
+          "Only used by the greedy fallback tracker.", {"min": 1.0, "max": 500.0, "step": 5.0}),
+     ]),
+
+    # -- cutting clips ------------------------------------------------------- #
+    ("Clip windows",
+     "A clip is 'clip length' frames of one track, and the grid steps by "
+     "'stride'. The two together decide how much of each movie you are asked "
+     "about, and they are also what the dense prediction grid under Bulk "
+     "labelling defaults to.",
+     [
+         ("clips", "frames", "int", "clip length",
+          "Frames per clip - the unit you actually judge, and the window length the "
+          "suggestion model is fitted at.", {"min": 2, "max": 10000}),
+         ("clips", "stride", "int", "stride",
+          "Spacing between windows. Equal to the clip length means non-overlapping.",
+          {"min": 1, "max": 10000}),
+         ("clips", "window_mode", "choice", "how much to cut",
+          "first: only the movie's first window. first_per_track: the first full "
+          "window of each track. all: every non-overlapping window of every track.",
+          {"options": ["all", "first_per_track", "first"]}),
+         ("clips", "min_clip_frames", "int", "min detected frames",
+          "A window needs this many detected frames to become a clip.",
+          {"min": 1, "max": 10000}),
+         ("clips", "max_clips_per_track", "int", "max clips per track",
+          "0 means unlimited.", {"min": 0, "max": 10000}),
+     ]),
+
+    ("What a clip shows",
+     "The crop that follows the animal, and how raw frames become 8-bit.",
+     [
+         ("clips", "follow", "choice", "crop follows",
+          "track: re-centred every frame - smallest crop, translation invisible. "
+          "smooth: follows a moving average. fixed: one crop for the window.",
+          {"options": ["smooth", "track", "fixed"]}),
+         ("clips", "pad", "float", "crop padding",
+          "Crop side = the per-frame box extent times this.",
+          {"min": 1.0, "max": 8.0, "step": 0.1}),
+         ("clips", "crop_size", "autonum", "cache crop size",
+          "'auto' takes the 99th percentile of the required sizes, rounded to a "
+          "multiple of 16, and is only known once the movies have been scanned. "
+          "A number forces it.", {"min": 16, "max": 1024, "step": 16}),
+         ("clips", "max_size", "int", "max crop size",
+          "Cap for auto. Larger crops are downscaled and their scale recorded.",
+          {"min": 32, "max": 1024, "step": 16}),
+         ("clips", "context_tracks", "bool", "record neighbours",
+          "Record neighbouring tracks that fall inside the crop, so they can be "
+          "outlined on demand.", {}),
+         ("clips", "thumbnails", "bool", "full-frame thumbnails",
+          "Needed for the context minimap. Costs about 65 kB per clip.", {}),
+         ("normalize", "mode", "choice", "intensity mapping",
+          "per_frame: own mapping per frame (flattest). smooth: corrects slow drift "
+          "only. fixed: one mapping for the movie, faithful including flicker.",
+          {"options": ["per_frame", "smooth", "fixed", "none"]}),
+         ("normalize", "percentiles", "floatpair", "percentiles",
+          "Low and high percentile mapped to 0 and 255.", {}),
+         ("normalize", "smooth_window", "int", "smooth window",
+          "Samples in the rolling median (smooth mode only).", {"min": 1, "max": 999}),
+     ]),
+
+    # -- annotating ---------------------------------------------------------- #
+    ("Annotating",
+     "How the clips are handed over, and who is judging them.",
+     [
+         ("ui", "annotator", "text", "annotator name",
+          "Written into every row of the CSV.", {}),
+         ("ui", "fps", "int", "playback fps",
+          "How fast the clip loops in the GUI - not the acquisition rate.",
+          {"min": 1, "max": 120}),
+         ("ui", "auto_advance", "bool", "auto-advance",
+          "One keypress labels the clip and jumps to the next, once every required "
+          "group is filled.", {}),
+         ("ui", "shuffle", "bool", "shuffle clip order",
+          "Seeded random order. Going movie-by-movie invites order effects - you "
+          "calibrate on the first movie and drift.", {}),
+         ("ui", "resume", "choice", "on open, go to",
+          "Where the session resumes.",
+          {"options": ["first_unannotated", "last_position"]}),
+         ("ui", "theme", "choice", "appearance",
+          "dark, light, or follow the desktop.",
+          {"options": ["dark", "light", "system"]}),
+     ]),
+
+    ("What is drawn on the clip",
+     "Which animal the clip is about, and how closely the view follows it.",
+     [
+         ("ui", "follow", "choice", "view follows",
+          "centred: one view on the track's median position, all motion visible. "
+          "smooth: drift removed, beat kept. locked: re-centred every frame.",
+          {"options": ["centred", "smooth", "locked"]}),
+         ("ui", "view_zoom", "float", "view zoom",
+          "Magnification into the crop. 1.0 shows the whole crop.",
+          {"min": 1.0, "max": 4.0, "step": 0.25}),
+         ("ui", "show_overlay", "bool", "show the marker",
+          "Outline the animal this clip is about.", {}),
+         ("ui", "show_context_tracks", "bool", "outline neighbours too",
+          "Off by default: the marker's job is to say which animal is being judged.", {}),
+         ("ui", "show_skeleton", "bool", "show keypoints",
+          "Draw the pose skeleton on top of the marker.", {}),
+     ]),
+
+    ("Curvature kymograph",
+     "The flagellum's shape along its length against time, drawn under the "
+     "clip. Needs keypoints, so it only appears on a pose project.",
+     [
+         ("ui", "show_kymograph", "bool", "show curvature kymograph",
+          "Plot the flagellum's curvature along its length against time, under the "
+          "clip. Needs keypoints, so it only appears on a pose project.", {}),
+         ("ui", "kymo_field", "choice", "kymograph shows",
+          "curvature (dpsi/ds, a second derivative: sharper but noisier) or the "
+          "tangent angle psi itself (first order, unwrapped along the flagellum and "
+          "over time). They are the same beat seen two standard ways.",
+          {"options": ["curvature", "tangent"]}),
+         ("ui", "kymo_sign", "choice", "kymograph sign",
+          "A 2D image cannot tell a cell from its mirror image, so the same beat can "
+          "come out blue in one clip and red in the next. 'canonical' flips each clip "
+          "so its static curvature is positive when that is decidable, 'raw' leaves "
+          "it as measured, 'absolute' drops the sign entirely.",
+          {"options": ["canonical", "raw", "absolute"]}),
+         ("ui", "kymo_interpolate", "bool", "smooth the kymograph",
+          "Filter the kymograph when it is drawn. Off shows the raw sample grid - "
+          "one hard-edged block per frame - which is what you want when judging "
+          "whether a track is noisy.", {}),
+         ("ui", "kymo_smooth_px", "float", "kymograph fit tolerance",
+          "How far the fitted centreline may pull away from each keypoint, in "
+          "pixels. Curvature is a second derivative, so too little turns tracking "
+          "jitter into stripes that are not there and too much flattens a real beat.",
+          {"min": 0.0, "max": 5.0, "step": 0.1}),
+     ]),
+
+    # -- training the suggester ---------------------------------------------- #
+    ("Suggesting a label",
+     "A classifier trained on your own labels, shown beside the clip and never "
+     "pre-selected. It stays silent until it clears the bars below.",
+     [
+         ("suggest", "enabled", "bool", "suggest labels",
+          "Show what a classifier trained on your labels predicts. Displayed only, "
+          "never pre-selected.", {}),
+         ("suggest", "model", "choice", "classifier",
+          "catboost, the default, handles the lopsided label distribution and NaN "
+          "natively; hist is scikit-learn's HistGradientBoosting.",
+          {"options": ["catboost", "hist"]}),
+         ("suggest", "feature_groups", "groups", "features the model may use",
+          "Which families of measurement the classifier is allowed to see. Groups "
+          "that this project cannot compute are disabled with the reason.", {}),
+         ("suggest", "min_confidence", "float", "minimum confidence",
+          "A near-uniform posterior is noise with a number attached, and it still "
+          "anchors the annotator. Below this, say nothing.",
+          {"min": 0.0, "max": 1.0, "step": 0.05}),
+         ("suggest", "retrain_every", "int", "retrain every N labels",
+          "How many new labels trigger a background refit.", {"min": 1, "max": 1000}),
+         ("suggest", "min_per_class", "int", "min labels per class",
+          "A class with fewer labels than this is not modelled.", {"min": 1, "max": 1000}),
+         ("suggest", "min_macro_f1", "float", "min macro-F1",
+          "The model stays silent below this cross-validated score.",
+          {"min": 0.0, "max": 1.0, "step": 0.05}),
+         ("suggest", "seed", "int", "random seed",
+          "Fixes the cross-validation split and the model fit.", {"min": 0, "max": 10**6}),
+     ]),
+
+    ("How the model is fitted",
+     "Hyperparameters, shared by both classifiers so switching model does not "
+     "quietly change the fit as well.",
+     [
+         ("suggest", "iterations", "int", "boosting iterations",
+          "More iterations fit harder. 400 is a sensible default for a few hundred "
+          "labelled clips.", {"min": 10, "max": 5000, "step": 50}),
+         ("suggest", "depth", "int", "tree depth",
+          "CatBoost trees are symmetric, so depth alone sets the width: 2**depth "
+          "leaves. Past 6 it overfits a hand-labelled set fast.", {"min": 1, "max": 10}),
+         ("suggest", "learning_rate", "float", "learning rate",
+          "Smaller learns more slowly and generalises better, given enough "
+          "iterations.", {"min": 0.005, "max": 1.0, "step": 0.01, "decimals": 3}),
+         ("suggest", "l2_leaf_reg", "float", "L2 regularisation",
+          "Higher values penalise large leaf values, which helps on small label "
+          "sets.", {"min": 0.0, "max": 30.0, "step": 0.5}),
+         ("suggest", "balance_classes", "bool", "balance the classes",
+          "Weight the loss by inverse class frequency. Without it the model answers "
+          "a lopsided label set by predicting the dominant state.", {}),
+         ("suggest", "pca_components", "int", "CNN components",
+          "The CNN embeddings are reduced to this many components before they meet "
+          "the labels. Only used when the CNN group is selected.",
+          {"min": 2, "max": 256, "step": 2}),
+     ]),
+
+    ("Measuring the model against yourself",
+     "A share of clips that never shows a suggestion and is never trained on, "
+     "so human-vs-model agreement stays measurable on clips the model has not "
+     "seen. This is why a confident model still says nothing on roughly one "
+     "clip in ten.",
+     [
+         ("suggest", "audit_fraction", "float", "audit holdout",
+          "Share of clips that never show a suggestion and are never trained on, so "
+          "human-vs-model agreement stays measurable. Set it to 0 to suggest on "
+          "every clip and give up the measure.",
+          {"min": 0.0, "max": 0.9, "step": 0.05}),
+         ("suggest", "audit_visible", "bool", "say when a clip is held out",
+          "Mark held-out clips on screen instead of just showing nothing. Off by "
+          "default: knowing a clip is being audited can change how carefully it is "
+          "judged, which is the very influence the holdout exists to exclude. Turn "
+          "it on if silent clips are more confusing than that bias is costly.", {}),
+     ]),
+
+    ("Which clip you are asked about next",
+     "'off' hands clips over in the GUI's shuffled order, so the labelled set "
+     "stays a random sample of the project. Any rule lets the model choose "
+     "instead: fewer labels for the same model, and a labelled set assembled to "
+     "be HARD, so accuracy measured on it reads lower than the truth.",
+     [
+         ("suggest", "select_rule", "choice", "choose the next clip by",
+          "'off' hands clips over in the GUI's own shuffled order, so the labelled "
+          "set stays a random sample of the project and every number computed over "
+          "it - the class balance, the cross-validated F1 - is a statement about "
+          "your data. Any other value lets the model pick instead: it ranks the "
+          "unlabelled clips by how unsure it is and gives you the ones a label would "
+          "teach it most, which saves your time and makes the labelled set one "
+          "assembled to be HARD, so accuracy measured on it reads lower than the "
+          "truth by an amount nobody can work out afterwards. margin reads the gap "
+          "between the model's top two answers, least_confidence only the top one, "
+          "entropy the whole vector and so mostly its tail.",
+          {"options_from": _uncertainty_rules}),
+         ("suggest", "select_batch_size", "int", "clips per batch",
+          "How many clips one ranking pass hands over. Twice 'retrain every N "
+          "labels' by default, so a batch outlives the refit that produced it, and "
+          "big enough that the audit share below is a whole slot rather than "
+          "rounding to no draw at all.", {"min": 1, "max": 1000}),
+         ("suggest", "select_audit_share", "autonum", "audit share of a batch",
+          "Share of each batch drawn at random from the audit holdout instead of "
+          "being ranked. 'auto' is the audit holdout above, so the labelled audit "
+          "set keeps growing at the rate the project holds audit clips; anything "
+          "else and the one unbiased accuracy in the tool starts describing a "
+          "differently composed sample from the one it names.",
+          {"numeric": "float", "min": 0.0, "max": 1.0, "step": 0.05}),
+         ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
+          "Two clips of the same track must start this many frames apart before "
+          "both can be in one batch. 'auto' is the clip length: closer than that "
+          "they overlap, which is the same footage judged twice. 0 turns it off.",
+          {"min": 0, "max": 100000}),
+         ("suggest", "select_target_quota", "int", "labels a class is chased to",
+          "Labels a class needs before batch slots go hunting for it. 0 is off, and "
+          "off even with a rule set: filling a rare class deliberately skews the "
+          "label balance, and the reliability gate (Cohen's kappa, the majority "
+          "baseline) is computed against that balance - so a targeted run can turn "
+          "the suggester silent on a model that has not changed.",
+          {"min": 0, "max": 100000}),
+         ("suggest", "select_target_rule", "choice", "how a starved class is chased",
+          "target_runner_up picks clips where the starved class is the model's "
+          "SECOND choice - the boundary between it and its rival, the only place a "
+          "label moves the decision surface - and fills the class slowly, since many "
+          "come back as the other class. target_confident picks clips the model "
+          "already calls that class: fastest to fill the count, and it only ever "
+          "confirms what the model already believes.",
+          {"options_from": _target_rules}),
+     ]),
+
+    # -- predicting ---------------------------------------------------------- #
+    ("Bulk labelling",
+     "One decision, not nine. The window length, how far the grid steps, how "
+     "many lengths it is scored at and what turns the result back into one "
+     "label per frame all have to agree: a tiling grid needs no decode, while "
+     "overlapping windows and several scales each need one, and several scales "
+     "also need a model fitted on columns that do not scale with the window. "
+     "The project refuses to open on any combination that does not, naming "
+     "whichever key it reached first.",
+     [
+         ("predict", "coverage", "choice", "what is scored",
+          "dense lays its own window grid over every frame of every track. manifest "
+          "scores exactly the clips that were cut for annotation, so everything "
+          "between two annotation windows stays unlabelled and unpainted.",
+          {"options": ["dense", "manifest"]}),
+         ("predict", "window_frames", "autonum", "dense window length",
+          "Frames per dense prediction window. 'auto' is min(clip length, stride), "
+          "which only resolves while the clips tile; with overlapping clips write "
+          "the clip length here. Changing it changes what the features MEAN, so a "
+          "length the model was not fitted at is train/serve skew.",
+          {"min": 1, "max": 100000}),
+         ("predict", "window_stride", "autonum", "dense window stride",
+          "How far the dense grid advances. 'auto' follows the window length, which "
+          "tiles. Anything smaller overlaps and needs a decode; anything larger is "
+          "refused, since it leaves unscored gaps.", {"min": 1, "max": 100000}),
+         ("predict", "window_scales", "intlist", "extra window lengths",
+          "Every window LENGTH to score at, the dense window length included. Empty "
+          "is the single length above. A shorter scale finds a behaviour too brief "
+          "for one window; a longer one stops a long bout being cut into verdicts "
+          "that disagree. Costs a feature build per scale, needs a decode, and needs "
+          "the length-invariant feature scope below.",
+          {"min": 1, "placeholder": "empty, or 25, 50, 100"}),
+         ("suggest", "feature_scope", "choice", "columns the model is fitted on",
+          "all: every column the feature groups selected. length_invariant: only "
+          "the columns whose value does not scale with the window length, which is "
+          "what lets ONE model be scored at several window lengths. It costs real "
+          "signal, so it is opted into. Changing it means retraining.",
+          {"options": ["all", "length_invariant"]}),
+         ("predict", "decode", "choice", "turn windows into bouts",
+          "none: one row per window. min_bout: absorb runs shorter than the floor "
+          "below. viterbi: the most likely label sequence under a sticky prior.",
+          {"options": ["none", "min_bout", "viterbi"]}),
+         ("predict", "min_bout_frames", "int", "shortest bout",
+          "Frames a bout must reach under min_bout. A claim about the ANIMAL: the "
+          "briefest episode you would accept as real. Must be at least 2; 0 and 1 "
+          "exclude nothing.", {"min": 0, "max": 100000}),
+         ("predict", "self_transition", "autonum", "stickiness",
+          "viterbi only: the probability that a frame keeps the previous frame's "
+          "label. 'auto' is 1 - 1/shortest bout, the stickiness whose average run "
+          "is that long. 0 and 1 are both refused.",
+          {"numeric": "float", "min": 0.001, "max": 0.999, "step": 0.01, "decimals": 3}),
+         ("predict", "min_frames", "int", "detections a window needs",
+          "Detections a dense window needs before its features mean anything. 2 is "
+          "the floor at which any motion feature can exist. Not the clip minimum, "
+          "which exists to give an annotator a watchable video.",
+          {"min": 1, "max": 100000}),
+         ("predict", "save_posteriors", "bool", "keep the per-frame posterior",
+          "Write the per-frame posterior beside the predictions. One row per frame "
+          "per track rather than one per window, so it dwarfs predictions.parquet; "
+          "mostly worth keeping while tuning a decode.", {}),
+     ]),
+
+    # -- exporting ----------------------------------------------------------- #
+    ("Overlay movies",
+     "The rendered movie, with each track painted by the label it carries.",
+     [
+         ("render", "out_dir", "dir", "render output",
+          "Where overlay movies are written.", {}),
+         ("render", "hide_unlabelled", "bool", "hide unlabelled tracks",
+          "Draw only tracks that carry an annotation.", {}),
+         ("render", "show_track_id", "bool", "show track ids",
+          "Label each box with its track id.", {}),
+         ("render", "quality", "int", "video quality",
+          "imageio quality, 1-10.", {"min": 1, "max": 10}),
+     ]),
+]
+
+# The flat view, for anything that wants the fields without their grouping.
+FIELDS: list[tuple[str, str, str, str, str, dict]] = [
+    field for _title, _blurb, fields in GROUPS for field in fields
+]
 
 # The settings someone setting up a project has to decide. Everything else is a
-# tuning knob with a defensible default.
+# tuning knob with a defensible default. Filtered per field, not per group, so
+# both tabs keep their group headings and no key appears twice.
 BASIC = {
     "paths.video_dir", "paths.model", "paths.work_dir", "paths.csv",
     "detection.task", "detection.device",
-    "tiff.fps",
-    "clips.frames", "clips.window_mode", "clips.follow", "clips.pad",
     "tracking.min_track_length",
+    "clips.frames", "clips.stride", "clips.window_mode", "clips.follow", "clips.pad",
     "ui.fps", "ui.annotator", "ui.auto_advance", "ui.shuffle", "ui.theme",
 }
 
 # Fields that need a second line under the row for something the value alone
 # cannot say. paths.model has its own (see :class:`_PathField`).
-HAS_STATUS = {"detection.device"}
+HAS_STATUS = {"detection.device", "clips.stride"}
 
 # Changing these invalidates a clip cache that has already been built.
 NEEDS_REPREPARE = {
@@ -55,332 +517,11 @@ NEEDS_REPREPARE = {
     "paths.video_dir", "paths.model", "keypoints.nodes",  # via KeypointEditor
 }
 
-# (section, key, kind, label, tooltip, extra)
-FIELDS: list[tuple[str, str, str, str, str, dict]] = [
-    # -- paths --
-    ("paths", "video_dir", "dir", "video folder",
-     "Folder containing the movies. .tif/.tiff and .nd2 are both read natively.", {}),
-    ("paths", "model", "file", "detection model",
-     "YOLO weights used for detection (and pose, if detection.task is 'pose').",
-     {"filter": "PyTorch weights (*.pt);;All files (*)"}),
-    ("paths", "work_dir", "dir", "clip cache",
-     "Clip cache and per-movie tables. Keep this on a LOCAL disk: the GUI does "
-     "~1 MB random reads per clip and network latency is what you feel.", {}),
-    ("paths", "csv", "file", "annotation csv",
-     "The annotation log; one row per annotated clip. This file is the state - "
-     "any clip whose id appears in it is done.",
-     {"filter": "CSV (*.csv);;All files (*)", "save": True}),
-    ("paths", "patterns", "strlist", "file patterns",
-     "Which files in the video folder count as movies.", {}),
-
-    # -- detection --
-    ("detection", "task", "choice", "task",
-     "'pose' if the model predicts keypoints, 'detect' if it only gives boxes. "
-     "Choosing 'pose' needs the keypoint names below; the button fills them in "
-     "from the model file.",
-     {"options": ["detect", "pose"]}),
-    ("detection", "device", "choice", "compute device",
-     "'auto' picks the best available and falls back to the CPU if there is no "
-     "GPU here, which is what makes a project portable between machines. The "
-     "list is filled in from this computer.",
-     {"options": ["auto", "cpu"]}),
-    ("detection", "imgsz", "int", "inference size",
-     "The resolution each tile is seen at. Match what the model was trained "
-     "for - changing it changes what the model detects.", {"min": 64, "max": 4096, "step": 32}),
-    ("detection", "conf", "float", "confidence",
-     "Minimum detection confidence.", {"min": 0.0, "max": 1.0, "step": 0.05}),
-    ("detection", "iou", "float", "NMS IoU",
-     "Per-tile non-maximum-suppression threshold.", {"min": 0.0, "max": 1.0, "step": 0.05}),
-    ("detection", "batch", "int", "batch",
-     "Tiles per forward pass. Lower this first if CUDA runs out of memory.",
-     {"min": 1, "max": 64}),
-    ("detection", "max_det", "int", "max detections",
-     "Cap on detections per tile.", {"min": 1, "max": 5000, "step": 50}),
-    ("detection", "half", "bool", "fp16 inference",
-     "Half-precision inference. Faster on most GPUs, unsupported on CPU.", {}),
-
-    # -- tiling --
-    ("tiling", "enabled", "scalar", "tiling",
-     "'auto' tiles only frames larger than one tile; true/false force it.", {}),
-    ("tiling", "tile", "int", "tile size",
-     "How the frame is CUT. detection.imgsz is the resolution each tile is SEEN "
-     "at; keep the ratio the model was trained for.", {"min": 64, "max": 4096, "step": 32}),
-    ("tiling", "overlap", "float", "tile overlap",
-     "Fraction of a tile shared with its neighbour.", {"min": 0.0, "max": 0.89, "step": 0.05}),
-    ("tiling", "merge_iou", "float", "merge IoU",
-     "Global NMS threshold when merging tiles back together.",
-     {"min": 0.0, "max": 1.0, "step": 0.05}),
-
-    # -- tracking --
-    ("tracking", "backend", "choice", "tracker",
-     "tracktrack is built for crowded scenes with frequent occlusion; greedy is "
-     "a nearest-centroid fallback that is adequate at high frame rates.",
-     {"options": ["bytetrack", "botsort", "tracktrack", "ocsort", "deepocsort",
-                  "fasttrack", "greedy"]}),
-    ("tracking", "min_track_length", "int", "min track length",
-     "Drop tracks seen in fewer frames than this. Must not exceed the number of "
-     "frames actually processed.", {"min": 1, "max": 100000}),
-    ("tracking", "greedy_max_dist_px", "float", "greedy max distance",
-     "Only used by the greedy fallback tracker.", {"min": 1.0, "max": 500.0, "step": 5.0}),
-
-    # -- normalize --
-    ("normalize", "mode", "choice", "intensity mapping",
-     "per_frame: own mapping per frame (flattest). smooth: corrects slow drift "
-     "only. fixed: one mapping for the movie, faithful including flicker.",
-     {"options": ["per_frame", "smooth", "fixed", "none"]}),
-    ("normalize", "percentiles", "floatpair", "percentiles",
-     "Low and high percentile mapped to 0 and 255.", {}),
-    ("normalize", "smooth_window", "int", "smooth window",
-     "Samples in the rolling median (smooth mode only).", {"min": 1, "max": 999}),
-
-    # -- clips --
-    ("clips", "frames", "int", "clip length",
-     "Frames per clip - the unit you actually judge.", {"min": 2, "max": 10000}),
-    ("clips", "stride", "int", "stride",
-     "Spacing between windows. Equal to the clip length means non-overlapping.",
-     {"min": 1, "max": 10000}),
-    # -- predict --
-    # The fields load_config names when it refuses an overlapping grid, which
-    # clips.frames and clips.stride on this same form can produce.
-    ("predict", "window_frames", "autonum", "dense window length",
-     "Frames per dense prediction window. 'auto' is min(clip length, stride), "
-     "which only resolves while the clips tile; with overlapping clips write "
-     "the clip length here.", {}),
-    ("predict", "window_stride", "autonum", "dense window stride",
-     "How far the dense grid advances. 'auto' follows the window length, which "
-     "tiles. Anything smaller overlaps and needs a decode.", {}),
-    ("predict", "decode", "choice", "turn windows into bouts",
-     "none: one row per window. min_bout: absorb runs shorter than the floor "
-     "below. viterbi: the most likely label sequence under a sticky prior.",
-     {"options": ["none", "min_bout", "viterbi"]}),
-    ("predict", "min_bout_frames", "int", "shortest bout",
-     "Frames a bout must reach under min_bout. Must be at least 2; 0 and 1 "
-     "exclude nothing.", {"min": 0, "max": 100000}),
-    ("clips", "window_mode", "choice", "how much to cut",
-     "first: only the movie's first window. first_per_track: the first full "
-     "window of each track. all: every non-overlapping window of every track.",
-     {"options": ["all", "first_per_track", "first"]}),
-    ("clips", "follow", "choice", "crop follows",
-     "track: re-centred every frame - smallest crop, translation invisible. "
-     "smooth: follows a moving average. fixed: one crop for the window.",
-     {"options": ["smooth", "track", "fixed"]}),
-    ("clips", "pad", "float", "crop padding",
-     "Crop side = the per-frame box extent times this.", {"min": 1.0, "max": 8.0, "step": 0.1}),
-    ("clips", "crop_size", "scalar", "cache crop size",
-     "'auto' takes the 99th percentile of the required sizes, rounded to a "
-     "multiple of 16. A number forces it.", {}),
-    ("clips", "max_size", "int", "max crop size",
-     "Cap for auto. Larger crops are downscaled and their scale recorded.",
-     {"min": 32, "max": 1024, "step": 16}),
-    ("clips", "min_clip_frames", "int", "min detected frames",
-     "A window needs this many detected frames to become a clip.", {"min": 1, "max": 10000}),
-    ("clips", "max_clips_per_track", "int", "max clips per track",
-     "0 means unlimited.", {"min": 0, "max": 10000}),
-    ("clips", "context_tracks", "bool", "record neighbours",
-     "Record neighbouring tracks that fall inside the crop, so they can be "
-     "outlined on demand.", {}),
-    ("clips", "thumbnails", "bool", "full-frame thumbnails",
-     "Needed for the context minimap. Costs about 65 kB per clip.", {}),
-
-    # -- ui --
-    ("ui", "fps", "int", "playback fps",
-     "How fast the clip loops in the GUI - not the acquisition rate.",
-     {"min": 1, "max": 120}),
-    ("ui", "follow", "choice", "view follows",
-     "centred: one view on the track's median position, all motion visible. "
-     "smooth: drift removed, beat kept. locked: re-centred every frame.",
-     {"options": ["centred", "smooth", "locked"]}),
-    ("ui", "view_zoom", "float", "view zoom",
-     "Magnification into the crop. 1.0 shows the whole crop.",
-     {"min": 1.0, "max": 4.0, "step": 0.25}),
-    ("ui", "show_overlay", "bool", "show the marker",
-     "Outline the animal this clip is about.", {}),
-    ("ui", "show_context_tracks", "bool", "outline neighbours too",
-     "Off by default: the marker's job is to say which animal is being judged.", {}),
-    ("ui", "show_skeleton", "bool", "show keypoints",
-     "Draw the pose skeleton on top of the marker.", {}),
-    ("ui", "show_kymograph", "bool", "show curvature kymograph",
-     "Plot the flagellum's curvature along its length against time, under the "
-     "clip. Needs keypoints, so it only appears on a pose project.", {}),
-    ("ui", "kymo_interpolate", "bool", "smooth the kymograph",
-     "Filter the kymograph when it is drawn. Off shows the raw sample grid - "
-     "one hard-edged block per frame - which is what you want when judging "
-     "whether a track is noisy.", {}),
-    ("ui", "kymo_field", "choice", "kymograph shows",
-     "curvature (dpsi/ds, a second derivative: sharper but noisier) or the "
-     "tangent angle psi itself (first order, unwrapped along the flagellum and "
-     "over time). They are the same beat seen two standard ways.",
-     {"options": ["curvature", "tangent"]}),
-    ("ui", "kymo_sign", "choice", "kymograph sign",
-     "A 2D image cannot tell a cell from its mirror image, so the same beat can "
-     "come out blue in one clip and red in the next. 'canonical' flips each clip "
-     "so its static curvature is positive when that is decidable, 'raw' leaves "
-     "it as measured, 'absolute' drops the sign entirely.",
-     {"options": ["canonical", "raw", "absolute"]}),
-    ("ui", "kymo_smooth_px", "float", "kymograph fit tolerance",
-     "How far the fitted centreline may pull away from each keypoint, in "
-     "pixels. Curvature is a second derivative, so too little turns tracking "
-     "jitter into stripes that are not there and too much flattens a real beat.",
-     {"min": 0.0, "max": 5.0, "step": 0.1}),
-    ("ui", "auto_advance", "bool", "auto-advance",
-     "One keypress labels the clip and jumps to the next, once every required "
-     "group is filled.", {}),
-    ("ui", "shuffle", "bool", "shuffle clip order",
-     "Seeded random order. Going movie-by-movie invites order effects - you "
-     "calibrate on the first movie and drift.", {}),
-    ("ui", "resume", "choice", "on open, go to",
-     "Where the session resumes.",
-     {"options": ["first_unannotated", "last_position"]}),
-    ("ui", "annotator", "text", "annotator name",
-     "Written into every row of the CSV.", {}),
-    ("ui", "theme", "choice", "appearance",
-     "dark, light, or follow the desktop.",
-     {"options": ["dark", "light", "system"]}),
-
-    # -- suggest --
-    ("suggest", "enabled", "bool", "suggest labels",
-     "Show what a classifier trained on your labels predicts. Displayed only, "
-     "never pre-selected.", {}),
-    ("suggest", "retrain_every", "int", "retrain every N labels",
-     "How many new labels trigger a background refit.", {"min": 1, "max": 1000}),
-    ("suggest", "min_per_class", "int", "min labels per class",
-     "A class with fewer labels than this is not modelled.", {"min": 1, "max": 1000}),
-    ("suggest", "min_macro_f1", "float", "min macro-F1",
-     "The model stays silent below this cross-validated score.",
-     {"min": 0.0, "max": 1.0, "step": 0.05}),
-    ("suggest", "feature_groups", "groups", "features the model may use",
-     "Which families of measurement the classifier is allowed to see. Groups "
-     "that this project cannot compute are disabled with the reason.", {}),
-    ("suggest", "model", "choice", "classifier",
-     "catboost, the default, handles the lopsided label distribution and NaN "
-     "natively; hist is scikit-learn's HistGradientBoosting.",
-     {"options": ["catboost", "hist"]}),
-    ("suggest", "balance_classes", "bool", "balance the classes",
-     "Weight the loss by inverse class frequency. Without it the model answers "
-     "a lopsided label set by predicting the dominant state.", {}),
-    ("suggest", "iterations", "int", "boosting iterations",
-     "More iterations fit harder. 400 is a sensible default for a few hundred "
-     "labelled clips.", {"min": 10, "max": 5000, "step": 50}),
-    ("suggest", "depth", "int", "tree depth",
-     "CatBoost trees are symmetric, so depth alone sets the width: 2**depth "
-     "leaves. Past 6 it overfits a hand-labelled set fast.", {"min": 1, "max": 10}),
-    ("suggest", "learning_rate", "float", "learning rate",
-     "Smaller learns more slowly and generalises better, given enough "
-     "iterations.", {"min": 0.005, "max": 1.0, "step": 0.01, "decimals": 3}),
-    ("suggest", "l2_leaf_reg", "float", "L2 regularisation",
-     "Higher values penalise large leaf values, which helps on small label "
-     "sets.", {"min": 0.0, "max": 30.0, "step": 0.5}),
-    ("suggest", "pca_components", "int", "CNN components",
-     "The CNN embeddings are reduced to this many components before they meet "
-     "the labels. Only used when the CNN group is selected.",
-     {"min": 2, "max": 256, "step": 2}),
-    ("suggest", "min_confidence", "float", "minimum confidence",
-     "A near-uniform posterior is noise with a number attached, and it still "
-     "anchors the annotator. Below this, say nothing.",
-     {"min": 0.0, "max": 1.0, "step": 0.05}),
-    ("suggest", "seed", "int", "random seed",
-     "Fixes the cross-validation split and the model fit.", {"min": 0, "max": 10**6}),
-    ("suggest", "audit_fraction", "float", "audit holdout",
-     "Share of clips that never show a suggestion and are never trained on, so "
-     "human-vs-model agreement stays measurable. This is why a confident model "
-     "still shows nothing on roughly one clip in ten; set it to 0 to suggest on "
-     "every clip and give up the measure.",
-     {"min": 0.0, "max": 0.9, "step": 0.05}),
-    ("suggest", "audit_visible", "bool", "say when a clip is held out",
-     "Mark held-out clips on screen instead of just showing nothing. Off by "
-     "default: knowing a clip is being audited can change how carefully it is "
-     "judged, which is the very influence the holdout exists to exclude. Turn "
-     "it on if silent clips are more confusing than that bias is costly.", {}),
-    ("suggest", "select_rule", "choice", "choose the next clip by",
-     "'off' hands clips over in the GUI's own shuffled order, so the labelled "
-     "set stays a random sample of the project and every number computed over "
-     "it - the class balance, the cross-validated F1 - is a statement about "
-     "your data. Any other value lets the model pick instead: it ranks the "
-     "unlabelled clips by how unsure it is and gives you the ones a label would "
-     "teach it most, which saves your time and makes the labelled set one "
-     "assembled to be HARD, so accuracy measured on it reads lower than the "
-     "truth by an amount nobody can work out afterwards. margin reads the gap "
-     "between the model's top two answers, least_confidence only the top one, "
-     "entropy the whole vector and so mostly its tail.",
-     {"options": ["off", "margin", "least_confidence", "entropy"]}),
-    ("suggest", "select_batch_size", "int", "clips per batch",
-     "How many clips one ranking pass hands over. Twice 'retrain every N "
-     "labels' by default, so a batch outlives the refit that produced it, and "
-     "big enough that the audit share below is a whole slot rather than "
-     "rounding to no draw at all.", {"min": 1, "max": 1000}),
-    ("suggest", "select_audit_share", "autonum", "audit share of a batch",
-     "Share of each batch drawn at random from the audit holdout instead of "
-     "being ranked. 'auto' is the audit holdout above, so the labelled audit "
-     "set keeps growing at the rate the project holds audit clips; anything "
-     "else and the one unbiased accuracy in the tool starts describing a "
-     "differently composed sample from the one it names.", {}),
-    ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
-     "Two clips of the same track must start this many frames apart before "
-     "both can be in one batch. 'auto' is the clip length: closer than that "
-     "they overlap, which is the same footage judged twice. 0 turns it off.",
-     {}),
-    ("suggest", "select_target_quota", "int", "labels a class is chased to",
-     "Labels a class needs before batch slots go hunting for it. 0 is off, and "
-     "off even with a rule set: filling a rare class deliberately skews the "
-     "label balance, and the reliability gate (Cohen's kappa, the majority "
-     "baseline) is computed against that balance - so a targeted run can turn "
-     "the suggester silent on a model that has not changed.",
-     {"min": 0, "max": 100000}),
-    ("suggest", "select_target_rule", "choice", "how a starved class is chased",
-     "target_runner_up picks clips where the starved class is the model's "
-     "SECOND choice - the boundary between it and its rival, the only place a "
-     "label moves the decision surface - and fills the class slowly, since many "
-     "come back as the other class. target_confident picks clips the model "
-     "already calls that class: fastest to fill the count, and it only ever "
-     "confirms what the model already believes.",
-     {"options": ["target_runner_up", "target_confident"]}),
-
-    # -- render --
-    ("render", "out_dir", "dir", "render output", "Where overlay movies are written.", {}),
-    ("render", "hide_unlabelled", "bool", "hide unlabelled tracks",
-     "Draw only tracks that carry an annotation.", {}),
-    ("render", "show_track_id", "bool", "show track ids", "Label each box with its track id.", {}),
-    ("render", "quality", "int", "video quality", "imageio quality, 1-10.", {"min": 1, "max": 10}),
-]
-
-SECTION_TITLES = {
-    "paths": "Paths",
-    "keypoints": "Keypoints",
-    "detection": "Detection",
-    "tiling": "Tiled inference",
-    "tracking": "Tracking",
-    "normalize": "Intensity",
-    "clips": "Clip extraction",
-    "ui": "Annotation GUI",
-    "suggest": "Suggestions",
-    "render": "Overlay movies",
-}
-
-
-def _parse_scalar(text: str) -> Any:
-    """Free-text field back into the type YAML would have given it."""
-    text = text.strip()
-    low = text.lower()
-    if low in ("true", "yes"):
-        return True
-    if low in ("false", "no"):
-        return False
-    if low in ("null", "none", ""):
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        return float(text)
-    except ValueError:
-        return text
-
 
 class ConfigForm(QScrollArea):
-    """Scalar settings, grouped by section. ``scope`` selects which appear:
-    ``"basic"`` is the short list to get started, ``"advanced"`` everything else,
-    ``"all"`` the lot."""
+    """Scalar settings, grouped by what they are for. ``scope`` selects which
+    appear: ``"basic"`` is the short list to get started, ``"advanced"``
+    everything else, ``"all"`` the lot."""
 
     changed = Signal()
 
@@ -392,27 +533,36 @@ class ConfigForm(QScrollArea):
         self._kinds: dict[str, str] = {}
         self._status: dict[str, QLabel] = {}
         self._rows: dict[str, QHBoxLayout] = {}
+        # Keys the file being edited does not mention, and what the form read
+        # back straight after loading it. Together they are how :meth:`values`
+        # tells a setting somebody chose from one nobody has touched.
+        self._absent: set[str] = set()
+        self._at_load: dict[str, Any] = {}
 
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(14)
 
-        by_section: dict[str, list] = {}
-        for field in FIELDS:
-            dotted = f"{field[0]}.{field[1]}"
-            if scope == "basic" and dotted not in BASIC:
+        for title, blurb, fields in GROUPS:
+            chosen = [f for f in fields if self._in_scope(scope, f)]
+            if not chosen:
                 continue
-            if scope == "advanced" and dotted in BASIC:
-                continue
-            by_section.setdefault(field[0], []).append(field)
-
-        for section, fields in by_section.items():
-            box = QGroupBox(SECTION_TITLES.get(section, section))
-            form = QFormLayout(box)
+            box = QGroupBox(title)
+            outer = QVBoxLayout(box)
+            # One sentence for the group, above the rows, saying what the
+            # combination produces. Coupled keys are what the config refuses
+            # over, and a per-row tooltip can only ever explain its own row.
+            if blurb:
+                caption = QLabel(blurb)
+                caption.setWordWrap(True)
+                caption.setProperty("role", "muted")
+                outer.addWidget(caption)
+            form = QFormLayout()
             form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
             form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-            for _, key, kind, label, tip, extra in fields:
+            outer.addLayout(form)
+            for section, key, kind, label, tip, extra in chosen:
                 dotted = f"{section}.{key}"
                 if dotted in NEEDS_REPREPARE:
                     tip += ("\n\nChanging this means the clips have to be cut again "
@@ -436,6 +586,15 @@ class ConfigForm(QScrollArea):
         layout.addWidget(note)
         layout.addStretch(1)
         self.setWidget(body)
+
+    @staticmethod
+    def _in_scope(scope: str, field: tuple) -> bool:
+        dotted = f"{field[0]}.{field[1]}"
+        if scope == "basic":
+            return dotted in BASIC
+        if scope == "advanced":
+            return dotted not in BASIC
+        return True
 
     # -- widget construction ------------------------------------------------ #
     def _with_status(self, dotted: str, widget: QWidget) -> QWidget:
@@ -487,10 +646,12 @@ class ConfigForm(QScrollArea):
             return widget
         if kind == "choice":
             widget = QComboBox()
-            widget.addItems(extra.get("options", []))
+            widget.addItems(_options(extra))
             widget.setEditable(True)  # a config may legitimately hold something newer
             widget.currentTextChanged.connect(self.changed)
             return widget
+        if kind == "tristate":
+            return _TriStateField(self.changed)
         if kind == "int":
             widget = QSpinBox()
             widget.setRange(int(extra.get("min", 0)), int(extra.get("max", 1_000_000)))
@@ -509,13 +670,9 @@ class ConfigForm(QScrollArea):
         if kind == "groups":
             return _GroupPicker(self.changed)
         if kind == "autonum":
-            # A setting that is a number OR the word 'auto'. A spin box cannot
-            # hold the word and a combo would write the number back quoted,
-            # which the loader refuses, so it is free text.
-            widget = QLineEdit()
-            widget.setPlaceholderText("auto")
-            widget.textChanged.connect(self.changed)
-            return widget
+            return _AutoField(extra, self.changed)
+        if kind == "intlist":
+            return _IntListField(extra, self.changed)
         widget = QLineEdit()
         widget.textChanged.connect(self.changed)
         return widget
@@ -523,12 +680,15 @@ class ConfigForm(QScrollArea):
     # -- values ------------------------------------------------------------- #
     def load(self, data: dict) -> None:
         """Fill the form from a raw config dict. Missing keys are left blank."""
+        self._absent = set()
         for dotted, widget in self._widgets.items():
             section, _, key = dotted.partition(".")
             block = data.get(section) or {}
             if key not in block:
+                self._absent.add(dotted)
                 continue
             self._set(widget, self._kinds[dotted], block[key])
+        self._at_load = self._raw_values()
 
     def _set(self, widget: QWidget, kind: str, value: Any) -> None:
         widget.blockSignals(True)
@@ -541,9 +701,7 @@ class ConfigForm(QScrollArea):
                 widget.setValue(int(value))
             elif kind == "float":
                 widget.setValue(float(value))
-            elif kind in ("dir", "file"):
-                widget.set_value(str(value))
-            elif kind == "groups":
+            elif kind in ("dir", "file", "groups", "autonum", "intlist", "tristate"):
                 widget.set_value(value)
             elif kind in ("strlist", "floatpair"):
                 text = ", ".join(str(v) for v in (value or []))
@@ -560,13 +718,84 @@ class ConfigForm(QScrollArea):
         finally:
             widget.blockSignals(False)
 
+    def show_resolved(self, values: dict) -> None:
+        """Fill in what every 'auto' on this form stands for, and the couplings.
+
+        ``values`` is the whole file's worth of dotted keys, not this form's:
+        what ``auto`` means is a fact about another section, and on a split form
+        usually about the other tab. The numbers come from the resolvers on the
+        config dataclasses, so the form says what the loader will do rather than
+        offering a second opinion about it.
+        """
+        from ..config import Clips, Predict
+
+        def number(key: str, default):
+            try:
+                return type(default)(values.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        frames = max(1, number("clips.frames", 50))
+        stride = max(1, number("clips.stride", frames))
+        clips = Clips(frames=frames, stride=stride)
+        dense = str(values.get("predict.coverage", "dense")) == "dense"
+        predict = Predict(
+            window_frames=values.get("predict.window_frames", "auto"),
+            window_stride=values.get("predict.window_stride", "auto"),
+            min_bout_frames=number("predict.min_bout_frames", 0),
+        )
+
+        # 'auto' for the dense window is min(clips.frames, clips.stride), which
+        # is two different intentions collapsed into one number and so has no
+        # answer once the clips overlap. load_config refuses it there, naming
+        # this key; saying so here is the same fact before the save.
+        overlapping = dense and stride < frames
+        window = None if overlapping else predict.resolved_window(clips)
+        blocked = "the clips overlap, write a number" if overlapping else ""
+        self._resolve("predict.window_frames", window, blocked)
+        self._resolve("predict.window_stride",
+                      None if overlapping else predict.resolved_stride(clips), blocked)
+        self._resolve("suggest.select_frame_gap", frames)
+        self._resolve("suggest.select_audit_share",
+                      number("suggest.audit_fraction", 0.10))
+        min_bout = number("predict.min_bout_frames", 0)
+        self._resolve(
+            "predict.self_transition",
+            predict.resolved_self_transition() if min_bout >= 2 else None,
+            "" if min_bout >= 2 else "needs a shortest bout of 2 or more",
+        )
+        # crop_size resolves off the movies themselves, which nothing here has
+        # read, so it keeps a bare 'auto'.
+        self._resolve("clips.crop_size", None)
+
+        if stride == frames:
+            self.set_status("clips.stride",
+                            "The windows tile: every frame is in exactly one clip.")
+        elif stride < frames:
+            self.set_status(
+                "clips.stride",
+                f"The windows overlap by {frames - stride} frames, so the dense "
+                "window length cannot stay 'auto' - write the clip length under "
+                "Bulk labelling.")
+        else:
+            self.set_status("clips.stride",
+                            f"{stride - frames} frames between one clip and the next "
+                            "are never cut.")
+
+    def _resolve(self, dotted: str, value, note: str = "") -> None:
+        widget = self._widgets.get(dotted)
+        if widget is not None and hasattr(widget, "set_resolved"):
+            widget.set_resolved(value, note)
+
     # -- validation --------------------------------------------------------- #
     def warnings(self, root: Path | None = None) -> dict[str, str]:
         """Fields that are syntactically fine but point at nothing. Warnings, not
         errors: an offline share must not block editing, and a half-typed path is
         a normal intermediate state."""
         out: dict[str, str] = {}
-        values = self.values()
+        # What is on screen, not what would be written: an amber outline is
+        # about the box you are looking at.
+        values = self._raw_values()
 
         def resolve(text: str) -> Path:
             p = Path(str(text))
@@ -600,6 +829,21 @@ class ConfigForm(QScrollArea):
                 out[key] = "needs two numbers, e.g. 0.5, 99.5"
         return out
 
+    def problems(self) -> dict[str, str]:
+        """Fields whose text is not the SHAPE the key takes at all.
+
+        Unlike :meth:`warnings` this blocks the save. A half-typed list is not a
+        value the loader can refuse helpfully - it would reject the whole file
+        over one stray character - so the field says so itself and nothing is
+        written.
+        """
+        out: dict[str, str] = {}
+        for dotted, widget in self._widgets.items():
+            message = widget.problem() if hasattr(widget, "problem") else ""
+            if message:
+                out[dotted] = message
+        return out
+
     def mark(self, problems: dict[str, str]) -> None:
         """Outline the offending fields and say why on hover."""
         for dotted, widget in self._widgets.items():
@@ -612,7 +856,22 @@ class ConfigForm(QScrollArea):
                 target.setToolTip(message)
 
     def values(self) -> dict[str, Any]:
-        """Dotted-key updates, ready for :func:`trackanno.project.write_config`."""
+        """Dotted-key updates, ready for :func:`trackanno.project.write_config`.
+
+        A key the FILE does not mention is left out until somebody touches it.
+        The widget for one of those holds whatever its range happens to start
+        at, which is neither the setting's default nor anyone's choice: the
+        generated config.yaml does not mention ``suggest.iterations``, so
+        writing every widget back turned it into the spin box's minimum of 10 -
+        and ``depth`` into 1, and ``balance_classes`` off - on the first
+        autosave of every project.
+        """
+        raw = self._raw_values()
+        return {key: value for key, value in raw.items()
+                if key not in self._absent or value != self._at_load.get(key)}
+
+    def _raw_values(self) -> dict[str, Any]:
+        """Every field as it stands, touched or not."""
         out: dict[str, Any] = {}
         for dotted, widget in self._widgets.items():
             kind = self._kinds[dotted]
@@ -624,22 +883,213 @@ class ConfigForm(QScrollArea):
                 out[dotted] = int(widget.value())
             elif kind == "float":
                 out[dotted] = round(float(widget.value()), 6)
-            elif kind in ("dir", "file", "groups"):
+            elif kind in ("dir", "file", "groups", "autonum", "tristate"):
                 out[dotted] = widget.value()
+            elif kind == "intlist":
+                # None while the text is malformed: problems() refuses the save,
+                # and leaving the key out keeps what is on disk meanwhile.
+                parsed = widget.value()
+                if parsed is not None:
+                    out[dotted] = parsed
             elif kind == "strlist":
                 out[dotted] = [p.strip() for p in widget.text().split(",") if p.strip()]
             elif kind == "floatpair":
                 parts = [p.strip() for p in widget.text().split(",") if p.strip()]
                 if len(parts) == 2:
                     out[dotted] = [float(parts[0]), float(parts[1])]
-            elif kind == "autonum":
-                # An empty box writes the WORD, never null. Both mean auto to
-                # the loader, but `null` reads as a value somebody cleared.
-                text = widget.text().strip()
-                out[dotted] = "auto" if not text else _parse_scalar(text)
             else:
-                out[dotted] = _parse_scalar(widget.text())
+                # A name, not a scalar: an annotator called 2024 is a name, and
+                # an empty box is the empty name rather than null - `null` here
+                # reaches ui.annotator as the string "None" and signs every row
+                # of the CSV with it.
+                out[dotted] = widget.text().strip()
         return out
+
+
+class _AutoField(QWidget):
+    """A setting that is either a number or the word ``auto``.
+
+    Free text hid two things at once: that ``auto`` is one of exactly two
+    shapes, and what ``auto`` stands for on THIS project. The tick says which
+    shape; its label carries the number, filled in by
+    :meth:`ConfigForm.show_resolved` from the rest of the file. Leaving auto
+    starts from that number rather than from nothing.
+    """
+
+    def __init__(self, extra: dict, changed_signal):
+        super().__init__()
+        self._changed = changed_signal
+        self._float = extra.get("numeric") == "float"
+        if self._float:
+            self.edit = QDoubleSpinBox()
+            self.edit.setRange(float(extra.get("min", 0.0)), float(extra.get("max", 1.0)))
+            self.edit.setSingleStep(float(extra.get("step", 0.05)))
+            self.edit.setDecimals(int(extra.get("decimals", 2)))
+        else:
+            self.edit = QSpinBox()
+            self.edit.setRange(int(extra.get("min", 0)), int(extra.get("max", 1_000_000)))
+            self.edit.setSingleStep(int(extra.get("step", 1)))
+        self.edit.valueChanged.connect(self._on_edited)
+
+        self.auto = QCheckBox("auto")
+        self.auto.setChecked(True)
+        self.auto.toggled.connect(self._on_toggled)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(self.auto)
+        row.addWidget(self.edit, 1)
+        self.edit.setEnabled(False)
+
+    def _on_toggled(self, on: bool) -> None:
+        self.edit.setEnabled(not on)
+        self._changed.emit()
+
+    def _on_edited(self, _value) -> None:
+        if not self.auto.isChecked():
+            self._changed.emit()
+
+    def set_resolved(self, value, note: str = "") -> None:
+        """Say what 'auto' means here: ``auto (50)``, or why there is no answer."""
+        if note:
+            self.auto.setText(f"auto - {note}")
+        elif value is None:
+            self.auto.setText("auto")
+        else:
+            self.auto.setText(f"auto ({value:g})" if self._float
+                              else f"auto ({int(value)})")
+        if value is not None and self.auto.isChecked():
+            self.edit.blockSignals(True)
+            self.edit.setValue(float(value) if self._float else int(value))
+            self.edit.blockSignals(False)
+
+    def set_value(self, value) -> None:
+        auto = isinstance(value, str)
+        for widget in (self.auto, self.edit):
+            widget.blockSignals(True)
+        try:
+            self.auto.setChecked(auto)
+            if not auto:
+                self.edit.setValue(float(value) if self._float else int(value))
+        finally:
+            for widget in (self.auto, self.edit):
+                widget.blockSignals(False)
+        self.edit.setEnabled(not auto)
+
+    def value(self):
+        if self.auto.isChecked():
+            return "auto"
+        return round(float(self.edit.value()), 6) if self._float else int(self.edit.value())
+
+    def setToolTip(self, text):  # noqa: N802 (Qt naming)
+        super().setToolTip(text)
+        self.edit.setToolTip(text)
+        self.auto.setToolTip(text)
+
+
+class _TriStateField(QComboBox):
+    """``auto`` or a plain yes/no, which is three values and not free text.
+
+    The word and the booleans are read differently downstream - ``auto`` is a
+    string compare and anything else is truthiness - so the item carries the
+    value it writes rather than its own label: ``off`` typed into a text box
+    arrives as the string "off" and is TRUE.
+    """
+
+    def __init__(self, changed_signal):
+        super().__init__()
+        for label, value in (("auto", "auto"), ("on", True), ("off", False)):
+            self.addItem(label, value)
+        self.currentIndexChanged.connect(lambda _i: changed_signal.emit())
+
+    def set_value(self, value) -> None:
+        if isinstance(value, str):
+            wanted = {"true": True, "yes": True, "false": False, "no": False}.get(
+                value.strip().lower(), "auto")
+        else:
+            wanted = bool(value)
+        index = self.findData(wanted)
+        if index >= 0:
+            self.blockSignals(True)
+            self.setCurrentIndex(index)
+            self.blockSignals(False)
+
+    def value(self):
+        return self.currentData()
+
+
+class _IntListField(QWidget):
+    """A list of whole numbers, typed as ``25, 50, 100``.
+
+    A malformed entry is refused HERE, with the entry named, rather than being
+    written for the loader to reject: the loader can only refuse the whole file,
+    and it would do it on the next autosave keystroke.
+    """
+
+    def __init__(self, extra: dict, changed_signal):
+        super().__init__()
+        self._min = int(extra.get("min", 1))
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(extra.get("placeholder", "empty, or 1, 2, 3"))
+        self.edit.textChanged.connect(self._on_edited)
+        self._changed = changed_signal
+
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
+        self.note.setProperty("role", "warning")
+        self.note.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.edit)
+        layout.addWidget(self.note)
+
+    def _on_edited(self, _text: str) -> None:
+        self._refresh_note()
+        self._changed.emit()
+
+    def _refresh_note(self) -> None:
+        message = self.problem()
+        self.note.setText(message)
+        self.note.setVisible(bool(message))
+
+    def _parse(self) -> tuple[list[int] | None, str]:
+        entries = [p for p in self.edit.text().replace(",", " ").split() if p]
+        out: list[int] = []
+        for entry in entries:
+            try:
+                frames = int(entry)
+            except ValueError:
+                return None, f"{entry!r} is not a whole number of frames"
+            if frames < self._min:
+                return None, f"{frames} is below the smallest allowed, {self._min}"
+            if frames in out:
+                return None, (f"{frames} is listed twice. Every entry carries the "
+                              "same weight, so a repeat would quietly count double")
+            out.append(frames)
+        return out, ""
+
+    def problem(self) -> str:
+        return self._parse()[1]
+
+    def set_value(self, value) -> None:
+        text = ", ".join(str(v) for v in (value or []))
+        if self.edit.text() != text:
+            self.edit.blockSignals(True)
+            self.edit.setText(text)
+            self.edit.blockSignals(False)
+        self._refresh_note()
+
+    def value(self) -> list[int] | None:
+        return self._parse()[0]
+
+    def setToolTip(self, text):  # noqa: N802 (Qt naming)
+        super().setToolTip(text)
+        self.edit.setToolTip(text)
+
+
 
 
 class _GroupPicker(QWidget):

@@ -61,7 +61,7 @@ from .store import IDENTITY_COLUMNS, TRAILING_COLUMNS, plain_json
 from .subcluster import (
     DEFAULT_MIN_CLUSTER_SIZE, SCALINGS, STABLE, SubClusters, subcluster,
 )
-from .suggest import audit_records, is_audit_clip, labelled_rows
+from .suggest import AuditHoldout, labelled_rows
 
 __all__ = [
     "Composition", "DiscoveredCluster", "Discovery",
@@ -1108,7 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         features, labels = _load_tables(cfg)
-        recorded = audit_records(labels)
+        holdout = AuditHoldout.from_labels(cfg, labels)
         if args.list:
             _list_classes(cfg, features, labels)
             return 0
@@ -1138,10 +1138,10 @@ def main(argv: list[str] | None = None) -> int:
             n_representatives=args.representatives,
             batch_fraction=args.batch_frac,
             exclude_movies=args.exclude_movie,
-            # Recorded membership, not a fresh hash: clip_id embeds the track
-            # id, so on a re-detected project the hash draws a different holdout
-            # from the one train actually held out.
-            audit_of=(lambda clip: is_audit_clip(clip, cfg, recorded)),
+            # Resolved from the labels, not hashed afresh: clip_id embeds the
+            # track id, so on a re-detected project the hash draws a different
+            # holdout from the one train actually held out.
+            audit_of=(lambda clip: clip in holdout),
             exclude_audit=args.exclude_audit,
         )
     except ValueError as exc:

@@ -5,6 +5,13 @@ A row of ``predictions.parquet`` is either a fixed window off a grid or, under
 behavioural boundaries. Which of the two a file holds comes from
 :func:`trackanno.predict.row_kind`, which reads the file.
 
+The footage sits beside the drawing, because whether a boundary is in the right
+place is a question about the animal at that frame and no timeline can answer
+it. Frames come from the clip cache the annotator labelled off - the same
+memmap, crop and viewer as the annotation window - and only where the cache
+never reached are they cut from the movie, which the line under the picture
+says out loud.
+
 Boundaries are drawn as bands the width of the measured error against a planted
 transition, a bout's mean posterior as a fill height, and a span overlapping
 hand-labelled frames is hatched. Corrections are recorded in
@@ -17,16 +24,19 @@ posterior over it.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
+from qtpy.QtCore import (
+    QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal,
+)
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from qtpy.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QToolTip, QVBoxLayout,
-    QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QToolTip,
+    QVBoxLayout, QWidget,
 )
 
 from ..config import Config
@@ -34,12 +44,16 @@ from ..corrections import (
     CorrectionStore, Partition, Span, apply_corrections, build_corrections,
     corrections_path, derivation_report, derive_window_labels, manifest_windows,
 )
+from ..overlay import build_clip_view
 from ..store import MULTI_SEP
+from .prefetch import Prefetcher
 from .theme import tokens
+from .viewer import SimpleViewer
 
 __all__ = [
     "Segment", "TrackPredictions", "Resolution", "PredictionReader",
-    "caption_lines", "BoutTimeline", "BoutReviewPanel", "BoutReviewDialog",
+    "caption_lines", "TrackClips", "MovieFrames", "TrackFootage",
+    "BoutTimeline", "BoutReviewPanel", "BoutReviewDialog",
 ]
 
 # The README's measured boundary error, as divisors of the window stride.
@@ -678,6 +692,9 @@ class BoutTimeline(QWidget):
     # (group, boundary was at, boundary dragged to). The widget does not apply
     # it; the partition is what enforces the invariant.
     boundaryMoved = Signal(str, int, int)
+    # The frame the reviewer pointed at, so the video can go there. Emitted on
+    # press and on every drag, because scrubbing is how a boundary is checked.
+    positionPicked = Signal(int)
 
     def __init__(self, cfg: Config | None = None, parent=None):
         super().__init__(parent)
@@ -686,6 +703,9 @@ class BoutTimeline(QWidget):
         self.resolution = Resolution()
         self.note = ""
         self.selected: tuple[str, int, int] | None = None
+        # The frame the video is showing, or None before it shows one.
+        self.position: int | None = None
+        self._scrub = False
         self._hits: list[tuple[QRectF, str, object, str]] = []
         # Set on every paint so the mouse handlers measure with the same ruler
         # the picture was drawn with.
@@ -701,8 +721,19 @@ class BoutTimeline(QWidget):
         self.resolution = resolution
         self.note = note
         self.selected = None
+        self.position = None
         self._drag = None
+        self._scrub = False
         self.updateGeometry()
+        self.update()
+
+    def set_position(self, frame: int | None) -> None:
+        """Where the video is. Drawn, never emitted: this is the widget being
+        told, and telling it back would be a loop."""
+        frame = None if frame is None else int(frame)
+        if frame == self.position:
+            return
+        self.position = frame
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -788,7 +819,27 @@ class BoutTimeline(QWidget):
                                    self.track.partitions[group], y, gutter, scale)
                 bottom = y + self.RECORD_LANE
         self._paint_axis(painter, t, bottom, gutter, scale)
+        self._paint_position(painter, t, bottom, gutter, scale)
         painter.end()
+
+    def _paint_position(self, painter, t, bottom, gutter, scale) -> None:
+        """The frame the video is on, across every lane at once.
+
+        Last, so it is over the bars: it is the one mark here that says where
+        you are rather than what was predicted.
+        """
+        if self.position is None or not self.track.f_hi > self.track.f_lo:
+            return
+        if not self.track.f_lo <= self.position <= self.track.f_hi:
+            return
+        x = self._x(self.position, gutter, scale)
+        painter.setPen(QPen(QColor(t["accent"]), 1))
+        painter.drawLine(QPointF(x, self.TOP - 6), QPointF(x, bottom))
+        head = QPolygonF([QPointF(x - 4, self.TOP - 8), QPointF(x + 4, self.TOP - 8),
+                          QPointF(x, self.TOP - 2)])
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(t["accent"]))
+        painter.drawPolygon(head)
 
     def _nothing_here(self) -> str:
         """The empty state, spelled out: a track with no predicted rows is a
@@ -1041,42 +1092,55 @@ class BoutTimeline(QWidget):
 
     # -- editing with the mouse ---------------------------------------------- #
     def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
-        """Grab a boundary if the press is near one, otherwise select a span.
+        """Grab a boundary if the press is near one, otherwise select a span and
+        take the video to the frame under the mouse.
 
-        Record lane only: the model lane is a picture of what the run produced
-        and is never edited.
+        A boundary is grabbed on the record lane only: the model lane is a
+        picture of what the run produced and is never edited. Everything else is
+        a scrub, including a click on a span, because "which frames are these?"
+        is answered by watching them.
         """
-        hit = self._at(event.pos())
-        if event.button() != Qt.LeftButton or hit is None or hit[2] != "record":
+        if event.button() != Qt.LeftButton or self.note or self.track.empty:
             super().mousePressEvent(event)
             return
-        group, span, _ = hit
-        partition = self.track.partitions.get(group)
-        if partition is None:
-            return
-        gutter, scale = self._geom
-        near = [c for c in partition.boundaries()
-                if abs(self._x(c, gutter, scale) - event.pos().x()) <= self.GRAB_PX]
-        if near:
-            cut = min(near, key=lambda c: abs(self._x(c, gutter, scale)
-                                              - event.pos().x()))
-            self._drag = (group, cut, cut)
-            self.update()
-            return
-        self.selected = (group, span.f_start, span.f_end)
-        self.spanClicked.emit(group, span.f_start, span.f_end)
-        self.update()
+        hit = self._at(event.pos())
+        if hit is not None and hit[2] == "record":
+            group, span, _ = hit
+            partition = self.track.partitions.get(group)
+            if partition is not None:
+                gutter, scale = self._geom
+                near = [c for c in partition.boundaries()
+                        if abs(self._x(c, gutter, scale) - event.pos().x())
+                        <= self.GRAB_PX]
+                if near:
+                    cut = min(near, key=lambda c: abs(self._x(c, gutter, scale)
+                                                      - event.pos().x()))
+                    self._drag = (group, cut, cut)
+                    self.update()
+                    return
+                self.selected = (group, span.f_start, span.f_end)
+                self.spanClicked.emit(group, span.f_start, span.f_end)
+        self._scrub = True
+        self._pick(event.pos().x())
 
     def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
-        if self._drag is None:
-            super().mouseMoveEvent(event)
+        if self._drag is not None:
+            group, cut, _ = self._drag
+            self._drag = (
+                group, cut,
+                self._clamp_boundary(group, cut, self._frame_at(event.pos().x())),
+            )
+            self.update()
             return
-        group, cut, _ = self._drag
-        self._drag = (group, cut, self._clamp_boundary(group, cut,
-                                                       self._frame_at(event.pos().x())))
-        self.update()
+        if self._scrub:
+            self._pick(event.pos().x())
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):  # noqa: N802 (Qt naming)
+        if self._scrub:
+            self._scrub = False
+            return
         if self._drag is None:
             super().mouseReleaseEvent(event)
             return
@@ -1085,6 +1149,12 @@ class BoutTimeline(QWidget):
         self.update()
         if moved != cut:
             self.boundaryMoved.emit(group, cut, moved)
+
+    def _pick(self, x: float) -> None:
+        frame = self._frame_at(x)
+        self.set_position(frame)
+        self.positionPicked.emit(frame)
+        self.update()
 
     def _clamp_boundary(self, group: str, cut: int, frame: int) -> int:
         """Where a dragged boundary is allowed to end up.
@@ -1188,6 +1258,702 @@ def _axis_ticks(f_lo: int, f_hi: int, target: int = 6) -> list[int]:
 
 
 # --------------------------------------------------------------------------- #
+# the footage the timeline is a picture of
+# --------------------------------------------------------------------------- #
+class TrackClips:
+    """Which cached clip serves which frame of one track.
+
+    The cache holds fixed-length windows cut on the annotation grid; a bout is a
+    variable-length span between two inferred boundaries and need not line up
+    with any of them. So a span is served frame by frame rather than as a unit:
+    every frame comes from a clip that covers it, and the clips overlapping a
+    bout are stitched in time by switching between them, not by copying pixels.
+
+    Where several clips cover a frame the one whose own window is centred
+    nearest to it wins, so the crop changes midway between two windows instead
+    of on every frame.
+
+    A frame no clip covers is a hole. That is normal rather than broken: a
+    window with too few detections is never cut, ``clips.window_mode`` may stop
+    after the first, and a dense decode predicts over frames the annotation grid
+    never reached.
+    """
+
+    def __init__(self, store, movie_id: str, track_id: int):
+        manifest = store.manifest
+        mask = (
+            (manifest["movie_id"].astype(str) == str(movie_id))
+            & (pd.to_numeric(manifest["track_id"], errors="coerce") == int(track_id))
+        ).to_numpy()
+        # Positions, not index labels: the store addresses a clip by its row in
+        # this frame and reads pixels with `.iloc`.
+        rows = np.flatnonzero(mask)
+        starts = pd.to_numeric(manifest["f_start"], errors="coerce").to_numpy()[rows]
+        ends = pd.to_numeric(manifest["f_end"], errors="coerce").to_numpy()[rows]
+        keep = np.argsort(starts, kind="stable")
+        self.index = rows[keep].astype(np.int64)
+        self.f_start = starts[keep].astype(np.int64)
+        self.f_end = ends[keep].astype(np.int64)
+
+    def __len__(self) -> int:
+        return int(self.index.size)
+
+    def at(self, frame: int) -> tuple[int, int] | None:
+        """``(store index, the frame's offset inside that clip)``, or None."""
+        covering = np.flatnonzero((self.f_start <= frame) & (frame < self.f_end))
+        if covering.size == 0:
+            return None
+        centres = (self.f_start[covering] + self.f_end[covering]) / 2.0
+        pick = int(covering[int(np.argmin(np.abs(centres - frame)))])
+        return int(self.index[pick]), int(frame - self.f_start[pick])
+
+    def runs(self) -> list[tuple[int, int]]:
+        """The frame ranges the cache can serve, overlaps merged."""
+        out: list[list[int]] = []
+        for a, b in zip(self.f_start.tolist(), self.f_end.tolist()):
+            if out and a <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return [(int(a), int(b)) for a, b in out]
+
+    def order(self, index: int) -> tuple[list[int], int]:
+        """The track's clips in frame order and where ``index`` sits among them,
+        which is the line :class:`Prefetcher` reads ahead along."""
+        listed = [int(i) for i in self.index]
+        return listed, listed.index(int(index)) if int(index) in listed else 0
+
+
+class MovieFrames(QObject):
+    """The movie itself, cut to the crop the cache would have held.
+
+    Only ever the fallback. The cache is already cropped to the track, costs one
+    memmap read and is there when the recording is not; this exists because a
+    dense decode predicts over frames no annotation window was cut for, and a
+    bout there would otherwise have no pixels at all.
+
+    The geometry is the one :func:`trackanno.clips.plan_clips` uses and the
+    padding is :func:`trackanno.clips._crop`, so a fallback frame is cut the way
+    the cache's own frames were rather than by a second rule. What differs is
+    stated where it shows: the crop is centred over THIS chunk instead of over
+    an annotation window.
+
+    Decoding runs on a worker thread and arrives as a signal - one seek into a
+    TIFF on a share is long enough to freeze the window.
+    """
+
+    # request id, first frame, ((T, S, S) uint8, the target's box per frame).
+    # Both together, because a second request overwrites whatever the worker
+    # keeps and the pixels and the marker on them must be the same chunk.
+    ready = Signal(int, int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, cfg: Config, movie_id: str, track_id: int, size: int,
+                 chunk: int, side: int = 0, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.movie_id = str(movie_id)
+        self.track_id = int(track_id)
+        self.size = int(size)
+        self.chunk = max(1, int(chunk))
+        # The crop this track's own clips were cut at, when the manifest still
+        # says. Taken rather than recomputed so a fallback frame is framed like
+        # the cached frame beside it and not merely like it.
+        self.side = int(side)
+        self._request: tuple[int, int] | None = None
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self._movie = None
+        self._normalizer = None
+        self._boxes: np.ndarray | None = None     # (n_frames, 4), held-filled
+
+    # -- the request -------------------------------------------------------- #
+    def want(self, request_id: int, first: int) -> None:
+        """Ask for the chunk starting at ``first``. Latest wins: a scrub
+        produces a request per mouse move and only the last one is worth
+        decoding."""
+        with self._lock:
+            self._request = (int(request_id), int(first))
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run, name="trackanno-review-movie", daemon=True
+            )
+            self._thread.start()
+        self._wake.set()
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Stop and WAIT, then close the movie. The thread holds a file handle
+        the caller may be about to overwrite."""
+        self._stop = True
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+            if thread.is_alive():
+                return False
+        self._close()
+        return True
+
+    # -- the worker --------------------------------------------------------- #
+    def _run(self) -> None:
+        while not self._stop:
+            self._wake.wait(timeout=0.25)
+            self._wake.clear()
+            with self._lock:
+                request, self._request = self._request, None
+            if request is None or self._stop:
+                continue
+            request_id, first = request
+            try:
+                self.ready.emit(request_id, first, self._cut(first))
+            except Exception as exc:      # a missing movie is a sentence, not a crash
+                self.failed.emit(request_id, str(exc))
+        self._close()
+
+    def _close(self) -> None:
+        movie, self._movie = self._movie, None
+        if movie is not None:
+            try:
+                movie.close()
+            except Exception:
+                pass
+
+    def _open(self):
+        from ..clips import NORM_FILE, TRACKS_FILE, _hold_fill
+        from ..movies import Normalizer, open_movie
+
+        if self._movie is not None:
+            return self._movie
+        movie = open_movie(self.cfg, self.movie_id)
+        path = self.cfg.movie_dir(self.movie_id) / NORM_FILE
+        # The same mapping prepare wrote, or measured the same way it measured
+        # it: a different one would make the fallback frames a different grey.
+        self._normalizer = (
+            Normalizer.load(path) if path.exists()
+            else Normalizer.from_movie(movie, self.cfg.normalize)
+        )
+
+        tracks = pd.read_parquet(
+            self.cfg.movie_dir(self.movie_id) / TRACKS_FILE,
+            columns=["frame", "track_id", "x1", "y1", "x2", "y2"],
+        )
+        tracks = tracks[
+            pd.to_numeric(tracks["track_id"], errors="coerce") == self.track_id
+        ]
+        if tracks.empty:
+            raise ValueError(
+                f"{TRACKS_FILE} has no detections for track {self.track_id}, so "
+                "there is nothing to centre a crop on"
+            )
+        n = int(len(movie))
+        boxes = np.full((n, 4), np.nan)
+        frames = pd.to_numeric(tracks["frame"], errors="coerce").to_numpy(dtype=np.int64)
+        inside = (frames >= 0) & (frames < n)
+        boxes[frames[inside]] = tracks[["x1", "y1", "x2", "y2"]].to_numpy()[inside]
+        present = np.zeros(n, bool)
+        present[frames[inside]] = True
+        self._boxes = _hold_fill(boxes, present)
+        if not np.isfinite(self._boxes).all():
+            raise ValueError(
+                f"track {self.track_id} was never detected inside the "
+                f"{n} frames of {self.movie_id}, so no crop can be centred on it"
+            )
+        self._movie = movie
+        return movie
+
+    def _side_for(self, boxes: np.ndarray, path: np.ndarray) -> int:
+        """The crop's side in movie pixels, by ``plan_clips``' own rule.
+
+        Only reached where the manifest could not say - a project whose cache
+        was never built. The rule is copied because the point of the fallback is
+        to look like the cache, and a crop chosen some other way would put the
+        animal at a different size on the same screen.
+        """
+        if self.side > 0:
+            return self.side
+        clips = self.cfg.clips
+        if clips.crop_from == "union":
+            base = float(max(boxes[:, 2].max() - boxes[:, 0].min(),
+                             boxes[:, 3].max() - boxes[:, 1].min()))
+        else:
+            base = float(np.percentile(
+                np.maximum(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]), 95))
+        reach = np.max(np.abs(
+            np.concatenate([boxes[:, :2] - path, boxes[:, 2:] - path], axis=1)
+        ), axis=1)
+        need = max(16, int(np.ceil(max(base * clips.pad, float(reach.max()) * 2.2))))
+        return need if need > self.size else self.size
+
+    def _cut(self, first: int) -> tuple[np.ndarray, pd.DataFrame]:
+        import cv2
+
+        from ..clips import _crop, _moving_average
+
+        movie = self._open()
+        n = min(self.chunk, max(0, int(len(movie)) - int(first)))
+        if n <= 0:
+            raise ValueError(f"frame {first} is past the end of {self.movie_id}")
+        boxes = self._boxes[first: first + n]
+        centres = np.stack([(boxes[:, 0] + boxes[:, 2]) * 0.5,
+                            (boxes[:, 1] + boxes[:, 3]) * 0.5], axis=1)
+        if self.cfg.clips.follow == "fixed":
+            path = np.repeat(centres.mean(axis=0, keepdims=True), n, axis=0)
+        elif self.cfg.clips.follow == "track":
+            path = centres
+        else:
+            path = _moving_average(centres, self.cfg.clips.smooth_window)
+
+        side = self._side_for(boxes, path)
+        origins = np.round(path - side / 2.0).astype(np.int64)
+        out = np.zeros((n, self.size, self.size), np.uint8)
+        for t in range(n):
+            if self._stop:
+                raise RuntimeError("cancelled")
+            frame = int(first + t)
+            u8 = self._normalizer.to_u8(movie.frame(frame), frame)
+            crop = _crop(u8, int(origins[t, 0]), int(origins[t, 1]), side, side,
+                         movie.height, movie.width)
+            if crop.shape[0] != self.size:
+                interp = cv2.INTER_AREA if crop.shape[0] > self.size else cv2.INTER_LINEAR
+                crop = cv2.resize(crop, (self.size, self.size), interpolation=interp)
+            out[t] = crop
+
+        # The reticle, in cache pixels, so the fallback names the track it is
+        # following rather than showing an unlabelled animal.
+        scale = self.size / float(side)
+        marks = (boxes - np.repeat(origins, 2, axis=1)) * scale
+        return out, pd.DataFrame({
+            "t": np.arange(n, dtype=np.int32),
+            "is_target": True,
+            "x1": marks[:, 0], "y1": marks[:, 1],
+            "x2": marks[:, 2], "y2": marks[:, 3],
+        })
+
+
+class TrackFootage(QWidget):
+    """The video beside the timeline: the frames of the track under review.
+
+    The pixels come from the clip cache the annotator labelled off - the same
+    memmap, the same crop, the same :class:`~trackanno.gui.viewer.SimpleViewer`
+    as the annotation window - so a boundary is judged against exactly what a
+    person saw. Frames the cache never covered are cut from the movie instead,
+    and the line under the picture always says which of the two is on screen,
+    because a crop centred per chunk is not the crop a window was labelled in.
+
+    When there is neither, the picture goes away rather than going black: a dark
+    rectangle reads as a broken decoder, and the one question worth answering
+    here is why there is nothing to see.
+    """
+
+    positionChanged = Signal(int)         # the movie frame now on screen
+
+    def __init__(self, cfg: Config | None = None, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        # Looping, as the annotation window does: the end of a cached clip is
+        # not the end of the track, and the wrap is what says so in time to
+        # carry playback into the clip that holds the next frame.
+        self.viewer = SimpleViewer(fps=int(getattr(getattr(cfg, "ui", None), "fps", 30)),
+                                   loop=True)
+        self.viewer.frame_changed.connect(self._on_viewer_frame)
+        # Smaller than the annotation window asks for: there the crop IS the
+        # window, here it shares one with the lanes and the captions under them,
+        # and a 320 px floor takes the room out of the video rather than giving
+        # it any.
+        self.viewer.canvas.setMinimumSize(240, 240)
+        # Hidden until there are frames: an empty canvas is a black rectangle,
+        # and this widget's whole job on a project with no pixels is to not be
+        # one.
+        self.viewer.setVisible(False)
+        self.source = QLabel("")
+        self.source.setWordWrap(True)
+        self.source.setProperty("role", "muted")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.viewer, 1)
+        layout.addWidget(self.source)
+
+        self._store = None
+        self._store_problem = ""
+        self._prefetcher: Prefetcher | None = None
+        self._clips: TrackClips | None = None
+        self._movie: MovieFrames | None = None
+        self._movie_problem = ""
+        self._movie_id, self._track_id = "", 0
+        self._span = (0, 0)
+        self._loaded: tuple[str, int] = ("", -1)   # kind and key of the array shown
+        self._first = 0                            # movie frame of offset 0
+        self._length = 0                           # offsets of it that are real
+        self._offset = 0                           # offset the viewer is on
+        self._position = -1
+        self._request = 0
+        self._pending = (0, 0)                     # request id, frame wanted
+        self._awaiting = -1                        # frame a movie read is out for
+        self._resume_at = -1                       # play on when this frame lands
+        self._seeking = False
+
+    # -- the cache ----------------------------------------------------------- #
+    def set_config(self, cfg: Config | None) -> None:
+        self.release()
+        self.cfg = cfg
+        self.viewer.set_fps(int(getattr(getattr(cfg, "ui", None), "fps", 30)))
+
+    def _open_store(self):
+        """The clip cache, opened once per project and closed with the panel.
+
+        Lazy, because a project with no cache is a normal state and the reason
+        it gives is the sentence this widget shows instead of a picture.
+        """
+        if self._store is not None or self._store_problem or self.cfg is None:
+            return self._store
+        from ..clips import ClipStore
+
+        try:
+            self._store = ClipStore(self.cfg.paths.work_dir)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            self._store_problem = " ".join(str(exc).split())
+            return None
+        self._prefetcher = Prefetcher(self._store, int(self.cfg.ui.prefetch))
+        return self._store
+
+    def release(self) -> None:
+        """Drop every clip, thread and memory map this widget holds.
+
+        Not optional and not left to the garbage collector: Windows will not let
+        a mapped file be overwritten, so a leaked store makes the next detection
+        run fail on nothing more than when the collector happened to run.
+        """
+        self.viewer.pause()
+        # The array in the viewer is a VIEW on the map, so it goes first.
+        self.viewer.clear()
+        self._release_movie()
+        prefetcher, self._prefetcher = self._prefetcher, None
+        stopped = prefetcher.stop() if prefetcher is not None else True
+        if not stopped:
+            print("[trackanno] review prefetch thread did not stop in time")
+        store, self._store = self._store, None
+        # Only once nothing is reading it: unmapping under a live prefetch is a
+        # segfault rather than an error.
+        if store is not None and stopped:
+            store.close()
+        self._store_problem = ""
+        self._clips = None
+        self._loaded = ("", -1)
+        self._length = 0
+
+    def _release_movie(self) -> None:
+        movie, self._movie = self._movie, None
+        # A cancelled decode still emits, and by then the answer is about a
+        # frame nobody is looking at any more.
+        self._request += 1
+        self._resume_at = self._awaiting = -1
+        if movie is not None:
+            movie.ready.disconnect()
+            movie.failed.disconnect()
+            movie.stop()
+        self._movie_problem = ""
+
+    # -- one track ----------------------------------------------------------- #
+    def set_track(self, movie_id: str, track_id: int, f_lo: int, f_hi: int) -> None:
+        self.viewer.pause()
+        self._release_movie()
+        self._movie_id, self._track_id = str(movie_id), int(track_id)
+        self._span = (int(f_lo), int(f_hi))
+        self._loaded = ("", -1)
+        self._position = -1
+        self._length = 0
+        store = self._open_store()
+        self._clips = (TrackClips(store, movie_id, track_id)
+                       if store is not None else None)
+        self.show_frame(f_lo)
+
+    @property
+    def position(self) -> int:
+        """The movie frame on screen, or -1 when there is nothing to show."""
+        return self._position
+
+    @property
+    def showing(self) -> str:
+        """``"cache"``, ``"movie"`` or ``""``: where the pixels came from."""
+        return self._loaded[0]
+
+    def frame_image(self) -> np.ndarray | None:
+        """The (S, S) array currently drawn, so what is on screen can be checked
+        against the cache it is supposed to have come from."""
+        array = self.viewer._array
+        if array is None or not len(array):
+            return None
+        return np.asarray(array[min(self.viewer._frame, array.shape[0] - 1)])
+
+    # -- moving ------------------------------------------------------------- #
+    def show_frame(self, frame: int) -> None:
+        """Put ``frame`` of this track on screen, from wherever it can be had."""
+        frame = int(frame)
+        self._resume_at = self._awaiting = -1
+        hit = (self._clips.at(frame)
+               if self._clips is not None and len(self._clips) else None)
+        if hit is not None:
+            self._show_cached(hit[0], hit[1], frame)
+            return
+        self._show_from_movie(frame)
+
+    def _show_cached(self, index: int, offset: int, frame: int) -> None:
+        store = self._store
+        if self._loaded != ("cache", index):
+            meta = store.meta(index)
+            clip = store.clip(index)
+            # Only the window's own frames: a clip cut short at the end of a
+            # movie keeps the cache's fixed length and the tail of it is zeros,
+            # which would play as black frames nobody recorded.
+            real = int(min(clip.shape[0],
+                           int(meta["f_end"]) - int(meta["f_start"])))
+            clip = clip[:real]
+            self.viewer.set_clip(clip, self._view(store.clip_boxes(index), clip))
+            self.viewer.set_overlay(True)
+            self.viewer.setVisible(True)
+            self._loaded = ("cache", int(index))
+            self._first = int(meta["f_start"])
+            self._length = real
+            self._warm(index)
+        self._seek(frame - self._first, frame)
+        self.source.setText(self._cache_note())
+
+    def _view(self, boxes, clip: np.ndarray):
+        ui = getattr(self.cfg, "ui", None)
+        return build_clip_view(
+            boxes, int(clip.shape[0]), int(clip.shape[1]),
+            mode=getattr(ui, "follow", "centred"),
+            zoom=float(getattr(ui, "view_zoom", 1.0)),
+            smooth_window=int(getattr(ui, "smooth_window", 15)),
+        )
+
+    def _warm(self, index: int) -> None:
+        """Read the clips either side of this one ahead, on the prefetch thread.
+
+        The cache is an uncompressed memmap, so a scrub is only ever as slow as
+        the page cache is cold - and the UI thread must not be where that is
+        discovered."""
+        if self._prefetcher is None or self._clips is None:
+            return
+        order, position = self._clips.order(index)
+        self._prefetcher.around(order, position)
+
+    def _seek(self, offset: int, frame: int) -> None:
+        offset = int(min(max(offset, 0), max(0, self._length - 1)))
+        self._position = int(frame)
+        self._offset = offset
+        # The viewer's own signal would bounce straight back as a position, and
+        # the frame it names is the one just asked for.
+        self._seeking = True
+        try:
+            self.viewer.seek(offset)
+        finally:
+            self._seeking = False
+        self.positionChanged.emit(int(frame))
+
+    def _on_viewer_frame(self, offset: int) -> None:
+        """Playing the clip walks the marker along the timeline."""
+        if self._seeking or not self._loaded[0]:
+            return
+        offset, was = int(offset), self._offset
+        self._offset = offset
+        self._position = self._first + offset
+        self.positionChanged.emit(self._position)
+        if not self.viewer.is_playing:
+            return
+        # Two ways to reach the end of a clip: play into it, or be sitting on
+        # its last frame when play is pressed, which the viewer answers by
+        # looping back to the start. Both mean the same thing here.
+        arrived = offset >= self._length - 1
+        looped = offset == 0 and was >= self._length - 1 and self._length > 1
+        if arrived or looped:
+            # Queued rather than immediate: this runs inside the viewer's own
+            # slider signal, and replacing the clip under it there re-enters.
+            QTimer.singleShot(0, self._roll_on)
+
+    def _roll_on(self) -> None:
+        """Carry playback into whatever serves the next frame.
+
+        A clip's last frame is not the end of the track, and a boundary that
+        falls near a window edge is exactly the one worth watching across. Where
+        the next frame has to come from the movie it arrives later, so playback
+        waits for it rather than running on over the frames it already has.
+        """
+        if not self.viewer.is_playing:
+            return                       # paused between the schedule and here
+        nxt = self._first + self._length
+        if nxt >= self._span[1]:
+            return                       # the end of the track; the clip loops
+        was = self._loaded
+        self.viewer.pause()
+        self.show_frame(nxt)
+        if self._awaiting == nxt:
+            self._resume_at = nxt        # the movie is being read for it
+        elif self._loaded != was and self._position == nxt and self._loaded[0]:
+            self.viewer.play()
+        # Otherwise nothing else serves that frame and playback stays stopped:
+        # a manifest and a cache header that disagree can leave the clip that
+        # just ended answering for the frame after it, and handing playback back
+        # to it would spin.
+
+    # -- the fallback -------------------------------------------------------- #
+    def _show_from_movie(self, frame: int) -> None:
+        reason = self._no_clip_here(frame)
+        if self.cfg is None or not self._movie_id or self._movie_problem:
+            self._no_video(f"{reason} {self._movie_problem}".strip())
+            return
+        chunk = int(getattr(getattr(self.cfg, "clips", None), "frames", 50) or 50)
+        first = (frame // chunk) * chunk
+        if self._loaded == ("movie", first):
+            self._seek(frame - self._first, frame)
+            return
+        if self._movie is None:
+            size, side = self._cache_geometry()
+            self._movie = MovieFrames(
+                self.cfg, self._movie_id, self._track_id, size, chunk, side)
+            self._movie.ready.connect(self._on_movie_chunk)
+            self._movie.failed.connect(self._on_movie_failed)
+        self._request += 1
+        self._pending = (self._request, frame)
+        self._awaiting = frame
+        self._movie.want(self._request, first)
+        self.source.setText(
+            f"{reason}, so frames {first}-{first + chunk} are being read from the "
+            "movie itself..."
+        )
+
+    def _on_movie_chunk(self, request_id: int, first: int, payload) -> None:
+        if int(request_id) != self._request:
+            return                        # a scrub moved on while this decoded
+        array, marks = payload
+        self._awaiting = -1
+        frame = int(min(max(self._pending[1], first), first + len(array) - 1))
+        self.viewer.set_clip(array, self._view(marks, array))
+        self.viewer.set_overlay(True)
+        self.viewer.setVisible(True)
+        self._loaded = ("movie", int(first))
+        self._first = int(first)
+        self._length = int(len(array))
+        self._seek(frame - first, frame)
+        if self._resume_at == frame:
+            # Playback stopped at the edge of the cache waiting for these.
+            self._resume_at = -1
+            self.viewer.play()
+        self.source.setText(
+            f"frames {first}-{first + self._length} are cut from the movie, not "
+            "read from the clip cache: no annotation window was ever cached over "
+            "them. Same normalisation and same padding, but the crop is centred "
+            "over this stretch rather than over a labelled window."
+        )
+
+    def _on_movie_failed(self, request_id: int, message: str) -> None:
+        """Asked once and then remembered: a movie that has moved will not be
+        back by the next mouse move, and re-opening it per scrub would hang the
+        window on a dead share."""
+        if int(request_id) != self._request:
+            return
+        self._awaiting = -1
+        self._release_movie()
+        self._movie_problem = (
+            f"and the movie could not be read ({' '.join(str(message).split())})"
+        )
+        self._no_video(f"{self._no_clip_here(self._pending[1])} {self._movie_problem}")
+
+    # -- what there is to say ------------------------------------------------ #
+    def _cache_geometry(self) -> tuple[int, int]:
+        """``(the cache's side length, the crop side this track was cut at)``.
+
+        Both off the manifest where there is one, so a frame the movie has to
+        supply is framed exactly like the cached frames around it. ``0`` for the
+        second when nothing on disk says, and the fallback works it out.
+        """
+        store = self._store
+        try:
+            size = int(store.header(self._movie_id)["size"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            declared = getattr(getattr(self.cfg, "clips", None), "crop_size", 96)
+            return (int(declared) if isinstance(declared, int) else 96), 0
+        if self._clips is None or not len(self._clips):
+            return size, 0
+        try:
+            widths = pd.to_numeric(
+                store.manifest["crop_w"].iloc[self._clips.index], errors="coerce"
+            ).dropna()
+        except (KeyError, IndexError):
+            return size, 0
+        return size, int(widths.max()) if len(widths) else 0
+
+    def _cache_note(self) -> str:
+        """One line under the picture, and only what changes what you would
+        conclude from it: where these pixels came from, and whether the cache
+        runs out before the predictions do."""
+        note = (
+            f"frame {self._position} of track {self._track_id}, from the clip "
+            "cache - the crop and the normalisation it was labelled in."
+        )
+        covered = self._clips.runs() if self._clips is not None else []
+        f_lo, f_hi = self._span
+        if covered and (covered[0][0] > f_lo or covered[-1][1] < f_hi):
+            listed = ", ".join(f"{a}-{b}" for a, b in covered[:3])
+            note += (
+                f" Cached over {listed}"
+                + (f" and {len(covered) - 3} more" if len(covered) > 3 else "")
+                + f"; the predictions cover {f_lo}-{f_hi}, and the rest is cut "
+                "from the movie."
+            )
+        return note
+
+    def _no_clip_here(self, frame: int) -> str:
+        if self._clips is None:
+            return (
+                "There is no clip cache in this project"
+                + (f" ({self._store_problem})" if self._store_problem else "")
+            )
+        if not len(self._clips):
+            return (
+                f"No clip was ever cached for track {self._track_id} of "
+                f"{self._movie_id}"
+            )
+        listed = ", ".join(f"{a}-{b}" for a, b in self._clips.runs()[:3])
+        return (
+            f"Frame {frame} is outside every cached clip on this track "
+            f"(the cache holds {listed})"
+        )
+
+    def clear(self, reason: str = "") -> None:
+        """No track under review, and the reason if there is one."""
+        self.viewer.pause()
+        self._release_movie()
+        self._clips = None
+        self._position = -1
+        self._span = (0, 0)
+        self._no_video(reason or "no track is selected")
+
+    def _no_video(self, reason: str) -> None:
+        """No picture at all: hide it and say why.
+
+        A hidden viewer rather than an empty one, because a black square is read
+        as a decoder that failed and this is usually a project that was never
+        prepared.
+        """
+        self.viewer.pause()
+        self.viewer.clear()
+        self.viewer.setVisible(False)
+        self._loaded = ("", -1)
+        self._length = 0
+        text = f"No video. {reason.strip().rstrip('.')}."
+        if self._span[1] > self._span[0]:
+            text += (
+                " The timeline still shows what was predicted; only the frames "
+                "behind it are missing."
+            )
+        self.source.setText(text)
+
+
+# --------------------------------------------------------------------------- #
 # the panel and its window
 # --------------------------------------------------------------------------- #
 class BoutReviewPanel(QWidget):
@@ -1239,6 +2005,20 @@ class BoutReviewPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.timeline)
 
+        # The picture and the pixels it is a picture of, side by side and tied
+        # both ways: scrubbing the timeline moves the video, playing the video
+        # moves the marker. Whether a boundary is in the right place is not a
+        # question a drawing can answer on its own.
+        self.footage = TrackFootage(cfg)
+        self.timeline.positionPicked.connect(self.footage.show_frame)
+        self.footage.positionChanged.connect(self.timeline.set_position)
+        self.split = QSplitter(Qt.Horizontal)
+        self.split.addWidget(self.footage)
+        self.split.addWidget(scroll)
+        self.split.setStretchFactor(0, 0)
+        self.split.setStretchFactor(1, 1)
+        self.split.setSizes([400, 760])
+
         self.caption = QLabel("")
         self.caption.setWordWrap(True)
         self.caption.setTextFormat(Qt.RichText)
@@ -1247,7 +2027,7 @@ class BoutReviewPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.headline)
-        layout.addWidget(scroll, 1)
+        layout.addWidget(self.split, 1)
         layout.addLayout(self._build_edit_row())
         layout.addWidget(self.status)
         layout.addWidget(self.caption)
@@ -1322,7 +2102,37 @@ class BoutReviewPanel(QWidget):
     def set_config(self, cfg: Config | None) -> None:
         self.cfg = cfg
         self.timeline.cfg = cfg
+        # Before reload(): the clip cache of the project being left has to be
+        # unmapped, or the next detection run over it fails on Windows.
+        self.footage.set_config(cfg)
         self.reload()
+
+    def release(self) -> None:
+        """Let go of the clip cache. Idempotent, and called from every way this
+        panel can stop being looked at."""
+        self.footage.release()
+
+    def hideEvent(self, event):  # noqa: N802 (Qt naming)
+        self.release()
+        super().hideEvent(event)
+
+    def showEvent(self, event):  # noqa: N802 (Qt naming)
+        """Put the footage back. The cache was unmapped when this window was
+        last hidden, and the Model page reuses one dialog for the life of the
+        session, so re-showing it must not leave a sentence where the video
+        was."""
+        super().showEvent(event)
+        track = self._track
+        if track is None or track.empty:
+            return
+        was = self.timeline.position
+        self.footage.set_track(track.movie_id, track.track_id, track.f_lo, track.f_hi)
+        if was is not None:
+            self.footage.show_frame(was)
+
+    def closeEvent(self, event):  # noqa: N802 (Qt naming)
+        self.release()
+        super().closeEvent(event)
 
     def reload(self) -> None:
         """Re-read the files and rebuild the selectors. Cheap enough to call on
@@ -1380,6 +2190,13 @@ class BoutReviewPanel(QWidget):
         self._track = track
         self._undo.clear()
         self.timeline.set_track(track, self.reader.resolution)
+        if track.empty:
+            self.footage.clear(
+                f"track {track.track_id} of {track.movie_id} has no predicted "
+                "rows, so there is no span to watch"
+            )
+        else:
+            self.footage.set_track(movie_id, int(track_id), track.f_lo, track.f_hi)
         self._fill_groups()
         t = tokens()
         head = (
@@ -1423,6 +2240,7 @@ class BoutReviewPanel(QWidget):
         self.timeline.set_track(
             TrackPredictions("", 0, False, ""), Resolution(), note=problem
         )
+        self.footage.clear(problem)
         self._refresh_edit_gate()
 
     # -- correcting ----------------------------------------------------------- #
@@ -1748,13 +2566,17 @@ class BoutReviewDialog(QDialog):
     """The panel in a window of its own.
 
     Close and no Save: every accepted edit is already on disk by the time the
-    button could be pressed.
+    button could be pressed. Closing also unmaps the clip cache, through the
+    panel's own hide handler, so leaving this window open cannot block the next
+    detection run.
     """
 
     def __init__(self, cfg: Config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Review and correct predictions")
-        self.resize(1040, 560)
+        # Room for a square of film beside the lanes: the two are read against
+        # each other, and a video that has to be scrolled to is not.
+        self.resize(1280, 780)
         self.panel = BoutReviewPanel(cfg, self)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
