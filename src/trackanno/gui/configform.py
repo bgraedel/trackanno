@@ -28,7 +28,7 @@ __all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "FIELDS", "BASIC",
            "NEEDS_REPREPARE", "HAS_STATUS"]
 
 # The settings someone setting up a project has to decide. Everything else is a
-# tuning knob with a defensible default; all 54 on one page is unusable.
+# tuning knob with a defensible default.
 BASIC = {
     "paths.video_dir", "paths.model", "paths.work_dir", "paths.csv",
     "detection.task", "detection.device",
@@ -140,9 +140,8 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
      "Spacing between windows. Equal to the clip length means non-overlapping.",
      {"min": 1, "max": 10000}),
     # -- predict --
-    # clips.frames and clips.stride are on this form, so the overlapping grid
-    # that load_config refuses can be reached from here. These are the fields
-    # that refusal names, and without them it points at nothing the form owns.
+    # The fields load_config names when it refuses an overlapping grid, which
+    # clips.frames and clips.stride on this same form can produce.
     ("predict", "window_frames", "autonum", "dense window length",
      "Frames per dense prediction window. 'auto' is min(clip length, stride), "
      "which only resolves while the clips tile; with overlapping clips write "
@@ -381,8 +380,7 @@ def _parse_scalar(text: str) -> Any:
 class ConfigForm(QScrollArea):
     """Scalar settings, grouped by section. ``scope`` selects which appear:
     ``"basic"`` is the short list to get started, ``"advanced"`` everything else,
-    ``"all"`` the lot. Two instances let the Configure page put the tuning knobs
-    behind a tab."""
+    ``"all"`` the lot."""
 
     changed = Signal()
 
@@ -444,8 +442,7 @@ class ConfigForm(QScrollArea):
         """The field as it goes into the row, with room under it for a note.
 
         Same shape as :class:`_PathField`: the control keeps a row of its own so
-        a page can put a button beside it, and a muted line underneath says what
-        the value cannot.
+        a page can put a button beside it.
         """
         if dotted not in HAS_STATUS:
             return widget
@@ -512,12 +509,9 @@ class ConfigForm(QScrollArea):
         if kind == "groups":
             return _GroupPicker(self.changed)
         if kind == "autonum":
-            # A setting that is a number OR the word 'auto', where 'auto' stands
-            # for a value in another section entirely (clips.frames,
-            # suggest.audit_fraction). A spin box cannot hold the word, and a
-            # combo would write the number back as a quoted string, which the
-            # loader refuses - so it is free text, and the placeholder says what
-            # an empty box means.
+            # A setting that is a number OR the word 'auto'. A spin box cannot
+            # hold the word and a combo would write the number back quoted,
+            # which the loader refuses, so it is free text.
             widget = QLineEdit()
             widget.setPlaceholderText("auto")
             widget.textChanged.connect(self.changed)
@@ -592,10 +586,9 @@ class ConfigForm(QScrollArea):
                 continue
             if must is None:
                 continue
-            # The shared bounded probe, never a bare is_dir(): these settings are
-            # the ones that point at network shares, one is_dir() on a
-            # disconnected share blocks for two minutes, and this method runs on
-            # every config load and every save.
+            # The shared bounded probe, never a bare is_dir(): these settings
+            # point at network shares, where one is_dir() on a disconnected
+            # share blocks for minutes.
             target = resolve(text)
             if must == "folder" and not _exists(target, "dir"):
                 out[key] = "this folder does not exist"
@@ -641,10 +634,7 @@ class ConfigForm(QScrollArea):
                     out[dotted] = [float(parts[0]), float(parts[1])]
             elif kind == "autonum":
                 # An empty box writes the WORD, never null. Both mean auto to
-                # the loader, but a file that says `null` where the key's whole
-                # vocabulary is `auto` reads as a value somebody cleared, and
-                # the next person to open the form would see it blank again
-                # with nothing saying which of the two it is.
+                # the loader, but `null` reads as a value somebody cleared.
                 text = widget.text().strip()
                 out[dotted] = "auto" if not text else _parse_scalar(text)
             else:
@@ -653,9 +643,8 @@ class ConfigForm(QScrollArea):
 
 
 class _GroupPicker(QWidget):
-    """Which feature families the model may use, with the unusable ones disabled
-    and labelled with the reason: a plain checklist would let you pick keypoint
-    features on a detect project and only fail at training time."""
+    """Which feature families the model may use, with the ones this project
+    cannot compute disabled and labelled with the reason."""
 
     def __init__(self, changed_signal):
         super().__init__()
@@ -686,8 +675,8 @@ class _GroupPicker(QWidget):
 
     def _on_toggled(self, _checked: bool) -> None:
         """Hold the "at least one group" rule here, where it can be explained.
-        The config loader rejects an empty list and autosave fires 700 ms after
-        every click, so unticking the last box would fail the whole save."""
+        The config loader rejects an empty list, so unticking the last box would
+        fail the autosave that follows the click."""
         if self._guard:
             return
         box = self.sender()
@@ -705,9 +694,9 @@ class _GroupPicker(QWidget):
         self._changed.emit()
 
     def _refresh_note(self) -> None:
-        """Warn when everything ticked is something this project cannot compute:
-        the config only checks the list is non-empty, so {pose, waveform} on a
-        detect project passes validation and fails at training time instead."""
+        """Warn when everything ticked is something this project cannot compute.
+        The config only checks the list is non-empty, so that combination passes
+        validation and fails at training time instead."""
         chosen = self.value()
         usable = [g for g in chosen if not self._available.get(g)]
         if chosen and not usable and self._available:
@@ -728,7 +717,7 @@ class _GroupPicker(QWidget):
             why = availability.get(name, "")
             # Left checked, not unchecked: the tick records what you WANT, so a
             # project temporarily on 'detect' gets its keypoint features back on
-            # returning to 'pose'. Training drops unavailable groups and says so.
+            # returning to 'pose'.
             box.setEnabled(not why)
             base = FEATURE_GROUPS[name]["about"]
             box.setToolTip(("UNAVAILABLE: " + why + "\n\n" + base) if why else base)
@@ -757,8 +746,7 @@ class _PathField(QWidget):
     """Line edit plus a Browse button that knows what it is picking."""
 
     # Browsing is a deliberate choice of THIS file, which is more than a text
-    # change: paths.model may be shadowed by a shared model, and only the
-    # picking tells the page the person meant to stop using it.
+    # change: paths.model may be shadowed by a shared model.
     picked = Signal(str)
 
     def __init__(self, kind: str, extra: dict, changed_signal):
@@ -771,8 +759,7 @@ class _PathField(QWidget):
         button.setFixedWidth(70)
         button.clicked.connect(self._browse)
         # A second line under the row, for a field whose value is not the whole
-        # story: paths.model reads as a file even when a downloaded model is
-        # what the project actually runs.
+        # story: paths.model reads as a file even when a downloaded model runs.
         self.status = QLabel("")
         self.status.setProperty("role", "muted")
         self.status.setWordWrap(True)
@@ -1074,8 +1061,7 @@ class _OptionRow(QWidget):
 # --------------------------------------------------------------------------- #
 def _row_height() -> int:
     """A table row tall enough for a themed combo box, measured not guessed: the
-    stylesheet's padding and border make an input taller than Qt's default
-    30 px row."""
+    stylesheet's padding and border make an input taller than Qt's default."""
     probe = QComboBox()
     probe.addItem("Head")
     return max(30, probe.sizeHint().height() + 8)
@@ -1087,8 +1073,7 @@ class KeypointEditor(QWidget):
     The count comes from the checkpoint; the names do not, since no ultralytics
     checkpoint carries them. The ORDER is a contract: ``clipfeatures`` addresses
     keypoints by position - 0 the head, 1 the base and body-frame origin, 1..end
-    the flagellum chain. Keypoints in a different order still produce
-    body-length and beat numbers, and they mean nothing.
+    the flagellum chain.
     """
 
     changed = Signal()
@@ -1227,8 +1212,7 @@ class KeypointEditor(QWidget):
     @staticmethod
     def _fit(table: QTableWidget, max_rows: int = 12) -> None:
         """Size a table to its rows so nothing is clipped. Both tables live in a
-        scroll area, so letting them grow and letting the page scroll shows every
-        keypoint at once instead of hiding rows behind an inner scrollbar."""
+        scroll area, so the page scrolls rather than the table."""
         rows = table.rowCount()
         row_height = table.rowHeight(0) if rows else table.verticalHeader().defaultSectionSize()
         header = table.horizontalHeader().height()
@@ -1296,8 +1280,8 @@ class KeypointEditor(QWidget):
 
     def _refresh_edge_choices(self) -> None:
         """Keep the link dropdowns in step with renamed keypoints, tracked by
-        POSITION and never by name: a renamed keypoint would leave its links
-        looking for text that no longer exists and silently fall back to 0."""
+        POSITION and never by name: a rename would leave a link looking for text
+        that no longer exists."""
         names = self.names()
         for row in range(self.edges.rowCount()):
             for column in (0, 1):

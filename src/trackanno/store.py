@@ -7,12 +7,8 @@ One CSV, one row per annotated clip. Design constraints:
   loses at most the clip on screen.
 * **Reassociatable** - every row carries the source file, track id, frame range
   and crop rectangle in original pixel coordinates.
-* **Self-describing** - every row records *why* that clip was put in front of a
-  human, because the answer stopped being "the next one in the manifest" the
-  moment a selector started picking by model uncertainty, and *whether it was
-  held out for audit at the moment it was labelled*, because that answer used
-  to be recomputed from the clip_id and the clip_id does not survive a
-  re-detection.
+* **Self-describing** - every row records why that clip was put in front of a
+  human, and whether it was held out for audit at the moment it was labelled.
 """
 
 from __future__ import annotations
@@ -57,33 +53,19 @@ TRAILING_COLUMNS = [
     # Provenance for the suggestion model: without these, agreement cannot be
     # told from influence, nor drift measured.
     "suggested", "suggest_conf", "suggest_shown",
-    # These two are LAST, in the order they were ADDED, and that is load-bearing
-    # rather than cosmetic. An older build opening a file this one wrote treats
-    # an unrecognised column as `extra` and appends it to the end of its own
-    # list (see `_load`); only if the newer columns are already last, in the
-    # order that build learned them, does the reconstruction match the header on
-    # disk, so the old build leaves the file alone instead of rewriting it. A
-    # build that knows `selected_by` but not `audit_holdout` reconstructs
-    # `... selected_by` + `[audit_holdout]`; one that predates both
-    # reconstructs `... suggest_shown` + `[selected_by, audit_holdout]`. Both
-    # match. Insert a new column anywhere but the end and every downgrade churns
-    # the whole log.
+    # These two are LAST, in the order they were ADDED, and that order is
+    # load-bearing: an older build reconstructs its header as its own columns
+    # plus any it does not recognise appended in file order (see `_load`), which
+    # matches the header on disk only while the newer columns are already last.
+    # Insert one anywhere else and every downgrade rewrites the whole log.
     PROVENANCE_COLUMN,
     AUDIT_COLUMN,
 ]
 
-# config.RESERVED_GROUP_NAMES restates these two lists by hand, and a column
-# added here but not there is not an error - it is a name a user is then allowed
-# to give a category, after which `record` writes the built-in and the category
-# into one key and the built-in is gone, silently.
-# tests/test_store_provenance.py asserts the two sets are equal, which is the
-# only thing that catches the omission.
-#
-# The duplication is not forced: `Config` is used here only in an annotation, and
-# `from __future__ import annotations` makes that lazy, so this import could move
-# under TYPE_CHECKING and config.py could derive its set from these two lists.
-# That inversion was left out of the change that added the provenance column
-# rather than bundled into it; the equality test is what makes leaving it safe.
+# config.RESERVED_GROUP_NAMES restates these two lists by hand. A column added
+# here but not there becomes a name a user may give a category, after which
+# `record` writes the built-in and the category into one key and the built-in is
+# gone silently; tests/test_store_provenance.py asserts the two sets are equal.
 
 
 # --------------------------------------------------------------------------- #
@@ -93,10 +75,9 @@ def _plain(value):
     """numpy scalars to Python scalars, exactly, so ``json`` will take them.
 
     A score straight out of ``predict_proba`` is a ``numpy.float32``, which
-    ``json`` refuses. Left to fail it would abort the save of a label a person
-    had just typed - the one moment in this program where losing work is least
-    acceptable. ``.item()`` widens rather than rounds, so nothing is guessed;
-    anything it cannot convert is passed through to fail loudly at ``dumps``.
+    ``json`` refuses, and the save it would abort is a label just typed.
+    ``.item()`` widens rather than rounds, so nothing is guessed; anything it
+    cannot convert is passed through to fail at ``dumps``.
     """
     if isinstance(value, (str, bytes, bool, int, float, type(None))):
         return value
@@ -116,40 +97,23 @@ def _plain(value):
 def encode_provenance(decision: Mapping | str | None) -> str:
     """Serialise *why* a clip was put in front of a human, for one CSV cell.
 
-    Clips used to be served in manifest order, which made the labelled set an
-    unbiased sample and made every statistic computed over it - class balance,
-    cross-validated F1 - a statement about the data. An active-learning selector
-    breaks that silently: the labelled set becomes whatever the model asked for
-    and nothing in the file says so, and "the model is 89% accurate" can no
-    longer be read at all, because nobody can tell which rows were drawn at
-    random and which the model chose.
+    JSON, one line, keys sorted, rather than a fixed pair of columns: a new
+    selection rule can then record one more thing without a schema migration,
+    and re-recording the same decision is a no-op in a diff. ASCII-only (the
+    ``json.dumps`` default) is what keeps a literal newline out of the cell -
+    :meth:`AnnotationStore._repair_torn_append` finds where a row ends by the
+    last newline *byte* and never by parsing.
 
-    JSON, one line, keys sorted, rather than a fixed pair of columns: the set of
-    selection rules will grow, and a rule that needs to record one more thing
-    (which class was starved, which model scored it) must not force another
-    schema migration - each of which rewrites everyone's CSV. Sorting the keys
-    makes the encoding byte-stable, so re-recording the same decision is a no-op
-    in a diff rather than a spurious change.
-
-    ASCII-only (the ``json.dumps`` default) is what makes the value safe for
-    :meth:`AnnotationStore._repair_torn_append`, which decides where a row ends
-    by looking for the last newline *byte* and never by parsing: a literal
-    newline inside any field would let it cut an intact row in half. JSON
-    escapes those to ``\\n``, so no rule name ever can. Commas and quotes need no
-    such care - the csv module quotes and doubles them and reads them back
-    identically.
-
-    ``None`` encodes as ``""``, which is the encoding of *not recorded*. That is
-    a different fact from *chosen at random*, and it is deliberately not
-    spellable as a rule: a blank rule name is refused below, so the empty cell
-    stays the one and only way to say "this row does not know".
+    ``None`` encodes as ``""``, meaning *not recorded*, which is a different
+    fact from *chosen at random*. A blank rule name is refused below, so the
+    empty cell stays the only way to say "this row does not know".
     """
     if decision is None:
         return ""
     if isinstance(decision, str):
         # Already encoded - the GUI may carry a decision through as an opaque
-        # string. Re-encode rather than trust it: an unreadable value written
-        # into the log would only be discovered by whoever tried to analyse it.
+        # string. Re-encode rather than trust it: an unreadable value in the log
+        # would only be found by whoever tried to analyse it.
         return encode_provenance(decode_provenance(decision)) if decision.strip() else ""
     if not isinstance(decision, Mapping):
         raise TypeError(
@@ -177,15 +141,11 @@ def encode_provenance(decision: Mapping | str | None) -> str:
 def decode_provenance(value: str | None) -> dict:
     """Read a ``selected_by`` cell back. ``{}`` means *the row does not say*.
 
-    This function exists so that "not recorded" and "chosen at random" cannot be
-    conflated. An empty cell - an old file, or a caller that declined to say -
-    decodes to ``{}``; a clip genuinely drawn at random decodes to a mapping
-    whose ``rule`` says so. Anything that defaults the empty case to "random" is
-    re-introducing the bug this column was added to prevent.
-
-    A cell that will not decode raises rather than returning ``{}``: corrupt is a
-    third fact again, and reporting it as "not recorded" would hide a damaged log
-    behind a plausible-looking answer.
+    An empty cell - an old file, or a caller that declined to say - decodes to
+    ``{}``; a clip genuinely drawn at random decodes to a mapping whose ``rule``
+    says so, so the two are never conflated. A cell that will not decode raises
+    rather than returning ``{}``, since reporting a damaged log as "not
+    recorded" hides it behind a plausible answer.
     """
     if value is None or not str(value).strip():
         return {}
@@ -209,27 +169,16 @@ def decode_provenance(value: str | None) -> dict:
 def encode_audit(member: bool | None) -> str:
     """Serialise *was this clip held out for audit when it was labelled*.
 
-    Membership used to be recomputed on demand, as a hash of the ``clip_id``.
-    That is stable only for as long as the ``clip_id`` is, and it is not:
-    ``clip_id`` embeds the track id, re-running detection renumbers the tracks,
-    and ``reassociate`` then rewrites the id in place to put the label back on
-    its clip. The label survives; the membership it was earned under does not.
-    A clip deliberately never trained on can come back with an id that hashes
-    into the training set, the next fit trains on the holdout, and the
-    "unbiased" accuracy is reported over a different, partly overlapping set -
-    with nothing in the program able to notice, because there is nothing to
-    compare against. This column is that something to compare against.
+    A recorded fact rather than a hash of the ``clip_id``, because the id embeds
+    the track id and re-running detection renumbers the tracks: re-hashing would
+    move a labelled clip INTO the holdout after the model had already seen it,
+    or OUT of it after it was excluded. Only a LABELLED clip needs the
+    guarantee; an unlabelled clip's membership is nobody's dependency and is
+    left to the hash.
 
-    Only a LABELLED clip needs the guarantee. Nothing has been trained on an
-    unlabelled clip and nothing has been withheld from it, so its membership can
-    move freely and is left to the hash; what must never happen is a clip moving
-    INTO the holdout after the model has already seen it, or OUT of it after
-    being excluded.
-
-    ``"1"``/``"0"``, matching the ``uncertain`` column rather than inventing a
-    third spelling of a flag in one file. ``None`` encodes as ``""``, which is
-    *not recorded* - a different fact from *not held out*, and deliberately the
-    only way to say it, so an old row and a training row stay distinguishable.
+    ``"1"``/``"0"``, matching the ``uncertain`` column. ``None`` encodes as
+    ``""``, meaning *not recorded*, which is a different fact from *not held
+    out*.
     """
     if member is None:
         return ""
@@ -239,16 +188,11 @@ def encode_audit(member: bool | None) -> str:
 def decode_audit(value) -> bool | None:
     """Read an ``audit_holdout`` cell back. ``None`` means *the row does not say*.
 
-    Accepts what the readers of this file actually produce, which is more than
-    the two strings written: ``suggest.train`` reads the CSV with
-    ``pandas.read_csv`` and no dtype, so a column of ``1``/``0``/``""`` arrives
-    as floats with ``NaN`` for the blanks.
-
-    Anything else RAISES rather than defaulting. A cell nobody can read means
-    nobody can say whether the clip was held out, and the two ways to guess are
-    both silent corruption: guess "held out" and a trained-on clip is scored as
-    if it were fresh; guess "not held out" and a clip kept out of the model is
-    fed to it. An unreadable log is a thing to fix, not a thing to average over.
+    Accepts more than the two strings written: ``suggest.train`` reads the CSV
+    with ``pandas.read_csv`` and no dtype, so a column of ``1``/``0``/``""``
+    arrives as floats with ``NaN`` for the blanks. Anything else RAISES rather
+    than defaulting - guessing "held out" scores a trained-on clip as fresh, and
+    guessing "not held out" feeds the model a clip kept from it.
     """
     if value is None or isinstance(value, bool):
         return value
@@ -271,10 +215,8 @@ def read_audit_records(path: str | Path) -> dict[str, bool]:
     """``{clip_id: was_held_out}`` for the rows that SAY, straight off the CSV.
 
     Rows with an empty cell are absent from the mapping rather than present as
-    ``None``: the caller's question is "is there a record", and a key that maps
-    to "no" would have to be checked for by identity at every call site, which
-    is exactly how the empty-cell-means-random conflation got into the
-    provenance column's first draft.
+    ``None``: the caller's question is "is there a record", and a key mapping to
+    "no" would have to be checked for by identity at every call site.
 
     Read with the ``csv`` module and not pandas, because this is on the import
     path of the GUI's clip view and pandas is not.
@@ -303,14 +245,11 @@ class AnnotationStore:
         self.cfg = cfg
         self.group_columns = [g.name for g in cfg.categories]
         # `columns` is plain concatenation, so a category named after a built-in
-        # appears in it TWICE and nothing downstream complains: DictWriter emits
-        # the header name twice, `record` has already overwritten the built-in's
-        # value with the category's (the group loop runs after the row literal),
-        # and DictReader keeps only the last occurrence on the way back in. The
-        # net effect is a built-in column silently discarded - which for
-        # PROVENANCE_COLUMN is exactly the failure it was added to prevent.
-        # `load_config` refuses these names, but a Config built any other way
-        # does not go through it, so refuse here too rather than corrupt the log.
+        # would appear twice and the built-in would be silently discarded:
+        # DictWriter emits the name twice, `record`'s group loop has already
+        # overwritten the built-in's value, and DictReader keeps only the last
+        # occurrence. `load_config` refuses these names, but a Config built any
+        # other way does not go through it.
         clashes = sorted(set(self.group_columns) & set(IDENTITY_COLUMNS + TRAILING_COLUMNS))
         if clashes:
             raise ValueError(
@@ -388,16 +327,11 @@ class AnnotationStore:
                 row.setdefault(col, "")
 
         # FREEZE the audit membership of every labelled clip that has not
-        # recorded one, at whatever the hash says TODAY. Recording today's
-        # answer is what makes this an upgrade rather than a redraw: the
-        # holdout an existing project has right now is the holdout it keeps,
-        # clip for clip, and no row changes side. Re-deriving it later - after a
-        # re-detection has renumbered the tracks and rewritten every clip_id -
-        # would move about a fifth of them at the default fraction, silently.
-        #
-        # Here rather than at train time because this is the module that owns
-        # the file: a fit must be able to READ the membership without being the
-        # thing that decides it, or two fits of the same project could disagree.
+        # recorded one, at whatever the hash says TODAY, so the holdout an
+        # existing project has now is the holdout it keeps, clip for clip.
+        # Here rather than at train time because this module owns the file: a
+        # fit must be able to READ the membership without deciding it, or two
+        # fits of the same project could disagree.
         stamped, by_record = 0, 0
         for clip_id, row in self.rows.items():
             try:
@@ -420,12 +354,10 @@ class AnnotationStore:
                 "renumbering the tracks.",
                 stacklevel=2,
             )
-        # Said once per open, and only when it is true, because it is the ONLY
-        # way anyone finds out their project has been re-detected: these clips
-        # are held out (or trained on) against what their new clip_id hashes to.
-        # NOT a warning per row - disagreement is the case this column exists to
-        # handle, not an error - but the COUNT is news, because on a project
-        # that has never been re-detected it is zero.
+        # Said once per open, and only when non-zero: on a project that has
+        # never been re-detected the count is zero, so a non-zero one is the
+        # only way anyone finds out theirs has been. Not a warning per row -
+        # disagreement is the case this column exists to handle, not an error.
         if by_record:
             warnings.warn(
                 f"{self.path.name}: {by_record} of {len(self.rows)} labelled clip(s) "
@@ -437,10 +369,9 @@ class AnnotationStore:
                 stacklevel=2,
             )
 
-        # Say it once, in the one moment it matters: the rewrite below fills the
-        # new column with "" for every historical row, and "" means NOT RECORDED.
-        # Left unsaid, a later analysis would read those blanks as "chosen at
-        # random" - the exact conflation this column exists to make impossible.
+        # Said once, in the one moment it matters: the rewrite below fills the
+        # new column with "" for every historical row, and "" means NOT
+        # RECORDED, which a later analysis must not read as "chosen at random".
         if self.rows and disk_columns and PROVENANCE_COLUMN not in disk_columns:
             warnings.warn(
                 f"{self.path.name} predates the {PROVENANCE_COLUMN!r} column: its "
@@ -451,11 +382,9 @@ class AnnotationStore:
                 stacklevel=2,
             )
         # `stamped` on its own is enough to force the rewrite: an older build
-        # appending to an upgraded file writes a row one field SHORT (its
-        # DictWriter does not know the column), which reads back as unrecorded
-        # while the header on disk already matches. Without this the stamp would
-        # live in memory only and be recomputed - from a possibly different hash
-        # - on the next open.
+        # appending to an upgraded file writes a row one field SHORT, which
+        # reads back as unrecorded while the header on disk already matches, so
+        # a stamp left in memory would be recomputed on the next open.
         if stamped or (disk_columns and disk_columns != self.columns):
             self.rewrite()
 
@@ -541,17 +470,14 @@ class AnnotationStore:
         """Insert or update the annotation for one clip and persist it.
 
         ``selected_by`` is the selector's own account of why this clip was shown
-        (see :func:`encode_provenance`). It defaults to ``None`` - *not recorded*
-        - and deliberately not to "random": a caller that says nothing has not
-        told us the sample was unbiased, it has told us nothing, and writing the
-        stronger claim on its behalf is the guess this column exists to refuse.
+        (see :func:`encode_provenance`). It defaults to ``None`` - *not
+        recorded* - and never to "random": a caller that says nothing has not
+        said the sample was unbiased.
 
         ``audit_holdout`` has no parameter and is not the caller's to supply.
-        Provenance is a fact only the selector knows; membership is a fact
-        anyone with the clip_id and the config can derive, so leaving it to
-        callers would only create a way to forget it - and a row written without
-        it would fall back to the hash for ever after. See
-        :meth:`_audit_membership` for the one case where it is not derived.
+        Provenance is a fact only the selector knows; membership anyone with the
+        clip_id and the config can derive, so a parameter would only be a way to
+        forget it. See :meth:`_audit_membership`.
         """
         clip_id = str(meta["clip_id"])
         previous = self.rows.get(clip_id)
@@ -578,16 +504,16 @@ class AnnotationStore:
             "suggested": suggestion[0] if suggestion else "",
             "suggest_conf": f"{suggestion[1]:.3f}" if suggestion else "",
             "suggest_shown": "1" if suggestion_shown else "0",
-            # Encoded here, before anything is written: a decision that cannot be
+            # Encoded before anything is written: a decision that cannot be
             # serialised must stop the record outright, not land as a blank cell
             # that reads back as "this row does not know why it was shown".
             PROVENANCE_COLUMN: encode_provenance(selected_by),
             AUDIT_COLUMN: encode_audit(self._audit_membership(clip_id, previous)),
         }
         for group in self.cfg.categories:
-            # This runs AFTER the literal above, so a group named like a built-in
-            # column would overwrite it without a word. __init__ refuses those
-            # names outright; this loop is the reason it has to.
+            # Runs AFTER the literal above, so a group named like a built-in
+            # column would overwrite it without a word; __init__ refuses those
+            # names for this reason.
             row[group.name] = values.get(group.name, "")
 
         # Persist before committing: on a failed write (a concurrent reader
@@ -614,18 +540,14 @@ class AnnotationStore:
     def _audit_membership(self, clip_id: str, previous: dict | None) -> bool:
         """Whether this clip counts as held out, for the row about to be written.
 
-        An existing row KEEPS what it recorded, and that is the whole guarantee
-        rather than a nicety. After a re-detection, ``reassociate`` re-points a
-        label at the clip_id the same animal now has; re-deriving membership
-        here would let a clip that was held out - never suggested on, never
-        trained on, its label earned under those conditions - be re-hashed into
-        the training set by the act of correcting a typo in its notes. The
-        recorded value is what the human judged under, so it is what stands.
+        An existing row KEEPS what it recorded: after a re-detection has
+        renumbered the tracks, re-deriving membership here would let correcting
+        a typo in a held-out clip's notes re-hash it into the training set. The
+        recorded value is what the human judged under, so it stands.
 
-        A row being written for the FIRST time has no record to keep and takes
-        the hash, which is the answer everything else in the program was already
-        using for it: an unlabelled clip's membership is nobody's dependency, so
-        this is the moment it stops being free to move, and not before.
+        A row written for the FIRST time has no record to keep and takes the
+        hash, which is what everything else was already using for it. That is
+        the moment an unlabelled clip's membership stops being free to move.
         """
         if previous is not None:
             recorded = decode_audit(previous.get(AUDIT_COLUMN))

@@ -81,40 +81,22 @@ def build_frame_marks(
     opinion appended to the caption; untouched tracks keep the dashed mark.
 
     TWO BOUTS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this function
-    raises if they do. Every row is painted over ``range(f_start, f_end)`` into
-    one dict, so a second row covering a frame the first already claimed simply
-    replaces it, and the exported colour of that frame is then decided by the
-    order pandas handed the rows over rather than by the model. For a BOUT that
-    is always a broken invariant: a decode cuts a track's frames into runs
-    between inferred boundaries, so within one group they are disjoint by
-    construction and a collision means the decode or the file is wrong. Painting
-    one of the two competing values would hide that behind a picture that looks
-    entirely normal.
+    raises if they do: a decode cuts a track's frames into runs between inferred
+    boundaries, so within one group bouts are disjoint by construction and a
+    collision means the decode or the file is wrong. WINDOW rows are not
+    guarded, because overlapping windows are a legitimate geometry -
+    ``predict.coverage: manifest`` with ``clips.stride`` below ``clips.frames``
+    gives one track consecutive clips that share frames on purpose - so they get
+    the labels pass's rule instead: whichever row comes later in the file wins
+    the shared frames.
 
-    WINDOWS ARE NOT GUARDED, and the difference is geometry rather than
-    strictness. A window row is a row off a grid, and one of the grids that
-    produces them legitimately overlaps: ``predict.coverage: manifest`` scores
-    exactly the clips cut for annotation, so a project whose ``clips.stride`` is
-    below ``clips.frames`` has consecutive clips of one track sharing frames on
-    purpose - the same geometry the labels pass below calls a configuration
-    rather than a fault. Guarding it made every such movie fail to render at all.
-    The dense grid's windows do not overlap, but that rests on
-    :func:`trackanno.config.load_config` refusing an overlapping
-    ``predict.window_stride`` without a ``predict.decode`` (which turns the rows
-    into bouts, guarded above), and nothing in the FILE distinguishes a dense
-    window row from a manifest one - a dense window's ``clip_id`` is deliberately
-    formed to collide with an annotation clip's. So window rows get the labels
-    pass's rule: whichever row comes later in the file wins the shared frames.
+    Which of the two a file holds is read off the FILE, as
+    :func:`prediction_unit` reads it: ``predict.decode`` can be edited after a
+    run, and ``bout_id`` is the column a decoded row carries.
 
-    Which of the two a file holds is read off the FILE, exactly as
-    :func:`prediction_unit` reads it and for the same reason: ``predict.decode``
-    can be edited after a run, and the config would then describe the run that
-    has not happened yet. ``bout_id`` is the column a decoded row carries.
-
-    A hand label landing on a frame a prediction already claimed is a different
-    thing again and is NOT a collision: it is exactly what ``--source both``
-    is for, and the labels pass below deliberately overwrites the dashed mark
-    while keeping the model's answer in the caption.
+    A hand label landing on a frame a prediction already claimed is NOT a
+    collision: it is what ``--source both`` is for, and the labels pass below
+    overwrites the dashed mark while keeping the model's answer in the caption.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
@@ -177,8 +159,8 @@ def build_frame_marks(
             # the predictions pass above gives a WINDOW: a hand label overwriting
             # a prediction is what 'both' means, and two annotation rows
             # overlapping is what `clips.stride` below `clips.frames` asks for.
-            # Both are choices, not broken invariants. Only a bout is guarded,
-            # because only a bout is disjoint by construction.
+            # Only a bout is guarded, because only a bout is disjoint by
+            # construction.
             for frame in range(int(row["f_start"]), int(row["f_end"])):
                 existing = out.get(frame, {}).get(track_id)
                 text = value
@@ -198,17 +180,11 @@ def _overlap_message(
 ) -> str:
     """Why two BOUTS meeting on one frame is fatal, in terms of the rows.
 
-    Names the frame, the track and BOTH values, because "predictions overlap" is
-    something to go and investigate whereas "frame 812, track 3: [800, 850) says
-    'immotile', [812, 862) says 'swimming'" is something to go and fix. The two
-    spans come from the rows themselves, so a duplicated row and a genuinely
-    overlapping pair - which want different fixes - do not read alike.
-
-    Only reachable for rows carrying ``bout_id``; overlapping WINDOW rows are a
-    legitimate geometry and are painted, see :func:`build_frame_marks`. So this
-    is never a configuration to be corrected - a decode cuts each track's frames
-    into disjoint runs, and there is no setting that makes it produce two rows
-    for one frame of one track.
+    Names the frame, the track and BOTH spans, taken from the rows themselves,
+    so a duplicated row and a genuinely overlapping pair - which want different
+    fixes - do not read alike. Only reachable for rows carrying ``bout_id``;
+    overlapping WINDOW rows are a legitimate geometry and are painted, see
+    :func:`build_frame_marks`.
     """
     earlier = next(
         (f"[{s}, {e}) says {v!r}" for s, e, v in claimed.get(track_id, [])
@@ -348,18 +324,11 @@ def render_movie(
 def prediction_unit(predictions: pd.DataFrame) -> str:
     """What one row of ``predictions.parquet`` actually IS, for counting it aloud.
 
-    "predicted clips" was only ever true by coincidence: a dense row is a window
-    off a grid the predictor laid down itself, and it lined up with an annotation
-    clip because ``window_frames: auto`` picks min(clips.frames, clips.stride) so
-    that it would. Under a decode the rows stop being windows at all - they are
-    BOUTS, variable-length runs between inferred behavioural boundaries - and a
-    count of "clips" would then describe neither the grid nor the animal.
-
-    The answer is read off the FILE rather than off ``predict.decode``, because
-    the config can be edited after a prediction run and the count then names what
-    the next run would produce instead of what this one did. ``bout_id`` is the
-    column a decoded row carries in place of ``clip_id``; a row without one came
-    off a grid, whether that grid was the dense one or the annotation manifest.
+    A decoded row is a BOUT, a variable-length run between inferred behavioural
+    boundaries; an undecoded one is a window off a grid. Read off the FILE
+    rather than off ``predict.decode``, because the config can be edited after a
+    run and the count would then name what the next run would produce.
+    ``bout_id`` is the column a decoded row carries in place of ``clip_id``.
     """
     return "predicted bouts" if "bout_id" in predictions.columns else "predicted windows"
 

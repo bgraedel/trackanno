@@ -3,11 +3,10 @@
 Two halves. **Kinematic** (~25 features from ``tracks.parquet``): the annotated
 categories are mostly *motion*, which no single frame shows, so speed,
 straightness, turn rate and beat frequency carry the signal. **CNN**
-(PCA-reduced ROI features): these encode individual identity almost perfectly
-(100% re-ID in testing), so a model can score well by recognising animals rather
-than behaviours. Fit the PCA on *per-instance* vectors, not on the handful of
-clip vectors, and judge the payoff by grouped cross-validation in
-:mod:`trackanno.suggest`.
+(PCA-reduced ROI features): these encode individual identity almost perfectly,
+so a model can score well by recognising animals rather than behaviours. Fit the
+PCA on *per-instance* vectors, not on the handful of clip vectors, and judge the
+payoff by grouped cross-validation in :mod:`trackanno.suggest`.
 """
 
 from __future__ import annotations
@@ -43,10 +42,9 @@ BEAT_F_MIN_HZ = 1.0
 # tethered cell beating at ~1.2 Hz has a period longer than a whole 50-frame clip
 # at 100 fps. Report NaN rather than the lowest searchable bin.
 BEAT_MIN_CYCLES = 3.0
-# Do not reinstate a significance threshold: a fixed 10x excess gate passes 30% of
-# pure red noise at 25 frames, 81% at 50 and ~100% at 100+, since peak-over-band-
-# median scales with the search band and so with clip length. `beat_excess` and
-# `beat_censored` are emitted as features instead.
+# No significance threshold: a fixed excess gate passes most pure red noise,
+# because peak-over-band-median scales with the search band and so with clip
+# length. `beat_excess` and `beat_censored` are emitted as features instead.
 #
 # Above this filled share a spectral estimate describes the interpolator, not the
 # cell, and is NaN. The 20% `badFileFlag` in computeGoodFrameRange.m.
@@ -94,9 +92,8 @@ def _on_grid(sub: pd.DataFrame, columns: list[str], n_frames: int, f_start: int)
     """Lay a track's rows onto the full clip frame grid, NaN where undetected.
 
     Missing frames are absent ROWS in tracks.parquet, so np.diff would bridge a
-    gap and read a 5-frame jump as one frame of motion, inflating speed by up to
-    27%. On a NaN-filled grid the gap propagates to NaN and the nan-aware
-    reducers drop it.
+    gap and read a 5-frame jump as one frame of motion, inflating speed. On a
+    NaN-filled grid the gap propagates to NaN and the nan-aware reducers drop it.
     """
     out = np.full((n_frames, len(columns)), np.nan, dtype=float)
     idx = sub["frame"].to_numpy(dtype=int) - f_start
@@ -131,8 +128,8 @@ def _beat_estimate(lateral: np.ndarray, fps: float) -> dict:
     Three rules, none of which an argmax on the raw bin index obeys:
 
     * Search a PHYSICAL band (>= BEAT_F_MIN_HZ), never a bin index: a red
-      spectrum searched from bin 2 always returns bin 2, making the feature a
-      readout of track length (r = -0.999 with frame count).
+      spectrum searched from a fixed bin always returns that bin, making the
+      feature a readout of track length.
     * Fix the FFT grid (zero-padded to BEAT_NFFT) so clips of different length
       are comparable.
     * REPORT the peak's excess over the red-noise baseline (``beat_excess``);
@@ -217,10 +214,9 @@ def _heading_lag(x: np.ndarray, y: np.ndarray, n_frames: int) -> int:
 
     Heading is an angle, defined only once the cell has moved further than the
     localisation jitter. Test that over a LAG, never over a single frame: a
-    per-frame test demands ``LOCALISATION_NOISE_PX`` per frame, 180 px/s at
-    100 fps against a median cell speed of 83, so it leaves turn_* undefined on
-    most clips. It is also a speed threshold in disguise, which makes the NaN
-    pattern itself a speed measurement (AUC 0.985 against speed_p90) that a
+    per-frame test demands ``LOCALISATION_NOISE_PX`` of motion every frame, so
+    it leaves turn_* undefined on most clips, and it is a speed threshold in
+    disguise - which makes the NaN pattern itself a speed measurement that a
     NaN-native model splits on and reads as "turning".
     """
     max_lag = max(1, min(n_frames // 4, 25))
@@ -265,7 +261,7 @@ def _body_frame_motion(px: np.ndarray, py: np.ndarray, dt: float = 1.0) -> dict:
     # Mask, never compact. Dropping the rows where Head or Base was undetected
     # leaves the survivors non-uniformly sampled while _beat_estimate still
     # assumes 1/fps, scaling beat_freq_hz by the reciprocal of the surviving
-    # fraction (8 Hz read as 14.1 at 50% loss).
+    # fraction.
     rx = np.where(valid[:, None], rx, np.nan)
     ry = np.where(valid[:, None], ry, np.nan)
     if valid.sum() < 2:
@@ -279,8 +275,8 @@ def _body_frame_motion(px: np.ndarray, py: np.ndarray, dt: float = 1.0) -> dict:
         out["beat_amp_max"] = _safe(np.nanmax(amp))
         out["beat_speed_mean"] = _safe(np.nanmean(step) / dt)
 
-    # The most distal node alone: pooling all flagellar keypoints averages Flag1
-    # (rms ~3 px) with Tip (~15 px), a ~5x dilution.
+    # The most distal node alone: pooling all flagellar keypoints averages the
+    # low-amplitude proximal nodes with the tip and dilutes the signal.
     out["beat_amp_distal"] = _safe(
         np.sqrt(np.nanmean((ry[:, -1] - np.nanmean(ry[:, -1])) ** 2))
     )
@@ -357,32 +353,11 @@ def window_features(
     ordered, adjacent, or a partition of the track, so a dense stride-1 grid and
     the annotation tiling go through the same code and get the same answers.
 
-    They are NOT free, though. Only the `wave_*` STFT is genuinely amortised -
-    :func:`trackanno.wavespectra.track_spectral_series` transforms the track
-    once and each window is a slice of it, as is the
-    :mod:`trackanno.trackseries` layout. The `beat_*` block is amortised not at
-    all: :func:`_beat_on_window` pays a fresh O(N) boolean mask over the WHOLE
-    track and a fresh FFT for every window, and is the largest per-window term.
-
-    Measured (500-frame track, 8 keypoints, `spectral.window=75`): about 37 ms
-    fixed per track plus about 4 ms per window. Taking that track's exact tiling
-    as the baseline (50-frame windows at stride 50 = 10 windows, ~77 ms), 5x the
-    windows costs about 2.8x the wall time and 10x about 5.4x. Linear in the
-    window count over a substantial constant - not free. These are ONE TRACK:
-    a real project measured 4x for 5x the windows, because a run also pays
-    per-movie and per-track costs a single-track timing amortises away. Quote
-    the project number when budgeting; see the README. (The 2.7x/6.7x figures
-    this paragraph used to quote were `trackseries`-only numbers from
-    `tests/test_trackseries.py`, which measure the amortised half alone and are
-    not the cost of `window_features`. Do not reinstate them.)
-
-    Two cheap optimisations are available if this ever becomes hot, both inside
-    :func:`_beat_on_window` and neither done here - this branch is about
-    correctness, and an unmeasured optimisation in the same commit would
-    confound the numbers above. First, hoist `tdf["frame"].to_numpy(dtype=int)`
-    out of it; the caller below already has that array. Second, replace its
-    full-track boolean mask with a `searchsorted` slice - both callers sort
-    `tdf` by frame first, so the window is already a contiguous range.
+    They are not free. The `wave_*` STFT and the :mod:`trackanno.trackseries`
+    layout are amortised over the track, each window being a slice, but the
+    `beat_*` block is not: :func:`_beat_on_window` pays a fresh mask over the
+    whole track and a fresh FFT per window, so cost is linear in the window
+    count over a substantial constant. See the README for the timings.
     """
     from . import trackseries, wavespectra
 
@@ -524,8 +499,9 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
                     rows_idx = sub.index.to_numpy()
                     # instance_features.npy is row-aligned with tracks.parquet.
                     # Assert it rather than trust it: these vectors re-identify
-                    # individuals at 100%, so a mis-pairing shows up not as lower
-                    # accuracy but as a model that tests well and fails later.
+                    # individuals almost perfectly, so a mis-pairing shows up not
+                    # as lower accuracy but as a model that tests well and fails
+                    # later.
                     if len(feats) != len(tracks) or rows_idx.max(initial=0) >= len(feats):
                         raise RuntimeError(
                             f"{movie_id}: instance_features.npy has {len(feats)} rows but "

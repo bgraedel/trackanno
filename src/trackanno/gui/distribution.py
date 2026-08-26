@@ -2,12 +2,9 @@
 
 Three things worth seeing on the way to Export: one class swallowing most of the
 clips, so a classifier that always answers it scores well and means nothing; a
-class below ``suggest.min_per_class``, silently dropped at training time; a class
-living in a single movie, which grouped cross-validation cannot put in both train
-and test, so its score is meaningless.
-
-Painted with QPainter rather than a plotting library: no new dependency, it
-follows the theme without a second palette, and it stays sharp at any DPI.
+class below ``suggest.min_per_class``, dropped at training time; a class living
+in a single movie, which grouped cross-validation cannot put in both train and
+test.
 """
 
 from __future__ import annotations
@@ -62,9 +59,8 @@ class GroupTally:
 def tally_annotations(rows, cfg) -> list:
     """[GroupTally] from CSV rows, in the order the config declares them.
 
-    Every configured option gets a bar even at zero: an empty class is the most
-    important thing on the chart. Values in the CSV the config no longer declares
-    get bars too, marked unknown, so a renamed option shows as orphaned."""
+    Every configured option gets a bar even at zero, and a value in the CSV the
+    config no longer declares gets one marked unknown."""
     out = []
     for group in cfg.categories:
         tally = GroupTally(name=group.name, is_multi=group.is_multi)
@@ -103,8 +99,7 @@ def tally_annotations(rows, cfg) -> list:
 
 
 class BarChart(QWidget):
-    """Horizontal bars for one category group, sized from its own contents: three
-    options and twelve options should not get the same height."""
+    """Horizontal bars for one category group, sized from its own contents."""
 
     ROW = 26
     GAP = 5
@@ -260,7 +255,7 @@ def summary_lines(tallies, cfg) -> list:
                 "this group."
             )
         # Imbalance, judged on the labels themselves: counting the "(not set)"
-        # bar makes an entirely unlabelled group report a nonsense percentage.
+        # bar would make an unlabelled group report a nonsense percentage.
         labelled = sum(b.count for b in real)
         top = max(real, key=lambda b: b.count, default=None)
         if labelled >= 20 and top is not None and top.count / labelled > 0.9:

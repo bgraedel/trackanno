@@ -3,12 +3,10 @@
 Time runs left to right and arclength top to bottom, base at the top and tip at
 the bottom - the flagellar convention, under which a travelling wave reads as
 diagonal stripes sloping down-right. Curvature is signed and its zero is
-meaningful, so the colour scale is **diverging**: a neutral grey midpoint and
-two poles (the application's own accent and danger tokens, which clear
-colourblind separation and contrast on both surfaces), never a rainbow and never
-a hue in the middle. Frames the tracker missed stay bare surface; painting a gap
-as the midpoint colour would invent a straight flagellum where there was no
-measurement.
+meaningful, so the colour scale is diverging: a neutral grey midpoint and the
+accent and danger tokens as poles. Frames the tracker missed stay bare surface,
+since painting a gap as the midpoint colour would show a straight flagellum
+where there was no measurement.
 """
 
 from __future__ import annotations
@@ -47,9 +45,8 @@ def _srgb(c: float) -> float:
 def diverging_ramp(steps: int = 256, theme: str | None = None) -> np.ndarray:
     """(steps, 3) uint8 from the negative pole through neutral to the positive.
 
-    Mixed through linear light, not straight sRGB: interpolating a saturated blue
-    to a grey in sRGB dips in luminance and leaves a dark band either side of zero
-    that reads as structure the data does not have."""
+    Mixed through linear light, not straight sRGB, where the interpolation dips
+    in luminance and leaves a dark band either side of zero."""
     t = tokens()
     theme = theme or current()
     negative = QColor(t["accent"])
@@ -99,7 +96,7 @@ class KymographView(QWidget):
     def field(self):
         """The (frames, arclength) array to paint, after field and sign choices.
         Both are applied here rather than baked into the Kymograph, so switching
-        either one repaints without refitting fifty splines."""
+        either one repaints without refitting the splines."""
         if self.kymo is None:
             return None
         if self.field_kind == "tangent" and self.kymo.psi is not None:
@@ -109,8 +106,8 @@ class KymographView(QWidget):
 
         # The sign is judged on the curvature even when the tangent angle is on
         # screen: the static mode deciding it is a property of the cell, not of
-        # the selected view. Cached against the clip - the verdict cannot change
-        # without the data - because field() runs on every repaint and mouse move.
+        # the selected view. Cached against the clip, since field() runs on every
+        # repaint and mouse move.
         if self.verdict is None or self._verdict_for is not self.kymo:
             self.verdict = canonical_sign(self.kymo.kappa)
             self._verdict_for = self.kymo
@@ -239,9 +236,8 @@ class KymographView(QWidget):
         # The plot ground, so a transparent gap reads as a hole.
         painter.setBrush(QColor(t["raised"]))
         painter.drawRect(plot)
-        # Filtered: both axes are sampled continuous quantities (arclength off a
-        # fitted curve; at 100 fps a 10-20 Hz beat is five to ten frames per
-        # cycle), so smoothing invents nothing. Switchable, for a noisy track.
+        # Filtered: both axes sample a continuous quantity, so smoothing invents
+        # nothing. Switchable, for a noisy track.
         painter.setRenderHint(QPainter.SmoothPixmapTransform, self.interpolate)
         painter.drawImage(plot, self._image)
 
@@ -325,8 +321,8 @@ class KymographView(QWidget):
             QRectF(bar.right() + 3, bar.center().y() + 6, MARGIN_RIGHT - 26, 12),
             int(Qt.AlignLeft | Qt.AlignVCenter), label,
         )
-        # Say when the handedness could not be decided, rather than letting the
-        # colours imply a convention the data never established.
+        # Say when the handedness could not be decided, so the colours do not
+        # imply a convention the data never established.
         if self.sign_mode == "canonical" and self.verdict is not None:
             if not self.verdict.confident:
                 painter.setPen(QColor(t["warning"]))

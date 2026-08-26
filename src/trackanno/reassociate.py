@@ -4,21 +4,18 @@
 detection renumbers the tracks and every existing ``clip_id`` stops resolving
 while the pixels, frame range and crop rectangle are unchanged. Nothing
 announces it: ``suggest.train`` inner-joins the CSV to the feature table on
-``clip_id``, so orphaned rows vanish from the fit - on one real project 145 of
-468 labels, and 30 of the 39 ``unclear`` ones.
+``clip_id``, so orphaned rows simply vanish from the fit.
 
 A label is therefore re-linked by geometry, from the movie, absolute frame range
 and crop rectangle every CSV row also carries in original pixels
-(``store.IDENTITY_COLUMNS``) and which identify the animal independently of any
+(``store.IDENTITY_COLUMNS``), which identify the animal independently of any
 track numbering. Movie and f_start must match EXACTLY - windows are aligned to
-the movie's frame grid, not to each track's start, so a near-match would
-silently pair adjacent windows - then the nearest crop centre within
-``max_centre_px``, the crop moving a pixel or two between runs but never across
-the frame.
+the movie's frame grid, not to each track's start, so a near-match would pair
+adjacent windows - then the nearest crop centre within ``max_centre_px``, the
+crop moving a pixel or two between runs but never across the frame.
 
 Refuse rather than guess: a mis-link is trained on and never questioned again,
-while an orphan is merely ignored. No Qt and no randomness; the only I/O is at
-the bottom, where a repaired frame is backed up and swapped into place.
+while an orphan is merely ignored.
 """
 
 from __future__ import annotations
@@ -76,9 +73,8 @@ class Reassociation:
     unmatched: list[str]        # no candidate at all, or none close enough
     already_valid: int          # label rows whose clip_id is still in the manifest
     ambiguous: list[str]        # two candidates equally close, or two orphans one clip
-    # Orphans whose clip is already labelled - what happens when someone
-    # re-prepares mid-project and carries on annotating. Re-linking anyway would
-    # duplicate a clip_id or overwrite the newer judgement with the older one.
+    # Orphans whose clip is already labelled. Re-linking anyway would duplicate a
+    # clip_id or overwrite the newer judgement with the older one.
     conflicted: list[str] = field(default_factory=list)
 
     @property
@@ -234,7 +230,7 @@ def apply_reassociation(labels_df: pd.DataFrame, plan: Reassociation) -> pd.Data
     The input is never touched; the caller still has to back the CSV up and
     write it. Only ``clip_id`` and the geometry move - the category values,
     notes, uncertain flag, annotator, timestamps and suggestion provenance are
-    the human's record of what they saw and are copied through exactly.
+    copied through exactly.
     """
     out = labels_df.copy(deep=True)
     if not plan.matched:
@@ -279,9 +275,8 @@ def apply_reassociation(labels_df: pd.DataFrame, plan: Reassociation) -> pd.Data
 def backup_labels(path: Path) -> Path:
     """Copy the annotation CSV aside, to a name no earlier backup can own.
 
-    This is the user's primary data; a repair that got the matching wrong must
-    be undoable with a file rename. Numbered rather than timestamped so repeated
-    repairs stack up in order and none can land on top of another.
+    Numbered rather than timestamped, so repeated repairs stack up in order and
+    none can land on top of another.
     """
     path = Path(path)
     n = 1
@@ -296,10 +291,9 @@ def backup_labels(path: Path) -> Path:
 def write_labels(path: Path, frame: pd.DataFrame) -> None:
     """Replace the CSV in a single rename, the way ``AnnotationStore`` does.
 
-    Writing in place would truncate the annotation log if anything failed part
-    way, and there is no second copy. CRLF and no index, matching the ``csv``
-    module output the store appends with, or a repaired file gains mixed line
-    endings the first time a label is appended.
+    CRLF and no index, matching the ``csv`` module output the store appends
+    with, or a repaired file gains mixed line endings the first time a label is
+    appended.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

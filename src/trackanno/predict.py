@@ -18,32 +18,23 @@ plotted or compared against the hand labels. Three rules, all about provenance:
 cut for annotation, leaving every frame between two windows unlabelled and
 unpainted, while ``dense`` (the default) lays its own grid over every frame of
 every track and adds ``n_present`` and ``skip_reason``, so a window the model
-could not be given is still a row that says so. :mod:`trackanno.densepredict`
-explains why that needs no pixels and how the two grids stay compatible.
+could not be given is still a row that says so. See
+:mod:`trackanno.densepredict`.
 
 ``predict.decode`` decides what a row IS. With the default ``none`` a row is a
-WINDOW, exactly as above, and this module has not changed. With a decode the
-dense windows are averaged onto the frames they cover, that per-frame posterior
-is cut into runs, and a row becomes a BOUT: a variable-length stretch between
-two inferred behavioural boundaries. Bouts are what an overlapping
-``predict.window_stride`` needs - several windows then speak for one frame, and
-``load_config`` refuses that pairing without a decode - but a decode at the
-tiling stride is legal and does something too, joining adjacent windows that
-agreed and enforcing ``predict.min_bout_frames``.
-
-``predict.window_scales`` widens the same posterior in the other direction: the
-dense grid is built at several window LENGTHS and their rows all reach the same
-average, so a behaviour shorter than the base window is visible to the shorter
-scales and a long one is not chopped up by the longer. It needs the decode for
-the same reason overlap does, and a model whose features do not scale with the
-window length as well - see :meth:`trackanno.suggest.Suggester.scale_problem`.
+WINDOW. With a decode the dense windows are averaged onto the frames they cover,
+that per-frame posterior is cut into runs, and a row becomes a BOUT: a
+variable-length stretch between two inferred behavioural boundaries. A decode is
+what an overlapping ``predict.window_stride`` and several
+``predict.window_scales`` both need, since either makes more than one window
+speak for a frame; a decode at the tiling stride is legal too, joining adjacent
+windows that agreed and enforcing ``predict.min_bout_frames``.
 
 Bouts go into ``predictions.parquet`` beside the windows rather than into a file
-of their own, because they carry the same ``f_start``/``f_end``/``track_id``/
+of their own: they carry the same ``f_start``/``f_end``/``track_id``/
 ``<group>_pred``/``<group>_conf`` the renderer already reads and are disjoint by
-construction, so ``range(f_start, f_end)`` per track keeps meaning what it meant.
-What they do NOT carry is ``clip_id`` - see :func:`_bout_id` for why an absent
-column is the safe answer there. :mod:`trackanno.bouts` holds the arithmetic.
+construction. What they do NOT carry is ``clip_id`` - see :func:`_bout_id`.
+:mod:`trackanno.bouts` holds the arithmetic.
 """
 
 from __future__ import annotations
@@ -72,8 +63,7 @@ __all__ = [
 PREDICTIONS_FILE = "predictions.parquet"
 # The per-frame posterior a decode was computed from, written only when
 # `predict.save_posteriors` asks for it. Its own file rather than more columns
-# on the predictions: it has one row per (track, frame) against one per bout, so
-# folding it in would multiply the size of the file everything downstream reads.
+# on the predictions: it has one row per (track, frame) against one per bout.
 POSTERIORS_FILE = "frame_posteriors.parquet"
 
 
@@ -102,8 +92,7 @@ def verdict(cfg: Config) -> Verdict:
 
     Two file probes and a small JSON read, cheap enough for the Model page to
     ask on every repaint. The gate is ``suggest_report.json``, not the model
-    payload; when the two disagree the conservative answer is the one that
-    refuses.
+    payload; when the two disagree the refusing answer wins.
     """
     work = cfg.paths.work_dir
     if not (work / MODEL_FILE).exists():
@@ -187,18 +176,13 @@ def _human_spans(cfg: Config, groups: list[str]) -> dict[tuple[str, int], list]:
 
     What ``human_labelled`` is built from once the rows stop being clips. The
     window path answers "did a person decide this" with an ``isin`` over
-    ``clip_id``, which works only because a dense window's id is deliberately the
-    same string as a coincident annotation clip's. A bout starts wherever a
-    behaviour started and has no clip id at all, so the question has to be asked
-    in FRAMES instead, and the answer is a fraction rather than a flag - hence
+    ``clip_id``; a bout has no clip id at all, so the question is asked in FRAMES
+    instead and the answer is a fraction rather than a flag - hence
     ``human_overlap_frac``.
 
-    The spans of every predicted group, UNIONED. A per-group version would be the
-    sharper statement about leakage, since only a group's own labels trained that
-    group's model, but ``human_labelled`` has meant "did a person decide any of
-    this" since it was introduced and one column meaning two things in two modes
-    is worse than a superset. A union over-reports contamination, which is the
-    safe direction for a provenance flag.
+    The spans of every predicted group, UNIONED: ``human_labelled`` means "did a
+    person decide any of this", and a union over-reports contamination, which is
+    the safe direction for a provenance flag.
 
     Read-only, like :func:`_human_labels`, and just as tolerant of a broken CSV:
     a file that will not parse means nothing can be CLAIMED to be hand labelled,
@@ -219,9 +203,7 @@ def _human_spans(cfg: Config, groups: list[str]) -> dict[tuple[str, int], list]:
     for group in groups:
         if group not in frame.columns:
             continue
-        # Same emptiness rule as `_human_labels`: an empty cell reads back as
-        # NaN, whose str() is "nan", and taken as a label it would claim a clip
-        # nobody has looked at.
+        # Same emptiness rule as `_human_labels`.
         values = frame[group].astype(str).str.strip()
         decided |= (values.ne("") & values.str.lower().ne("nan")).to_numpy()
     if not decided.any():
@@ -247,9 +229,8 @@ def _labelled_mask(spans, f_lo: int, f_hi: int) -> np.ndarray:
     """Which frames of ``[f_lo, f_hi)`` fall inside a hand-labelled clip.
 
     A mask rather than an interval intersection, because annotation clips may
-    OVERLAP each other - ``clips.stride`` below ``clips.frames`` cuts them that
-    way on purpose - and summing per-clip overlaps would count a doubly-annotated
-    frame twice and report a fraction above 1.
+    OVERLAP each other (``clips.stride`` below ``clips.frames``) and summing
+    per-clip overlaps would report a fraction above 1.
     """
     mask = np.zeros(max(int(f_hi) - int(f_lo), 0), dtype=bool)
     for start, end in spans:
@@ -263,24 +244,18 @@ def _labelled_mask(spans, f_lo: int, f_hi: int) -> np.ndarray:
 def _bout_id(movie_id: str, track_id: int, f_start: int, f_end: int) -> str:
     """The identity of one decoded bout, and deliberately NOT a ``clip_id``.
 
-    ``clip_id_for`` is ``{movie}__t{track:04d}__f{f_start:06d}`` - derived from
-    the START ALONE - and the dense grid is laid out so its windows collide with
-    the annotation grid's ids ON PURPOSE: ``window_frames: auto`` picks
-    ``min(clips.frames, clips.stride)`` precisely so the starts coincide, and
-    that coincidence is the whole mechanism behind ``human_labelled`` and
-    ``include_labelled``, which are set-membership tests over clip ids.
-
-    A bout starts wherever a behaviour started. One that happens to begin on an
-    annotated clip's ``f_start`` would therefore inherit that clip's entire
-    identity while spanning a different number of frames, and a downstream merge
-    of ``predictions.parquet`` with ``annotations.csv`` on ``clip_id`` would
-    attribute a 300-frame bout's prediction to a 51-frame hand label. Nothing in
-    this codebase checks length agreement on such a collision.
+    ``clip_id_for`` is ``{movie}__t{track:04d}__f{f_start:06d}``, derived from
+    the START ALONE, and the dense grid is laid out so its windows collide with
+    the annotation grid's ids ON PURPOSE - that coincidence is what
+    ``human_labelled`` and ``include_labelled`` are built on. A bout starts
+    wherever a behaviour started, so one beginning on an annotated clip's
+    ``f_start`` would inherit that clip's whole identity while spanning a
+    different number of frames.
 
     So a bout carries this instead, embedding BOTH ends so it cannot collide with
-    a clip id by construction, and a bout row carries no ``clip_id`` column at
-    all. The absent column turns that merge into a KeyError naming ``clip_id``;
-    a present-but-wrong one would be silent mis-attribution. Loud wins.
+    a clip id, and a bout row carries no ``clip_id`` column at all: an absent
+    column turns a merge on ``clip_id`` into a KeyError rather than silent
+    mis-attribution.
 
     Not unique on its own across GROUPS: each group decodes the same track into
     its own bouts and two of them may agree on a span. The row key is
@@ -314,8 +289,7 @@ def _clip_ends(cfg: Config, features: pd.DataFrame, reporter) -> np.ndarray:
     unmatched = ends < 0
     if unmatched.any():
         # The feature table and the clip cache came from different runs. Fall
-        # back to the configured window rather than dropping the clip, and say
-        # so: the fallback is the one number here that can be wrong.
+        # back to the configured window rather than dropping the clip, and say so.
         reporter.log(
             f"{int(unmatched.sum())} clip(s) are not in any clips.parquet manifest; "
             f"their frame range falls back to f_start + clips.frames "
@@ -338,9 +312,9 @@ def _rows_to_score(cfg: Config, suggester, coverage: str, reporter):
 
         features = build_dense_features(cfg, reporter=reporter)
         # The dense table is built without ever consulting the model, so this is
-        # where the two meet. A missing column is not a degraded prediction but a
-        # KeyError naming a column and neither file - most often the SAVED PCA
-        # went missing and every cnn* column with it.
+        # where the two meet. A missing column would otherwise be a KeyError
+        # naming neither file; most often the saved PCA went missing and every
+        # cnn* column with it.
         missing = [c for c in suggester.columns if c not in features.columns]
         if missing:
             shown = ", ".join(missing[:6]) + ("..." if len(missing) > 6 else "")
@@ -350,11 +324,10 @@ def _rows_to_score(cfg: Config, suggester, coverage: str, reporter):
                 f"({shown}). Rebuild the clip features (retrain) so the saved "
                 "PCA and the model agree, then label again."
             )
-        # A column the dense pass cannot compute arrives as NaN rather than as
-        # an error - `_align_to_reference` fills it from the training table's
-        # schema, so the model keeps its full input space. Right failure mode,
-        # but invisible: an input undefined for EVERY window is one the model is
-        # now guessing without.
+        # A column the dense pass cannot compute arrives as NaN, filled in from
+        # the training table's schema by `_align_to_reference`. An input
+        # undefined for EVERY window is one the model is now guessing without,
+        # which is worth saying out loud.
         blank = [
             c for c in suggester.columns
             if not np.isfinite(features[c].to_numpy(dtype=np.float64)).any()
@@ -388,9 +361,7 @@ def _write_atomic(frame: pd.DataFrame, work: Path, name: str = PREDICTIONS_FILE)
 
     Everything downstream treats ``predictions.parquet`` as authoritative, so a
     run that dies mid-write must leave the previous predictions intact. The
-    posterior file goes through the same route for the same reason: a truncated
-    parquet under the real name is worse than no file, because only one of the
-    two announces itself.
+    posterior file goes the same route for the same reason.
     """
     work.mkdir(parents=True, exist_ok=True)
     staged = StagedWrite(work)
@@ -409,10 +380,9 @@ def _write_atomic(frame: pd.DataFrame, work: Path, name: str = PREDICTIONS_FILE)
 def _decode(cfg: Config, posterior: np.ndarray) -> np.ndarray:
     """Per-frame class indices from a per-frame posterior, per ``predict.decode``.
 
-    ``none`` cannot be reached from a loaded config - it is what selects the
-    window path in the first place - so arriving here with it means a Config was
-    edited in place after loading, and the honest answer is to say so rather than
-    to pick a decode nobody asked for.
+    ``none`` selects the window path instead, so arriving here with it means a
+    Config was edited in place after loading. Say so rather than pick a decode
+    nobody asked for.
     """
     decode = str(cfg.predict.decode)
     if decode == "min_bout":
@@ -434,38 +404,22 @@ def _bout_predictions(
     """One row per (group, decoded bout), and the posterior those bouts came from.
 
     The windows are read OFF THE FEATURE TABLE rather than re-planned with
-    :func:`trackanno.densepredict.plan_dense_windows`. The table's rows ARE that
-    plan - ``build_dense_features`` writes one per (track, window) - and
-    :func:`trackanno.bouts.frame_posterior` matches windows to probability rows
-    BY POSITION, so a second copy of the plan is a second thing that can disagree
-    with the rows actually scored. Re-planning would also mean re-reading every
-    movie's ``tracks.parquet`` and header to learn a grid this function is
-    already holding.
-
-    That is also why ``predict.window_scales`` needs nothing here. Windows of
-    several LENGTHS are just more rows with different spans, and
-    ``frame_posterior`` was written to take ``(f_start, f_end)`` pairs of
-    arbitrary extent that may overlap, repeat and hang off either end - equal
-    spans were never an assumption it made. The multi-scale posterior is
-    therefore the same arithmetic over a wider set of windows, and the only
-    thing that had to be decided was the WEIGHT each scale carries, which
-    :func:`trackanno.densepredict.scale_grid` settles by making the covering
-    counts equal before the mean is taken.
+    :func:`trackanno.densepredict.plan_dense_windows`: the table's rows ARE that
+    plan, and :func:`trackanno.bouts.frame_posterior` matches windows to
+    probability rows BY POSITION, so a second copy could disagree with the rows
+    actually scored. That is also why ``predict.window_scales`` needs nothing
+    here - windows of several LENGTHS are just more rows with different spans,
+    and ``frame_posterior`` takes ``(f_start, f_end)`` pairs of arbitrary extent.
 
     A window that could not be featurised is LEFT OUT of the array handed to
-    ``frame_posterior``, never passed as NaN: that function refuses a non-finite
-    probability because its running sum would spread one NaN over every later
-    frame. The frames those windows would have spoken for simply have fewer
-    covering windows, or none - and a frame with none comes back as an all-NaN
-    posterior row, decodes to ``-1``, and leaves the span as a bout with an empty
-    label and a ``skip_reason``, which is the same convention a window under
-    ``predict.min_frames`` already follows.
+    ``frame_posterior``, never passed as NaN, because that function's running sum
+    would spread one NaN over every later frame. A frame no window reaches comes
+    back as an all-NaN posterior row, decodes to ``-1``, and leaves the span as a
+    bout with an empty label and a ``skip_reason``.
 
     The span decoded for a track is the union of ITS OWN WINDOWS, not the range
-    of its detections. The two differ at both ends, where a window legitimately
-    reaches past the first and last detection, and those frames carry real
-    evidence: cutting them would throw away the model's opinion of exactly the
-    frames the tiling path would have painted.
+    of its detections: a window legitimately reaches past the first and last
+    detection, and those frames carry real evidence.
 
     ``n_covering`` does not depend on the group - the same windows are scorable
     for all of them - so it is taken from the first group's posterior and
@@ -478,15 +432,10 @@ def _bout_predictions(
     scorable = np.asarray(skip_reason).astype(str) == ""
     scored = np.flatnonzero(scorable)
     # THE SCORED ROWS ONLY, ONE COLUMN AT A TIME. `features[columns].to_numpy(
-    # dtype=np.float32)` builds two whole copies of the model's input space
-    # before a single row is predicted - pandas materialises the column subset at
-    # the table's own float64, then numpy casts that to float32 - and then
-    # `matrix[scored]` copies a third time for the model. The dense table is one
-    # row per window per track per SCALE, so on a multi-scale run over a real
-    # project those copies are the largest things in the process, and the rows a
-    # skip_reason withheld are never handed to a model at all. Same values in the
-    # same order, so the predictions are unchanged; the per-column transient is
-    # one column of the table.
+    # dtype=np.float32)` would build two whole copies of the model's input space
+    # (pandas materialises the subset at the table's float64, then numpy casts)
+    # and `matrix[scored]` a third. Same values in the same order; the transient
+    # is one column of the table.
     matrix = np.empty((scored.size, len(suggester.columns)), dtype=np.float32)
     for position, column in enumerate(suggester.columns):
         matrix[:, position] = features[column].to_numpy(dtype=np.float32)[scored]
@@ -506,9 +455,8 @@ def _bout_predictions(
         classes = [str(c) for c in np.asarray(model.classes_)]
         # (n_scored, n_classes), not (n_rows, n_classes): these are held for
         # every group at once until the decode below has walked every track, and
-        # the rows a skip_reason withheld would be a NaN block per group that
-        # nothing ever reads - the slices taken below are all `scorable` rows.
-        # `rank` is what keeps the compact form addressable by row position.
+        # the rows a skip_reason withheld would be a NaN block nothing reads.
+        # `rank` keeps the compact form addressable by row position.
         scores = np.full((scored.size, len(classes)), np.nan)
         if scored.size:
             proba = np.asarray(model.predict_proba(matrix), dtype=np.float64)
@@ -524,11 +472,11 @@ def _bout_predictions(
                     "would be labelled with the wrong behaviour"
                 )
             if not np.isfinite(proba).all():
-                # Caught here rather than in `frame_posterior`, which would be
-                # right to refuse it but would report a position within one
-                # track's windows and blame the caller for passing an unscored
-                # window. This is the other case: the window WAS scored and the
-                # model's own answer is not a probability.
+                # Caught here rather than in `frame_posterior`, which would
+                # report a position within one track's windows and blame the
+                # caller for passing an unscored window. This is the other case:
+                # the window WAS scored and the model's answer is not a
+                # probability.
                 bad = int(np.flatnonzero(~np.isfinite(proba).all(axis=1))[0])
                 raise RuntimeError(
                     f"{group}: the model returned a non-finite probability for the "
@@ -545,8 +493,7 @@ def _bout_predictions(
         reporter.advance()
 
     # The models have been asked everything they are going to be asked, and the
-    # decode below allocates per track. Dropped here rather than left to fall out
-    # of scope at the end of the function, which is after the expensive part.
+    # decode below allocates per track.
     del matrix
 
     labelled = _human_spans(cfg, groups)
@@ -592,9 +539,9 @@ def _bout_predictions(
                     "n_frames": int(bout["n_frames"]),
                     "group": group,
                     # How much evidence the row rests on, the way `n_present`
-                    # says it for a window. Without it a bout at the very start
-                    # of a track, where only one window reaches, reads exactly
-                    # like one in the interior that five windows agreed on.
+                    # says it for a window: a bout at the start of a track, where
+                    # only one window reaches, would otherwise read like one
+                    # several windows agreed on.
                     "n_covering_mean": float(covering[lo:hi].mean()),
                     "skip_reason": "" if bout["label"] else (
                         f"no window over frames {bout['f_start']}-{bout['f_end']} "
@@ -603,11 +550,11 @@ def _bout_predictions(
                     ),
                     "human_overlap_frac": float(human[lo:hi].mean()),
                 }
-                # Every predicted group gets its pair of columns on every row,
-                # so the file has one schema rather than one per group; only the
-                # group that owns the bout fills them in. An empty prediction is
-                # already what the renderer skips, so another group's rows are
-                # invisible to it instead of being a second opinion on the frame.
+                # Every predicted group gets its pair of columns on every row, so
+                # the file has one schema rather than one per group; only the
+                # group that owns the bout fills them in. The renderer already
+                # skips an empty prediction, so another group's rows are
+                # invisible to it.
                 for other in groups:
                     row[f"{other}_pred"] = bout["label"] if other == group else ""
                     row[f"{other}_conf"] = bout["conf"] if other == group else np.nan
@@ -650,18 +597,14 @@ def _check_trained_window(suggester, length: int, coverage: str, reporter) -> No
 
     Window length changes what the features are WORTH, not what they are called,
     so a model fitted on 50-frame rows and handed 25-frame ones passes every
-    check ``Suggester.load`` makes - same feature version, same column names -
-    and then predicts confidently on a scale it has never seen. That is the one
-    train/serve skew in this pipeline nothing else guards.
+    check ``Suggester.load`` makes and then predicts confidently on a scale it
+    has never seen.
 
-    The two answers are deliberately different. A MISMATCH is a known-wrong
-    number and worth refusing over: every row of the output would be scored on
-    the wrong scale and nothing in the file would show it. An UNRECORDED length
-    is a model saved before the stamp existed, and refusing those would mean
-    upgrading trackanno silently invalidates every model anyone already has - so
-    it is a warning, and the run continues unchecked rather than not at all.
-    ``window_problem`` returns a sentence in both cases so this caller can tell
-    them apart by ``trained_window`` alone.
+    A MISMATCH is refused: every row would be scored on the wrong scale and
+    nothing in the file would show it. An UNRECORDED length is a model saved
+    before the stamp existed, so it is only a warning and the run continues.
+    ``window_problem`` returns a sentence in both cases, and ``trained_window``
+    is what tells them apart.
     """
     problem = suggester.window_problem(length)
     if not problem:
@@ -669,14 +612,10 @@ def _check_trained_window(suggester, length: int, coverage: str, reporter) -> No
     if suggester.trained_window is None:
         reporter.log(problem, "warning")
         return
-    # `window_problem` says "retrain, or restore the window length it was trained
-    # at" without being able to say WHICH key that is - it is a method on the
-    # model and does not know which coverage asked. Naming the key here is the
-    # difference between a diagnosis and an instruction, and the two coverages
-    # need different instructions: on the dense path the length is a setting of
-    # its own and can simply be written down, while on the manifest path it IS
-    # the length the clip features were cut at, so there is nothing to write down
-    # that would not also have to re-cut them.
+    # `window_problem` is a method on the model and cannot know WHICH key the
+    # length came from, so the instruction is added here. The two coverages need
+    # different ones: on the dense path the length is a setting of its own, while
+    # on the manifest path it IS the length the clip features were cut at.
     fix = (
         f"The {length} frames are predict.window_frames, this run's dense grid. "
         f"Writing predict.window_frames: {suggester.trained_window} is the edit "
@@ -697,23 +636,18 @@ def _check_scales(suggester, scales: list[int]) -> None:
     """Refuse a model that cannot be scored at several window lengths at once.
 
     ``_check_trained_window`` above has already established that the BASE scale
-    is the one the model was fitted at. Every other scale is by definition one
-    it was not, so the question is no longer "do these two numbers match" but
-    "does this model read features that survive the difference" - and the answer
-    is in the column names in its own payload.
+    is the one the model was fitted at, so the question here is whether the model
+    reads features that survive the difference - answered by the column names in
+    its own payload.
 
-    Unlike the unrecorded-window case this is never a warning. There is no
-    legacy model to be kind to: a project only reaches here by having typed
-    ``predict.window_scales`` into its config, and the mistake it makes is one
-    the output cannot show. Every scale's rows would be scored at unchanged
-    confidence and then averaged into the same per-frame posterior as the
-    correct ones, so the damage is spread evenly over every bout in the file.
+    Never a warning: a project only reaches here by typing
+    ``predict.window_scales`` into its config, and every scale's rows would be
+    averaged into the same per-frame posterior at unchanged confidence.
 
     ``load_config`` refuses the same combination against
-    ``suggest.feature_scope``. It is not the same check: that one is about the
-    model this project will fit next, and this one is about the model on disk.
-    Retraining is exactly what moves a project from failing this to passing it,
-    and a config edit alone must not.
+    ``suggest.feature_scope``, which is about the model this project will fit
+    next; this is about the model on disk, so retraining is what moves a project
+    from failing this to passing it and a config edit alone must not.
     """
     problem = suggester.scale_problem(scales)
     if not problem:
@@ -729,12 +663,11 @@ def _window_predictions(
     extra: dict, suggester, groups: list[str], include_labelled: bool, noun: str,
     reporter,
 ) -> pd.DataFrame:
-    """One row per scored window, exactly as this module has always written them.
+    """One row per scored window.
 
-    Untouched by the decode work on purpose: every project on disk was labelled
-    by this path, and ``predict.decode: none`` has to keep reproducing it row for
-    row, column for column and value for value. Anything that would improve it
-    belongs on the bout path until that guarantee is deliberately given up.
+    ``predict.decode: none`` reproduces this path row for row, column for column
+    and value for value, so anything that would improve it belongs on the bout
+    path until that guarantee is deliberately given up.
     """
     labelled = _human_labels(cfg, groups)
     # Through numpy rather than by assigning Series: the feature table's index
@@ -752,9 +685,7 @@ def _window_predictions(
 
     # The models are used directly rather than through Suggester.suggest, which
     # drops audit clips and low-confidence rows to stop the ANNOTATOR being
-    # anchored. Nothing here is shown during annotation, and a hole in the
-    # exported movie is a worse lie than a prediction with its confidence beside
-    # it.
+    # anchored. Nothing here is shown during annotation.
     matrix = features[suggester.columns].to_numpy(dtype=np.float32)
     # A skipped row is NaN in every column, which both backends read as
     # "undefined" and will happily turn into a class. Withheld from the model
@@ -764,8 +695,8 @@ def _window_predictions(
     for group in groups:
         reporter.raise_if_cancelled()
 
-        # No `suggest.min_confidence` filter here, on purpose: it exists to stop
-        # a near-uniform posterior anchoring the annotator, and a consumer that
+        # No `suggest.min_confidence` filter here: it exists to stop a
+        # near-uniform posterior anchoring the annotator, and a consumer that
         # wants a threshold can apply its own to the confidence column.
         keep = scorable.copy()
         if not include_labelled and labelled[group]:
@@ -810,24 +741,19 @@ def predict_all(
     scored; ``predict.decode`` decides what one row of the answer is. With the
     default ``decode: none`` it is one row per clip or per dense window, whether
     or not the model had anything to say about it, so the file joins on
-    ``clip_id`` with no reasoning about missing clips. With a decode the windows
-    are averaged onto frames and re-cut, and a row is a BOUT carrying ``bout_id``
-    and no ``clip_id`` at all - see the module docstring and :func:`_bout_id`.
+    ``clip_id``. With a decode the windows are averaged onto frames and re-cut,
+    and a row is a BOUT carrying ``bout_id`` and no ``clip_id`` at all - see the
+    module docstring and :func:`_bout_id`.
 
     ``include_labelled`` decides what happens on clips the annotator has already
     judged. The default leaves them blank: those clips were training data, so the
     model's opinion of them is not evidence. Turn it on to measure agreement,
     knowing the number is optimistic.
 
-    UNDER A DECODE THAT FLAG DOES NOTHING, and says so in the log. Withholding a
-    hand-labelled window there punches a hole in the per-frame posterior, and the
-    decode does not merely lose those frames - a gap breaks the run structure
-    either side of it, so the label of frames nobody annotated moves too. Under
-    an overlapping stride it would not even work: the neighbouring windows, whose
-    features come from almost the same frames, paint the annotated frames anyway.
-    So every window is scored and the provenance moves onto the row, as
-    ``human_overlap_frac`` - the share of the bout's frames a person did decide.
-    A flag that quietly half-works is worse than one that openly does not.
+    UNDER A DECODE THAT FLAG DOES NOTHING, and says so in the log: withholding a
+    hand-labelled window would leave its frames with no posterior, and a gap
+    re-cuts the bouts on both sides of it. Every window is scored instead and the
+    provenance moves onto the row, as ``human_overlap_frac``.
     """
     from .progress import NullReporter
 
@@ -865,19 +791,15 @@ def predict_all(
         reporter.log(f"group {group!r} not predicted: {why}", "warning")
 
     # The length the rows about to be scored were MEASURED over: the dense grid's
-    # own window on the dense path, and `clips.frames` on the manifest path,
-    # where the rows are clip_features.parquet's and that table is built over the
-    # annotation manifest. Checked before the features are built, because on the
-    # dense path building them is the expensive part of the run.
+    # own window on the dense path, and `clips.frames` on the manifest path.
+    # Checked before the features are built, which is the expensive part.
     length = (cfg.predict.resolved_window(cfg.clips) if coverage == "dense"
               else int(cfg.clips.frames))
     _check_trained_window(suggester, length, coverage, reporter)
 
     # The other window-length skew, and it only exists on the dense path: the
-    # manifest path scores clip_features.parquet, which is one table built at
-    # one length, so there is nothing to score at several. Checked here for the
-    # same reason as the base length - the feature build is the expensive part
-    # of a dense run, and a refusal after it is a refusal that cost ten minutes.
+    # manifest path scores clip_features.parquet, one table built at one length.
+    # Checked before the feature build, for the same reason as the base length.
     scales = cfg.predict.resolved_scales(cfg.clips) if coverage == "dense" else [length]
     _check_scales(suggester, scales)
     if len(scales) > 1:
@@ -890,8 +812,7 @@ def predict_all(
     elif coverage != "dense" and len(cfg.predict.window_scales) > 1:
         # Reachable only through `--coverage manifest`, which overrides a config
         # `load_config` would otherwise have refused. Said rather than ignored:
-        # the run produces a perfectly ordinary file, and nothing in it shows
-        # that the scales the config asks for were not used.
+        # nothing in the resulting file shows that the scales were not used.
         reporter.log(
             f"predict.window_scales lists {len(cfg.predict.window_scales)} window "
             "lengths but this run was asked for manifest coverage, which scores "
@@ -1004,14 +925,10 @@ def staleness(cfg: Config) -> str:
 def _distinct_frames(frame: pd.DataFrame) -> int:
     """Frames at least one row speaks for, counted ONCE.
 
-    ``(f_end - f_start).sum()`` was the old answer and is a track-frame count
-    only while the rows are disjoint. They are not, in either of the two ways
-    this file is now written: an overlapping ``predict.window_stride`` puts every
-    frame in about ``window_frames / window_stride`` windows, and a bout table
-    carries one row per (group, bout), so a project with three category groups
-    would claim three times the frames its movies contain. Both inflate a number
-    a reader has no way to sanity-check - it is only ever compared against
-    itself, run to run.
+    ``(f_end - f_start).sum()`` would be a track-frame count only while the rows
+    are disjoint, and they are not: an overlapping ``predict.window_stride`` puts
+    every frame in about ``window_frames / window_stride`` windows, and a bout
+    table carries one row per (group, bout).
 
     Intervals are merged per (movie_id, track_id), so overlapping annotation
     clips (``clips.stride`` below ``clips.frames``) and the several groups'
@@ -1044,11 +961,10 @@ def summarise(frame: pd.DataFrame) -> str:
     """Human-readable tally of a predictions frame, for the log and the GUI.
 
     What one row IS is read off the FILE, never off the config: ``predict.decode``
-    can be changed after a run, and a summary that consulted it would describe
-    the run somebody is about to do instead of the one that wrote these rows.
-    ``bout_id`` is what a decoded row carries in place of ``clip_id``, and
-    ``skip_reason`` is what the dense grid adds to a window - the same two probes
-    :func:`trackanno.render.prediction_unit` makes, and for the same reason.
+    can be changed after a run, so a summary consulting it would describe a
+    different run. ``bout_id`` is what a decoded row carries in place of
+    ``clip_id`` and ``skip_reason`` is what the dense grid adds to a window - the
+    same two probes :func:`trackanno.render.prediction_unit` makes.
     """
     groups = [c[: -len("_pred")] for c in frame.columns if c.endswith("_pred")]
     n_human = int(frame["human_labelled"].sum()) if "human_labelled" in frame else 0
@@ -1059,8 +975,7 @@ def summarise(frame: pd.DataFrame) -> str:
         f"{len(frame)} {noun}"
         # Spelled out because a bout table has one row per (group, bout): with
         # three groups "600 bouts" is 200 stretches of behaviour asked three
-        # questions, and the sentence has to say so or the number reads as
-        # three times the animal's behaviour.
+        # questions.
         + (f" over {len(groups)} category group(s)" if bouts else "")
         + f", {n_human} of them "
         + ("overlapping a clip a person labelled" if bouts
@@ -1086,9 +1001,8 @@ def summarise(frame: pd.DataFrame) -> str:
         mean_conf = float(conf[given].mean()) if given.any() else float("nan")
         tally = ", ".join(f"{name} {int(n)}" for name, n in counts.items()) or "nothing"
         # Named, not bare "predicted": under a decode this counts the group's own
-        # bouts and skips the other groups' rows, which carry an empty prediction
-        # in this column, so "N predicted" out of a row count several times larger
-        # would look like a coverage failure.
+        # bouts and skips the other groups' rows, so a bare count out of a row
+        # count several times larger would look like a coverage failure.
         lines.append(
             f"  {group}: {int(given.sum())} {noun} predicted ({tally}); "
             f"mean confidence {mean_conf:.3f}"

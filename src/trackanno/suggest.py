@@ -42,91 +42,56 @@ REPORT_FILE = "suggest_report.json"
 # Columns whose VALUE depends on how many frames the window spans, named in the
 # mismatch message because "the features mean something else now" is not
 # actionable and "path_length is longer because the window is longer" is.
-#
-# Verified against trackseries/clipfeatures rather than guessed. Length-dependent
-# are the extensive quantities (`path_length`, `net_displacement`,
-# `radius_gyration`, the `body_*` equivalents), everything derived from them
-# (`straightness`, `body_straightness`, `body_displacement_per_len`), the
-# lag-based turn statistics through `turn_lag_frames`/`turn_n_valid`, every
-# dispersion (`*_std`, `flagellum_len_cv`, `tip_angle_std`), the order
-# statistics (`speed_max`, `speed_p90`) and `present_frac`.
-#
-# Length-INVARIANT, and so no reason to refuse on their own: every `beat_*` and
-# `wave_*` column, which are measured on a window pinned to `cfg.spectral.window`
-# and not on the requested range at all, plus the intensive means
-# (`speed_mean`, `area_mean`, `body_len_mean`, `immotile_frac`, ...).
 _LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
 
 # --------------------------------------------------------------------------- #
 # which columns survive a change of window length
 # --------------------------------------------------------------------------- #
-# The paragraph above says which families move with the window. This turns it
-# into a predicate, because two things now have to agree about it and a prose
-# comment cannot hold them together: `train` uses it to FIT a model that may
-# legitimately be scored at several window lengths, and
-# :meth:`Suggester.scale_problem` uses it to REFUSE a model that may not. Two
-# copies of the rule would agree until one was edited, after which a project
-# would fit on one subset and be checked against another.
+# A column's VALUE moves with the window length while its NAME does not, so the
+# rule is a predicate rather than prose: `train` fits by it and
+# :meth:`Suggester.scale_problem` refuses by it, and two copies would agree only
+# until one was edited.
 #
-# An ALLOWLIST, deliberately, and this is the whole safety argument. Under a
-# denylist a column added to the schema later matches no "length-dependent"
-# pattern, is treated as invariant, and is scored at three window lengths with
-# nothing raising - which is precisely the silent skew this machinery exists to
-# stop. Under an allowlist the same new column is treated as dependent, costs a
-# little signal, and says so. Wrong in the recoverable direction.
+# An ALLOWLIST, deliberately: under a denylist a column added to the schema
+# later would match no length-dependent pattern, be treated as invariant, and be
+# scored at several window lengths with nothing raising. Two ways in:
 #
-# Two ways in:
-#
-# * ``beat_*`` and ``wave_*`` are invariant BY CONSTRUCTION, not by measurement.
-#   Since ``FEATURE_VERSION`` 2 they are measured over a window of
+# * ``beat_*`` and ``wave_*`` are invariant BY CONSTRUCTION. Since
+#   ``FEATURE_VERSION`` 2 they are measured over a window of
 #   ``cfg.spectral.window`` frames CENTRED on the requested range rather than
-#   over the range itself (:func:`trackanno.clipfeatures._beat_on_window`,
-#   :func:`trackanno.wavespectra.window_values`), so the requested length does
-#   not enter their definition at all.
-# * An INTENSIVE reduction of a per-frame series - a mean, a median, or the
-#   mean of an indicator, which is what a ``_frac`` is. Averaging more frames
-#   does not scale the average. The reducer is legible in the suffix because
-#   :data:`trackanno.trackseries.SERIES_SPEC` names features
-#   ``column + reducer``, so ``_std``, ``_p90`` and ``_max`` - the dispersions
-#   and order statistics, which do grow with the number of samples - are
-#   excluded by not being on this list rather than by being on another one.
-#   ``cnn{i}_mean`` comes through the same door: it is the mean of the window's
-#   per-detection embeddings, with no length term.
+#   over the range itself, so the requested length is absent from their
+#   definition.
+# * An INTENSIVE reduction of a per-frame series - a mean, a median, or the mean
+#   of an indicator, which is what a ``_frac`` is. The reducer is legible in the
+#   suffix because :data:`trackanno.trackseries.SERIES_SPEC` names features
+#   ``column + reducer``, so the dispersions and order statistics (``_std``,
+#   ``_p90``, ``_max``) are excluded by not being on this list.
 _LENGTH_INVARIANT_PREFIXES = ("beat_", "wave_")
 _INTENSIVE_SUFFIXES = ("_mean", "_median", "_frac")
 
 # Named because the suffix rule would otherwise wave them through, and each is a
-# mean of something the window length itself changes:
-#
-# * ``present_frac``'s denominator IS the window. A longer window at a track's
-#   end reaches further past the last detection, so the fraction falls with
-#   length even though the animal did nothing different.
-# * ``turn_abs_mean`` averages turns measured over ``turn_lag_frames``, and
-#   :func:`trackanno.clipfeatures._heading_lag` sets that lag to
-#   ``min(n_frames // 4, 25)`` - an explicit function of the window length. The
-#   mean is intensive; the quantity being averaged is not the same quantity.
+# mean of something the window length itself changes: ``present_frac``'s
+# denominator IS the window, and ``turn_abs_mean`` averages turns measured over
+# the lag :func:`trackanno.clipfeatures._heading_lag` derives from the window
+# length.
 _LENGTH_DEPENDENT_DESPITE_SUFFIX = frozenset({"present_frac", "turn_abs_mean"})
 
-# `shape_elong` reduced by `mean`, renamed in `trackseries._FEATURE_NAMES`
-# because renaming it back would change the input schema of every model already
-# trained. An intensive mean wearing no suffix, so it has to be named here.
+# `shape_elong` reduced by `mean`, renamed in `trackseries._FEATURE_NAMES`. An
+# intensive mean wearing no suffix, so it has to be named here.
 _LENGTH_INVARIANT_NAMES = frozenset({"shape_elongation"})
 
-# Deliberately NOT on the list, so that their absence reads as a decision rather
-# than an oversight: `body_rotation_speed`, `tip_angular_speed` and
-# `cnn*_delta` are all per-step means and so are intensive by construction, but
-# none of them has been measured across window lengths in this repository, and
-# the allowlist's rule is that construction alone is enough only where the
-# window length is absent from the definition outright (the two spectral
-# families above). Measure one and it can move.
+# `body_rotation_speed`, `tip_angular_speed` and `cnn*_delta` are per-step means
+# and so intensive by construction, but are deliberately absent: construction
+# alone counts only where the window length is absent from the definition
+# outright, as it is for the two spectral families above.
 
 
 def is_length_invariant(column: str) -> bool:
     """Whether ``column``'s VALUE survives a change of window length.
 
-    Not whether it is a good feature, and not whether it is stable: a column can
-    be invariant and useless. It answers the one question that decides whether a
-    model fitted at 50 frames may be shown a 100-frame row.
+    Not whether it is a good feature: a column can be invariant and useless.
+    This answers only whether a model fitted at 50 frames may be shown a
+    100-frame row.
     """
     name = str(column)
     if name.startswith(_LENGTH_INVARIANT_PREFIXES):
@@ -147,8 +112,7 @@ def length_dependent_columns(columns) -> list[str]:
     """``columns`` in their original order, keeping only the ones that scale.
 
     The complement of :func:`length_invariant_columns`, spelled separately
-    because the refusal has to NAME the offenders: "your features scale with the
-    window" is not actionable and "path_length, speed_std and 71 others do" is.
+    because the refusal has to NAME the offenders.
     """
     return [c for c in columns if not is_length_invariant(c)]
 
@@ -157,15 +121,11 @@ def scoped_columns(columns, scope: str) -> list[str]:
     """``columns`` narrowed by ``suggest.feature_scope``.
 
     The second axis of feature selection, applied after
-    :func:`trackanno.clipfeatures.feature_columns` has applied the first. They
-    compose rather than overlap: the groups say which instrument a column came
-    from, this says how it behaves when the window length changes, and a project
-    that wants "the spectral columns only, at three scales" gets there by
-    setting both rather than by typing out 34 column names.
-
-    An unknown scope RAISES rather than falling through to "all". Falling
-    through would fit on more columns than were asked for and report success,
-    which is the failure mode a typo in a config key already has too much of.
+    :func:`trackanno.clipfeatures.feature_columns` has applied the first: the
+    groups say which instrument a column came from, this says how it behaves
+    when the window length changes. An unknown scope RAISES rather than falling
+    through to "all", which would fit on more columns than were asked for and
+    report success.
     """
     if scope == "all":
         return list(columns)
@@ -182,26 +142,17 @@ def is_audit_clip(clip_id: str, cfg: Config,
     """Hold a share of clips out of the suggestion loop: never suggested on,
     never trained on, so agreement measured there is unbiased.
 
-    THE RECORD WINS, and the hash is only consulted where there is none.
+    THE RECORD WINS, and the hash is only consulted where there is none:
     ``clip_id`` embeds the track id, so re-running detection renumbers the
-    tracks, every id changes, and a hash of the id redraws the holdout from
-    scratch - roughly ``2*f*(1-f)`` of the clips change side, about a fifth at
-    the default fraction. ``reassociate`` then rewrites the id in place to put
-    each label back on its clip, so a label earned on a held-out clip can arrive
-    under an id that hashes into the training set: the next fit trains on the
-    holdout and reports ``audit_accuracy`` over a different, partly overlapping
-    set. Membership is therefore written into the CSV when a clip is LABELLED
-    (``store.AUDIT_COLUMN``) and read back here.
-
-    A recorded value that disagrees with the hash is the NORMAL state of a
-    re-detected project, not an error, and is not reported per clip; the count
-    is surfaced once, by :func:`train` and by the store on open, because it is
-    the only way anyone learns their project was re-detected.
+    tracks and re-hashing would redraw the holdout under a model that has
+    already seen part of it. Membership is written into the CSV when a clip is
+    LABELLED (``store.AUDIT_COLUMN``) and read back here. A recorded value that
+    disagrees with the hash is the normal state of a re-detected project and is
+    not reported per clip.
 
     ``recorded`` maps ``clip_id`` to its recorded membership, holding only the
-    clips that HAVE one. Absent (the default) means no records were available,
-    which is the pre-existing behaviour exactly - so ``predict`` and any caller
-    that only ever asks about unlabelled clips need no records and no change.
+    clips that HAVE one; absent (the default) means no records were available,
+    so a caller that only ever asks about unlabelled clips needs none.
 
     Uses its OWN seed - see :meth:`trackanno.config.Suggest.audit_by_hash`.
     """
@@ -216,11 +167,9 @@ def audit_records(labels: pd.DataFrame | None) -> dict[str, bool]:
     """``{clip_id: was_held_out}`` from an annotation table already in memory.
 
     The same mapping :func:`trackanno.store.read_audit_records` builds from the
-    file, for the callers that have the frame instead (``train`` reads the CSV
-    with pandas once and hands it to every group). Sharing the codec rather than
-    re-deriving the flag is what keeps the two readings from disagreeing about a
-    cell - a disagreement that would put a clip in the training set for one
-    group and the holdout for another.
+    file, for the callers that have the frame instead. Both share one codec, so
+    the two readings cannot disagree about a cell and put a clip in the training
+    set for one group and the holdout for another.
     """
     if labels is None or AUDIT_COLUMN not in getattr(labels, "columns", ()):
         return {}
@@ -241,21 +190,15 @@ __all__ = ["Suggester", "train", "main", "is_audit_clip", "audit_records",
 def _selection_slots(n: int, share: float, ranked: int, audit: int) -> int:
     """The largest batch <= ``n`` that the two candidate pools can actually fill.
 
-    :func:`trackanno.select.select_batch` refuses a batch bigger than its pools
-    on the grounds that the caller built the mask and so knows the pool size
-    before it asks. This is that caller doing the knowing. A project simply runs
-    out of clips near the end, and an annotator who has labelled all but three
-    should be handed three, not an exception.
+    :func:`trackanno.select.select_batch` refuses a batch bigger than its pools,
+    so an annotator who has labelled all but three clips is sized down to three
+    rather than handed an exception.
 
-    Both pools bind, and they bind separately: the ranked slots need ranked
-    candidates and the reserved slots need unannotated AUDIT candidates, and
-    topping one up from the other is exactly what the stratum exists to prevent.
-    The reserve is not linear in the batch size - it is ``int(share * n + 0.5)``,
-    a rounding - so this searches downward from ``n`` rather than solving for it,
-    over a batch size that is a screenful of clips.
-
-    Returns ``0`` when nothing fits, which is the "nothing left to choose" the
-    caller reports as an empty batch.
+    Both pools bind separately: the ranked slots need ranked candidates and the
+    reserved slots need unannotated AUDIT candidates, and topping one up from
+    the other is what the stratum exists to prevent. The reserve is a rounding
+    of ``share * size`` rather than linear in it, so this searches downward from
+    ``n``. Returns ``0`` when nothing fits.
     """
     for size in range(int(n), 0, -1):
         reserved = int(float(share) * size + 0.5) if audit else 0
@@ -270,8 +213,8 @@ class GroupReport:
     group: str
     n_labels: int
     # Labels whose clip_id is absent from the feature table, so they never
-    # reached the fit. Per class as well as total: 31% missing overall hurts,
-    # 77% of ONE class destroys the model.
+    # reached the fit. Per class as well as total: a loss spread evenly is a
+    # smaller model, a loss concentrated in one class is a class that is gone.
     n_orphaned: int
     orphaned_by_class: dict
     n_classes: int
@@ -289,23 +232,16 @@ class GroupReport:
     # while the saved model uses the global one already in clip_features.parquet.
     # Both deliberate, but different fits - `top_features` is the saved model's.
     cv_pca: str
-    # How the CNN basis was fitted for the AUDIT score, which is a different
-    # answer and an honest admission rather than a description. The audit clips
-    # are scored on `columns`, whose `cnn*` block comes from a PCA fitted in
-    # `clipfeatures` over the detections of every prepared movie - the audit
-    # clips' own included. The CV path refits that basis inside each fold and so
-    # keeps the held-out movie out of it; the audit path has no folds and does
-    # not. The labels never leak, so this is unsupervised leakage only and is
-    # probably small - but "probably small" is not measured here, and the figure
-    # it inflates is the one number this tool asks people to trust. Stated in
-    # the report so a reader is not left to infer it from the source. NOT fixed:
-    # a per-audit-clip refit is a different change with its own cost.
+    # How the CNN basis was fitted for the AUDIT score, which is not the CV's
+    # answer: these clips are scored on `columns`, whose `cnn*` block comes from
+    # a PCA fitted over every prepared movie, the audit clips' own detections
+    # included. The CV refits that basis inside each fold; the audit path has no
+    # folds. The labels never leak, so this is unsupervised leakage only, and it
+    # is stated in the report rather than left to be inferred from the source.
     audit_pca: str
     audit_n: int                      # audit clips actually SCORED below
-    # The audit population and the labelled part of it, because `audit_n` alone
-    # cannot be read: "10 audit clips, all correct" and "10 of 200 audit clips
-    # have been labelled" are the same 10 and completely different claims about
-    # how much of the holdout has been spent.
+    # The audit population and the labelled part of it: `audit_n` alone cannot
+    # say how much of the holdout has been spent.
     audit_population: int             # audit clips this project HAS, labelled or not
     audit_labelled: int               # of those, how many carry a label for this group
     audit_accuracy: float
@@ -319,12 +255,11 @@ class GroupReport:
 def _build_model(cfg: Config, n_classes: int):
     """The classifier behind the suggestions.
 
-    CatBoost is the default because **the label distribution is lopsided**: one
+    CatBoost is the default because the label distribution is lopsided: one
     state dominates and an unweighted model answers by predicting it, while
     ``auto_class_weights="Balanced"`` reweights the loss by inverse class
-    frequency. It also takes NaN natively, which matters because the kinematic
-    features use NaN to mean "undefined" (no beat detected, straightness of a
-    stationary track), and 0.0 would disguise those as real extremes.
+    frequency. It also takes NaN natively, which the kinematic features use to
+    mean "undefined".
     """
     if cfg.suggest.model == "catboost":
         try:
@@ -333,7 +268,7 @@ def _build_model(cfg: Config, n_classes: int):
             return CatBoostClassifier(
                 iterations=cfg.suggest.iterations,
                 # CatBoost grows SYMMETRIC trees, so depth alone sets the width:
-                # 2**depth leaves, no separate knob, and depth 6 is already 64 -
+                # 2**depth leaves, no separate knob, and depth 6 is already 64,
                 # which overfits fast on a few hundred hand-labelled clips.
                 depth=cfg.suggest.depth,
                 learning_rate=cfg.suggest.learning_rate,
@@ -368,8 +303,7 @@ def _build_model(cfg: Config, n_classes: int):
 def describe_model(cfg: Config, n_classes: int, n_rows: int, n_cols: int) -> str:
     """One line naming the estimator and every hyperparameter that shapes the fit.
 
-    A score is only interpretable next to what produced it. Written to the
-    reporter, so it lands in the GUI's log.
+    Written to the reporter, so it lands in the GUI's log beside the score.
     """
     s = cfg.suggest
     if s.model == "catboost":
@@ -437,10 +371,10 @@ def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int, raw_cnn=No
                             reporter=None, label: str = ""):
     """Out-of-fold predictions with folds split on whole movies.
 
-    When ``raw_cnn`` is supplied the CNN PCA is refitted **inside each fold** on
+    When ``raw_cnn`` is supplied the CNN PCA is refitted inside each fold on
     training rows only, and ``X`` carries the kinematic features alone. One PCA
     over everything lets the held-out movie into the basis and the global mean,
-    where between-movie variance dominates - the leak that flatters this score.
+    where between-movie variance dominates, which flatters this score.
     """
     from sklearn.decomposition import PCA
     from sklearn.model_selection import StratifiedGroupKFold
@@ -540,22 +474,18 @@ def train_group(
     # say the model does not cover them.
     dropped = {k: v for k, v in all_counts.items() if v < cfg.suggest.min_per_class}
 
-    # Hold the audit clips out of TRAINING as well as out of the display;
-    # training on them makes the "unbiased" estimate circular.
-    #
-    # Read off the CSV, not recomputed: a labelled clip's membership is whatever
-    # was recorded when it was labelled, and after a re-detection that is no
-    # longer what its clip_id hashes to. Recomputing here is what would let a
-    # clip the model was deliberately kept away from walk into this fit.
+    # The audit holdout is excluded from TRAINING as well as from suggestions;
+    # training on it makes the "unbiased" estimate circular. Read off the CSV
+    # and not recomputed: after a re-detection a labelled clip's recorded
+    # membership is no longer what its clip_id hashes to.
     recorded = audit_records(labels)
     audit_mask = merged["clip_id"].astype(str).map(lambda c: is_audit_clip(c, cfg, recorded))
     audit_set = merged[audit_mask].copy()
     merged = merged[~audit_mask]
 
     # The DENOMINATOR for `audit_n`: audit clips this project has at all, not
-    # only the ones a human has reached. Counted over the feature table because
-    # that is the set of clips that could be scored; a clip with no features
-    # cannot be audited whether it is held out or not.
+    # only the ones a human has reached. Counted over the feature table, since a
+    # clip with no features cannot be scored whether it is held out or not.
     audit_population = int(sum(
         is_audit_clip(c, cfg, recorded) for c in features["clip_id"].astype(str)
     ))
@@ -578,9 +508,8 @@ def train_group(
             scope="not validated", cv_pca="not validated",
             audit_pca="not scored",
             # 0 SCORED, which is what audit_n counts: nothing was fitted, so
-            # nothing was scored. The labelled count goes in its own field
-            # rather than standing in here, or a report that never reached a fit
-            # would claim an audit result it does not have.
+            # nothing was scored. The labelled count has its own field, or a
+            # report that never reached a fit would claim an audit result.
             audit_n=0,
             audit_population=audit_population, audit_labelled=len(audit_set),
             audit_accuracy=float("nan"),
@@ -606,12 +535,10 @@ def train_group(
         X_cv = merged[cv_columns].to_numpy(dtype=np.float32)
         fold_cnn = raw_cnn[merged["_row"].to_numpy()]
 
-    # Group by MOVIE, not by track: with clips.window_mode: first there is
-    # exactly one clip per track, making track groups identical to ungrouped CV,
-    # and cells in one movie share illumination, focus, density and treatment,
-    # which conf_mean/area_mean/present_frac proxy and the CNN embeddings
-    # fingerprint. Only leave-one-movie-out answers "will this work on my next
-    # movie".
+    # Group by MOVIE, not by track: cells in one movie share illumination,
+    # focus, density and treatment, which conf_mean/area_mean/present_frac proxy
+    # and the CNN embeddings fingerprint, so only leave-one-movie-out answers
+    # "will this work on my next movie".
     groups = merged["movie_id"].astype(str).to_numpy()
     n_movies = int(len(np.unique(groups)))
     tracks_per_clip = merged.groupby(["movie_id", "track_id"]).size()
@@ -634,10 +561,9 @@ def train_group(
 
     from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, f1_score
 
-    # Said before the fit takes any time. The width reported is the one the model
-    # is fitted on, not the raw CNN aggregate handed to the fold PCA: 5760 raw
-    # dimensions reduce to `pca_components`, and the larger figure describes a
-    # model nobody fits.
+    # Said before the fit takes any time. The width reported is the one the
+    # model is fitted on, not the raw CNN aggregate handed to the fold PCA,
+    # which reduces to `pca_components` and describes a model nobody fits.
     fold_width = X_cv.shape[1]
     if fold_cnn is not None:
         fold_width += int(min(cfg.suggest.pca_components, len(merged), fold_cnn.shape[1]))
@@ -662,8 +588,8 @@ def train_group(
     kappa = float(cohen_kappa_score(y, pred, labels=classes))
 
     # Bootstrap the lower bound over GROUPS (movies), the unit the folds were
-    # split on; resampling clips would understate the uncertainty that matters.
-    # A single point estimate opens the gate on ~27% of pure-noise runs here.
+    # split on; resampling clips would understate the uncertainty that matters,
+    # and a single point estimate opens the gate on many pure-noise runs.
     rng = np.random.default_rng(cfg.suggest.seed)
     unique_groups = np.unique(groups)
     kappas = []
@@ -675,11 +601,11 @@ def train_group(
         kappas.append(cohen_kappa_score(y[idx], pred[idx], labels=classes))
     kappa_lo = float(np.percentile(kappas, 5)) if len(kappas) >= 50 else float("-inf")
 
-    # Gate on Cohen's kappa, not accuracy-vs-majority, which fails BOTH ways: it
-    # rejects an informative minority-sensitive model (kappa 0.41, balanced
-    # accuracy 0.75, accuracy below the majority rate) and accepts a
-    # near-degenerate one that clears it by luck. Kappa is chance-corrected
-    # against the marginals; the bootstrap lower bound stops one lucky split.
+    # Gate on Cohen's kappa, not accuracy-vs-majority, which fails both ways: it
+    # rejects an informative minority-sensitive model whose accuracy sits below
+    # the majority rate, and accepts a near-degenerate one that clears it by
+    # luck. Kappa is chance-corrected against the marginals; the bootstrap lower
+    # bound stops one lucky split.
     reliable = kappa_lo > 0.0 and macro_f1 >= cfg.suggest.min_macro_f1
     if kappa_lo <= 0.0:
         reason = (
@@ -701,8 +627,7 @@ def train_group(
     # The audit clips, scored by a model that never saw them: the only number
     # here free of both training LABEL leakage and suggestion feedback. Not free
     # of the unsupervised kind - `columns` carries the globally-fitted CNN basis
-    # and these rows were in the fit of it. See `GroupReport.audit_pca`, which is
-    # where that is written down rather than left to be discovered.
+    # and these rows were in the fit of it. See `GroupReport.audit_pca`.
     audit_n, audit_acc, audit_kappa = 0, float("nan"), float("nan")
     audit_eval = audit_set[audit_set[group_name].astype(str).isin(classes)]
     if len(audit_eval) >= 3:
@@ -802,12 +727,9 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         raise RuntimeError(f"{cfg.paths.csv} has no rows")
 
     # Said ONCE per run, next to the scores it qualifies, and only when it is
-    # non-zero. A labelled clip is held to the membership recorded when it was
-    # labelled; disagreeing with the hash is what a re-detected project looks
-    # like and is not an error, so there is no per-row warning. The count is
-    # still news: on a project detection has only ever run once it is zero, so a
-    # non-zero number is how someone finds out theirs was re-run - and that the
-    # holdout below is the original one rather than a fresh draw.
+    # non-zero: on a project detection has only ever run once the count is zero,
+    # so a non-zero one is how someone finds out theirs was re-run, and that the
+    # holdout below is the original rather than a fresh draw.
     recorded = audit_records(labels)
     moved = sum(1 for clip_id, member in recorded.items()
                 if member != cfg.suggest.audit_by_hash(clip_id))
@@ -858,9 +780,9 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         )
 
     # The fold-wise CNN basis is only wanted when the CNN columns are in the
-    # model: `_grouped_cv_predictions` appends it on `raw_cnn is not None` alone,
-    # so gating on file existence would fit a CNN-free model and cross-validate a
-    # CNN-carrying one. The CV has to score the model that is saved.
+    # model: `_grouped_cv_predictions` appends it on `raw_cnn is not None`
+    # alone, so gating on file existence would fit a CNN-free model and
+    # cross-validate a CNN-carrying one.
     if raw_cnn is not None and "cnn" not in usable:
         raw_cnn = None
         reporter.log(
@@ -874,11 +796,9 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
             f"the selected feature groups {usable} produced no columns; the "
             "clip features may predate them - rebuild them from the Model page."
         )
-    # The second cut, and it has to happen HERE rather than per group: `columns`
-    # is what gets written into the model payload, and that payload is what
-    # `Suggester.scale_problem` reads back to decide whether the model may be
-    # scored at several window lengths. Narrowing it later, or per group, would
-    # leave the file claiming a wider input space than the fit used.
+    # The second cut, HERE rather than per group: `columns` is what goes into
+    # the model payload, and `Suggester.scale_problem` reads that back. Narrowing
+    # it later would leave the file claiming a wider input space than the fit.
     scope = str(cfg.suggest.feature_scope)
     if scope != "all":
         dropped = length_dependent_columns(columns)
@@ -901,15 +821,11 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
             "several predict.window_scales."
         )
         if raw_cnn is not None:
-            # The fold-wise basis is fitted on `clip_cnn_raw.npy`, which is the
-            # mean, the std AND the per-step delta of the embeddings
-            # concatenated - so its components mix the length-invariant half
-            # with the two halves this scope just removed, and no subset of the
-            # components is the invariant part. Left in, the CROSS-VALIDATED
-            # score would describe a model that is not the one being saved: it
-            # would be scored with length-dependent inputs the saved model does
-            # not have. Dropping it costs the fold-PCA leak fix on this path and
-            # says so, which is the lesser of two wrong numbers.
+            # The fold-wise basis is fitted on `clip_cnn_raw.npy`, the mean, std
+            # and per-step delta concatenated, so its components mix the
+            # length-invariant half with the two halves this scope removed and
+            # no subset of them is the invariant part. Left in, the CV score
+            # would describe a model that is not the one being saved.
             raw_cnn = None
             reporter.log(
                 f"suggest.feature_scope is {scope!r}, so the fold-wise CNN basis "
@@ -924,7 +840,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
 
     # Said before any group is fitted: every score below is computed on whatever
     # survived this join, and a group whose rare class was mostly orphaned
-    # reports 0.000 F1 for it, which reads as "hard" rather than "gone".
+    # reports a near-zero F1 for it, which reads as "hard" rather than "gone".
     n_orphaned = int((~labels["clip_id"].astype(str)
                       .isin(set(features["clip_id"].astype(str)))).sum())
     if n_orphaned:
@@ -967,27 +883,18 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         if model is not None:
             models[group.name] = model
 
-    # The feature-schema version travels with the model: a model is meaningful
-    # only against features that still mean what they meant when it was fitted,
-    # which the column names cannot attest to.
+    # The feature-schema version travels with the model, because a model is
+    # meaningful only against features that still mean what they meant when it
+    # was fitted and the column names cannot attest to that. So does the WINDOW
+    # LENGTH, which can change with the schema untouched: same version, same
+    # column names, values on a different scale. `Suggester.window_problem`
+    # reads it back.
     #
-    # So does the WINDOW LENGTH, for the same reason and a second one: the
-    # version stamp catches a schema that changed, but the window length can
-    # change with the schema untouched - same version, same column names, values
-    # on a different scale. `Suggester.window_problem` is what reads it back.
-    #
-    # Why `cfg.clips.frames` and not something else: these rows come from
-    # clip_features.parquet, which is built over the ANNOTATION clip manifest
-    # (`build_clip_features` iterates the manifest's (f_start, f_end) pairs), and
-    # that manifest is laid out by `clips._windows`, whose window length is
-    # `cfg.clips.frames`. `cfg.clips.stride` only sets how far the grid advances,
-    # and `cfg.predict.resolved_window(cfg.clips)` belongs to the dense export
-    # grid, a different table this model was not fitted on.
-    #
-    # It is the NOMINAL length: `_windows` truncates the last window of a track
-    # against the movie end, and `clips.min_clip_frames` lets a partly-present
-    # window through. Those are per-row shortfalls within one grid, not a
-    # different grid, and they are exactly what `present_frac` is for.
+    # `cfg.clips.frames` and not another length because these rows come from
+    # clip_features.parquet, built over the ANNOTATION clip manifest, which
+    # `clips._windows` lays out at `cfg.clips.frames`. It is the NOMINAL length:
+    # a truncated last window is a per-row shortfall within one grid rather than
+    # a different grid, which is what `present_frac` is for.
     trained_window = int(cfg.clips.frames)
     payload = {"columns": columns, "models": models,
                "feature_version": FEATURE_VERSION,
@@ -1014,17 +921,15 @@ class Suggester:
         self.problem: str = ""
         # Audit membership as recorded in the annotation CSV, for the clips that
         # record one. Kept here because this object is what the GUI asks "is
-        # this clip held out", and it is the only reader of that file on this
-        # path; see `load` for why it is refreshed there and nowhere else.
+        # this clip held out"; see `load` for why it is refreshed there only.
         self._audit_records: dict[str, bool] = {}
         # Frames per window the training rows were measured over. None for a
         # model saved before this was recorded - those still load; see
         # `window_problem`.
         self.trained_window: int | None = None
         self._by_clip: dict[str, np.ndarray] = {}
-        # Bumped by every `load`, and the only thing a caller needs in order to
-        # know that a batch from `selection_batch` is out of date. See that
-        # method on why the answer must NOT be recomputed per label.
+        # Bumped by every `load`, and all a caller needs to know that a batch
+        # from `selection_batch` is out of date.
         self.model_epoch: int = 0
         self.load()
 
@@ -1041,13 +946,9 @@ class Suggester:
         self.trained_window = None
 
         # Before every early return below, because `is_audit_clip` is asked on
-        # clips whether or not a model exists - the GUI asks it to decide
-        # whether to explain a missing suggestion. Refreshed HERE and not per
-        # question: a clip labelled since the last refit is a clip the annotator
-        # has finished with, and re-reading the CSV on every clip change would
-        # put a file read in the path of turning a page. An unreadable flag is
-        # allowed to raise: it means nobody can say which clips are held out,
-        # and carrying on would train on the holdout silently.
+        # clips whether or not a model exists. Refreshed HERE and not per
+        # question, so turning a page does not read the CSV. An unreadable flag
+        # is allowed to raise: nobody could then say which clips are held out.
         self._audit_records = read_audit_records(self.cfg.paths.csv)
 
         work = self.cfg.paths.work_dir
@@ -1068,10 +969,9 @@ class Suggester:
             return False
 
         # Read straight off the payload, and MISSING IS NOT AN ERROR: a model
-        # trained before this was recorded has to keep loading, or upgrading
-        # trackanno silently invalidates every model anyone already has. A
-        # length that will not parse is treated as absent for the same reason -
-        # `window_problem` reports "unrecorded" and the caller warns.
+        # trained before this was recorded has to keep loading, or an upgrade
+        # invalidates every model anyone already has. A length that will not
+        # parse is treated as absent, and `window_problem` reports it.
         try:
             recorded = payload.get("trained_window")
             self.trained_window = None if recorded is None else int(recorded)
@@ -1079,15 +979,12 @@ class Suggester:
             self.trained_window = None
 
         # The model's input space is fixed at fit time, so a table missing a
-        # column it was fitted on makes predicting meaningless, not degraded.
-        # Refuse, and SAY SO rather than failing silently.
-        #
-        # The name check below catches a renamed or dropped feature but not a
-        # REDEFINED one, which is the failure that matters. Hence the version
-        # stamp: bump ``FEATURE_VERSION`` whenever a feature's MEANING changes,
-        # not only when one is added. Both artefacts must carry it; an unstamped
-        # one is refused rather than assumed to match, since "unknown" is exactly
-        # the case the stamp exists to catch.
+        # column it was fitted on makes predicting meaningless rather than
+        # degraded. The name check below catches a renamed or dropped feature
+        # but not a REDEFINED one, hence the version stamp: bump
+        # `FEATURE_VERSION` whenever a feature's MEANING changes. Both artefacts
+        # must carry it, and an unstamped one is refused rather than assumed to
+        # match.
         fitted_on = payload.get("feature_version")
         built_with = None
         if "_feature_version" in features.columns and len(features):
@@ -1137,15 +1034,13 @@ class Suggester:
     def window_problem(self, length: int) -> str:
         """'' if a feature table built at `length` is safe for this model, else why not.
 
-        The skew this closes is silent by construction: window length changes
-        what the features are worth, not what they are called, so a 50-frame
-        model handed 100-frame rows passes every check `load` makes - same
-        version, same columns - and predicts confidently on inputs whose scale
-        it has never seen.
+        Window length changes what a column's VALUE is worth and not what it is
+        called, so a 50-frame model handed 100-frame rows passes every check
+        `load` makes and predicts confidently on a scale it has never seen.
 
-        Returns a sentence rather than raising, and returns one for the
-        unrecorded case too, so the caller can choose: a mismatch is worth
-        refusing over, "cannot be checked" only worth a warning.
+        Returns a sentence rather than raising, and one for the unrecorded case
+        too, so the caller can refuse a mismatch and merely warn about "cannot
+        be checked".
         """
         examples = ", ".join(_LENGTH_DEPENDENT_EXAMPLES)
         try:
@@ -1181,24 +1076,19 @@ class Suggester:
     def scale_problem(self, scales) -> str:
         """'' if this model may be scored at all of ``scales``, else why not.
 
-        The authoritative half of the multi-scale check, and the reason there
-        are two. :func:`trackanno.config.load_config` refuses
-        ``predict.window_scales`` against ``suggest.feature_scope``, which is a
-        statement about the model the project will fit NEXT; this asks the model
-        actually on disk what it was fitted on, by reading the column names in
-        its own payload. A project whose config was changed after the last fit
-        passes the first check and fails this one, which is the case that
-        matters: the config is a plan and the payload is a fact.
+        The authoritative half of the multi-scale check.
+        :func:`trackanno.config.load_config` refuses ``predict.window_scales``
+        against ``suggest.feature_scope``, which describes the model the project
+        will fit NEXT; this asks the model on disk what it was fitted on, by
+        reading the column names in its own payload. The config is a plan and
+        the payload is a fact.
 
-        ONE scale is always fine - that is the run this codebase has always
-        done, and :meth:`window_problem` is the check that belongs to it. Beyond
-        one, a length-dependent column is scored at a length the model has never
-        seen; the columns line up, the feature version matches, the confidences
-        look normal, and the answer is averaged together with the scales that
-        were right. Nothing downstream can see it, so it is refused here.
+        ONE scale is always fine, and :meth:`window_problem` is the check that
+        belongs to it. Beyond one, a length-dependent column is scored at a
+        length the model has never seen and the answer is averaged in with the
+        scales that were right, which nothing downstream can see.
 
-        Returns a sentence rather than raising, like :meth:`window_problem`, so
-        the caller decides between refusing and warning.
+        Returns a sentence rather than raising, like :meth:`window_problem`.
         """
         lengths = [int(s) for s in scales]
         if len(set(lengths)) <= 1:
@@ -1229,10 +1119,8 @@ class Suggester:
         """Which group's model ranks the clips, or ``""`` if none can.
 
         The first single-choice group in config order that the model covers,
-        which is the same group the GUI already records as the primary
-        suggestion - so the ranking and the suggestion on screen come from one
-        model rather than two, and a project with several groups does not
-        silently rank on whichever one a dict happened to yield first.
+        which is the group the GUI already records as the primary suggestion, so
+        the ranking and the suggestion on screen come from one model.
 
         Multi-select groups are not candidates: their label is a SET, and every
         rule in :mod:`trackanno.select` reads a posterior over mutually
@@ -1246,14 +1134,12 @@ class Suggester:
     def _refuse_window_mismatch(self, length: int) -> None:
         """Refuse a model fitted at another window length; only warn if it never said.
 
-        The same split :func:`trackanno.predict._check_trained_window` makes, for
-        the same reason. A MISMATCH means every clip in the batch is scored on a
-        scale the model has never seen, and the batch that comes back looks
-        exactly like a good one - the ordering is the whole output, so there is
-        nothing to notice afterwards. An UNRECORDED length is a model saved
-        before the stamp existed, and refusing those would mean upgrading
-        trackanno stops selection working on every project that already has a
-        model.
+        The same split :func:`trackanno.predict._check_trained_window` makes. A
+        MISMATCH scores every clip in the batch on a scale the model has never
+        seen, and the ordering is the whole output, so there is nothing to
+        notice afterwards. An UNRECORDED length is a model saved before the
+        stamp existed, and refusing those would stop selection working on every
+        project that already has a model.
         """
         problem = self.window_problem(length)
         if not problem:
@@ -1277,26 +1163,19 @@ class Suggester:
         order untouched.
 
         Each record is a :func:`trackanno.select.select_batch` record, passed
-        through unchanged and with the ``group`` whose model produced it added:
-        the store's provenance codec and ``select`` were designed against each
-        other, and a second shape here would be a translation nobody asked for.
+        through unchanged with the ``group`` whose model produced it added.
         ``index`` is a row of the probability matrix built below, NOT a position
         in ``manifest``; ``clip_id`` is the join key.
 
-        WHEN TO CALL THIS, which matters as much as what it returns. Recompute
-        when the model changes - :attr:`model_epoch` counts that, and the GUI
-        refits every ``suggest.retrain_every`` labels - and NOT once per label.
-        Re-ranking after every label would re-order the queue under the
-        annotator mid-session: the cursor only moves forward, so a clip that
-        dropped a place is not revisited, and which clips get stranded depends
-        on the order the labels happened to arrive in. The staleness that buys:
-        within one batch every score is the model's opinion as of the last
-        refit, so the last clip of a batch is ranked by a model up to
-        ``retrain_every`` labels out of date. That is a bounded, stated error;
-        a queue that reshuffles under the person reading it is not.
+        WHEN TO CALL THIS: recompute when the model changes - :attr:`model_epoch`
+        counts that, and the GUI refits every ``suggest.retrain_every`` labels -
+        and NOT once per label. Re-ranking after every label re-orders the queue
+        under the annotator, and the cursor only moves forward, so a clip that
+        dropped a place is never revisited. The cost is that the last clip of a
+        batch is ranked by a model up to ``retrain_every`` labels out of date.
 
         The batch is a function of the pool's contents, the config and
-        ``suggest.audit_seed`` alone - never of the row order of ``manifest`` -
+        ``suggest.audit_seed`` alone, never of the row order of ``manifest``,
         because :mod:`trackanno.select` breaks every tie on ``clip_id``.
 
         Parameters
@@ -1311,8 +1190,7 @@ class Suggester:
         n
             How many clips to ask for. The answer may be SHORTER: the diversity
             rule can forbid the rest, and the request is sized down to what the
-            pools actually hold rather than refused, because this method built
-            those pools and so is the caller that ought to know.
+            pools hold rather than refused.
         """
         cfg = self.cfg
         if not cfg.suggest.enabled or not cfg.suggest.selection_on:
@@ -1332,11 +1210,10 @@ class Suggester:
         gap = cfg.suggest.resolved_frame_gap(cfg.clips)
         ids = manifest["clip_id"].astype(str).to_numpy()
 
-        # A clip with no feature row cannot be scored, so it is left OUT of the
-        # pool rather than imputed: an imputed row still ranks, and it would
-        # rank on numbers the clip does not have. This is the ordinary state
-        # after re-running detection - the manifest is rebuilt, the feature
-        # table is not - so it is a filter, not an error.
+        # A clip with no feature row is left OUT of the pool rather than
+        # imputed: an imputed row still ranks, on numbers the clip does not
+        # have. The ordinary state after re-running detection rebuilds the
+        # manifest and not the feature table, so it is a filter, not an error.
         rows = [self._by_clip.get(clip_id) for clip_id in ids]
         keep = np.array([row is not None for row in rows], dtype=bool)
         if not keep.any():
@@ -1370,16 +1247,15 @@ class Suggester:
             rule=cfg.suggest.select_rule,
             candidates=candidates,
             # An audit pool with nothing unannotated left in it is passed as
-            # None. That is not the "this project has no holdout" lie the
-            # parameter warns about: every audit clip is already labelled, so
-            # the two masks select the same rows, and the only difference is
-            # whether slots are reserved for a draw that has nothing to draw.
+            # None: every audit clip is already labelled, so the two masks
+            # select the same rows and the only difference is whether slots are
+            # reserved for a draw that has nothing to draw.
             audit=audit if n_audit else None,
             audit_share=share,
             # The audit set's membership and its sampling are one mechanism, so
-            # they share one seed. `suggest.seed` is deliberately not used: it
-            # exists to be varied to check CV stability, and doing that must not
-            # change which clips a human is handed.
+            # they share one seed. Not `suggest.seed`, which exists to be varied
+            # to check CV stability - varying it must not change which clips a
+            # human is handed.
             seed=cfg.suggest.audit_seed,
             class_counts=self._label_counts(group, classes),
             target_quota=cfg.suggest.select_target_quota,
@@ -1389,19 +1265,14 @@ class Suggester:
             min_frame_gap=gap,
         )
         for record in records:
-            # Which model scored the clip, which `predicted_class` is meaningless
-            # without on a project with more than one category group. The store's
-            # codec takes any extra key, precisely so a rule that needs to record
-            # one more thing does not force a schema migration.
+            # Which model scored the clip, without which `predicted_class` is
+            # meaningless on a project with more than one category group.
             record["group"] = group
-            # A record that cannot be written down is not provenance. `select`
-            # scores a random draw NaN - it has no score, and inventing 0.0 would
+            # `select` scores a random draw NaN - it has no score, and 0.0 would
             # read as "the model was certain" - but `store.encode_provenance`
-            # refuses NaN outright, on the grounds that JSON has no such value
-            # and it does not read back the same everywhere. So the one float
-            # that can be non-finite is translated here, at the seam, to the JSON
-            # value that means the same thing and survives the round trip. None
-            # is still not 0.0, which is the distinction that mattered.
+            # refuses NaN, which JSON has no spelling for. So the one float that
+            # can be non-finite is translated here, at the seam, to null. None is
+            # still not 0.0, which is the distinction that mattered.
             for key, value in list(record.items()):
                 if isinstance(value, float) and not np.isfinite(value):
                     record[key] = None
@@ -1411,19 +1282,14 @@ class Suggester:
         """Labels per class as of the last fit, for the starved-class quota.
 
         Read off the training report rather than recounted from the CSV: these
-        are the counts the model was actually FITTED on, which is the right
-        denominator for "does it have enough examples of this class", and they
-        move only when the model does - so the quota cannot re-plan the batch
-        halfway through it.
+        are the counts the model was FITTED on, and they move only when the
+        model does, so the quota cannot re-plan a batch halfway through it.
 
-        Classes with no column in the probability matrix are dropped rather than
-        passed: `select_batch` refuses a count it cannot target, and a report
-        left behind by an earlier fit can legitimately name a class the current
-        model does not have. The consequence worth stating is that a class too
-        rare to be MODELLED at all (below ``suggest.min_per_class``) has no
-        column either, so targeting cannot reach the one class that is scarcest
-        of all - only more labels of it can, which is what min_per_class is
-        already saying.
+        Classes with no column in the probability matrix are dropped, because
+        `select_batch` refuses a count it cannot target and an older report can
+        name a class the current model does not have. So a class too rare to be
+        MODELLED at all (below ``suggest.min_per_class``) cannot be targeted;
+        only more labels of it help.
         """
         if int(self.cfg.suggest.select_target_quota) <= 0:
             return {}
@@ -1439,9 +1305,8 @@ class Suggester:
         Track ids are numbered per MOVIE and so are ``f_start`` frames, so two
         movies routinely hold a track 3 whose clips start at frame 250. Handed a
         bare ``track_id`` the diversity rule would read those as the same animal
-        at the same moment and suppress one of them: a genuinely informative
-        clip dropped from the batch for a collision between two movies that
-        share nothing. The pair is unique because ``clip_id`` is built from it.
+        at the same moment and suppress one. The pair is unique because
+        ``clip_id`` is built from it.
         """
         missing = [c for c in ("movie_id", "track_id", "f_start")
                    if c not in manifest.columns]
@@ -1518,22 +1383,16 @@ def _print_report(reports: dict) -> None:
         if rep.get("dropped_classes"):
             print(f"  NOT modelled (too few labels): {rep['dropped_classes']}")
         print(f"  scope: {rep.get('scope', '?')}")
-        # Against the POPULATION where the report carries one. "12 audit clips,
-        # all correct" and "12 of 340 audit clips have been labelled" are the
-        # same 12 and different claims: the first reads as a result, the second
-        # as a result resting on 3.5% of the holdout. Printed even when nothing
-        # was scored, because "the holdout exists and is empty" is the more
-        # actionable of the two.
+        # Against the POPULATION where the report carries one, so a result on
+        # 12 audit clips is read next to how much of the holdout that is.
+        # Printed even when nothing was scored: "the holdout exists and is
+        # empty" is the more actionable answer.
         #
-        # THREE cases, and they are kept apart on purpose. `audit_population` is
-        # newer than `suggest_report.json` itself, so a report written before it
-        # existed has no such key - and gating the whole block on it deleted a
-        # kappa that had printed the day before, silently, from a file whose
-        # numbers were still perfectly real. A `.get` default cannot fix that
-        # either: 0 would then mean both "this report cannot say" and "this
-        # project holds nothing out", which are different facts with different
-        # answers (retrain / raise suggest.audit_fraction). So the missing key is
-        # read as missing.
+        # THREE cases, kept apart. A report written before `audit_population`
+        # existed has no such key, and a `.get` default of 0 would mean both
+        # "this report cannot say" and "this project holds nothing out" - two
+        # facts with different answers (retrain / raise suggest.audit_fraction).
+        # So the missing key is read as missing.
         population = rep.get("audit_population")
         labelled = rep.get("audit_labelled", rep.get("audit_n", 0))
         scored = rep.get("audit_n") or 0
@@ -1541,10 +1400,9 @@ def _print_report(reports: dict) -> None:
         ak = "n/a" if ak is None or ak != ak else f"{ak:+.3f}"
         aa = "n/a" if aa is None or aa != aa else f"{aa:.3f}"
         if population is None:
-            # An older report. It carries audit_n, which is what the audit line
-            # was gated on before the population was recorded, so that is what it
-            # is gated on here - the same line it printed then, with the missing
-            # denominator named rather than guessed at.
+            # An older report, gated on audit_n as the audit line was before the
+            # population was recorded, with the missing denominator named rather
+            # than guessed at.
             if scored:
                 print(
                     f"  audit holdout ({scored} scored, never suggested nor "
@@ -1571,8 +1429,8 @@ def _print_report(reports: dict) -> None:
                 )
         else:
             # The population was counted and came out 0: this project holds
-            # nothing out at all. Said rather than skipped, because a report with
-            # no audit line reads as one that forgot to compute it.
+            # nothing out. Said rather than skipped, because a report with no
+            # audit line reads as one that forgot to compute it.
             print(
                 "  audit holdout: none - no clip in this project is held out, so "
                 "every number below was computed on clips the model was fitted on "
@@ -1600,11 +1458,10 @@ def _print_report(reports: dict) -> None:
 def ablate(cfg: Config) -> None:
     """What each subset of the features is worth, on this project's own labels.
 
-    Kinematic vs CNN vs both - does the 190 MB of embeddings earn its place? -
-    plus the length-invariant subset, which is priced here because it is the
-    only one of these that buys something other than accuracy: it is the
-    condition on scoring at several ``predict.window_scales``, and what it costs
-    is a per-project number nothing else reports.
+    Kinematic vs CNN vs both, plus the length-invariant subset: that one buys
+    something other than accuracy, being the condition on scoring at several
+    ``predict.window_scales``, and what it costs is a per-project number nothing
+    else reports.
     """
     features = build_clip_features(cfg, verbose=False)
     labels = pd.read_csv(cfg.paths.csv)
@@ -1612,8 +1469,8 @@ def ablate(cfg: Config) -> None:
 
     # The same positional tag and fold-wise PCA that `train` sets up: without
     # `_row` the guard inside train_group never fires and every row is
-    # cross-validated on the GLOBALLY fitted PCA - the leak this comparison
-    # exists to quantify (0.047 / 0.237 leaked, 0.101 / 0.269 with the fold PCA).
+    # cross-validated on the GLOBALLY fitted PCA, the leak this comparison
+    # exists to quantify.
     features = features.reset_index(drop=True)
     features["_row"] = np.arange(len(features))
     raw_cnn = None
@@ -1630,10 +1487,8 @@ def ablate(cfg: Config) -> None:
     if "cnn" in usable:
         subsets["no CNN"] = feature_columns(features, [g for g in usable if g != "cnn"])
     # The subset `suggest.feature_scope: length_invariant` would fit on, priced
-    # the same way as the groups. It is the only one of these that buys
-    # something other than accuracy - it is what makes `predict.window_scales`
-    # legitimate - so the number worth reading here is what dropping the
-    # length-dependent columns COSTS, which nothing else in this tool reports.
+    # the same way as the groups: the number worth reading is what dropping the
+    # length-dependent columns COSTS.
     invariant = length_invariant_columns(all_cols)
     if invariant and len(invariant) < len(all_cols):
         subsets["length-invariant"] = invariant
@@ -1649,13 +1504,10 @@ def ablate(cfg: Config) -> None:
             fold_cnn = raw_cnn if any(c.startswith("cnn") for c in cols) else None
             _, rep = train_group(features, labels, group.name, cfg, cols,
                                  verbose=False, raw_cnn=fold_cnn)
-            # kappa's 5th percentile is in the line because it is the column
-            # that answers the question a subset comparison is usually asked:
-            # macro-F1 differences of a few hundredths over a few hundred labels
-            # are not distinguishable from each other, while the bootstrap lower
-            # bound over MOVIES is about whether the subset holds up on the next
-            # one. Reading the point estimates alone is how a difference that is
-            # not there gets acted on.
+            # kappa's 5th percentile is in the line because macro-F1 differences
+            # of a few hundredths over a few hundred labels are not
+            # distinguishable, while the bootstrap lower bound over MOVIES says
+            # whether the subset holds up on the next one.
             print(f"  {name:<16} {len(cols):>4} cols  macro-F1 {rep.macro_f1:.3f}  "
                   f"acc {rep.accuracy:.3f}  kappa {rep.kappa:+.3f} "
                   f"[5th pct {rep.kappa_lower:+.3f}]"

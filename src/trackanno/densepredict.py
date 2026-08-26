@@ -12,31 +12,22 @@ Rules:
   and the frame rate in ``cache.json``, so a dense grid costs arithmetic.
 * The windows TILE by default: ``predict.window_stride`` is the window length,
   every detected frame lands in exactly one window, and one label per frame
-  falls out of ``predictions.parquet`` unaided. A SHORTER stride is permitted,
-  and only with a ``predict.decode``: overlapping windows pin a transition to
-  within one stride instead of one window, but then several windows speak for
-  the same frame, and the renderer paints ``range(f_start, f_end)`` per track -
-  so without a decode one prediction silently overwrites the other and the
-  colour depends on row order. The decode is what collapses the overlap into a
-  per-frame posterior and disjoint bouts before anything paints them, which is
-  why :func:`trackanno.config.load_config` refuses the pairing without it.
-  Never reproduce the annotation grid's one-frame overlap (``frames: 51`` with
-  ``stride: 50``) though: that is an off-by-one, not a decode.
+  falls out of ``predictions.parquet`` unaided. A SHORTER stride pins a
+  transition to within one stride instead of one window, but then several
+  windows speak for the same frame and the renderer paints
+  ``range(f_start, f_end)`` per track, so it is permitted only with a
+  ``predict.decode``, which collapses the overlap into disjoint bouts first.
 * ``predict.window_scales`` plays the same game with the window's LENGTH rather
-  than its offset: the grid is built once per listed length and the rows go
-  into one table, so a frame is spoken for by windows of several durations and
-  the decode averages them. It needs the same decode, and one condition overlap
-  does not have - the model must have been fitted on columns that do not scale
-  with the window length, or the extra scales reach it in units it has never
-  seen. See :func:`scale_grid` for the weighting, and
-  :meth:`trackanno.suggest.Suggester.scale_problem` for the refusal.
+  than its offset: the grid is built once per listed length and the rows go into
+  one table. It needs the same decode plus one condition overlap does not - the
+  model must have been fitted on columns that do not scale with the window
+  length. See :func:`scale_grid` for the weighting.
 * Features come through :func:`trackanno.clipfeatures.window_features`, the
   same entry point that builds ``clip_features.parquet``: its spectral columns
   are measured over a window CENTRED on each clip rather than over the clip, so
   any other route is train/serve skew no shape check could catch.
 * The CNN PCA is LOADED from beside the model, never refitted. A refit gives a
-  different orthogonal basis - no error, no warning, and a model whose input
-  space quietly stops meaning anything.
+  different orthogonal basis, silently.
 
 A window with too few detections still gets a row carrying ``skip_reason`` and
 ``n_present``; an absent row is indistinguishable from one the model declined
@@ -85,27 +76,18 @@ def window_length(cfg: Config) -> int:
     """How many frames one dense window spans.
 
     ``auto`` resolves to ``min(clips.frames, clips.stride)``, the longest window
-    that both LANDS ON THE ANNOTATION GRID (anything longer than ``clips.stride``
-    falls between that grid's own starts and stops reproducing a coincident
-    clip's ``clip_id``) and IS THE LENGTH THE MODEL WAS FITTED ON - two goals
-    that are one number only while ``clips.stride >= clips.frames``. Below that
-    the ``min`` would silently keep the landing and give up the trained length,
-    so :func:`trackanno.config.load_config` refuses ``auto`` for a dense project
-    whose annotation clips overlap rather than resolving it; see
-    :func:`trackanno.config._refuse_unresolvable_window` for the two ways out.
-    A ``coverage: manifest`` config still loads and can still be pushed down this
-    path by ``predict.py --coverage dense``, where
-    :func:`trackanno.predict._check_trained_window` refuses the mismatch against
-    the model's own recorded length. The length is
-    no longer also the stride - that is :func:`window_stride` - but it is still
-    what the features are measured over, and most of them scale with it:
-    ``path_length``, ``net_displacement``, ``radius_gyration``, ``straightness``,
-    ``turn_n_valid``, every ``*_std``, ``speed_max``/``speed_p90`` and
-    ``present_frac``. Score a window of another length and the model reads those
-    values on a scale it was never fitted at. The spectral half (``beat_*``,
-    ``wave_*``) is the exception: since ``FEATURE_VERSION`` 2 it is measured over
-    ``cfg.spectral.window`` centred on the window, so it is length-invariant.
-    With the usual ``stride == frames`` the ``min`` is a no-op.
+    that both LANDS ON THE ANNOTATION GRID (so a coincident window reproduces the
+    annotation clip's ``clip_id``) and IS THE LENGTH THE MODEL WAS FITTED ON -
+    two goals that are one number only while ``clips.stride >= clips.frames``.
+    Below that :func:`trackanno.config.load_config` refuses ``auto`` for a dense
+    project rather than resolving it.
+
+    The length is what the features are measured over, and most of them scale
+    with it: ``path_length``, ``net_displacement``, ``radius_gyration``,
+    ``straightness``, ``turn_n_valid``, every ``*_std``,
+    ``speed_max``/``speed_p90`` and ``present_frac``. The spectral half
+    (``beat_*``, ``wave_*``) is the exception, measured over
+    ``cfg.spectral.window`` centred on the window and so length-invariant.
     """
     value = cfg.predict.window_frames
     if isinstance(value, str):
@@ -116,12 +98,10 @@ def window_length(cfg: Config) -> int:
 def window_stride(cfg: Config) -> int:
     """Frames between one dense window's start and the next.
 
-    ``auto`` is :func:`window_length`, the tiling grid this module was born with.
-    Anything shorter overlaps the windows, which is only reachable together with
-    a ``predict.decode``; ``load_config`` refuses a stride longer than the window
-    (it would leave holes the dense pass exists to close) and refuses an
-    overlapping one without a decode, so by the time a Config gets here the value
-    only has to be spelled out, never judged.
+    ``auto`` is :func:`window_length`, an exact tiling. ``load_config`` refuses a
+    stride longer than the window (it would leave holes the dense pass exists to
+    close) and an overlapping one without a ``predict.decode``, so by the time a
+    Config gets here the value only has to be spelled out, never judged.
     """
     value = cfg.predict.window_stride
     if isinstance(value, str):
@@ -142,15 +122,11 @@ def scale_stride(length: int, base_length: int, base_stride: int) -> int:
     """The stride to walk a ``length``-frame grid with, given the base grid.
 
     Proportional to the length, and that proportionality IS the weighting
-    decision - see :func:`scale_grid`, which is where the argument for it is
-    written down. ``base_stride >= base_length`` (the default exact tiling) is
-    special-cased to return ``length`` itself rather than the same number
-    through a division, so the ordinary case cannot pick up a rounding error and
-    every scale tiles exactly.
-
-    Elsewhere the ratio need not be whole - scales of 25, 50 and 75 at base
-    stride 20 give 10, 20 and 30 - and where it is not, the rounding is the one
-    place the equal weighting below is approximate rather than exact.
+    decision - see :func:`scale_grid`. ``base_stride >= base_length`` (the
+    default exact tiling) returns ``length`` itself rather than the same number
+    through a division, so the ordinary case cannot pick up a rounding error.
+    Elsewhere the ratio need not be whole, and that rounding is the one place the
+    equal weighting is approximate rather than exact.
     """
     base_length, base_stride, length = int(base_length), int(base_stride), int(length)
     if base_stride >= base_length:
@@ -161,50 +137,30 @@ def scale_stride(length: int, base_length: int, base_stride: int) -> int:
 def scale_grid(cfg: Config) -> list[tuple[int, int]]:
     """``(length, stride)`` per scale, the base grid first.
 
-    THE WEIGHTING DECISION, and it is made here rather than emerging from the
-    arithmetic somewhere downstream.
+    THE WEIGHTING DECISION. Each scale gets EQUAL WEIGHT in the per-frame
+    posterior, and nothing new computes that:
+    :func:`trackanno.bouts.frame_posterior` takes the plain mean over the windows
+    covering a frame, so a scale's weight is however many of its windows reach
+    that frame, and a stride proportional to the length makes that count
+    ``length / stride`` - the same number at every scale. One stride for every
+    scale instead would weight a scale by its LENGTH, letting the longest window
+    outvote the rest, which is exactly the answer adding a short scale was meant
+    to question. The cost of equal weight is that a frame deep inside a long
+    uniform bout gains no extra confidence from the long window agreeing.
 
-    Each scale gets EQUAL WEIGHT in the per-frame posterior. Nothing new
-    computes that: :func:`trackanno.bouts.frame_posterior` takes the plain mean
-    over the windows covering a frame, so a scale's weight is however many of
-    its windows reach that frame, and giving every scale a stride proportional
-    to its length makes that count ``length / stride`` - the same number at every
-    scale. Equal weight then falls out of the uniform mean already there, with
-    no weights array, no change to ``bouts``, and nothing to keep in sync.
+    Two limits on the word "equal":
 
-    The alternative - one stride for every scale - would weight a scale by its
-    LENGTH, since a 100-frame window at stride 25 covers a frame four times
-    where a 50-frame one covers it twice. That is rejected on the failure it
-    causes: the longest scale would outvote the rest two or three to one, and
-    the whole reason to add a short scale is to see a transition the long window
-    is too blunt to resolve. Paying three feature builds to have the long
-    window's answer confirmed by itself is the specific way this feature would
-    become useless, and it would be invisible - the posterior would simply be
-    smoother and later.
-
-    Equal weight has a failure too, stated rather than hidden: a frame deep
-    inside a long uniform bout gets no extra confidence from the long window
-    agreeing with the short ones, so the smoothing a long window buys is
-    diluted. That is a loss of sharpness in the easy case; the other is a loss
-    of detection in the hard one.
-
-    Two honest limits on the word "equal":
-
-    * It is exact in a track's INTERIOR. Near either end
-      :func:`window_grid` clips the grid, drops short windows and adds a flush
-      window, and :func:`plan_dense_windows` cuts the plan to the track's
-      lifetime - so the covering counts differ per scale there and the weights
-      drift with them. The frames at a track's ends are already the ones with
-      the least evidence, which ``n_covering_mean`` on each bout reports.
+    * It is exact in a track's INTERIOR. Near either end :func:`window_grid`
+      clips the grid, drops short windows and adds a flush window, and
+      :func:`plan_dense_windows` cuts the plan to the track's lifetime, so the
+      covering counts differ per scale there. ``n_covering_mean`` on each bout
+      reports how much evidence a bout rests on.
     * It is exact only where ``base_stride * length / base_length`` comes out
-      whole, since that is what makes ``length / stride`` the same number at
-      every scale. At the default tiling stride it is exact at every scale;
-      elsewhere :func:`scale_stride` rounds, and a scale whose stride rounded
-      down covers each frame slightly more often than its neighbours.
+      whole. At the default tiling stride it is exact at every scale; elsewhere
+      :func:`scale_stride` rounds.
 
-    A movie shorter than every scale is the degenerate case: each scale returns
-    the same single clipped window, so the same row is measured once per scale
-    and the mean of identical rows is that row. Wasteful, not wrong.
+    A movie shorter than every scale is degenerate: each scale returns the same
+    single clipped window, so the mean of identical rows is that row.
     """
     base_length = window_length(cfg)
     base_stride = window_stride(cfg)
@@ -217,31 +173,20 @@ def window_grid(
 ) -> list[tuple[int, int]]:
     """Windows over ``[0, n_frames)``, ``length`` long and ``stride`` apart.
 
-    ``stride is None`` means ``stride = length``: the exact tiling - no gap, no
-    overlap - and the ONLY behaviour this function had until strides existed, so
-    it is reproduced window for window, short tail included. That tail is
-    emitted even though it is measured over fewer frames than the model was
-    fitted on (``clips._windows`` drops it because a clip has to be watchable; a
-    frame to be coloured does not), and it is a known wart: window length changes
-    the feature VALUES - ``path_length``, ``net_displacement``,
-    ``radius_gyration``, ``straightness``, ``turn_n_valid``, every ``*_std``,
-    ``speed_max``/``speed_p90`` and ``present_frac`` all scale with the span - so
-    a short window is scored by a model fitted at a different length. At
-    ``stride == length`` that is one miscalibrated row per track, older than this
-    argument and documented here rather than silently changed.
+    ``stride is None`` means ``stride = length``: the exact tiling, no gap and no
+    overlap, short tail included. That tail is a known wart - window length
+    changes the feature VALUES, so a short window is scored by a model fitted at
+    a different length - but at ``stride == length`` it is one miscalibrated row
+    per track.
 
     Under overlap (``stride < length``) it would be one such row per stride at
-    every track's end, feeding the per-frame posterior exactly where tracks
-    finish, so short windows are dropped: every window is full length. Nothing is
-    lost. A window flush with ``n_frames`` is added whenever the stride does not
-    land on one, so every frame is still inside a full window - without it the
-    last ``(n_frames - length) % stride`` frames of the movie would have no
-    window at all, which is the hole this module exists to close. That flush
-    window sits less than a stride from its neighbour, so the movie's last few
-    frames are in one window more than the interior's ``length // stride``. A
-    decode averages however many windows reach a frame, so that costs nothing;
-    a short window scored at the wrong length would not have been averaged, it
-    would have been wrong.
+    every track's end, so short windows are dropped and every window is full
+    length. A window flush with ``n_frames`` is added whenever the stride does
+    not land on one, or the last ``(n_frames - length) % stride`` frames would
+    have no window at all. That flush window sits less than a stride from its
+    neighbour, so the last few frames are in one window more than the interior's
+    ``length // stride``; a decode averages however many windows reach a frame,
+    so that costs nothing.
 
     A movie SHORTER than one window has no full window to give, in either mode.
     It gets the one short window anyway: a miscalibrated row says what it is
@@ -277,12 +222,10 @@ def plan_dense_windows(
     annotation units, not about whether the animal was on screen.
 
     The span is found by SEARCHING the grid, never by dividing a frame number by
-    ``length``. That division assumes ``grid[i]`` starts at ``i * length``, true
-    only while the grid tiles: under an overlapping stride the grid is longer,
-    both bounds name windows far short of the ones they meant to, and a track
-    quietly loses coverage at its tail - no exception, just rows that are not
-    there. Two ``searchsorted`` calls per track keep it O(n log n) instead of
-    walking the whole grid per track.
+    ``length``: that division assumes ``grid[i]`` starts at ``i * length``, true
+    only while the grid tiles, and under an overlapping stride a track would
+    quietly lose coverage at its tail. Two ``searchsorted`` calls per track keep
+    it O(n log n) instead of walking the whole grid per track.
     """
     grid = window_grid(n_frames, length, stride)
     out: dict[int, list[tuple[int, int]]] = {}
@@ -295,9 +238,8 @@ def plan_dense_windows(
         if frames.size == 0:
             continue
         # The windows that INTERSECT [first, last]: the first whose end is past
-        # the first detection, through the last that starts at or before the
-        # last one. Both arrays are increasing, so this is the same contiguous
-        # slice the integer division used to name whenever the grid tiles.
+        # the first detection, through the last that starts at or before the last
+        # one. Both arrays are increasing, so the slice is contiguous.
         lo = int(np.searchsorted(ends, int(frames.min()), side="right"))
         hi = int(np.searchsorted(starts, int(frames.max()), side="right")) - 1
         chosen = grid[lo : hi + 1]
@@ -313,12 +255,11 @@ def plan_scaled_windows(
 ) -> dict[int, list[tuple[int, int, int]]]:
     """``{track_id: [(f_start, f_end, scale)]}`` over several ``(length, stride)`` grids.
 
-    Every grid is planned by :func:`plan_dense_windows`, unchanged, so a single
-    grid produces exactly the windows it always did in exactly the order it
-    always did - with the scale appended, which is the one thing the pair cannot
-    carry. The scale is NOT recoverable from ``f_end - f_start``: a window
+    Every grid is planned by :func:`plan_dense_windows`, so a single grid gives
+    exactly the windows and the order it gives on its own, with the scale
+    appended. The scale is NOT recoverable from ``f_end - f_start``: a window
     clipped against a short movie spans fewer frames than the scale it belongs
-    to, and it is exactly those rows whose provenance is worth knowing.
+    to, and those are the rows whose provenance is worth knowing.
 
     Grids are laid out in the order given - base first, by
     :meth:`trackanno.config.Predict.resolved_scales` - and the windows of one
@@ -341,17 +282,15 @@ def _dense_clip_id(
 ) -> str:
     """The dense row's id, with the scale appended for every scale but the base.
 
-    ``clip_id_for`` is built from the START ALONE, so two scales beginning at
-    the same frame would be handed the same id - duplicate keys in a table other
-    code joins on, and no error anywhere. Hence the suffix.
+    ``clip_id_for`` is built from the START ALONE, so two scales beginning at the
+    same frame would be handed the same id - duplicate keys in a table other code
+    joins on, and no error anywhere. Hence the suffix.
 
-    The BASE scale keeps the bare id on purpose, and that is not tidiness. The
-    dense grid is laid out so its windows collide with the annotation grid's ids
-    deliberately (see :func:`trackanno.predict._bout_id`), and that collision is
-    the whole mechanism behind ``human_labelled`` and ``include_labelled``.
-    Suffixing every row would break it for the sake of rows that did not need
-    it; suffixing only the added scales leaves a single-scale table byte for
-    byte what it was and makes the extra rows self-describing.
+    The BASE scale keeps the bare id because the dense grid is laid out so its
+    windows collide with the annotation grid's ids deliberately (see
+    :func:`trackanno.predict._bout_id`), and that collision is what
+    ``human_labelled`` and ``include_labelled`` are built on. Suffixing only the
+    added scales leaves a single-scale table byte for byte what it was.
     """
     clip_id = clip_id_for(movie_id, track_id, f_start)
     if int(length) == int(base_length):
@@ -367,10 +306,8 @@ def _load_pca(cfg: Config, reporter):
 
     LOADED, NEVER FITTED. ``build_clip_features`` fits one because it is building
     the space the model will be trained in; here that space already exists, and a
-    refit returns a different basis - sign flips at minimum, a different rotation
-    whenever the dense set of detections differs from the clipped one. Nothing
-    raises, the column names still line up, and every ``cnn*`` value the model
-    sees is nonsense.
+    refit would return a different basis under the same column names, with
+    nothing raising.
     """
     path = cfg.paths.work_dir / PCA_FILE
     if not path.exists():
@@ -448,30 +385,20 @@ def build_dense_features(
                 per_scale[scale] += 1
         plans.append((d, tracks, header, windows))
 
-    # A track costs ~37 ms to lay out plus ~4 ms per window, so halving the
-    # stride roughly doubles the run. Say the count and the stride BEFORE
-    # spending them: a run five times slower than the last one is otherwise a
-    # mystery with nothing in the log to pin it on.
+    # Halving the stride roughly doubles the run, so say the window count and the
+    # stride BEFORE spending them: a run several times slower than the last one
+    # is otherwise a mystery with nothing in the log to pin it on.
     if len(grid) == 1:
         reporter.log(
             f"planning {total} dense window(s) of {length} frame(s) at stride "
             f"{stride} over {len(plans)} movie(s)"
         )
     else:
-        # Same reason, one scale further out. The window multiple is the number
-        # worth reading, and it is an UPPER bound on the cost rather than the
-        # cost: the per-track setup inside `window_features` - the trackseries
-        # layout and the sliding spectral transform - is paid once for every
-        # scale of a track, because they all go through it in one call.
-        #
-        # Measured on this repository's synthetic fixture (`tests/fixtures.py`,
-        # two 120-frame tracks; scales 25/50/100 at the tiling stride, best of
-        # three): 3.3x the windows for 1.3x the wall time on a `task: detect`
-        # project and 2.2x on a `task: pose` one, where the spectral half
-        # dominates. On the 300-frame planted track in `tests/test_predict.py`,
-        # 3.5x the windows for 1.3x the time. That is one small fixture on one
-        # machine, not a project - quote your own log line, which is why the
-        # count is in it.
+        # Same reason, one scale further out. The window multiple is an UPPER
+        # bound on the cost rather than the cost: the per-track setup inside
+        # `window_features` - the trackseries layout and the sliding spectral
+        # transform - is paid once for every scale of a track, because they all
+        # go through it in one call.
         parts = "; ".join(
             f"{per_scale[scale]} of {scale} frame(s) at stride {step}"
             for scale, step in grid
@@ -495,14 +422,11 @@ def build_dense_features(
         feats = np.load(d / FEATURES_FILE) if (d / FEATURES_FILE).exists() else None
         if pca is not None and feats is None:
             # A saved PCA means the training features CONTAIN a cnn* block, so a
-            # movie that cannot supply one is not a degraded input, it is a
-            # different feature space wearing the same column names. Every cnn*
-            # column comes out NaN, and because the classifier is NaN-native
-            # nothing downstream objects: it predicts at unchanged confidence on
-            # 55% fewer inputs and can drop a whole class from the output. That
-            # is what this refusal is for. The two checks below already refuse a
-            # file that is MISALIGNED or the WRONG WIDTH; absent is the third
-            # case, and it was the silent one.
+            # movie that cannot supply one is a different feature space wearing
+            # the same column names. Every cnn* column would come out NaN, and
+            # the classifier is NaN-native, so it would predict at unchanged
+            # confidence on far fewer inputs. The two checks below cover the
+            # MISALIGNED and WRONG WIDTH cases; absent is the third.
             raise RuntimeError(
                 f"{movie_id}: {FEATURES_FILE} is missing, but {PCA_FILE} exists, "
                 "so the model was fitted with detector-embedding columns this "
@@ -513,9 +437,9 @@ def build_dense_features(
             )
         if feats is not None and len(feats) != len(tracks):
             # instance_features.npy is written row-aligned with tracks.parquet.
-            # Assert it rather than trust it: these vectors re-identify
-            # individuals almost perfectly, so a mis-pairing shows up not as
-            # reduced accuracy but as a model that tests well and fails later.
+            # Asserted rather than trusted: these vectors re-identify individuals
+            # almost perfectly, so a mis-pairing shows up not as reduced accuracy
+            # but as a model that tests well and fails later.
             raise RuntimeError(
                 f"{movie_id}: instance_features.npy has {len(feats)} rows but "
                 f"tracks.parquet has {len(tracks)}; features are not row-aligned"
@@ -537,18 +461,13 @@ def build_dense_features(
             frames = tdf["frame"].to_numpy(dtype=np.int64)
             # Through the SAME entry point build_clip_features uses, once per
             # track rather than once per window. Driving trackseries and
-            # wavespectra directly would give the export a different feature
-            # definition under identical column NAMES: the spectral columns are
-            # measured over a window centred on the clip, not over the clip.
-            # A non-empty re-iterable Sequence, every f_end past its f_start:
-            # window_features is exact on overlapping windows (bit-identical to
-            # one window at a time, order-invariant) but it walks the list twice.
-            #
-            # Every scale of this track goes through ONE call, which is why the
-            # cost of a scale is less than a whole extra feature build: the
-            # per-track work - the trackseries layout and the sliding spectral
-            # transform - is done once and every window of every scale is a
-            # slice of it. Only the per-window terms are paid again.
+            # wavespectra directly would give a different feature definition
+            # under identical column NAMES: the spectral columns are measured
+            # over a window centred on the clip, not over the clip. `spans` must
+            # be a non-empty re-iterable Sequence with every f_end past its
+            # f_start - window_features walks the list twice. Every scale of this
+            # track goes through ONE call, so the per-track work is done once and
+            # only the per-window terms are paid again.
             spans = [(f_start, f_end) for f_start, f_end, _ in windows[track_id]]
             measured = window_features(tdf, cfg, fps, spans)
             reached = np.zeros(frames.size, dtype=bool)
@@ -628,8 +547,7 @@ def _align_to_reference(frame: pd.DataFrame, reference: Path, reporter) -> pd.Da
     ``window_features`` fills its whole schema in, so this normally changes
     nothing. It matters where the dense grid produced no row that could compute a
     family at all - every window under ``min_frames``, or a missing saved PCA -
-    because then the column is *absent*, not NaN, and
-    ``features[suggester.columns]`` raises a KeyError naming neither file.
+    because then the column is absent rather than NaN.
     """
     if not reference.exists():
         return frame
@@ -656,24 +574,18 @@ def _summary(
     frame: pd.DataFrame, grid: Sequence[tuple[int, int]], min_present: int,
     covered: int, usable: int,
 ) -> str:
-    """The line the run logs. ``covered`` and ``usable`` are DISTINCT detected
-    frames, counted while the rows were built.
+    """The line the run logs.
 
-    They used to be ``n_present`` summed over the rows, which is the same number
-    only while the grid tiles. Under an overlapping stride a frame is counted
-    once per window holding it, so both sides of the ratio inflate by about
-    ``length / stride`` and the line claims more detected frames than the movie
-    has. The honest quantity under overlap is how many detected frames a
-    scorable window REACHES, whatever the number of windows that reach them.
-    Several scales multiply the same inflation again, for the same reason and
-    with the same answer.
+    ``covered`` and ``usable`` are DISTINCT detected frames, counted while the
+    rows were built. Summing ``n_present`` over the rows would count a frame once
+    per window holding it, so under an overlapping stride or several scales both
+    sides of the ratio would inflate and the line would claim more detected
+    frames than the movie has.
     """
     blank = frame["skip_reason"].astype(str) == ""
     share = usable / covered if covered else float("nan")
-    # One join over every scale, base grid included. A single-scale grid gives
-    # exactly the string the special case for it used to build - "50 frame(s)",
-    # or "50 frame(s) at stride 25" when it overlaps - so the branch it replaces
-    # only ever computed a value the multi-scale line then threw away.
+    # One join over every scale, base grid included: a single-scale grid gives
+    # "50 frame(s)", or "50 frame(s) at stride 25" when it overlaps.
     span = " + ".join(
         f"{scale} frame(s)" if step >= scale
         else f"{scale} frame(s) at stride {step}"
@@ -694,22 +606,17 @@ def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
     """Per movie: how many detected frames a dense window reaches, and how many
     windows reach each of them.
 
-    The invariant is now MODE-DEPENDENT, so this reports the quantity rather than
-    asserting the old rule. ``uncovered`` is a bug either way: a detected frame
-    no window speaks for comes back unlabelled and unpainted, which is the hole
-    this module exists to close. Windows per frame is not a bug: it is exactly 1
-    while the grid tiles, rises to about ``length / stride`` under an
-    overlapping stride, and to about that times the number of
-    ``predict.window_scales`` when several scales are in play - where several
-    windows speaking for one frame is the whole
-    point and ``predict.decode`` is what turns them back into one label. Above 1
-    with ``decode: none`` it IS a bug - the renderer paints
-    ``range(f_start, f_end)`` per track, so the colour would follow row order -
-    and that is the pairing ``load_config`` refuses.
+    Reports the quantities rather than asserting a rule, because the expected
+    windows-per-frame is mode-dependent: exactly 1 while the grid tiles, about
+    ``length / stride`` under an overlapping stride, and about that times the
+    number of ``predict.window_scales`` with several scales - where
+    ``predict.decode`` is what turns them back into one label. Above 1 with
+    ``decode: none`` it IS a bug, and that is the pairing ``load_config``
+    refuses. ``uncovered`` is a bug either way: a detected frame no window speaks
+    for comes back unlabelled and unpainted.
 
-    Kept called, by ``tests/test_dense_grid.py``, on purpose: it was dead code
-    while the grid changed under it, and a grid that quietly stops covering
-    everything shows up as a missing row rather than as an error.
+    Called by ``tests/test_dense_grid.py``, because a grid that quietly stops
+    covering everything shows up as a missing row rather than as an error.
     """
     out = []
     for movie_id, group in frame.groupby("movie_id", sort=True):

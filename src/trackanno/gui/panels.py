@@ -19,7 +19,7 @@ __all__ = ["CategoryPanel", "MetadataPanel", "MinimapWidget"]
 
 def _button_style(color: str, checked: bool) -> str:
     """A category button: its own colour, the theme's shape. Checked fills with
-    the colour; unchecked keeps a tinted left edge so the coding stays legible."""
+    the colour, unchecked keeps a tinted left edge."""
     t = tokens()
     if checked:
         return (

@@ -27,9 +27,7 @@ __all__ = ["Kymograph", "curvature_kymograph", "resample_centreline", "chain_fro
 SIGN_MODES = ("raw", "canonical", "absolute")
 
 # How much static curvature there has to be, relative to the beat, before its
-# sign is worth believing. On real trypanosome clips the ratio runs 0.13 to 1.13
-# (median 0.23), so this decides for perhaps half of them; the split-half test
-# below keeps the other half honest.
+# sign is worth believing. The split-half test below guards the rest.
 SIGN_MIN_RATIO = 0.20
 
 
@@ -51,19 +49,17 @@ def canonical_sign(kappa, min_ratio: float = SIGN_MIN_RATIO) -> SignVerdict:
     """Decide a consistent handedness for one clip's curvature field.
 
     A 2D image cannot tell a cell from its own mirror image: the two produce
-    curvature fields differing by an overall factor of -1 (20 real clips split
-    11 to 9). Every EVEN functional of curvature is mirror-invariant and so
-    useless here - amplitude profile, power spectrum, wave speed, direction of
-    travel. Only an ODD one separates them, and the physical one is the static
-    mode: the time-average ``psi_0(s)``, the intrinsic curvature left behind
-    once averaging over time cancels the beat.
+    curvature fields differing by an overall factor of -1. Every EVEN functional
+    of curvature is mirror-invariant and so useless here; the odd one used is the
+    static mode, the time-average ``psi_0(s)`` left once averaging cancels the
+    beat.
 
-    So: flip the clip so its static mode is positive, guarded twice because on a
-    near-symmetric beater that mode is small and its sign is noise. It must be
+    The clip is flipped so its static mode is positive, guarded twice because on
+    a near-symmetric beater that mode is small and its sign is noise: it must be
     big enough relative to the beat (``min_ratio``), and the two halves of the
     clip must independently agree. When either fails the verdict is ``+1`` with
-    ``confident=False``, left exactly as measured rather than flipped on a coin
-    toss, and the caller is expected to say so.
+    ``confident=False``, left exactly as measured, and the caller is expected to
+    say so.
     """
     field = np.asarray(kappa, dtype=np.float64)
     if field.ndim != 2 or not field.size or not np.isfinite(field).any():
@@ -158,9 +154,8 @@ def chain_from_edges(n_nodes: int, edges) -> list:
     if len(adjacency) < MIN_NODES:
         return []
 
-    # Skeletons are a handful of nodes, so an exhaustive search for the longest
-    # simple path is affordable and exact; the tree-diameter trick would be
-    # wrong the moment the skeleton contains a cycle.
+    # Skeletons are a handful of nodes, so an exhaustive longest-simple-path
+    # search is affordable and stays correct on a skeleton with a cycle.
     best: list = []
 
     def walk(node: int, seen: list) -> None:
@@ -181,6 +176,7 @@ def chain_from_edges(n_nodes: int, edges) -> list:
     if best and best[0] > best[-1]:
         best.reverse()
     return best if len(best) >= MIN_NODES else []
+
 
 # Below this many tracked points a curve cannot be fitted at all: a cubic needs
 # four, and dropping to a lower order silently changes what curvature means.
@@ -330,8 +326,8 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     # ARCLENGTH: atan2 wraps at +-pi, so a flagellum curling past that shows a
     # 2*pi cliff at whichever node crosses it. Unwrapping along time is the
     # caller's job, needing every frame at once. Same quantity as the curvature
-    # above (kappa = dpsi/ds, agreeing to 0.5%), kept because psi is
-    # FIRST-order and reads more cleanly on a noisy track.
+    # above (kappa = dpsi/ds), kept because psi is FIRST-order and reads more
+    # cleanly on a noisy track.
     psi = np.unwrap(np.arctan2(d1y, d1x))
     return np.column_stack([px, py]), kappa, length, psi
 

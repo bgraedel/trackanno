@@ -1,12 +1,11 @@
 """Surgical edits to config.yaml that keep its comments.
 
-``config.yaml`` is two thirds comment, and those comments are the documentation
-of what each knob does; a ``safe_load`` + ``safe_dump`` round trip throws every
-one of them away and reorders the file, and ``ruamel.yaml`` would fix that at the
-price of a dependency for one screen. So the *text* is edited: the schema is two
-levels deep and every leaf the GUI touches is a scalar or a short list, which
-makes line-oriented replacement reliable. Structural blocks (``categories``) go
-through :func:`replace_section`, which does lose the comments inside that block.
+``config.yaml`` is two thirds comment, and those comments document what each knob
+does; a ``safe_load`` + ``safe_dump`` round trip throws every one of them away
+and reorders the file. So the *text* is edited: the schema is two levels deep and
+every leaf the GUI touches is a scalar or a short list, which makes
+line-oriented replacement reliable. Structural blocks (``categories``) go through
+:func:`replace_section`, which does lose the comments inside that block.
 """
 
 from __future__ import annotations

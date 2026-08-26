@@ -1,21 +1,16 @@
 """Reusable project settings, saved from one project and applied to the next.
 
 A template is a whole ``config.yaml``, comments included, stored outside any
-project so it survives the project it came from. Tuning the detector, the crop
-geometry and the category buttons for one dataset is most of the setup work, and
-the next dataset almost always wants the same answers.
+project so it survives the project it came from.
 
-What a template does NOT carry is the three paths that describe one project on
-one disk: ``video_dir``, ``work_dir`` and ``csv`` are reset to what a new project
-uses, since a template pointing at last month's movie folder is worse than one
-pointing nowhere. ``paths.model`` IS kept, because the same weights are normally
-reused, and the New Project form overrides it when a model is chosen.
-``ui.annotator`` is cleared: a template is a protocol, not a person.
+It does NOT carry the three paths that describe one project on one disk:
+``video_dir``, ``work_dir`` and ``csv`` are reset to what a new project uses.
+``paths.model`` IS kept, and the New Project form overrides it when a model is
+chosen. ``ui.annotator`` is cleared: a template is a protocol, not a person.
 
 Saving copies the project's own file rather than re-serialising it, so the
-comments that document every setting come along unchanged. The result is parsed
-by the real loader before it is stored, so a template that would not load cannot
-be saved.
+comments come along unchanged, and parses the result with the real loader, so a
+template that would not load cannot be saved.
 """
 
 from __future__ import annotations
@@ -105,9 +100,8 @@ def list_templates() -> list[Template]:
 def find_template(name: str | None) -> Template | None:
     """Match a typed name, its slug, or the file name. None if unknown.
 
-    All three because the name a person types, the name shown in the picker and
-    the name on disk can differ by punctuation, and a template referred to by
-    any of them is the same template.
+    All three, because the typed name, the name shown in the picker and the name
+    on disk can differ by punctuation.
     """
     if name is None:
         return None
@@ -163,9 +157,8 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
     source = Path(config_path)
     text = set_values(source.read_text(encoding="utf-8"), dict(_PROJECT_PATHS))
 
-    # Parse it as a project before storing it: a template that cannot be loaded
-    # is a broken project waiting to be created, and the error is far more
-    # readable here than three steps later.
+    # Parse it as a project before storing it: the error reads far better here
+    # than three steps later, when the project is created.
     with tempfile.TemporaryDirectory() as tmp:
         probe = Path(tmp) / "config.yaml"
         probe.write_text(text, encoding="utf-8")

@@ -72,8 +72,7 @@ _active_name = "dark"
 
 def tokens() -> dict:
     """The palette currently in force. Underscore keys are generated assets
-    (arrow images), not colours; the stylesheet interpolates them in one pass.
-    """
+    (arrow images), not colours."""
     return _active
 
 
@@ -172,8 +171,7 @@ QPushButton[accent="true"]:disabled {{
     background: {t['surface']}; color: {t['faint']}; border-color: {t['border']};
 }}
 /* Small square buttons. The default 14px horizontal padding is wider than the
-   whole control on a 26px button, so the label had no room at all and simply
-   did not draw: the "?" help button and every "x" delete mark were blank. */
+   whole control on a 26px button, which leaves the label no room to draw. */
 QPushButton[compact="true"] {{
     padding: 0;
     font-weight: 700;
@@ -204,10 +202,9 @@ QLineEdit[invalid="true"], QSpinBox[invalid="true"],
 QDoubleSpinBox[invalid="true"], QComboBox[invalid="true"] {{
     border: 1px solid {t['warning']};
 }}
-/* Real images, not CSS border triangles. The border trick renders as two flat
-   lines here because the subcontrol keeps a non-zero content box, and once any
-   subcontrol is styled Qt stops asking the platform style to paint the native
-   arrow - so leaving them alone does not work either. These are painted once
+/* Real images, not CSS border triangles: the subcontrol keeps a non-zero
+   content box, and once any subcontrol is styled Qt stops painting the native
+   arrow, so leaving them unstyled is not an option either. Painted once
    per theme by _arrow_images(). */
 QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
@@ -384,10 +381,9 @@ QMenu::item:selected {{ background: {t['accent']}; color: {t['on_accent']}; }}
 
 
 def _arrow_images(t: dict) -> None:
-    """Paint the spin/combo arrows to PNGs, once per theme into a temp folder,
-    and record their paths in the tokens: Qt's stylesheet ``image:`` takes only
-    a URL, so an arrow that follows the palette has to be a file.
-    """
+    """Paint the spin/combo arrows to PNGs, once per theme, and record their
+    paths in the tokens. Qt's stylesheet ``image:`` takes only a URL, so an
+    arrow that follows the palette has to be a file."""
     import tempfile
 
     from qtpy.QtCore import QPointF
@@ -521,8 +517,7 @@ class Heading(QWidget):
 
 def theme_icon(size: int = 16) -> "QIcon":
     """A half-filled circle, painted rather than typed: a font glyph depends on
-    the font carrying it and on it not being promoted to a colour emoji.
-    """
+    the font carrying it and on it not being promoted to a colour emoji."""
     from qtpy.QtCore import QRectF
     from qtpy.QtGui import QIcon, QPainter, QPixmap
 
@@ -547,9 +542,8 @@ def theme_icon(size: int = 16) -> "QIcon":
 
 def app_icon() -> "QIcon":
     """The application icon: the corner reticle, painted at every size rather
-    than shipped as a file and scaled. The ground stays dark in both themes; a
-    taskbar has its own colour scheme and does not follow ours.
-    """
+    than shipped as a file and scaled. The ground stays dark in both themes,
+    since a taskbar has its own colour scheme."""
     from qtpy.QtCore import QLineF, QRectF
     from qtpy.QtGui import QIcon, QPainter, QPixmap
 
@@ -570,8 +564,8 @@ def app_icon() -> "QIcon":
         painter.drawRoundedRect(ground, size * 0.22, size * 0.22)
 
         # Float coordinates: rounding to whole pixels at 16px moves a corner by
-        # up to half an arm, and the stroke cannot go below a pixel, so the arms
-        # are pushed out and shortened to keep the corners from closing to a ring.
+        # up to half an arm. At small sizes the arms are pushed out and
+        # shortened so the corners do not close into a ring.
         small = size <= 24
         inset = size * (0.23 if small else 0.29)
         arm = size * (0.14 if small else 0.16)
@@ -594,8 +588,8 @@ def app_icon() -> "QIcon":
 def compact_button(label: str = "", size: int = 28, tooltip: str = "",
                    danger: bool = False):
     """A small square button whose label actually fits. Use this rather than
-    QPushButton + setFixedWidth: the themed padding is wider than the button and
-    the text silently vanishes."""
+    QPushButton + setFixedWidth, where the themed padding is wider than the
+    button and the text silently vanishes."""
     from qtpy.QtWidgets import QPushButton
 
     button = QPushButton(label)

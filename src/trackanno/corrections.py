@@ -1,59 +1,36 @@
 """What a person says a bout really was - in a file of its own, not in the clip log.
 
-A reviewer looking at a decoded timeline can see that a boundary is in the wrong
-place. Until now they could only see it. Writing what they saw back was fenced
-off for a real reason, and the fence is what this module replaces rather than
-removes:
-
 **A corrected bout is not a clip label.** ``annotations.csv`` holds one row per
 FIXED-LENGTH window, keyed by ``clip_id``, and every consumer of it - the
 feature join, ``suggest.train``, the audit holdout, ``reassociate`` - assumes
-that shape. A human saying "frames 812 to 1043 of track 3 are swimming" is
-saying something a window cannot hold: they have placed two BOUNDARIES, and no
-clip grid can express a boundary that does not fall on a grid multiple. Flatten
-that into clip rows at save time and the extra information is destroyed at the
-moment it is recorded, while the clip table quietly acquires rows of a second
-kind that nothing downstream can tell from a hand label.
-
-So a correction is its own record, in its own file, with its own schema, and
-turning corrections into window labels is a separate and explicit step
-(:func:`derive_window_labels`) that this module never takes on anyone's behalf.
+that shape. A human saying "frames 812 to 1043 of track 3 are swimming" has
+placed two BOUNDARIES, and no clip grid can express a boundary that does not
+fall on a grid multiple. So a correction is its own record, in its own file,
+with its own schema, and turning corrections into window labels is a separate
+and explicit step (:func:`derive_window_labels`) that this module never takes on
+anyone's behalf.
 
 Three things this file is NOT:
 
 * **Not a replacement for ``predictions.parquet``.** A correction is a record
-  ABOUT a run, not a rewritten run. The predictions stay exactly as the model
-  wrote them, so "what did the model say, and what did a person say instead"
-  remains a question anyone can answer later. Nothing here re-decodes or
-  retrains.
+  ABOUT a run, so "what did the model say, and what did a person say instead"
+  stays answerable. Nothing here re-decodes or retrains.
 * **Not an edit log.** A row is an ASSERTION - these frames are this class - not
-  an operation like "moved boundary 3 left by 40". Assertions can be read by
-  anything that understands a frame range; a log of operations can only be read
-  by a replayer, and a replayer is a second implementation of the edit rules
-  that can disagree with the first.
-* **Not the whole track.** Only the spans a person actually touched are written.
-  Recording the untouched model bouts alongside them would manufacture human
-  assertions the human never made, and requirement three of any review tool is
-  that model output and human judgement stay distinguishable for ever.
+  an operation like "moved boundary 3 left by 40"; a log of operations needs a
+  replayer, which is a second implementation of the edit rules.
+* **Not the whole track.** Only the spans a person actually touched are written,
+  so model output and human judgement stay distinguishable.
 
-Where it lives: beside ``annotations.csv``, not under ``work/``. ``work/`` is
-derived - it is deleted and rebuilt whenever detection is re-run - and a human
-judgement that a rebuild destroys is not a record. This is the second file in
-the project that holds something no computation can reproduce, so it sits with
-the first.
+Where it lives: beside ``annotations.csv``, not under ``work/``, which is
+derived and is deleted and rebuilt whenever detection is re-run.
 
-CSV, like the annotation log and unlike the prediction tables: this is a small,
-human-authored file that a person may want to read, diff or grep, and it must be
-readable without pandas. Schema evolution follows the rule
+CSV, like the annotation log: a small, human-authored file a person may want to
+read, diff or grep without pandas. Schema evolution follows the rule
 :mod:`trackanno.store` sets out - a column added later goes at the END, in the
-order it was added - so an older build reading a newer file reconstructs the
-same header it sees on disk and leaves the file alone instead of churning it.
-That rule is IMPLEMENTED here and not merely asked for: a column this build does
-not know is carried on the row it was read from
-(:attr:`Correction.extra`) and written back in the position the file already had
-it. The file is shared by every track, so a save touches rows the reviewer was
-not editing - stripping an unknown column would lose it from all of them at
-once, silently, because somebody opened an older build and moved one boundary.
+order it was added - and it is IMPLEMENTED here: a column this build does not
+know is carried on the row it was read from (:attr:`Correction.extra`) and
+written back where the file had it, because a save rewrites rows the reviewer
+was not editing.
 """
 
 from __future__ import annotations
@@ -83,15 +60,11 @@ CORRECTIONS_FILE = "bout_corrections.csv"
 
 # The column order the file is written in. `correction_id` leads because it is
 # the identity a derived label points back at, exactly as `clip_id` leads the
-# annotation log.
-#
-# ANY COLUMN ADDED LATER GOES AT THE END, in the order it was added, and this
-# comment is the whole reason: an older build reading a newer file keeps the
-# columns it does not recognise and reconstructs its own header as
-# `known + unknown-in-file-order` (see `AnnotationStore._load`). Only if the new
-# columns are already last, in that order, does the reconstruction match the
-# header on disk - and only then does the old build leave the file alone rather
-# than rewriting every row of somebody's corrections.
+# annotation log. ANY COLUMN ADDED LATER GOES AT THE END, in the order it was
+# added: an older build reconstructs its header as `known` plus the columns it
+# does not recognise in file order (see `AnnotationStore._load`), which matches
+# the header on disk only while the new columns are already last - and only then
+# does it leave the file alone rather than rewriting every row.
 CORRECTION_COLUMNS = [
     "correction_id",
     "movie_id", "track_id", "group", "f_start", "f_end", "label",
@@ -103,9 +76,9 @@ CORRECTION_COLUMNS = [
 def corrections_path(cfg) -> Path:
     """Beside the annotation log, deliberately, and not in ``work/``.
 
-    Derived from ``paths.csv`` rather than from a config key of its own so that
-    a project which moved its annotation log takes its corrections with it, and
-    so that opening an old project needs no config migration to find them.
+    Derived from ``paths.csv`` rather than from a config key of its own, so a
+    project that moved its annotation log takes its corrections with it and an
+    old project needs no config migration to find them.
     """
     return Path(cfg.paths.csv).with_name(CORRECTIONS_FILE)
 
@@ -129,22 +102,17 @@ def correction_id(movie_id, track_id: int, group: str, f_start: int, f_end: int)
 def encode_overruled(bouts: Iterable[Mapping] | None) -> str:
     """Serialise what the model said over these frames, at the moment of correction.
 
-    Without this a correction that CONFIRMS the model and one that OVERRULES it
-    are the same row, and the difference is the whole value of the file: only the
-    second is evidence that the model is wrong. The model's own answer cannot be
-    recovered later, because the next prediction run overwrites
-    ``predictions.parquet`` and a decode is not reproducible once the training
+    Without this, a correction that CONFIRMS the model and one that OVERRULES it
+    are the same row, and only the second is evidence the model is wrong. The
+    model's own answer cannot be recovered later: the next run overwrites
+    ``predictions.parquet``, and a decode is not reproducible once the training
     set has moved on.
 
     JSON in one cell, keys sorted, ASCII only - the encoding
-    :func:`trackanno.store.encode_provenance` established, for the same reasons:
-    the set of things worth recording will grow, and a new key must not force a
-    schema migration that rewrites everyone's file.
-
-    A non-finite confidence is written as ``null``. ``allow_nan=False`` would
-    refuse NaN outright, and NaN is a real value here - an unscored bout has no
-    confidence - so it is encoded as the JSON spelling of "no value" rather than
-    as a number that does not survive a round trip through other JSON readers.
+    :func:`trackanno.store.encode_provenance` established, so a new key does not
+    force a schema migration. A non-finite confidence is written as ``null``,
+    the JSON spelling of "no value", because an unscored bout genuinely has no
+    confidence and NaN does not survive a round trip.
     """
     if not bouts:
         return ""
@@ -197,11 +165,10 @@ def decode_overruled(value) -> dict:
 class Span:
     """One stretch of one track under one group, and who says so.
 
-    ``corrected`` is the field the whole design turns on. A span a person
-    asserted and a span the model produced are drawn differently, persisted
-    differently and derived from differently, and the moment the two become
-    interchangeable a reviewer starts reading their own corrections back as
-    evidence about the model.
+    ``corrected`` is the field the whole design turns on: a span a person
+    asserted and a span the model produced are drawn, persisted and derived from
+    differently, and once the two are interchangeable a reviewer reads their own
+    corrections back as evidence about the model.
 
     ``label`` is ``""`` only ever on a MODEL span - a stretch no window could be
     featurised over. A person cannot assert that nobody scored something, so
@@ -221,13 +188,10 @@ class Span:
 class Partition:
     """One track's run-length encoding for one group: disjoint, gapless, ordered.
 
-    The invariant is enforced HERE and not in the widget. A drag that ends in the
-    wrong place, an off-by-one in a hit test, a spin box that let a range run
-    backwards - every one of those produces a partition that overlaps or has a
-    hole, and a hole in a run-length encoding is indistinguishable from a stretch
-    nobody thought about. Checking after every edit means an interaction bug
-    fails loudly at the edit that caused it rather than silently, in a file, a
-    week later.
+    The invariant is enforced HERE and not in the widget, so an interaction bug
+    fails at the edit that caused it rather than in a file a week later: a hole
+    in a run-length encoding is indistinguishable from a stretch nobody thought
+    about.
 
     Edits return a NEW partition rather than mutating this one, so a refused edit
     cannot leave a half-applied state behind and undo is a stack of objects
@@ -246,9 +210,6 @@ class Partition:
     * merge a bout into its neighbour           -> assert the neighbour's class
       over it, after which the two cells have the same name and no cut between
       them survives canonicalisation
-
-    Implementing them as four code paths would be four chances to break the
-    invariant instead of one.
     """
 
     def __init__(self, spans: Iterable[Span], f_lo: int, f_hi: int):
@@ -321,9 +282,9 @@ class Partition:
         return -1
 
     def boundaries(self) -> list[int]:
-        """The interior cuts. The track's own two ends are not boundaries: they
-        are where the evidence stops, not where a behaviour changed, and a
-        reviewer must not be able to drag one."""
+        """The interior cuts. The track's own two ends are not boundaries - they
+        are where the evidence stops, not where a behaviour changed - so a
+        reviewer cannot drag one."""
         return [s.f_start for s in self.spans[1:]]
 
     def corrected_spans(self) -> list[Span]:
@@ -338,22 +299,15 @@ class Partition:
         """A person says frames ``[f_start, f_end)`` are ``label``. See the class
         docstring for why this is the only editing operation there is.
 
-        Everything it refuses, and the failure each refusal prevents:
-
-        * an empty label - "nobody could score these frames" is a statement only
-          the featuriser is in a position to make, and a person asserting it
-          would produce a hole that reads as a model gap;
-        * a backwards or empty range - a span claiming no frames is a row that
-          says nothing, and it would survive into the file;
-        * a range outside the track's decoded span - those frames have no model
-          row at all, so an assertion over them could never be drawn, compared
-          against anything, or joined to a window.
+        It refuses an empty label ("nobody could score these frames" is the
+        featuriser's statement, not a person's), a backwards or empty range, and
+        a range outside the track's decoded span, whose frames have no model row
+        to correct.
 
         The new span is marked ``corrected``; whatever it partly covers keeps its
         own marking on the frames left over. Adjacent spans are joined only when
-        they agree on BOTH label and origin: joining a corrected span to a model
-        span of the same class would silently extend a human's assertion over
-        frames nobody looked at.
+        they agree on BOTH label and origin, or a human's assertion would extend
+        silently over frames nobody looked at.
         """
         label = str(label).strip()
         if not label:
@@ -391,8 +345,7 @@ def _canonical(spans: list[Span]) -> list[Span]:
     """Join neighbours that agree on label AND origin.
 
     Both, not just the label: a corrected span joined to a model span of the same
-    class would put a person's name on frames they never looked at, which is the
-    one direction of error this whole module exists to prevent. Two adjacent
+    class would put a person's name on frames they never looked at. Two adjacent
     spans with the same class and different origins are a legitimate state and
     are drawn as two.
     """
@@ -414,10 +367,9 @@ class Correction:
     """One row of the file: a person's assertion about a half-open frame range.
 
     ``extra`` is every cell of that row this build has no column for, kept as
-    text under the name the file gave it. It is not a feature, it is the
-    downgrade path: this file is shared by every track, a save rewrites all of
-    it, and a build that dropped what it did not recognise would delete a newer
-    build's column from rows nobody was editing. See the module docstring.
+    text under the name the file gave it. It is the downgrade path: a save
+    rewrites the whole file, so a build that dropped what it did not recognise
+    would delete a newer build's column from rows nobody was editing.
     """
 
     correction_id: str
@@ -465,10 +417,10 @@ class Correction:
     def from_row(cls, row: Mapping, where: str) -> Correction:
         """One row off disk, or a refusal naming the row.
 
-        Every field is validated. A correction that cannot be read is not a
-        correction that can be ignored: the frames it covers would silently fall
-        back to model output, and the reviewer would see the model's answer where
-        their own is supposed to be.
+        Every field is validated, because a correction that cannot be read
+        cannot be skipped either: the frames it covers would fall back to model
+        output, and the reviewer would see the model's answer where their own
+        should be.
         """
         def integer(column: str) -> int:
             value = row.get(column, "")
@@ -500,12 +452,10 @@ class Correction:
                 f"(got movie_id={movie_id!r}, group={group!r})"
             )
         track_id = integer("track_id")
-        # Kept as TEXT and never parsed: this build has no idea what a column it
-        # has never heard of means, and the only safe thing to do with a value
-        # you cannot interpret is to hand it back exactly as you got it. A
-        # ``None`` key is csv.DictReader's bucket for cells past the end of the
-        # header, and a row wider than its own header is a broken row, not a
-        # column - it is dropped rather than written back under no name at all.
+        # Kept as TEXT and never parsed: a value this build cannot interpret is
+        # handed back exactly as it came. A ``None`` key is csv.DictReader's
+        # bucket for cells past the end of the header, so it is a broken row
+        # rather than a column and is dropped.
         extra = {
             str(column): "" if value is None else str(value)
             for column, value in row.items()
@@ -531,11 +481,10 @@ class CorrectionStore:
 
     No append path and no torn-append repair, unlike
     :class:`trackanno.store.AnnotationStore`, because nothing here appends: a
-    save replaces every row for one (movie, track, group) at once, since that is
-    what the reviewer just asserted about that track. One atomic
+    save replaces every row for one (movie, track, group) at once. One atomic
     ``os.replace`` per save gives the same guarantee an append and fsync gives
-    there - a kill loses at most the edit in progress, never a row already
-    written - without a second write path that can tear.
+    there - a kill loses at most the edit in progress - without a second write
+    path that can tear.
 
     Rows are written sorted by (movie, track, group, f_start), so the file is
     stable under re-saving and a diff shows the correction that changed rather
@@ -543,10 +492,7 @@ class CorrectionStore:
 
     ``columns`` is the header this store will write: the ones this build knows,
     then any it read off the file and does not, in the order the file had them.
-    Same reconstruction as :class:`trackanno.store.AnnotationStore`, for the same
-    reason - a save rewrites every row of a file shared by every track, so an
-    older build must put a newer build's column back where it found it rather
-    than delete it from work nobody was editing.
+    Same reconstruction as :class:`trackanno.store.AnnotationStore`.
     """
 
     def __init__(self, path: str | Path, annotator: str = ""):
@@ -589,11 +535,10 @@ class CorrectionStore:
     def _refuse_overlaps(self) -> None:
         """Two assertions over one frame is a record nobody can read.
 
-        The GUI cannot produce this - corrections come out of a partition that is
-        disjoint by construction - so it means the file was edited by hand or
-        merged from two sources. Applying them in some order and taking the last
-        would pick a winner nobody chose, and the reviewer would be shown a class
-        no row on screen justifies.
+        The GUI cannot produce this - corrections come out of a partition that
+        is disjoint by construction - so it means the file was edited by hand or
+        merged from two sources. Taking the last would pick a winner nobody
+        chose.
         """
         by_key: dict[tuple[str, int, str], list[Correction]] = {}
         for row in self.rows:
@@ -616,10 +561,9 @@ class CorrectionStore:
         """The columns to write: this build's, then everything the rows carry.
 
         Taken from the ROWS as well as from the header that was read, so a
-        correction carrying a column this store never saw cannot be dropped
-        without anyone noticing. ``extrasaction="ignore"`` would have done that
-        silently, which is the failure this whole ``extra`` path exists to
-        prevent - so the writer is given a header wide enough instead.
+        correction carrying a column this store never saw is not dropped:
+        ``extrasaction="ignore"`` would do that silently, so the writer is given
+        a header wide enough instead.
         """
         out = list(self.columns)
         for row in rows:
@@ -673,19 +617,16 @@ class CorrectionStore:
         """Make the file say exactly ``corrections`` about this (track, group).
 
         A whole-key replacement rather than a merge: the reviewer was looking at
-        this track's entire partition when they made the edit, so the set of
-        assertions they now hold about it is the set that stands. Merging would
-        leave an assertion they had just deleted still in the file, and the next
-        reload would put it back on screen.
+        this track's entire partition, so the set of assertions they now hold
+        about it is the set that stands. Merging would leave an assertion they
+        had just deleted in the file, to reappear on the next reload.
 
-        THE ARGUMENT ONLY HOLDS FOR SPANS THE REVIEWER COULD SEE, and this method
-        cannot tell which those were. A correction over frames the current
-        predictions have no row for is drawn nowhere and is absent from the
-        partition, so a caller that passed only what is on screen would have this
-        method delete it - a human judgement destroyed because a model ran again
-        over a shorter span. :func:`build_corrections` is what puts those rows
-        back in the set, and it is the only supported way to build the argument
-        to this method.
+        THE ARGUMENT ONLY HOLDS FOR SPANS THE REVIEWER COULD SEE, and this
+        method cannot tell which those were: a correction over frames the
+        current predictions have no row for is absent from the partition, so a
+        caller passing only what is on screen would delete it.
+        :func:`build_corrections` puts those rows back, and is the only
+        supported way to build the argument to this method.
         """
         key = (str(movie_id), int(track_id), str(group))
         kept = [c for c in self.rows if c.key != key]
@@ -760,15 +701,13 @@ def _still_stands(
 ) -> list[tuple[int, int]]:
     """Which frames of a stored correction the reviewer has left alone.
 
-    Two kinds, and they are joined into one list because they are the same
-    claim - "nothing has replaced this":
+    Two kinds, joined into one list because they make the same claim - "nothing
+    has replaced this":
 
     * frames OUTSIDE ``[f_lo, f_hi)``, the span the current predictions cover.
-      The reviewer was never shown them and so cannot have changed their mind
-      about them. This is the half that keeps a re-run from deleting a
-      judgement, and it is why a correction reaching past the predictions is
-      persisted at its FULL length even though it is drawn short.
-    * frames inside it that the partition still asserts under the same class -
+      The reviewer was never shown them, which is why a correction reaching past
+      the predictions is persisted at its FULL length though drawn short.
+    * frames inside it that the partition still asserts under the same class,
       whether as this correction's own span or as part of a longer one it was
       merged into for drawing.
 
@@ -795,42 +734,35 @@ def build_corrections(
 
     THE WHOLE SET, not the spans on screen. :meth:`CorrectionStore.replace_track`
     replaces every row under this key, so anything missing from what comes back
-    here is deleted - and the two spans easiest to leave out are the two it would
-    be worst to lose: a correction over frames the current predictions have no
-    row for, and the earlier half of two same-class corrections the partition
-    merged for drawing. Both are handled by starting from ``previous``, what the
-    file already holds, rather than from the partition alone.
+    here is deleted - including the two spans easiest to leave out, a correction
+    over frames the current predictions have no row for and the earlier half of
+    two same-class corrections the partition merged for drawing. Both survive by
+    starting from ``previous``, what the file already holds.
 
     **A stored row survives, unchanged, for as long as nothing has replaced it.**
-    Its frames outside the predicted span cannot have been replaced - nobody was
-    shown them (:func:`_still_stands`) - and its frames inside it are replaced
-    only where the reviewer asserted some other class over them. So:
+    Its frames outside the predicted span cannot have been replaced, since
+    nobody was shown them (:func:`_still_stands`), and its frames inside are
+    replaced only where the reviewer asserted another class over them. So:
 
     * an edit somewhere else on the track leaves every other row byte for byte
       as it was, including its timestamp, its annotator and what it overruled;
     * a correction the predictions no longer reach keeps ITS OWN ends. Clipping
-      is for drawing only. Writing the clipped ends back would let a re-run that
-      decoded a shorter span quietly edit a human judgement, and the frames
-      outside would be gone for good, with nothing in the file to say they were
-      ever claimed;
+      is for drawing only, so a re-run that decoded a shorter span cannot edit a
+      human judgement;
     * two same-class corrections asserted on different days stay TWO ROWS even
-      though they are drawn as one span. One row cannot hold two timestamps or
-      two annotators, and the timestamps are the only evidence of when a
-      judgement was actually made; a merged row would date Monday's work to
-      Tuesday and credit it to whoever was on shift then.
+      though they are drawn as one span, because one row cannot hold two
+      timestamps or two annotators.
 
-    A stored row is narrowed only where the reviewer actually overwrote part of
-    it, and then it keeps its annotator, its timestamp and the part of its
-    ``overruled`` record that still covers the frames it claims. Its
-    ``correction_id`` is recomputed, because both ends are in that id and an id
-    naming frames the row no longer claims is worse than a new one.
+    A stored row is narrowed only where the reviewer overwrote part of it, and
+    then it keeps its annotator, its timestamp and the part of its ``overruled``
+    record still covering the frames it claims. Its ``correction_id`` is
+    recomputed, because both ends are in that id.
 
     Whatever the surviving rows do not account for is new: a fresh row, stamped
-    now, with ``model_bouts`` - what ``predictions.parquet`` says over these
+    now, carrying ``model_bouts`` - what ``predictions.parquet`` says over these
     frames right now, as mappings with ``f_start``, ``f_end``, ``label`` and
-    ``conf`` - recorded on it, so a correction that CONFIRMS the model stays
-    distinguishable from one that OVERRULES it after the next run has overwritten
-    the evidence.
+    ``conf`` - so a correction that CONFIRMS the model stays distinguishable
+    from one that OVERRULES it once the next run has overwritten the evidence.
     """
     asserted: dict[str, list[tuple[int, int]]] = {}
     for span in partition.corrected_spans():
@@ -881,21 +813,18 @@ def apply_corrections(
     """Lay a track's corrections over the model's bouts, for DRAWING.
 
     Returns the effective partition, the corrections that could not be laid over
-    it at all, and the ones that could only be laid over part of themselves. The
-    two lists are the point: predictions get re-run, and a re-run can shorten the
-    span a track was decoded over, leaving an assertion about frames the current
-    file has no row for. Dropping those silently would show the reviewer the
-    model's answer where their own used to be; deleting them would destroy a
-    human judgement because a machine ran again. They stay in the file, they are
-    reported, and they are not drawn.
+    it at all, and the ones that could only be laid over part of themselves. A
+    re-run can shorten the span a track was decoded over, leaving an assertion
+    about frames the current file has no row for; those stay in the file, are
+    reported, and are not drawn.
 
     A correction that hangs off the end is CLIPPED to the frames the predictions
-    do cover, because those frames really were judged, and only a correction with
-    no overlap at all is an orphan. **The clipping is undone before anything is
-    written**: :func:`build_corrections` persists such a row at its own ends, so
-    what a shorter re-run costs is a picture, never a judgement. The clipped list
-    is returned rather than inferred by the caller so that the picture can say it
-    is showing less than the file holds.
+    do cover, because those frames really were judged; only a correction with no
+    overlap at all is an orphan. **The clipping is undone before anything is
+    written** - :func:`build_corrections` persists such a row at its own ends -
+    so what a shorter re-run costs is a picture, never a judgement. The clipped
+    list is returned so the picture can say it is showing less than the file
+    holds.
     """
     out = model
     orphans: list[Correction] = []
@@ -975,26 +904,19 @@ def derive_window_labels(
     that class. A window that overlaps a corrected span without being contained
     in one derives nothing, and is returned as a straddler with the reason.**
 
-    Why containment and not majority, or midpoint, or nearest: a window that
-    crosses a behavioural transition has features that are a BLEND of the two
-    behaviours - that is not an artefact of the featuriser, it is what the frames
-    contain, and it is the reason bouts exist at all
-    (:mod:`trackanno.bouts`). Labelling such a window with either class teaches
-    the next model that a blend looks like a pure class, and it does so exactly
-    at the transitions the model is already worst at. A majority rule would label
-    the most misleading windows most confidently.
+    Containment and not majority, midpoint or nearest, because a window crossing
+    a behavioural transition has features that are a BLEND of the two behaviours
+    (:mod:`trackanno.bouts`). Labelling it with either class teaches the next
+    model that a blend looks like a pure class, exactly at the transitions it is
+    already worst at.
 
-    Why they are RETURNED rather than dropped: a straddler is the most
-    informative window in the set - it is where a boundary is - and a function
-    that quietly discarded it would leave the caller unable to tell "your
-    corrections implied nothing here" from "your corrections implied something I
-    decided not to mention". Windows no correction touches at all are a fourth
-    thing again and are counted, not listed: nothing was asserted about them, so
-    there is nothing to report.
+    Straddlers are RETURNED rather than dropped, because a straddler is where a
+    boundary is, and a caller cannot otherwise tell "your corrections implied
+    nothing here" from "something I decided not to mention". Windows no
+    correction touches are counted, not listed.
 
-    Nothing is derived from MODEL output, only from corrections. Deriving a label
-    from a bout the model produced would feed the model its own answer, which is
-    the rule ``predictions never touch the annotation CSV`` exists to enforce.
+    Nothing is derived from MODEL output, only from corrections; deriving a
+    label from a bout the model produced would feed the model its own answer.
 
     ``windows`` are mappings with ``clip_id``, ``movie_id``, ``track_id``,
     ``f_start`` and ``f_end`` - the annotation manifest's own columns, because
@@ -1044,9 +966,7 @@ def derive_window_labels(
 def _straddle_reason(overlapping: list[Correction], w0: int, w1: int) -> str:
     """Why one window could not inherit a class, in frames.
 
-    Named rather than counted, because "17 windows straddle" tells a reviewer
-    nothing they can act on and "frames 800-850 cross the boundary at 812" tells
-    them where to look.
+    Named rather than counted, so a reviewer is told where to look.
     """
     if len(overlapping) > 1:
         cuts = [c.f_start for c in overlapping[1:]]
@@ -1075,10 +995,9 @@ def derivation_report(derivation: Derivation, examples: int = 6) -> str:
     """The derivation as prose, so the numbers can be checked without a screenshot.
 
     The last two sentences are part of the REPORT and not a comment in the
-    source, because the person reading it is the person who would otherwise
-    assume these labels had been written somewhere. Nothing in this codebase
-    writes a derived label into ``annotations.csv``; if anything ever does, this
-    report is where it has to say so.
+    source, because its reader is the person who would otherwise assume these
+    labels had been written somewhere. Nothing here writes a derived label into
+    ``annotations.csv``; anything that ever does must say so in this report.
     """
     lines = [
         f"{derivation.n_windows} annotation window(s) were checked against your "
@@ -1112,8 +1031,8 @@ def manifest_windows(cfg, movie_id) -> list[dict]:
 
     The manifest and not a grid computed here: ``clip_id`` is the join key the
     annotation CSV, the feature tables and the manifest all share, and a window
-    invented from ``clips.frames``/``clips.stride`` would agree with it only for
-    as long as nobody edited those settings.
+    invented from ``clips.frames``/``clips.stride`` would agree with it only
+    until somebody edited those settings.
     """
     import pandas as pd
 

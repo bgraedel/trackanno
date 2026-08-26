@@ -2,18 +2,12 @@
 
 A ``forward_pre_hook`` on the YOLO head captures the three feature maps it
 consumes (P3/P4/P5 at strides 8/16/32), so pose, localisation and appearance all
-come out of one pass - no second inference, no architecture surgery. Each
-detection's box is then ROI-aligned onto those maps and pooled to a vector.
+come out of one pass. Each detection's box is then ROI-aligned onto those maps
+and pooled to a vector.
 
-Measured on ``best_pose.pt`` (YOLO26-pose, 1280 px input, 1920-d concatenated):
-
-    same animal, consecutive frames   cosine 0.995 +- 0.004
-    different animals, same frame     cosine 0.717 +- 0.047
-    nearest-neighbour identity acc.   100% (15 animals)
-
-Read that as a warning: these vectors encode *identity* very well, and identity
-is not behaviour. Anything trained on them must be validated with
-cross-validation grouped by track (see :mod:`trackanno.suggest`).
+These vectors encode *identity* very well, and identity is not behaviour, so
+anything trained on them must be validated with cross-validation grouped by
+track (see :mod:`trackanno.suggest`).
 """
 
 from __future__ import annotations
@@ -52,8 +46,7 @@ class InstanceFeatures:
     def reset(self) -> None:
         """Drop captured maps before a predict.
 
-        Without this, a forward pass that never reaches the head (``embed=``, an
-        exported backend, an exception between capture and pooling) leaves
+        Without this, a forward pass that never reaches the head leaves
         ``pooled()`` returning the PREVIOUS frame's features - correctly shaped
         and row-aligned, so nothing downstream would notice.
         """
@@ -90,12 +83,10 @@ class InstanceFeatures:
         from torchvision.ops import roi_align
 
         maps = self._maps
-        # A head taking a different number of pyramid levels would break both
-        # lines below (they assume maps[0] is P3 at stride 8) and make
-        # `self.levels` select the wrong maps while still labelling them
-        # P3/P4/P5 - and the ROIs would still land correctly, net size and
-        # spatial_scale cancelling, so nothing downstream would look wrong.
-        # Refuse instead of guessing.
+        # The two lines below assume maps[0] is P3 at stride 8, and `self.levels`
+        # indexes P3/P4/P5. A pyramid of a different shape would mislabel the
+        # levels while the ROIs still landed correctly, so refuse rather than
+        # guess.
         if len(maps) != len(LEVEL_NAMES):
             raise RuntimeError(
                 f"the detection head received {len(maps)} feature maps, not "
@@ -107,15 +98,13 @@ class InstanceFeatures:
         net_w = int(maps[0].shape[-1]) * 8
         tile_h, tile_w = tile_size
 
-        # Reproduce ultralytics' LetterBox arithmetic exactly, never approximate
-        # it: it resizes to INTEGER `round(dim * r)` per axis and pads by INTEGER
-        # `round(pad - 0.1)`, so a float scale plus a float half-pad is silently
-        # off by up to 1 network pixel (0.125 of a P3 cell) on a non-square tile
-        # (square tiles pad by zero and are exact either way). `r` comes from the
-        # REQUESTED imgsz, not the delivered map: once extents are rounded and
-        # padding reduced to a stride multiple, net/tile no longer inverts to r.
-        # Whether the predictor padded min-rectangle (`auto=True`, what
-        # model.predict does for equal-shaped inputs) or square is decided by
+        # Reproduce ultralytics' LetterBox arithmetic exactly: it resizes to
+        # INTEGER `round(dim * r)` per axis and pads by INTEGER
+        # `round(pad - 0.1)`, so a float scale plus a float half-pad is off by up
+        # to one network pixel on a non-square tile. `r` comes from the REQUESTED
+        # imgsz, not the delivered map: once extents are rounded and padding
+        # reduced to a stride multiple, net/tile no longer inverts to r. Whether
+        # the predictor padded min-rectangle (`auto=True`) or square is decided by
         # which reproduces the captured map size.
         target = int(imgsz) if imgsz else max(net_h, net_w)
         r = min(target / max(tile_h, 1), target / max(tile_w, 1))

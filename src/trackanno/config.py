@@ -18,18 +18,11 @@ __all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption",
            "ModelSource", "RESERVED_GROUP_NAMES"]
 
 # A category group becomes a CSV column, so a group named like a built-in column
-# silently overwrites it. Kept here rather than imported from store.py, which
-# imports this module - though only for an annotation that ``from __future__
-# import annotations`` never evaluates, so that cycle is soft and this set could
-# be derived from the store's lists instead.
-#
-# Until it is, this is a hand-maintained mirror of ``store.IDENTITY_COLUMNS`` and
-# ``store.TRAILING_COLUMNS`` and there is nothing in the language keeping the two
-# together: a column added there and forgotten here is not an error, it is a name
-# a user is then allowed to pick, after which ``AnnotationStore.record`` writes
-# the built-in and the category into the same key and the built-in is gone.
-# ``tests/test_store_provenance.py`` asserts the two sets are equal, which is the
-# only thing that catches the omission. Add to both, or to neither.
+# silently overwrites it. Hand-maintained mirror of ``store.IDENTITY_COLUMNS``
+# and ``store.TRAILING_COLUMNS``, kept here rather than imported to avoid the
+# import cycle. Nothing in the language holds the two together;
+# ``tests/test_store_provenance.py`` asserts they are equal. Add to both, or to
+# neither.
 RESERVED_GROUP_NAMES = frozenset({
     "clip_id", "movie_id", "source_file", "series", "channel",
     "track_id", "f_start", "f_end",
@@ -77,11 +70,10 @@ def _spelled_out(written: int | str, value: int) -> str:
 def _optional_auto(value, where: str, expected: str):
     """A setting that may say ``auto``: ``None`` for auto, the value otherwise.
 
-    ``None`` rather than the resolved number, because what ``auto`` stands for
-    is a fact about another section (``clips.frames``, ``audit_fraction``) that
-    this parse cannot see yet - and because a config that says ``auto`` should
-    keep saying it when the GUI writes the file back, instead of freezing
-    today's answer into the text.
+    ``None`` rather than the resolved number: what ``auto`` stands for is a fact
+    about another section (``clips.frames``, ``audit_fraction``) this parse
+    cannot see yet, and a config that says ``auto`` should keep saying it when
+    the GUI writes the file back.
     """
     if isinstance(value, str):
         if value != "auto":
@@ -95,15 +87,10 @@ def _window_scales(value) -> list[int]:
 
     Only the checks a single section can make: that the entries are frame counts
     at all, and that none is repeated. Whether the list CONTAINS
-    ``predict.window_frames`` is a question about two sections and so belongs to
-    :func:`load_config`, which is the first place both have been parsed.
-
-    A repeat is refused rather than deduplicated because it is not a typo with
-    an obvious intent: the scales are averaged into the per-frame posterior with
-    equal weight each, so listing one twice gives it double weight, and a
-    weighting nobody chose is exactly the failure this whole setting exists to
-    replace. Deduplicating silently would grant the request and ignore it at the
-    same time.
+    ``predict.window_frames`` needs two sections and so belongs to
+    :func:`load_config`. A repeat is refused rather than deduplicated: the scales
+    are averaged into the per-frame posterior with equal weight each, so listing
+    one twice would silently give it double weight.
     """
     if value is None:
         return []
@@ -144,17 +131,15 @@ def _selection_rules(d: dict) -> tuple[str, str]:
     """``(select_rule, select_target_rule)``, or a refusal naming the choices.
 
     Both names are validated against :mod:`trackanno.select` itself rather than
-    against a list copied into this file: a rule added there and forgotten here
-    would be refused as unknown while it works perfectly, and the copy would rot
-    silently in the other direction too.
+    against a list copied into this file, which would rot silently in either
+    direction.
     """
     from .select import TARGET_RULES, UNCERTAINTY_RULES
 
     raw = d.get("select_rule", "off")
     if isinstance(raw, bool):
         # YAML reads a bare `off` (and `no`, and `false`) as a boolean, so the
-        # one value this key is most likely to be given is the one that arrives
-        # as the wrong type. Say which quotation mark fixes it.
+        # value this key is most likely to be given arrives as the wrong type.
         raise ConfigError(
             "suggest.select_rule came through as a YAML boolean, which is what an "
             "unquoted `off`/`on` becomes. Quote it - select_rule: \"off\" - so it "
@@ -431,56 +416,42 @@ class Suggest:
         default_factory=lambda: ["kinematic", "pose", "waveform", "cnn"])
     # A second, ORTHOGONAL cut through the same columns. `feature_groups` asks
     # which instrument a column came from; this asks how its value behaves when
-    # the window length changes, which is a different question with a different
-    # answer inside every group - `beat_*` is length-invariant and its
-    # groupmate `body_path_length` is not.
-    #
-    # 'all' is every column the groups selected, exactly as before.
-    # 'length_invariant' keeps only the columns whose value does not scale with
-    # the window, which is what makes ONE model legitimately applicable at
-    # several window lengths (`predict.window_scales`). It is a real cost - the
-    # extensive and dispersion columns carry signal - so it is opted into by a
-    # project that wants multi-scale scoring, never a default.
+    # the window length changes, which differs inside every group - `beat_*` is
+    # length-invariant and its groupmate `body_path_length` is not. 'all' is
+    # every column the groups selected; 'length_invariant' keeps only the ones
+    # that do not scale with the window, which is what makes ONE model applicable
+    # at several window lengths (`predict.window_scales`). That costs real
+    # signal, so it is opted into, never a default.
     feature_scope: str = "all"
 
     # -- which clips the annotator is handed next (:mod:`trackanno.select`) --- #
     # Every key below is prefixed `select_` rather than living in a section of
     # its own, because none of them mean anything without the model this section
-    # fits: a `select:` block would let someone configure a selector for a
-    # project whose suggester is switched off, and would sit far enough from
-    # `min_per_class` to hide that `select_target_quota` is a different bar over
-    # the same counts.
-    #
-    # 'off' is the default and reproduces the historical behaviour exactly: no
-    # ranking runs, the GUI keeps its seeded shuffle, and the annotation order is
-    # the one every earlier version produced. That is deliberate rather than
-    # cautious - selection stops the labelled set being a random sample of the
-    # clips, and every statistic computed over it changes meaning - so it is
-    # something a project opts into, never something an upgrade does to it.
+    # fits. 'off' is the default: no ranking runs and the GUI keeps its seeded
+    # shuffle. Selection stops the labelled set being a random sample of the
+    # clips, which changes what every statistic computed over it means, so it is
+    # something a project opts into.
     select_rule: str = "off"
     # Clips per batch. Twice `retrain_every` so a batch outlives the refit that
-    # produced it (an annotator who empties one is left with no order at all
-    # until the model next changes), and large enough that the reserved audit
-    # share is a whole slot: `int(share * n + 0.5)` rounds a batch of 4 at the
-    # 0.10 default down to no draw at all.
+    # produced it, and large enough that the reserved audit share is a whole
+    # slot: `int(share * n + 0.5)` rounds a batch of 4 at the 0.10 default down
+    # to no draw at all.
     select_batch_size: int = 20
     # Share of each batch drawn uniformly at random from the audit holdout.
-    # 'auto' is `audit_fraction`, DERIVED and not restated: draw audit clips at
-    # any other rate and the labelled audit subset stops being proportional to
-    # the audit set, so the one unbiased accuracy in the tool starts describing
-    # a differently-composed sample than the one it names.
+    # 'auto' is `audit_fraction`: draw audit clips at any other rate and the
+    # labelled audit subset stops being proportional to the audit set, so the one
+    # unbiased accuracy in the tool describes a differently-composed sample.
     select_audit_share: float | str = "auto"
     # Frames two ranked clips of one track must be apart. 'auto' is
     # `clips.frames`: closer than one clip length and two windows of a track
-    # literally share footage, so the second charges the annotator again for
-    # what the first already showed. Pairs exactly that far apart are kept, so
-    # 'auto' suppresses overlap and nothing else.
+    # share footage, so the second charges the annotator again for what the first
+    # already showed. Pairs exactly that far apart are kept.
     select_frame_gap: int | str = "auto"
     # Labels a class needs before slots are spent hunting for it. 0 (off) even
-    # when selection is on, because targeting deliberately skews the label
-    # marginals and both `train_group`'s gates - Cohen's kappa and the majority
-    # baseline - are computed against those marginals: it can turn the suggester
-    # silent on a model that has not changed. Worth doing, not worth defaulting.
+    # when selection is on: targeting skews the label marginals, and both
+    # `train_group`'s gates - Cohen's kappa and the majority baseline - are
+    # computed against those marginals, so it can turn the suggester silent on a
+    # model that has not changed.
     select_target_quota: int = 0
     select_target_rule: str = "target_runner_up"
 
@@ -493,12 +464,10 @@ class Suggest:
         """``select_audit_share`` with ``auto`` filled in: ``audit_fraction``.
 
         One number, two places it has to hold: `audit_fraction` decides which
-        clips are in the holdout, and this decides how often the batch draws
-        from it. Let them differ and the labelled audit subset drifts away from
-        the audit set's own share of the project - it is still a random sample,
-        so nothing raises, but it fills at the wrong rate and either stalls
-        (`audit_accuracy` computed on too few clips) or eats slots the ranking
-        was supposed to spend.
+        clips are in the holdout, and this decides how often the batch draws from
+        it. Let them differ and the labelled audit subset fills at the wrong
+        rate, either stalling `audit_accuracy` or eating slots the ranking was
+        supposed to spend.
         """
         if isinstance(self.select_audit_share, str):
             return float(self.audit_fraction)
@@ -507,29 +476,19 @@ class Suggest:
     def audit_by_hash(self, clip_id: str) -> bool:
         """Whether ``clip_id`` hashes into the audit holdout - the FALLBACK answer.
 
-        Fallback, because this answer is not stable: ``clip_id`` embeds the
-        track id and re-running detection renumbers every track, so every id
-        changes and this redraws the holdout from scratch - about
-        ``2*f*(1-f)`` of the clips change side at fraction ``f``. A clip that
-        was labelled while held out would land in the training set, and the
-        "never trained on" estimate would be computed over a different set than
-        the one it was earned on, with nothing anywhere saying so. So a
-        LABELLED clip's membership is written down the first time it is asked
+        Fallback, because this answer is not stable: ``clip_id`` embeds the track
+        id and re-running detection renumbers every track, so every id changes
+        and this redraws the holdout from scratch. A LABELLED clip's membership
+        is therefore written down the first time it is asked
         (``store.AUDIT_COLUMN``) and this is consulted only where no record
-        exists - an unlabelled clip, whose membership nothing has depended on
-        yet and is therefore free to move.
+        exists, on an unlabelled clip whose membership is still free to move.
 
-        It lives on the config rather than in :mod:`trackanno.suggest` because
-        two modules need it and neither can own it: the store stamps membership
-        into the CSV at label time and suggest reads the stamp back. A second
-        copy of the digest would be a duplicate nothing in the language holds
-        together, and its drift would be silent - the copies would agree until
-        one was edited, after which some clips would be trained on and audited
-        at once.
+        It lives on the config because two modules need it and neither can own
+        it: the store stamps membership into the CSV at label time and
+        :mod:`trackanno.suggest` reads the stamp back.
 
         Its own seed, not ``seed``: ``seed`` exists to be varied to check CV
-        stability, and doing that must not redraw the holdout (0 -> 1 leaves
-        about a tenth of it in place, by chance alone).
+        stability, and doing that must not redraw the holdout.
         """
         frac = float(self.audit_fraction)
         if frac <= 0:
@@ -542,11 +501,10 @@ class Suggest:
     def resolved_frame_gap(self, clips: "Clips") -> int:
         """``select_frame_gap`` with ``auto`` filled in: ``clips.frames``.
 
-        The one redundancy this codebase can assert rather than estimate: two
-        windows of one track less than a clip length apart overlap, so they are
-        partly the same footage and a human judging both judges some frames
-        twice. Anything wider is a claim about how fast behaviour changes, which
-        is a per-project number and so is left to be typed.
+        Two windows of one track less than a clip length apart overlap, so a
+        human judging both judges some frames twice. Anything wider is a claim
+        about how fast behaviour changes, which is per-project and left to be
+        typed.
         """
         if isinstance(self.select_frame_gap, str):
             return max(0, int(clips.frames))
@@ -698,25 +656,16 @@ class Spectral:
     A clip's length is chosen so a person can judge one behaviour, not for a
     Fourier transform: at 25 frames and 100 fps one FFT bin is 4 Hz and the
     resolvability floor lands at 12 Hz, above most of these cells' beats, so the
-    window is longer than the clip and CENTRED on it. Against 170 hand labels:
-
-        frames   direction accuracy   clips with a measurable frequency
-            25         0.853                       78 / 170
-            50         0.865                       95 / 170
-            75         0.853                      112 / 170
-           100         0.806                      122 / 170
-           150         0.702                      104 / 170
-
-    Past 75 accuracy falls because behaviour changes inside a track (70% of
-    multi-clip tracks reverse at least once) and a long window averages over the
-    reversal. Raise it if your cells hold a direction longer, lower it if they
-    switch faster than ~0.75 s.
+    window is longer than the clip and CENTRED on it. Past about 75 frames
+    accuracy falls again, because behaviour changes inside a track and a long
+    window averages over the reversal. Raise it if your cells hold a direction
+    longer, lower it if they switch faster than ~0.75 s.
     """
 
     window: int = 75
     # Frames between successive spectral estimates. The series is computed once
-    # per track, so a small hop is cheap: 5 is ~4x the work of 25 and localises a
-    # reversal to within one hop.
+    # per track, so a small hop is cheap and localises a reversal to within one
+    # hop.
     hop: int = 5
 
     @classmethod
@@ -743,56 +692,34 @@ class Predict:
     out unlabelled and unpainted in the rendered movie. ``dense`` lays its own
     grid over every frame of every track - see :mod:`trackanno.densepredict`.
 
-    By default that grid TILES: the stride equals the window length, every frame
-    lands in exactly one window, and every change of behaviour is therefore
-    reported at a window boundary. A cell that stops swimming a third of the way
-    through a window is called one thing for the whole window, and the error is
-    up to a window long. A stride shorter than the window overlaps them and
-    pins a transition to within one stride instead - but then several windows
-    speak for the same frame, and something has to decide what that frame is.
-    That is what ``decode`` does, which is why the two settings are only valid
-    together.
-
-    ``window_scales`` moves the same argument from OFFSET to DURATION. One
-    window length is one guess about how long a behaviour lasts: shorter events
-    are invisible inside it and longer ones are cut into verdicts that can
-    disagree. The two settings answer different questions and neither
-    substitutes for the other - a shorter stride moves WHERE a change is
-    reported, more scales change WHICH changes can be reported at all, and
-    ``tests/test_multiscale.py`` holds both halves of that as measurements on
-    constructed data. Scoring at several lengths and averaging the per-frame
-    posteriors is the fix, and it needs the same ``decode`` for the same reason - several
-    windows now speak for one frame - plus one more condition that overlap does
-    not need. Windows of different LENGTHS carry different feature values under
-    identical column names, so the model has to have been fitted on columns that
-    do not scale with the window. ``suggest.feature_scope`` is how a project says
-    it was, and ``load_config`` refuses the pairing when it does not.
+    By default that grid TILES, so a change of behaviour can only be reported at
+    a window boundary and the error is up to a window long. ``window_stride``
+    below the window length overlaps the windows and pins a transition to within
+    one stride; ``window_scales`` scores at several window LENGTHS instead, so a
+    behaviour shorter than one window is still visible and a long one is not cut
+    into verdicts that can disagree. Both make several windows speak for one
+    frame, which is what ``decode`` resolves, so both are only valid together
+    with it. Several scales need one condition more: windows of different lengths
+    carry different feature values under identical column names, so the model
+    must have been fitted on columns that do not scale with the window
+    (``suggest.feature_scope``).
     """
 
     coverage: str = "dense"
     window_frames: int | str = "auto"
     # Frames between one window's start and the next. 'auto' is window_frames,
-    # an exact tiling: the historical behaviour, and the only stride whose rows
-    # can be painted straight out of predictions.parquet without a decode.
+    # an exact tiling: the only stride whose rows can be painted straight out of
+    # predictions.parquet without a decode.
     window_stride: int | str = "auto"
     # Every window LENGTH the dense pass scores at, `window_frames` included.
-    # Empty (the default) is the single length `window_frames` - one scale, and
-    # byte for byte the run this module has always done.
-    #
-    # Window length is a commitment about the timescale of behaviour, and a
-    # single one is a guess: a transition shorter than the window is invisible
-    # inside it, and a bout much longer than the window is chopped into
-    # independent verdicts that can disagree. Scoring the same frames at several
-    # lengths and averaging the per-frame posteriors is the same trick
-    # `window_stride` plays with OFFSET, played with DURATION instead - and it
-    # needs no new arithmetic, because `bouts.frame_posterior` already averages
-    # over whatever windows cover a frame whatever their spans.
-    #
-    # The cost is a feature build per scale and the constraint is severe: a
-    # model fitted at one length reads another length's features on the wrong
-    # scale, so several scales are only coherent for a model fitted on
-    # length-invariant columns (`suggest.feature_scope`). `load_config` refuses
-    # the combination rather than skewing quietly.
+    # Empty (the default) is the single length `window_frames`. One window length
+    # is one guess about the timescale of behaviour: a transition shorter than it
+    # is invisible, and a longer bout is chopped into independent verdicts that
+    # can disagree. The cost is a feature build per scale, and the constraint is
+    # severe - a model fitted at one length reads another length's features on
+    # the wrong scale, so several scales are only coherent for a model fitted on
+    # length-invariant columns (`suggest.feature_scope`), which `load_config`
+    # enforces.
     window_scales: list[int] = field(default_factory=list)
     # Detections a dense window needs before its features mean anything. Two is
     # the floor at which ANY motion feature can exist. Deliberately NOT
@@ -801,18 +728,16 @@ class Predict:
     # Every row carries n_present and present_frac for a stricter downstream bar.
     min_frames: int = 2
     # How the per-frame posterior becomes labels. 'none' keeps the one label a
-    # window already carries, which is all a tiling grid needs. 'min_bout'
-    # cuts the posterior into bouts and absorbs any bout shorter than
-    # min_bout_frames into its neighbours. 'viterbi' asks the different question
-    # - the most likely label SEQUENCE under a sticky transition prior - so a
-    # short bout survives when the evidence for it outweighs the cost of the two
-    # transitions it needs, instead of being deleted for being short.
+    # window already carries, which is all a tiling grid needs. 'min_bout' cuts
+    # the posterior into bouts and absorbs any bout shorter than min_bout_frames
+    # into its neighbours. 'viterbi' asks for the most likely label SEQUENCE
+    # under a sticky transition prior, so a short bout survives when its evidence
+    # outweighs the cost of the two transitions it needs.
     decode: str = "none"
-    # The shortest bout worth believing, in frames. A statement about the
-    # ANIMAL, not about the model: the shortest episode of a behaviour you would
-    # accept as real. 0 means no such floor and disables the constraint, and so
-    # does 1 - a decode's shortest possible run is already one frame - which is
-    # why `decode: min_bout` refuses both rather than only the first.
+    # The shortest bout worth believing, in frames. A statement about the ANIMAL,
+    # not about the model: the shortest episode of a behaviour you would accept
+    # as real. 0 means no floor, and so does 1 - a decode's shortest possible run
+    # is already one frame - which is why `decode: min_bout` refuses both.
     min_bout_frames: int = 0
     # viterbi only: the probability that a frame keeps the previous frame's
     # label. 'auto' is 1 - 1/min_bout_frames, the stickiness whose average run
@@ -828,23 +753,18 @@ class Predict:
         """``window_frames`` with ``auto`` filled in: min(frames, stride) of the clips.
 
         The same number :func:`trackanno.densepredict.window_length` computes,
-        and that is still where the dense pipeline reads it. It is repeated here
-        because the stride check in :func:`load_config` has to compare two
-        numbers the user may never have typed, and loading a config must not
+        repeated here because the stride check in :func:`load_config` compares
+        two numbers the user may never have typed, and loading a config must not
         drag in the dense pipeline (and pandas behind it) to learn one integer.
 
-        The ``min`` is only meaningful while the annotation clips do NOT overlap.
-        ``auto`` is trying to be two things at once - the length the model was
-        fitted at (``clips.frames``) and a start that lands on the annotation
-        grid (a multiple of ``clips.stride``) - and ``clips.stride < clips.frames``
-        pulls them apart, at which point the ``min`` silently picks landing over
-        the trained length. :func:`load_config` refuses ``auto`` there rather
-        than resolving it, so on the dense path this branch is only ever reached
-        with ``clips.stride >= clips.frames``, where the ``min`` is ``frames``
-        and the two goals agree. It still resolves for a ``coverage: manifest``
-        project, which never builds a dense grid; ``predict.py --coverage dense``
-        on one of those is the one route left to the mismatch, and
-        :func:`trackanno.predict._check_trained_window` catches it there.
+        The ``min`` is only meaningful while the annotation clips do NOT overlap:
+        ``auto`` is trying to be both the length the model was fitted at
+        (``clips.frames``) and a start that lands on the annotation grid (a
+        multiple of ``clips.stride``), and ``clips.stride < clips.frames`` pulls
+        those apart. :func:`load_config` refuses ``auto`` there for a dense
+        project rather than resolving it; a ``coverage: manifest`` project still
+        resolves, and ``predict.py --coverage dense`` on one of those is caught
+        by :func:`trackanno.predict._check_trained_window`.
         """
         if isinstance(self.window_frames, str):
             return max(1, min(int(clips.frames), int(clips.stride)))
@@ -859,24 +779,15 @@ class Predict:
     def resolved_scales(self, clips: "Clips") -> list[int]:
         """Every window length to score at, the base one first.
 
-        Empty ``window_scales`` is ONE scale, ``resolved_window`` - the run this
-        module did before scales existed, and the answer every caller downstream
-        can treat uniformly, so nothing has to branch on "is multi-scale on".
+        Empty ``window_scales`` is ONE scale, ``resolved_window``, so no caller
+        downstream has to branch on "is multi-scale on".
 
-        The base length leads and the rest follow in ASCENDING order rather than
-        in the order they were typed. Two configs listing the same scales
-        differently would otherwise lay the dense table out in a different row
-        order and rewrite a parquet that means exactly the same thing, which is
-        the kind of spurious difference `predict.window_stride`'s byte-identity
-        guarantee exists to rule out. The base leads because it is the length
-        every other part of the pipeline is planned at - the trained-window
-        check, `densepredict.window_length`, the clip ids that deliberately
-        collide with the annotation grid's - so it is the row block a reader
-        recognises.
-
-        ``load_config`` has already refused a non-empty list that does not
-        contain the base length, so the deduplication below can never silently
-        drop a scale the user asked for.
+        The base length leads because it is what the rest of the pipeline is
+        planned at; the rest follow in ASCENDING order rather than as typed, so
+        two configs listing the same scales differently lay the dense table out
+        in the same row order. ``load_config`` has already refused a non-empty
+        list that does not contain the base length, so the deduplication below
+        cannot silently drop a scale the user asked for.
         """
         base = self.resolved_window(clips)
         if not self.window_scales:
@@ -958,13 +869,9 @@ class Predict:
                 "length in frames, and 'no shortest bout at all' is written as 0, not "
                 "as a negative length"
             )
-        # 1 is refused for exactly the reason 0 is, and it took a reading of
-        # `bouts.decode_min_bout` to see it: that function returns the plain
-        # argmax whenever the floor is `<= 1`, because the shortest run a decode
-        # can produce is already one frame long and a floor of 1 therefore
-        # excludes nothing. 0 and 1 are the same no-op wearing different numbers,
-        # so refusing one and accepting the other let the second spelling of "do
-        # nothing" through under a decode that announces it is doing something.
+        # 1 is refused for the same reason 0 is: `bouts.decode_min_bout` returns
+        # the plain argmax whenever the floor is `<= 1`, since the shortest run a
+        # decode can produce is already one frame long.
         if decode == "min_bout" and min_bout <= 1:
             raise ConfigError(
                 f"predict.decode is 'min_bout' but predict.min_bout_frames is "
@@ -1474,29 +1381,17 @@ def _refuse_unresolvable_window(cfg: Config) -> None:
       ``clips.stride``, so a dense window coinciding with an annotated one is
       handed the same ``clip_id`` and hand labels join to it.
 
-    ``clips.stride < clips.frames`` - an annotation grid cut to overlap on
-    purpose - pulls them apart, and ``min(frames, stride)`` then picks landing
-    and drops the trained length. That is not a preference this file is entitled
-    to have: the run it produces is scored at ``clips.stride`` frames by a model
-    fitted at ``clips.frames``, every row at normal confidence and nothing in the
-    output saying so. Before the trained-window stamp existed that skew simply
-    happened; since it exists the dense pass raises mid-run instead, which is
-    louder but arrives after the feature build and still does not say which key
-    to write.
+    ``clips.stride < clips.frames`` pulls them apart, and ``min(frames, stride)``
+    would then pick landing and drop the trained length, scoring every row at a
+    scale the model was not fitted at and at normal confidence. So ``auto`` is
+    refused and the number is asked for; the message names the two coherent
+    answers, both of which leave every existing label alone. A project whose
+    clips tile is untouched.
 
-    So ``auto`` is refused here and the number is asked for. The two coherent
-    answers are in the message, both of which leave every existing label alone -
-    this changes only which frames the PREDICTOR measures, never what anyone
-    annotated. A project whose clips tile (``stride >= frames``, the shipped
-    default and every project on disk that never touched the key) is untouched:
-    the two goals agree there and ``auto`` keeps meaning exactly what it meant.
-
-    Only under ``coverage: dense``, because that is the only coverage the key
-    governs - ``manifest`` scores ``clip_features.parquet``, whose length is
-    ``clips.frames`` whatever this says. ``predict.py --coverage dense`` can
-    still override a manifest config into the dense path, and
-    :func:`trackanno.predict._check_trained_window` refuses it there against the
-    model's own recorded length, which is the stronger check anyway.
+    Only under ``coverage: dense``, the one coverage this key governs.
+    ``predict.py --coverage dense`` can still push a manifest config down the
+    dense path, where :func:`trackanno.predict._check_trained_window` refuses the
+    mismatch against the model's own recorded length.
     """
     if not isinstance(cfg.predict.window_frames, str):
         return
@@ -1584,13 +1479,11 @@ def load_config(path: str | Path | None = None) -> Config:
     )
 
     # `task: pose` with no keypoints listed is INCOMPLETE, not invalid, and must
-    # not raise here: the count is readable from the checkpoint, and refusing to
-    # load would make switching the task to 'pose' from the GUI impossible.
+    # not raise here: the count is readable from the checkpoint.
     # `Config.needs_keypoints` carries the state and TiledDetector fills it in.
 
-    # The dense window grid spans two sections: both `predict.window_frames` and
-    # `predict.window_stride` may say `auto`, and what `auto` means for the
-    # length is min(clips.frames, clips.stride), so the two numbers can only be
+    # The dense window grid spans two sections: `auto` for the window length
+    # means min(clips.frames, clips.stride), so the two numbers can only be
     # compared once `clips` has been parsed as well.
     _refuse_unresolvable_window(cfg)
     length = cfg.predict.resolved_window(cfg.clips)
@@ -1623,9 +1516,9 @@ def load_config(path: str | Path | None = None) -> Config:
             "predict.window_stride back to 'auto'"
         )
 
-    # Multi-scale scoring spans three sections, and every one of the refusals
-    # below is silent skew if it is not made here: nothing downstream can tell a
-    # posterior averaged over incommensurable scales from a good one.
+    # Multi-scale scoring spans three sections, and each refusal below is silent
+    # skew if it is not made here: nothing downstream can tell a posterior
+    # averaged over incommensurable scales from a good one.
     written_scales = list(cfg.predict.window_scales)
     if written_scales and length not in written_scales:
         raise ConfigError(

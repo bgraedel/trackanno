@@ -13,23 +13,18 @@ and is therefore immutable.
 Three rules, all about not running the wrong code:
 
 * **The registry URL is a machine setting, never a project one.** It lives in the
-  state directory beside the recent-projects list. Loading weights runs the
-  pickle inside them, so a ``config.yaml`` somebody sends you may name a model
-  id but may not decide which server it comes from.
+  state directory. Loading weights runs the pickle inside them, so a
+  ``config.yaml`` somebody sends you may name a model id but may not decide which
+  server it comes from.
 * **https only, and the digest is checked.** A download whose sha256 does not
   match its manifest is deleted rather than cached, and ``model.sha256`` is
-  written back into the project on the first success, so a tag that later moves
-  to different weights is a loud mismatch rather than a silent substitution.
-* **A cache hit never reaches the network.** Offline is the normal case once a
-  model has been used, and a miss with no connection fails naming the id, the
-  digest and the directory it looked in.
+  written back into the project on the first success.
+* **A cache hit never reaches the network.** A miss with no connection fails
+  naming the id, the digest and the directory it looked in.
 
-The manifest carries what a checkpoint cannot. ``read_model_info`` already
-recovers the task, the keypoint count and the class names; it cannot recover the
-keypoint NAMES, the skeleton ``edges``, the ``imgsz`` the model was validated at
-or a sensible tile size, and those are most of what a person otherwise types in
-by hand. :func:`apply_manifest` writes them into the project and returns what it
-changed, rather than editing silently.
+The manifest carries what a checkpoint cannot: the keypoint NAMES, the skeleton
+``edges``, the ``imgsz`` the model was validated at and a sensible tile size.
+:func:`apply_manifest` writes them into the project and returns what it changed.
 """
 
 from __future__ import annotations
@@ -58,13 +53,9 @@ ENV_REGISTRY = "TRACKANNO_MODEL_REGISTRY"
 CHUNK = 1 << 20
 TIMEOUT = 30.0
 
-# What trackanno can drive as a detector. A registry may list anything, and
-# often will: segmentation and fluorescence models are useful to publish beside
-# these even while this tool cannot run them. They are shown and explained
-# rather than hidden, since a registry that silently omits half its contents is
-# worse than one that says why.
-# What this tool can load and drive. An entry naming anything else is listed
-# and downloadable, and something else runs it.
+# What this tool can load and drive. A registry may list anything else too -
+# segmentation and fluorescence models are useful to publish beside these - and
+# such an entry stays listed and downloadable, with the reason given.
 RUNNABLE_FRAMEWORKS = ("ultralytics",)
 RUNNABLE_TASKS = ("detect", "pose")
 
@@ -74,8 +65,7 @@ class RegistryError(RuntimeError):
 
 
 # Loopback is the exception to the https rule: a connection that never leaves
-# the machine cannot be tampered with in transit, and it is what makes this
-# testable without a certificate.
+# the machine cannot be tampered with in transit.
 _LOOPBACK = ("http://127.0.0.1", "http://localhost", "http://[::1]")
 
 
@@ -584,21 +574,17 @@ def resolve_model(cfg, reporter=None, allow_download: bool = True) -> Path:
 # what the manifest configures
 # --------------------------------------------------------------------------- #
 # `config` is keyed by consumer: trackanno reads the sections below and ignores
-# the rest, so `config.cellpose` reaches a cellpose runner untouched.
-# `preprocess` says how pixels must reach the model. Neither is interpreted here
-# beyond the sections listed.
-# Only these sections may be set from a manifest. A model may say how it should
-# be run; it may not point the project at different movies, a different work
-# directory or a different annotation log.
+# the rest, so `config.cellpose` reaches a cellpose runner untouched. Only these
+# sections may be set from a manifest - a model may say how it should be run, but
+# not point the project at different movies, work directory or annotation log.
 _ALLOWED_SECTIONS = ("detection", "tiling", "tracking", "clips", "spectral")
 
 
 def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str]:
     """Write the manifest's settings into the project. Returns what changed.
 
-    Returns rather than logs, because the Configure page reports what a model
-    decided in the same breath as applying it, and a setting that silently
-    changed how clips were cut is the one nobody notices.
+    Returned rather than logged, so the Configure page can report what a model
+    decided in the same breath as applying it.
     """
     from .config import load_config
     from .project import write_config
@@ -672,11 +658,9 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
 def span(value) -> tuple[float, float] | None:
     """What a range in ``assumes`` covers, as ``(low, high)``. None if absent.
 
-    Accepts a scalar for a model trained at one scale, and a list for one
-    trained across several: ``[0.2, 0.65]`` reads as a range and
-    ``[0.325, 0.65, 1.3]`` as discrete values. Both answer the only question
-    asked of them, which is whether a given acquisition falls inside what the
-    model saw, so the two spellings need not be told apart.
+    Accepts a scalar for a model trained at one scale and a list for one trained
+    across several; a list is read as its min and max either way, the only
+    question asked being whether an acquisition falls inside what the model saw.
     """
     if value is None or isinstance(value, bool):
         return None
@@ -717,16 +701,14 @@ def _outside(measured, value) -> bool:
 def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
     """Where a project disagrees with what the model was trained on.
 
-    Reported, never corrected: a model trained at 100 fps still runs on a 30 fps
-    movie, and only the person knows whether that is the experiment or a
-    mistake.
+    Reported, never corrected: only the person knows whether a mismatch is the
+    experiment or a mistake. Silent when they agree or when nothing can be
+    compared.
 
-    Silent when they agree, and silent when nothing can be compared. A project
-    carries no pixel size of its own, since it is a property of each movie
+    A project carries no pixel size of its own, it being a property of each movie
     (ND2 records it, TIFF does not), so pass ``pixel_size_um`` when one has been
-    read. Without it, a model trained at a SINGLE scale still gets a line,
-    because that is a real constraint on what it can be pointed at; a
-    multi-scale model gets nothing, having no constraint to state.
+    read. Without it, a model trained at a SINGLE scale still gets a line; a
+    multi-scale one gets nothing, having no constraint to state.
     """
     out: list[str] = []
     assumes = entry.assumes or {}

@@ -199,27 +199,22 @@ suggest:
   feature_groups: [kinematic, pose, waveform, cnn]
   # A second, independent cut through the same columns: `feature_groups` asks
   # which instrument a column came from, this asks what happens to its value
-  # when the window length changes. The two compose - "the beat and waveform
-  # families, length-invariant only" is `feature_groups: [pose, waveform]` with
-  # `feature_scope: length_invariant`.
+  # when the window length changes. The two compose.
   #   all               -> every column the groups selected.  (default)
   #   length_invariant  -> only the columns whose value does NOT scale with the
-  #                        window: the beat_* and wave_* families, which are
-  #                        measured over spectral.window and not over the window
-  #                        at all, plus the intensive means and fractions
-  #                        (speed_mean, area_mean, immotile_frac, cnn*_mean...).
-  #                        Out go the extensive quantities (path_length,
-  #                        net_displacement), everything derived from them
-  #                        (straightness), the dispersions (*_std), the order
-  #                        statistics (speed_max, speed_p90), present_frac and
-  #                        the lag-based turn columns - the lag itself is a
-  #                        function of the window length.
-  # This is what makes ONE model legitimately applicable at several
-  # predict.window_scales, and it costs real signal to get there: those columns
-  # carry information, they are simply not comparable between window lengths.
-  # `uv run suggest.py --ablate` prints what the subset is worth on YOUR labels
-  # beside the full set; read the kappa 5th percentile rather than the macro-F1,
-  # because it is the one that says whether a subset survives the next movie.
+  #                        window: the beat_* and wave_* families (measured over
+  #                        spectral.window instead), plus the intensive means and
+  #                        fractions (speed_mean, area_mean, immotile_frac,
+  #                        cnn*_mean...). Out go the extensive quantities
+  #                        (path_length, net_displacement), everything derived
+  #                        from them (straightness), the dispersions (*_std), the
+  #                        order statistics (speed_max, speed_p90), present_frac
+  #                        and the lag-based turn columns.
+  # This is what makes ONE model applicable at several predict.window_scales, and
+  # it costs real signal: those columns carry information, they are simply not
+  # comparable between window lengths. `uv run suggest.py --ablate` prints what
+  # the subset is worth on YOUR labels; read the kappa 5th percentile, which says
+  # whether a subset survives the next movie.
   feature_scope: all
   pca_components: 32
   retrain_every: 10     # retrain in the background after this many new labels
@@ -232,16 +227,12 @@ suggest:
   #
   # Which clips these are is decided by a hash of the clip_id ONLY while a clip
   # is unlabelled. The moment you label one, whether it was held out is written
-  # into the `audit_holdout` column of annotations.csv and that recording is
-  # what counts from then on. It has to be: clip_id embeds the track id, and
-  # re-running detection renumbers every track, so a hash of the id would redraw
-  # the holdout from scratch - about a fifth of the clips at 0.10 - and clips
-  # the model was deliberately kept away from would end up in its training set,
-  # with the "never trained on" accuracy quietly measured over something else.
-  # Raising or lowering audit_fraction therefore changes which of your UNLABELLED
-  # clips are held out, and leaves the clips you have already judged where they
-  # are. That is the intended behaviour and not a rounding error: it is what
-  # stops the one unbiased number in the tool from moving under you.
+  # into the `audit_holdout` column of annotations.csv and that recording is what
+  # counts from then on. It has to be: clip_id embeds the track id, so re-running
+  # detection would otherwise redraw the holdout from scratch and clips the model
+  # was kept away from would end up in its training set. Raising or lowering
+  # audit_fraction therefore changes which of your UNLABELLED clips are held out
+  # and leaves the ones you have already judged where they are.
   audit_visible: false  # share of clips that never show a suggestion, so
                         # human-vs-model agreement stays measurable
   seed: 0
@@ -251,15 +242,14 @@ suggest:
   # set is a random sample of the project and every number computed over it - the
   # class balance, the cross-validated F1 - is a statement about your data.
   #
-  # Turn it on and the model chooses instead: it ranks the unlabelled clips by
-  # how unsure it is and hands you the ones a label would teach it most. That is
-  # a real saving of your time and it costs something specific - the labelled set
-  # is now a set assembled to be HARD, so accuracy measured on it reads lower
-  # than the truth, by an amount nobody can work out afterwards. Two things keep
-  # that honest: every row records why it was shown (the `selected_by` column of
-  # annotations.csv), and a share of each batch is still drawn by a coin from the
-  # audit holdout, which is why audit_fraction: 0 below is refused with a rule
-  # set rather than warned about.
+  # Turn it on and the model ranks the unlabelled clips by how unsure it is and
+  # hands you the ones a label would teach it most. That saves your time and
+  # costs something specific: the labelled set is now assembled to be HARD, so
+  # accuracy measured on it reads lower than the truth by an amount nobody can
+  # work out afterwards. Two things keep it honest - every row records why it was
+  # shown (the `selected_by` column of annotations.csv), and a share of each
+  # batch is still drawn by a coin from the audit holdout, which is why
+  # audit_fraction: 0 with a rule set is refused rather than warned about.
   #   off               -> manifest/shuffle order, exactly as before  (default)
   #   margin            -> smallest gap between the model's top two answers. The
   #                        gap is what your label actually settles, and its scale
@@ -322,21 +312,18 @@ predict:
   # (clips.frames) and lands on the annotation grid's own starts (a multiple of
   # clips.stride), so a dense window coinciding with an annotated one keeps its
   # clip_id and hand labels still join to it. Changing it also changes what the
-  # features MEAN (path length, straightness, every *_std, present fraction), so a
-  # window the model was not fitted at is train/serve skew. The beat and wave
-  # columns are the exception: they are measured over spectral.window, not over
-  # this one, so they alone survive a change of length.
+  # features MEAN (path length, straightness, every *_std, present fraction), so
+  # a window the model was not fitted at is train/serve skew. The beat and wave
+  # columns are the exception: they are measured over spectral.window.
   #
-  # Those two goals are the same number only while the annotation clips tile.
-  # If you set clips.stride BELOW clips.frames - overlapping clips, cut on
-  # purpose - `auto` has no answer and the config refuses to load rather than
-  # quietly keeping the landing and dropping the trained length. Write the
+  # Those two goals are the same number only while the annotation clips tile. Set
+  # clips.stride BELOW clips.frames and `auto` has no answer, so the config
+  # refuses to load rather than quietly dropping the trained length. Write the
   # number instead: `clips.frames` on its own tiles at the trained length (dense
   # rows then stop sharing clip_ids with annotated clips, so `human_labelled`
-  # goes false on all of them), or `clips.frames` together with
+  # goes false on all of them), or `clips.frames` with
   # `window_stride: <clips.stride>` and a `decode` below keeps both, at the cost
-  # of overlapping windows - which is exactly what the decode is for. Neither
-  # touches a label you have already made.
+  # of overlapping windows. Neither touches a label you have already made.
   window_frames: auto
 
   # Frames from one window's start to the next.
@@ -350,20 +337,18 @@ predict:
   #              within one stride rather than one window. The cost is that
   #              several windows now speak for the same frame: the renderer
   #              paints range(f_start, f_end) per track and lets whichever row
-  #              came last win, so with overlapping rows the exported colour of
-  #              a frame would be decided by row order in the parquet rather
-  #              than by the model. This is why an overlapping stride REQUIRES a
-  #              decode below - the decode is what collapses the overlap into
-  #              one disjoint bout per stretch of frames. The config refuses to
-  #              load if you overlap without one.
+  #              came last win, so the exported colour of a frame would be
+  #              decided by parquet row order rather than by the model. This is
+  #              why an overlapping stride REQUIRES a decode below, which
+  #              collapses the overlap into one disjoint bout per stretch of
+  #              frames. The config refuses to load if you overlap without one.
   #   above window_frames -> refused: it leaves unscored gaps between windows,
   #              which is the hole `coverage: dense` exists to close.
   window_stride: auto
 
   # Every window LENGTH to score at. `window_stride` above changes where the
   # windows START; this changes how LONG they are, and averages the answers.
-  #   []       -> one scale, `window_frames`. Byte for byte the run every
-  #               earlier version did.  (default)
+  #   []       -> one scale, `window_frames`.  (default)
   #   a list   -> the dense grid is built once per length and every row goes
   #               into the same per-frame average, so a behaviour shorter than
   #               `window_frames` is still visible to the shorter scales, and a
@@ -371,37 +356,29 @@ predict:
   #               The list must INCLUDE `window_frames`: that is the length the
   #               rest of the pipeline is planned at, and two keys naming the
   #               window length and disagreeing is not a configuration.
-  # Every scale carries the SAME weight in the per-frame posterior - the stride
-  # of each scale is scaled with its length so that each covers a frame equally
-  # often, and the plain mean already in the decode does the rest. Weighting by
-  # length instead would let the longest window outvote the others two or three
-  # to one, which is precisely the answer adding a short scale was meant to
-  # question.
+  # Every scale carries the SAME weight in the per-frame posterior - each scale's
+  # stride is scaled with its length so that each covers a frame equally often,
+  # and the plain mean already in the decode does the rest. Weighting by length
+  # instead would let the longest window outvote the others, which is precisely
+  # the answer adding a short scale was meant to question.
   #
-  # What this does NOT buy is a sharper boundary. Each scale's grid still cuts
-  # at its own window edges, so on the test suite's planted movie - a transition
-  # at frame 137, window 50 - scales [25, 50, 100] report it at frame 150,
-  # exactly where one scale does. `window_stride` is the knob for WHERE a change
-  # is reported; this is the knob for WHICH changes exist to report. On the same
-  # movie a 30-frame stop is invisible to every window of a 50-frame grid (no
-  # window is ever more than 40% stopped, so a model reading that fraction back
-  # exactly still says "swimming" everywhere) and adding a 25-frame scale finds
-  # it. The two settings are independent and worth using together.
+  # What this does NOT buy is a sharper boundary: each scale's grid still cuts at
+  # its own window edges. `window_stride` is the knob for WHERE a change is
+  # reported; this is the knob for WHICH changes exist to report. A 30-frame stop
+  # is invisible to every window of a 50-frame grid - no window is ever more than
+  # 40% stopped - and adding a 25-frame scale finds it. The two settings are
+  # independent and worth using together.
   #
   # Two costs, both real:
   #   - A feature build per scale, but less than a whole one each: all the
   #     scales of a track are measured in one pass, so the per-track setup is
-  #     paid once and only the per-window work repeats. On the test fixture,
-  #     scales [25, 50, 100] cost 3.3x the windows for 1.3x the wall time on a
-  #     `detect` project and 2.2x on a `pose` one. That is a 120-frame synthetic
-  #     movie, not your data - the run logs the window count and the multiple
-  #     before it spends them, and that line is the one to budget from.
+  #     paid once and only the per-window work repeats. The run logs the window
+  #     count and the multiple before it spends them; budget from that line.
   #   - The model must have been fitted on columns that do not scale with the
   #     window length, i.e. `suggest.feature_scope: length_invariant`, or the
-  #     extra scales reach it in units it was never fitted at - at unchanged
-  #     confidence, with nothing in the output to show for it. The config
-  #     refuses to load without it, and a labelling run refuses again against
-  #     the columns the saved model actually records.
+  #     extra scales reach it in units it was never fitted at, at unchanged
+  #     confidence. The config refuses to load without it, and a labelling run
+  #     refuses again against the columns the saved model records.
   # Needs a `decode` below, for the same reason an overlapping stride does.
   window_scales: []
 
@@ -702,9 +679,9 @@ def _probe(path, kind: str) -> bool:
 
 
 # A path that answered once, and when. On a disconnected share a single is_dir()
-# blocks for 123 SECONDS and is_file() for 53 before Windows gives up, and the
-# window calls project_status on every refresh, so the verdict is cached and
-# _PROBE_TIMEOUT keeps even the first probe off the UI thread.
+# can block for minutes before Windows gives up, and the window calls
+# project_status on every refresh, so the verdict is cached and _PROBE_TIMEOUT
+# keeps even the first probe off the UI thread.
 _PROBE_CACHE: dict = {}
 _PROBE_RUNNING: set = set()
 _PROBE_LOCK = __import__("threading").Lock()
@@ -712,7 +689,7 @@ _PROBE_TTL = 30.0            # seconds a "not found" verdict is trusted for
 _PROBE_TIMEOUT = 0.6         # seconds the caller is willing to wait at all
 # 0.6s because a local path answers in microseconds and a dead share never
 # answers at all; longer only helps a merely-slow share, which the cache picks
-# up on the call after next anyway.
+# up on the call after next.
 
 
 def forget_path_probes() -> None:
@@ -764,8 +741,8 @@ def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
         return result[0]
 
     # Still blocked after the timeout: write a provisional "absent" so the next
-    # call answers instantly instead of paying the timeout again. The live thread
-    # overwrites it with the truth, and is a daemon so it cannot hold the app open.
+    # call answers instantly. The live thread overwrites it with the truth, and
+    # is a daemon so it cannot hold the app open.
     with _PROBE_LOCK:
         _PROBE_CACHE.setdefault(key, (False, time.monotonic()))
     return False
@@ -780,8 +757,8 @@ def project_status(cfg) -> ProjectStatus:
     status = ProjectStatus(config_path=cfg.path)
     video_dir = cfg.paths.video_dir
     # A path on a disconnected share does not answer "no", it RAISES: Windows
-    # reports WinError 64 out of is_dir(), glob() and is_file() alike. Never let
-    # that propagate - the clip cache is local, so annotating needs no share.
+    # reports WinError 64 out of is_dir(), glob() and is_file() alike. The clip
+    # cache is local, so annotating needs no share and that must not propagate.
     status.video_dir_ok = _exists(video_dir, "dir")
     if status.video_dir_ok:
         seen = set()

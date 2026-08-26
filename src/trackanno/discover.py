@@ -4,59 +4,36 @@
     uv run python -m trackanno.discover --class swimming
     uv run python -m trackanno.discover --class swimming --columns wave_freq_hz,wave_amp_*
 
-:mod:`trackanno.subcluster` answers that question about a bare matrix. This module
-is what a person runs: it chooses the rows (the clips of ONE class, from
-``clip_features.parquet`` joined to the annotation CSV), chooses the COLUMNS,
+:mod:`trackanno.subcluster` answers that question about a bare matrix. This
+module is what a person runs: it chooses the rows (the clips of ONE class, from
+``clip_features.parquet`` joined to the annotation CSV), chooses the columns,
 runs the clustering, makes the check :mod:`trackanno.subcluster` structurally
-cannot make for itself, and writes the answer down where a later step can read
-it.
+cannot make for itself, and writes the answer where a later step can read it.
 
-**The columns are the decision, so this module makes it explicitly and prints
-it.** Per-column scaling charges for a column that carries nothing:
-`tests/test_subcluster.py` plants three groups in two of six columns and
-recovers them at an adjusted Rand index of 1.00 from those two columns and
-under 0.05 from all six - and reports two groups where three exist. So handing
-over every column in the feature table is close to the worst available choice,
-and it is the choice a caller falls into by default unless something stops them.
-The default here is the ``wave_*`` block: the 25 columns of
-:data:`trackanno.wavespectra.SERIES_COLUMNS`, a least-squares projection of the
-flagellar tangent angle onto shifted Legendre polynomials, which is the basis
-:mod:`trackanno.subcluster` was designed against and the one in which a
-sub-behaviour is a difference in BEATING rather than in framing. It is a block
-rather than a hand-picked pair because the beat quantities are algebraically
-linked - the wave speed is the wavelength times the frequency, the amplitude
-coefficients move with the amplitude mean - so a real change in the beat moves
-many of these columns at once and none of them is the one to keep. ``--columns``
-widens or narrows it, and narrowing is the documented mitigation when a run
-comes back all noise.
+The columns are the decision, so it is made explicitly and printed. Per-column
+scaling puts a column carrying the split on the same footing as one carrying
+noise, so passing every column in the table is close to the worst available
+choice. The default is the ``wave_*`` block
+(:data:`trackanno.wavespectra.SERIES_COLUMNS`), in which a sub-behaviour is a
+difference in BEATING rather than in framing, taken whole because the beat
+quantities are algebraically linked. ``--columns`` widens or narrows it, and
+narrowing is the mitigation when a run comes back all noise. Four of the block's
+columns describe the measurement rather than the cell (``wave_interp_frac``,
+``wave_window_frames``, ``wave_censored``, ``wave_resolvable_hz``) and are left
+in, since a cluster forming on them says the class holds a population of badly
+tracked clips.
 
-Two of the block's columns describe the MEASUREMENT rather than the cell -
-``wave_interp_frac`` (how much of the window had to be filled in) and
-``wave_window_frames`` (how long the window was) - and ``wave_censored`` and
-``wave_resolvable_hz`` say what the window could resolve rather than what the
-cell did. They are left in the default because they are part of the block a
-reader can look up, and because a cluster that forms on them is a finding too:
-it says the class contains a population of badly tracked clips. If a run
-produces such a cluster, drop them by naming the columns you want instead.
+The batch-effect check is the reason this module is worth having. A cluster of
+clips from one movie, animal or session shares illumination, focus, cell density
+and body size; it is tight, reproducible under resampling, and
+:attr:`trackanno.subcluster.Cluster.stability` reports it as excellent. This
+module has ``movie_id`` and ``track_id`` beside every row, so it computes each
+cluster's composition, prints it whether or not it looks bad, and says in words
+what a lopsided one means.
 
-**The batch-effect check is the reason this module is worth having.** A cluster
-of clips from one movie, one animal or one session shares illumination, focus,
-cell density and body size; it is tight, it is perfectly reproducible under
-resampling, and :attr:`trackanno.subcluster.Cluster.stability` will report it as
-excellent. Handed a bare matrix, nothing can tell that from a sub-behaviour.
-This module has ``movie_id`` and ``track_id`` beside every row, so it computes
-each cluster's composition, prints it whether or not it looks bad, and says in
-words what a lopsided one means. It is the same trap as the re-identification
-warning on the ``cnn*`` features in :mod:`trackanno.clipfeatures`, in a place
-where nothing else is watching for it.
-
-**No new config keys.** Every parameter is a command-line flag. A discovery run
-is something a person does interactively and then repeats with the settings
-changed - a different column set, a smaller ``min_cluster_size``, one movie
-excluded - and a key in ``config.yaml`` would make the third of those runs a
-config edit and would leave a project file describing an exploration that
-finished last week. The config is read for two things only: where the work
-directory and the annotation CSV are, and the seed
+Every parameter is a command-line flag rather than a config key, a discovery run
+being something repeated interactively with the settings changed. The config is
+read only for the work directory, the annotation CSV and the seed
 (:attr:`trackanno.config.Suggest.seed`).
 
 Noise is an answer, as it is in :mod:`trackanno.subcluster`: the clips that
@@ -100,22 +77,18 @@ __all__ = [
 DEFAULT_COLUMNS = "waveform"
 
 # Above this share of one movie (or one track), a cluster is called out as a
-# possible batch effect. It is a convention and not a measurement - like
-# :data:`trackanno.subcluster.STABLE` - and it is deliberately close to 1: the
-# check is meant to catch the cluster that is ONE recording, not to grumble at
+# possible batch effect. A convention rather than a measurement, and close to 1
+# so the check catches the cluster that is ONE recording rather than grumbling at
 # every cluster with a favourite movie. `--batch-frac` lowers it, and the
-# composition is printed in full either way so the reader can apply their own
-# bar.
+# composition is printed in full either way.
 BATCH_FRACTION = 0.9
 
-# Stamped into the written report. A later step reading a file it does not
-# understand is worse than one refusing to read it, and the version has to travel
-# INSIDE the artefact - a name or a folder can be renamed away from it.
+# Stamped into the written report. The version has to travel INSIDE the artefact,
+# since a name or a folder can be renamed away from it.
 SCHEMA = "trackanno.discover/1"
 
 # What a written report is called when `--out` does not say. One file per
-# (group, class), because two classes of one project are two separate questions
-# and a single file would make the second run delete the first run's answer.
+# (group, class), so a second run does not delete the first run's answer.
 REPORT_TEMPLATE = "subclusters_{group}_{klass}.json"
 
 
@@ -211,23 +184,17 @@ def resolve_columns(features: pd.DataFrame, spec: str) -> list[str]:
 
     A spec is a comma-separated list of tokens, each one of:
 
-    * ``all`` - every feature column in the table. Allowed because a caller may
-      genuinely want it, and refused-by-default nowhere; the report says how many
-      columns were used and :func:`discover` prints the price alongside.
+    * ``all`` - every feature column in the table.
     * a feature-group name from :data:`trackanno.clipfeatures.FEATURE_GROUPS`
-      (``kinematic``, ``pose``, ``waveform``, ``cnn``), which is the same
-      vocabulary ``suggest.feature_groups`` uses.
+      (``kinematic``, ``pose``, ``waveform``, ``cnn``), the same vocabulary
+      ``suggest.feature_groups`` uses.
     * a prefix glob such as ``wave_amp_*``.
     * an exact column name.
 
     The result keeps the table's own column order and drops duplicates, so
-    ``waveform,wave_freq_hz`` is the waveform block rather than the block with
-    one column repeated - which :func:`trackanno.subcluster.subcluster` would
-    otherwise silently weight twice.
-
-    A token matching nothing is refused, never skipped. Skipping it would mean a
-    typo in one token of six quietly changes the feature space the answer was
-    computed in, and the run would still print a confident report.
+    ``waveform,wave_freq_hz`` does not weight one column twice. A token matching
+    nothing is refused rather than skipped, since skipping it would let a typo
+    quietly change the feature space the answer was computed in.
     """
     available = feature_columns(features)
     if not available:
@@ -290,11 +257,10 @@ def resolve_columns(features: pd.DataFrame, spec: str) -> list[str]:
 def _labelled(labels: pd.DataFrame, group: str) -> pd.DataFrame:
     """The non-empty values of one category column, as strings.
 
-    The same normalisation :func:`trackanno.suggest.train_group` makes, and for
-    the same reason: an unlabelled clip is an empty cell or a missing one
-    depending on how the CSV was written, and a class called ``"nan"`` or ``""``
-    would otherwise be counted as a behaviour and could even come back as the
-    majority one.
+    The same normalisation :func:`trackanno.suggest.train_group` makes: an
+    unlabelled clip is an empty cell or a missing one depending on how the CSV
+    was written, and a class called ``"nan"`` or ``""`` would otherwise be
+    counted as a behaviour.
     """
     if group not in labels.columns:
         category = [
@@ -335,31 +301,24 @@ def class_table(
     Returns ``(rows, class_name, census)``. ``rows`` carries the feature table's
     own columns plus the label column; ``census`` records what the join cost.
 
-    ``class_name`` of ``None`` selects the MAJORITY class, because that is the
-    one most likely to be hiding structure - a schema that never split it apart
-    is not evidence that it is one behaviour, and a class with a handful of
-    labels has nothing to split. Ties go to the alphabetically first name so the
-    default is reproducible rather than dependent on row order.
+    ``class_name`` of ``None`` selects the MAJORITY class, the one most likely to
+    be hiding structure. Ties go to the alphabetically first name, so the default
+    does not depend on row order.
 
     Every refusal here is a case where clustering would produce a confident
     answer about the wrong rows:
 
-    * a feature table with no ``movie_id`` or ``track_id``. Those are what the
-      batch-effect check reads, and that check is the one thing this module does
-      that :func:`trackanno.subcluster.subcluster` cannot do for itself, so
-      running without it would be running the part that misleads without the
-      part that catches it.
-    * a ``clip_id`` appearing twice in either table. The answer names clips, so a
-      duplicate leaves the reader unable to say which one to watch - and a
-      duplicated feature row is also a coincident pair of points, i.e. a density
-      spike a density-based clusterer reads as structure.
-    * no labelled clip of the class having a feature row at all. This is what
-      re-running detection does: ``clip_id`` embeds the track id, tracks get
-      renumbered, and every earlier label stops resolving. It is a disagreement
-      between the two tables, not an empty class.
-    * the two tables naming a different movie for the same clip, which means they
-      were built from different runs and the composition below would be computed
-      from the wrong provenance.
+    * a feature table with no ``movie_id`` or ``track_id``, which is what the
+      batch-effect check reads.
+    * a ``clip_id`` appearing twice in either table: the answer names clips, and
+      a duplicated feature row is also a coincident pair of points, a density
+      spike the clusterer reads as structure.
+    * no labelled clip of the class having a feature row at all. ``clip_id``
+      embeds the track id, so re-running detection renumbers the tracks and every
+      earlier label stops resolving; that is a disagreement between the two
+      tables, not an empty class.
+    * the two tables naming a different movie for the same clip, so the
+      composition below would be computed from the wrong provenance.
     """
     missing = [c for c in ("clip_id", "movie_id", "track_id") if c not in features.columns]
     if missing:
@@ -384,10 +343,8 @@ def class_table(
             "is no class to look inside"
         )
 
-    # Computed ONCE and reused below. Written out twice, the tie rule could be
-    # changed in one place and not the other, and the census would then claim a
-    # run took the majority class when it did not - a caveat about sampling that
-    # is wrong is worse than no caveat.
+    # Computed ONCE and reused below, so the tie rule cannot drift between the
+    # class chosen and the census claiming the majority was chosen.
     majority = max(sorted(counts), key=lambda name: counts[name])
     if class_name is None:
         class_name = majority
@@ -482,27 +439,20 @@ def _finite_rows(
 ) -> tuple[pd.DataFrame, list[str], dict]:
     """Drop what cannot be clustered, and record exactly what that cost.
 
-    :func:`trackanno.subcluster.subcluster` refuses a non-finite value outright,
-    and says why: NaN means "undefined" throughout this codebase, and imputing it
-    would place every clip nobody could measure at the column median - a dense
-    group made of the rows we know least about, which would then be perfectly
-    stable. So something has to be dropped, and the choice is the caller's. This
-    is that choice, made in two steps:
-
-    * a column that is NaN for EVERY row of this class is dropped. It carries no
-      information about these clips, so dropping it costs nothing at all;
-    * then any row still holding a NaN is dropped, and the columns responsible
-      are counted and reported.
+    :func:`trackanno.subcluster.subcluster` refuses a non-finite value, so
+    something has to be dropped and the choice is the caller's. Two steps: a
+    column that is NaN for EVERY row of this class goes first, costing nothing;
+    then any row still holding a NaN goes, and the columns responsible are
+    counted and reported.
 
     Rows rather than columns at the second step, because a partly-NaN column is
-    still a measurement of the clips that have it, while a row with a hole in it
-    has no position in the space. The price is stated rather than hidden: the
-    dropped clips are NOT a random sample - a ``wave_*`` column is undefined
-    exactly when the window could not be transformed, i.e. on short, sparse or
-    heavily interpolated tracks - so a discovery is a statement about the
-    measurable part of the class. When one column is doing most of the damage,
-    the report names it, since dropping that column with ``--columns`` is usually
-    better than dropping a third of the clips.
+    still a measurement of the clips that have it while a row with a hole has no
+    position in the space. The dropped clips are NOT a random sample - a
+    ``wave_*`` column is undefined exactly when the window could not be
+    transformed, i.e. on short, sparse or heavily interpolated tracks - so a
+    discovery is a statement about the measurable part of the class. The report
+    names the column doing most of the damage, since dropping it with
+    ``--columns`` is often better than dropping a third of the clips.
     """
     block = rows[columns]
     all_nan = [c for c in columns if not np.isfinite(block[c].to_numpy(dtype=float)).any()]
@@ -552,10 +502,9 @@ def _counts(values) -> dict:
 def _track_keys(rows: pd.DataFrame) -> np.ndarray:
     """``movie::track`` per row - the identity of one animal.
 
-    Track ids are numbered per MOVIE, so two movies routinely both hold a track
-    3; a bare ``track_id`` would read those as one animal and understate the
-    concentration this check exists to find. The same key
-    :meth:`trackanno.suggest.Suggester._track_keys` builds, for the same reason.
+    Track ids are numbered per MOVIE, so a bare ``track_id`` would read two
+    movies' track 3 as one animal. The same key
+    :meth:`trackanno.suggest.Suggester._track_keys` builds.
     """
     return np.array([
         f"{m}::{t}" for m, t in zip(rows["movie_id"].astype(str), rows["track_id"].astype(str))
@@ -566,14 +515,11 @@ def _compose(kind: str, member_keys, class_counts: dict, n_class: int,
              threshold: float) -> Composition:
     """One cluster's composition over movies or tracks, with the flag rule applied.
 
-    THE RULE, stated once: a cluster is flagged when its most common movie (or
-    track) holds at least ``threshold`` of it AND holds less than ``threshold``
-    of the class as a whole. The second half is what stops the check crying wolf
-    on a class that only exists in one movie - there every cluster is 100% that
-    movie, the comparison has no contrast in it, and the honest answer is that
-    this project cannot tell a batch effect from a behaviour at all. That case is
-    reported once, at the top, by :func:`_class_caveat` rather than as a flag on
-    every cluster.
+    A cluster is flagged when its most common movie (or track) holds at least
+    ``threshold`` of it AND holds less than ``threshold`` of the class as a
+    whole. The second half stops the check crying wolf on a class that exists in
+    one movie only, where every cluster is 100% that movie and the comparison has
+    no contrast; :func:`_class_caveat` reports that case once, at the top.
     """
     counts = _counts(member_keys)
     size = sum(counts.values())
@@ -611,11 +557,8 @@ def _class_caveat(class_movies: dict, n_class: int, threshold: float) -> str:
 def _batch_note(cluster: DiscoveredCluster) -> list[str]:
     """What a lopsided composition means, in words, and what to do about it.
 
-    Written out per cluster rather than left to a symbol, because this is the
-    finding a reader is most likely to talk themselves out of: the cluster is
-    tight, its stability score is excellent, and every number on the screen says
-    it is real. The number that says otherwise needs the sentence that explains
-    it.
+    Written out per cluster rather than left to a symbol, because every other
+    number on the screen says a batch-effect cluster is real.
     """
     out: list[str] = []
     movies, tracks = cluster.movies, cluster.tracks
@@ -668,53 +611,28 @@ def discover(
 ) -> Discovery:
     """Look inside one class for sub-behaviours, and check what each group is made of.
 
-    Parameters
-    ----------
-    features
-        ``clip_features.parquet`` as a frame: ``clip_id``, ``movie_id``,
-        ``track_id`` and the feature columns.
-    labels
-        The annotation CSV as a frame: ``clip_id`` and one column per category
-        group.
-    group
-        Which category column holds the class - a category group's name.
-    class_name
-        Which class to look inside; ``None`` takes the majority one. See
-        :func:`class_table`.
-    columns
-        A ``--columns`` spec. See :func:`resolve_columns`, and the module
-        docstring for why this is the decision that matters.
-    batch_fraction
-        The bar the composition check applies. See :func:`_compose`.
-    exclude_movies
-        Movie ids to leave out entirely - the follow-up to a flagged cluster.
-    audit_of
-        Optional ``clip_id -> bool`` predicate marking the project's audit
-        holdout, so the panel can say when it is about to send an annotator to a
-        clip that is meant to stay independent of any automated procedure. The
-        predicate rather than a :class:`~trackanno.config.Config`, because the
-        audit set is defined by two config keys and nothing else here needs a
-        project.
-    exclude_audit
-        Leave those clips out of the search entirely. Off by default, which is
-        the deliberate half: an audit clip is already labelled, this module fits
-        no model and makes no suggestion, and leaving 10% of a class out would
-        shrink the search and skew the very composition the batch check reads.
-        What it does cost is that a representative drawn from the holdout sends
-        an annotator to a clip whose label was meant to be independent of any
-        automated procedure - so those clips are marked ``(audit)`` in the panel
-        rather than quietly included, and this switch is here for a project that
-        would rather not be asked.
+    ``features`` is ``clip_features.parquet`` as a frame (``clip_id``,
+    ``movie_id``, ``track_id`` and the feature columns) and ``labels`` the
+    annotation CSV as a frame (``clip_id`` and one column per category group).
+    ``group`` names the category column holding the class and ``class_name`` the
+    class, ``None`` taking the majority one (see :func:`class_table`).
+    ``columns`` is a ``--columns`` spec (see :func:`resolve_columns`);
+    ``batch_fraction`` is the bar the composition check applies (see
+    :func:`_compose`); ``exclude_movies`` leaves movies out entirely, the
+    follow-up to a flagged cluster. ``audit_of`` is an optional
+    ``clip_id -> bool`` predicate marking the audit holdout, so the panel can
+    mark a representative ``(audit)`` rather than quietly sending an annotator to
+    a clip whose label was meant to be independent of any automated procedure;
+    ``exclude_audit`` leaves those clips out of the search instead, and is off by
+    default because dropping 10% of a class would shrink the search and skew the
+    composition the batch check reads. Everything else is passed through to
+    :func:`trackanno.subcluster.subcluster` and documented there.
 
-    Everything else is passed through to
-    :func:`trackanno.subcluster.subcluster` unchanged and is documented there.
-
-    Refusals are :class:`ValueError`, and each one names the number that
-    triggered it and what to change. The two that are this function's own rather
-    than :func:`class_table`'s: a class too small to hold two groups, and an
-    all-noise result. The second is not a bug - it is HDBSCAN saying this class
-    is one thing in these columns - but it is worth turning into advice, because
-    the fix is usually to narrow the columns rather than to give up.
+    Returns a :class:`Discovery`. Refusals are :class:`ValueError` naming the
+    number that triggered them. The two that are this function's own rather than
+    :func:`class_table`'s are a class too small to hold two groups, and an
+    all-noise result - the latter being HDBSCAN saying this class is one thing in
+    these columns, where the fix is usually to narrow the columns.
     """
     rows, class_name, census = class_table(
         features, labels, group, class_name, exclude_movies=exclude_movies
@@ -843,9 +761,8 @@ def _share(counts: dict, size: int, limit: int = 4) -> str:
 def _stability_text(cluster: DiscoveredCluster) -> str:
     """The score with its denominator, or 'not measured' - never a bare number.
 
-    NaN is "nobody looked", not "unstable", and the trial count has to travel
-    with the score: a mean over two trials is not the claim a mean over
-    twenty-five is.
+    NaN is "nobody looked", not "unstable", and a mean over two trials is not the
+    claim a mean over twenty-five is, so the trial count travels with the score.
     """
     if not np.isfinite(cluster.stability):
         return "stability not measured (--resamples 0)"
@@ -856,10 +773,8 @@ def _stability_text(cluster: DiscoveredCluster) -> str:
 def format_report(found: Discovery) -> str:
     """The human-readable answer: what was found, and what each group is made of.
 
-    Composition is printed for EVERY cluster, not only the flagged ones. A
-    cluster spread over six movies is the reassuring case and the reader needs to
-    see that it is spread, or the absence of a warning is indistinguishable from
-    nobody having looked.
+    Composition is printed for EVERY cluster, not only the flagged ones, or the
+    absence of a warning would be indistinguishable from nobody having looked.
     """
     census, out = found.census, []
     out.append(f"=== {found.group} = {found.class_name!r} ===")
@@ -931,9 +846,8 @@ def format_report(found: Discovery) -> str:
         ))
 
     # The summary states the flags whether or not the class-level caveat fired.
-    # The caveat kills the MOVIE comparison; the track one still bites - a cluster
-    # that is one animal is one animal however few movies the class spans - and a
-    # summary that swallowed it would hide the finding under the caveat.
+    # The caveat kills the MOVIE comparison, but a cluster that is one animal is
+    # one animal however few movies the class spans.
     flagged = found.flagged
     out.append("")
     if flagged:
@@ -960,9 +874,7 @@ def format_report(found: Discovery) -> str:
 def _flagged_lines(paragraphs: list[str], indent: str) -> list[str]:
     """``** `` on the first line of each paragraph, aligned continuations after it.
 
-    The marker on every line turns a paragraph into a wall and makes the sentence
-    harder to read, which for the one message on the page a reader most needs to
-    take in is the wrong trade.
+    The marker on every line would turn the paragraph into a wall.
     """
     out: list[str] = []
     for paragraph in paragraphs:
@@ -991,9 +903,8 @@ def _wrap(text: str, width: int = 74) -> list[str]:
 def _slug(text: str) -> str:
     """A class name reduced to something safe to put in a filename.
 
-    Class names are free text from ``config.yaml`` and can hold spaces, slashes
-    or dots; a slash would write the report into a directory nobody meant, and
-    ``..`` would write it outside the work directory entirely.
+    Class names are free text from ``config.yaml``, so a slash would write the
+    report into a directory nobody meant and ``..`` outside the work directory.
     """
     out = re.sub(r"[^A-Za-z0-9_-]+", "-", str(text)).strip("-")
     if not out:
@@ -1014,14 +925,10 @@ def report_path(cfg: Config, group: str, class_name: str) -> Path:
 def _plain(value):
     """Python scalars ``json`` will take, with non-finite floats becoming ``null``.
 
-    NaN is written as ``null`` rather than as the bare ``NaN`` token
-    ``json.dumps`` would otherwise emit, for the reason
-    :func:`trackanno.store.encode_provenance` gives: ``NaN`` is not valid JSON
-    and does not read back the same everywhere, so an artefact meant to be read
-    by a later step must not contain one. ``null`` keeps the distinction that
-    matters - an unmeasured stability is absent, not 0.0 - and survives the round
-    trip. ``allow_nan=False`` at the dump makes anything this misses fail loudly
-    instead of writing a file that only Python can read.
+    The bare ``NaN`` token ``json.dumps`` would otherwise emit is not valid JSON
+    and does not read back the same everywhere; ``null`` survives the round trip
+    and keeps the distinction that an unmeasured stability is absent, not 0.0.
+    ``allow_nan=False`` at the dump makes anything this misses fail loudly.
     """
     if isinstance(value, (str, bool, type(None))):
         return value
@@ -1039,17 +946,12 @@ def _plain(value):
 def to_payload(found: Discovery) -> dict:
     """The written form: everything a later step needs, and nothing it must guess.
 
-    ``member_ids`` is the load-bearing field - the step that directs annotation
-    at a discovered cluster works from it - so it is written in full rather than
-    summarised, and so are ``noise_ids``: the clips that resemble nothing else
-    are a queue somebody may want to look at too.
-
-    ``settings`` and ``columns`` travel with the answer because a discovery is a
-    claim about a procedure as much as about the data, and two reports are not
-    comparable unless those match. ``composition`` travels because a consumer
-    that enqueues a flagged cluster without seeing the flag is precisely the
-    accident this module exists to prevent - ``flagged`` is written per cluster
-    so it cannot be lost by a reader that only walks the clusters.
+    ``member_ids`` is the load-bearing field, since the step that directs
+    annotation at a discovered cluster works from it, so it is written in full
+    rather than summarised; so are ``noise_ids``. ``settings`` and ``columns``
+    travel with the answer because two reports are not comparable unless they
+    match, and ``composition`` travels with ``flagged`` written per cluster so a
+    reader that only walks the clusters cannot lose the flag.
     """
     return _plain({
         "schema": SCHEMA,
@@ -1102,9 +1004,8 @@ def write_report(found: Discovery, path: Path) -> Path:
 def load_report(path) -> dict:
     """Read a written report back, refusing one this build does not understand.
 
-    A later step reading an unknown layout would fail somewhere further in, on a
-    missing key, and would blame the data rather than the version - so the schema
-    stamp is checked here and the refusal names both versions.
+    Checked here rather than further in, where a missing key would blame the data
+    rather than the version. The refusal names both versions.
     """
     path = Path(path)
     if not path.exists():
@@ -1130,10 +1031,8 @@ def load_report(path) -> dict:
 def _load_tables(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     """The two tables, or a refusal naming the command that builds the missing one.
 
-    The feature table is READ, never rebuilt. Rebuilding is minutes of work over
-    every movie in the project and it belongs to the training path; a discovery
-    run that silently did it would make an exploratory command the slowest one in
-    the program.
+    The feature table is READ, never rebuilt: rebuilding is minutes of work over
+    every movie and belongs to the training path.
     """
     path = cfg.paths.work_dir / CLIP_FEATURES_FILE
     if not path.exists():
@@ -1236,9 +1135,8 @@ def main(argv: list[str] | None = None) -> int:
 
         group = args.group
         if group is None:
-            # The first single-choice group, which is the group the suggester
-            # ranks on as well - so a project with several groups gets the same
-            # default here as there rather than whichever a dict yielded first.
+            # The first single-choice group, which is the one the suggester ranks
+            # on, so a project with several groups gets the same default here.
             single = [c.name for c in cfg.categories if not c.is_multi]
             if not single:
                 raise ValueError(

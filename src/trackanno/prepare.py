@@ -6,6 +6,9 @@ The slow, GPU-bound half of the pipeline. Once per movie, it leaves behind:
 
     work/<movie_id>/
         tracks.parquet     every detection, in ORIGINAL full-frame coordinates
+        instance_features.npy  (N, D) CNN features, ROW-ALIGNED with
+                               tracks.parquet; absent unless every frame produced
+                               them
         clips.parquet      one row per annotatable clip + its crop geometry
         clip_boxes.parquet overlay geometry, in cache coordinates
         clips.dat          the pre-cropped pixels (uncompressed memmap)

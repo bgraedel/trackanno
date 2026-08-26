@@ -53,13 +53,12 @@ def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
 class Normalizer:
     """Percentile -> uint8 mapping for one movie, optionally per frame.
 
-    These acquisitions drift (p99.5 falls 135 -> 103 across the sample movie), so
-    one fixed mapping faithfully reproduces a movie that visibly dims, while
-    per-frame percentiles remove the drift but make brightness breathe as animals
-    enter and leave. ``smooth`` (the default) does neither: percentiles measured
-    on a subset of frames, median-filtered along time, then interpolated to every
-    frame. The curve is persisted so prepare, the GUI and the renderer agree
-    pixel-for-pixel.
+    These acquisitions drift, so one fixed mapping faithfully reproduces a movie
+    that visibly dims, while per-frame percentiles remove the drift but make
+    brightness breathe as animals enter and leave. ``smooth`` (the default) does
+    neither: percentiles measured on a subset of frames, median-filtered along
+    time, then interpolated to every frame. The curve is persisted so prepare,
+    the GUI and the renderer agree pixel-for-pixel.
     """
 
     lo: float | list[float]
@@ -139,8 +138,7 @@ class Normalizer:
             idx = np.unique(np.linspace(0, n - 1, min(20, n)).astype(int))
         elif opt.mode == "per_frame":
             # Every frame gets its own mapping: illumination here swings frame to
-            # frame (p99.5 ranges 115-195 inside 50 frames), so anything coarser
-            # leaves visible pulsing.
+            # frame, so anything coarser leaves visible pulsing.
             idx = np.arange(n)
         else:
             every = opt.sample_every

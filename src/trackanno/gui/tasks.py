@@ -2,11 +2,10 @@
 
 Detection takes minutes to hours, so it cannot run on the UI thread.
 :class:`TaskRunner` is a ``QThread`` that hands the job a
-:class:`~trackanno.progress.CallbackReporter` whose callbacks emit signals; never
-touch a widget from the worker thread, since Qt's cross-thread signals through
-the event loop are the only safe route. :class:`TaskPanel` renders those signals
-- stage, progress, an overall bar across movies, a log - for every long-running
-page in the hub.
+:class:`~trackanno.progress.CallbackReporter` whose callbacks emit signals;
+never touch a widget from the worker thread, since a queued signal is the only
+safe route. :class:`TaskPanel` renders those signals - stage, progress, an
+overall bar across movies, a log - for every long-running page in the hub.
 """
 
 from __future__ import annotations

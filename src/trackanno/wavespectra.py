@@ -5,20 +5,13 @@ clip has: at 25 frames / 100 fps the FFT bin is 4 Hz and the ``BEAT_MIN_CYCLES``
 floor lands at 12 Hz, above most annotated beats. So the window is centred on the
 clip but LONGER than it, and a clip's features are a median over the windows
 whose centres fall inside it. One STFT covers the whole track, the body frame,
-tangent angle, unwraps and arclength being per-FRAME quantities (500 frames,
-window 75, hop 5: 4.8 ms against 76 ms for the equivalent loop).
-
-Window length against 170 hand labels of propagation direction, as direction
-accuracy / clips with a usable frequency:
-
-    25 -> 0.853 / 78     50 -> 0.865 / 95     75 -> 0.853 / 112
-    100 -> 0.806 / 122   150 -> 0.702 / 112
+tangent angle, unwraps and arclength being per-FRAME quantities.
 
 ``DEFAULT_WINDOW = 75`` is where the two demands meet: shorter cannot resolve the
-beat, longer straddles a reversal, and 70% of multi-clip tracks change label at
-least once. A hop finer than the clip stride locates a reversal to within a few
-frames and lets ``wave_freq_drift_hz`` (local) and ``wave_freq_track_sd_hz``
-(whole-track) report wander a whole-record FFT would hide in its peak width.
+beat, longer straddles a reversal. A hop finer than the clip stride locates a
+reversal to within a few frames and lets ``wave_freq_drift_hz`` (local) and
+``wave_freq_track_sd_hz`` (whole-track) report wander a whole-record FFT would
+hide in its peak width.
 
 Rules, applied window by window:
 
@@ -29,18 +22,15 @@ Rules, applied window by window:
   time-unwrapped one inherits an arbitrary 2*pi branch.
 * ``wave_direction = -sign(slope)``, so **+1 means Base -> Tip**: a Base->Tip
   wave ``psi = A sin(wt - ks)``, k > 0, carries phase ``-ks`` at +f and so a
-  NEGATIVE gradient along arclength. Verified against the real labels; do not
-  flip it.
+  NEGATIVE gradient along arclength. Verified against the real labels.
 * The amplitude carries the Hanning coherent-gain factor ``(2/n) * 2``.
 * Nothing is blanked on a significance threshold; ``wave_excess`` and
   ``wave_censored`` are columns standing beside the values, as ``processFile.m``
-  reports ``domFreq`` beside ``domFreqDominance``. A fixed 10x excess gate passes
-  30% of pure red noise at 25 frames, 81% at 50 and ~100% at 100+, while
-  ``wave_phase_rsq`` (``phaseLinearityRsq``) separates a wave from a random walk
-  at 0.26 against ~1.0 (AUC 0.94). Condition on that.
+  reports ``domFreq`` beside ``domFreqDominance``. ``wave_phase_rsq``
+  (``phaseLinearityRsq``) is what separates a wave from a random walk; condition
+  on that rather than on excess.
 
-Shared primitives come from :mod:`trackanno.clipfeatures`. See
-``tests/test_wavespectra.py``.
+Shared primitives come from :mod:`trackanno.clipfeatures`.
 """
 
 from __future__ import annotations
@@ -61,7 +51,7 @@ __all__ = [
     "SERIES_COLUMNS", "DEFAULT_WINDOW", "DEFAULT_HOP",
 ]
 
-# 0.75 s at 100 fps, where the accuracy/coverage curves above cross.
+# 0.75 s at 100 fps.
 DEFAULT_WINDOW = 75
 # 50 ms at 100 fps: five readouts per 25-frame clip, so a reversal can be placed
 # inside a clip.
@@ -103,8 +93,8 @@ def _sliding_sum(values: np.ndarray, m: int, starts: np.ndarray) -> np.ndarray:
     """Sum of ``values[c : c + m]`` for every start ``c``, in one pass.
 
     A cumulative sum rather than a strided view, which at hop 1 materialises
-    ``window`` copies of the whole track. Complex input is accepted, which is
-    what makes the circular mean of the tangent angle cheap.
+    ``window`` copies of the whole track. Complex input is accepted, for the
+    circular mean of the tangent angle.
     """
     csum = np.concatenate([np.zeros((1,) + values.shape[1:], values.dtype),
                            np.cumsum(values, axis=0)])
@@ -200,8 +190,7 @@ def _sliding_spectrum(
           ``rfft(w * (x - a - b t)) = rfft(w * x) - a rfft(w) - b rfft(w t)``
 
       with ``rfft(w)`` and ``rfft(w * t)`` fixed vectors and ``a``, ``b`` from
-      sliding sums (:func:`_detrend_coeffs`). Exact to floating-point noise, and
-      worth 16x over ``stft_detrend``'s per-slice ``lstsq``.
+      sliding sums (:func:`_detrend_coeffs`). Exact to floating-point noise.
     """
     n = signal.shape[0]
     m = min(m, n)
@@ -230,15 +219,12 @@ def _legendre_batch(profiles: np.ndarray, s: np.ndarray, order: int = 2) -> np.n
     """Least-squares projection onto shifted Legendre polynomials, batched.
 
     Least squares rather than the analytic integral because ``s`` is a handful of
-    tracked keypoints, not a densely sampled arclength: quadrature on that grid
-    would be dominated by its own discretisation error.
+    tracked keypoints, not a densely sampled arclength.
 
     ``profiles`` and ``s`` are both ``(n_window, n_segment)``. The arclength grid
     is per-window because a flagellum foreshortening as it turns out of plane
-    really does move its normalised nodes.
-
-    Normal equations with a pseudo-inverse rather than a per-window ``lstsq``:
-    same minimum-norm answer on a rank-deficient basis, one call not hundreds.
+    really does move its normalised nodes. Normal equations with a pseudo-inverse
+    give the same minimum-norm answer as a per-window ``lstsq``, in one call.
     """
     basis = np.moveaxis(_shifted_legendre(s, order), 0, -1)   # (n_win, n_seg, order+1)
     good = np.isfinite(profiles)
@@ -257,9 +243,9 @@ def _line_fit(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     ``R^2`` is the point of this, not the slope. A phase profile that is not
     LINEAR in arclength is not a travelling wave: its fitted slope collapses
-    towards zero and the wavelength blows up (p90 7.6 L, max 53.5). This is the
-    reference pipeline's ``phaseLinearityRsq``, and it separates those blow-ups
-    at AUC 0.94 where ``wave_excess`` and ``wave_fundamental_frac`` are chance.
+    towards zero and the wavelength blows up. This is the reference pipeline's
+    ``phaseLinearityRsq``, and it is what separates those blow-ups where
+    ``wave_excess`` and ``wave_fundamental_frac`` cannot.
     """
     n = x.shape[1]
     xm, ym = x.mean(axis=1, keepdims=True), y.mean(axis=1, keepdims=True)
@@ -483,10 +469,9 @@ def spectral_series(
     # below the floor. Flag it rather than blanking it.
     censored = (local == 0)
     out["wave_censored"] = np.where(usable, censored.astype(float), np.nan)
-    # REPORT, then let the caller judge. Do not reinstate a fixed excess gate: it
-    # passes 30% of pure red noise at 25 frames, 81% at 50 and ~100% at 100+.
-    # `wave_phase_rsq` is what separates a wave from a random walk (0.26 vs
-    # ~1.0); condition on that, not on excess.
+    # Reported, not gated: a fixed excess threshold passes much of pure red
+    # noise. `wave_phase_rsq` is what separates a wave from a random walk, so
+    # condition on that rather than on excess.
     out["wave_freq_hz"] = np.where(usable, freqs[peak], np.nan)
     measured = usable
 
@@ -562,9 +547,9 @@ def track_spectral_series(
     """:func:`spectral_series` straight off one track's rows in ``tracks.parquet``.
 
     Missing frames are absent ROWS in that file, so the keypoints must be laid on
-    the FULL frame grid first; handing the packed rows to a spectral estimator is
-    the compaction bug the fill exists to prevent. ``f_start`` and ``n_frames``
-    default to the track's own extent, so the index is in real frame numbers.
+    the FULL frame grid first; packed rows would scale every reported frequency.
+    ``f_start`` and ``n_frames`` default to the track's own extent, so the index
+    is in real frame numbers.
     """
     sub = sub.sort_values("frame")
     frames = sub["frame"].to_numpy(dtype=int)
@@ -607,8 +592,7 @@ def window_values(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, f
 
     Median rather than mean, because these columns have heavy tails by
     construction: ``wave_wavelength_ratio`` blows up whenever a phase profile is
-    not linear (p90 7.6 L, max 53.5), and one such window would drag a mean
-    anywhere.
+    not linear, and one such window would drag a mean anywhere.
 
     Returns plain floats, NaN for anything undefined, plus ``n_windows`` and
     ``centre_offset``. Never fills with 0.0.

@@ -58,13 +58,8 @@ ZOOM_STEPS = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0)
 
 # The recorded reason for a clip the annotator reached under their own steam: an
 # arrow key back through the queue, a movie filter, a jump to the first unlabelled
-# clip. Deliberately NOT one of `select.py`'s rules - it is the negative space
-# around them, and it is the whole point of writing anything at all here. Once a
-# selector is running, "why is this row in the labelled set" has two possible
-# answers, and a set that cannot be split into the model's picks and the human's
-# own detours is a set on which no honest accuracy can be computed. Recording the
-# selector's rule on a clip it never chose would put the lie in the one column
-# that exists to prevent it.
+# clip. Deliberately NOT one of `select.py`'s rules, so the labelled set can be
+# split into the model's picks and the human's own detours.
 MANUAL_RULE = "annotator_navigated"
 
 
@@ -75,8 +70,7 @@ class AnnotationWidget(QWidget):
     counts_changed = Signal(int, int)      # labelled, total in the current filter
     # Emitted from the background retrain thread when a NEW model is loaded.
     # `order` and every widget under this one belong to the UI thread, so a
-    # queued signal is the only safe way for that thread to say the ranking the
-    # queue was built from has been replaced.
+    # queued signal is the only safe way to say the ranking has been replaced.
     model_refreshed = Signal()
 
     def __init__(self, cfg: Config, store: ClipStore, annotations: AnnotationStore, parent=None):
@@ -107,9 +101,8 @@ class AnnotationWidget(QWidget):
         self.suggester = Suggester(cfg) if cfg.suggest.enabled else None
         # The last batch actually spliced into the queue, and the accumulated
         # record of every clip the selector has put in front of this annotator.
-        # `_served` is keyed by clip_id and never by queue position, because
-        # `_shuffled_index` is permuted over the WHOLE manifest: adding a movie
-        # renumbers every position and would silently re-point every reason.
+        # `_served` is keyed by clip_id and never by queue position: adding a
+        # movie renumbers every position and would re-point every reason.
         self._batch: list[dict] = []
         self._served: dict[str, dict] = {}
 
@@ -412,29 +405,18 @@ class AnnotationWidget(QWidget):
     def _queue_with_batch(self, order: list[int], anchor: int | None) -> list[int]:
         """``order`` with the selector's picks moved to just after ``anchor``.
 
-        **Behind the cursor is out of reach.** ``next_clip`` is ``position += 1``
-        and nothing in this widget ever walks backwards on its own -
-        ``goto_first_unannotated`` takes a ``wrap`` argument it does not read - so
-        a batch dropped at the front of a queue whose cursor already sits at
-        position 40 would never be seen at all. ``anchor``, the clip on screen,
-        therefore keeps its place and the picks go IMMEDIATELY AFTER it: the
-        earliest slot forward-only navigation can still reach, and the one that
-        leaves the clip being judged right now untouched. On a fresh build there
-        is no clip on screen, ``anchor`` is ``None``, and the splice point is the
-        front - so the top-ranked pick is what opens the session.
+        The queue is forward-only, so anything spliced behind the cursor is
+        unreachable: ``anchor``, the clip on screen, keeps its place and the
+        picks go immediately after it. With ``anchor`` ``None`` the splice point
+        is the front, so the top-ranked pick opens the session.
 
-        ``anchor`` is never moved into the batch even when the selector chose it.
-        It was already in front of the annotator, so the selector is not why it is
-        being judged, and that is the WEAKER of the two available claims: it keeps
-        whatever reason it already had, ``annotator_navigated`` if it had none.
+        ``anchor`` is never moved into the batch even when the selector chose it:
+        it was already in front of the annotator, so it keeps whatever reason it
+        had. Everything not picked keeps its relative order, so an empty batch
+        returns ``order`` unchanged.
 
-        Everything not picked keeps its existing relative order, so with an empty
-        batch this returns ``order`` unchanged and the queue is the seeded shuffle
-        it has always been.
-
-        Records into ``_served`` as it goes: the reason a clip was queued has to
-        be captured at the moment it is queued, because by the time it is labelled
-        the batch that chose it may have been replaced twice over.
+        Records into ``_served`` as it goes, because commit time cannot tell the
+        selector's picks from the annotator's own detours.
         """
         batch = self._fresh_batch(order)
         if not batch:
@@ -466,20 +448,15 @@ class AnnotationWidget(QWidget):
         """The selector's next picks, or ``[]`` to leave the queue exactly as it is.
 
         The pool handed over is the clips the current filter makes REACHABLE and
-        not the whole manifest: ``selection_batch`` ranks whatever pool it is
-        given, and a pick outside the movie filter could only be honoured by
-        changing that filter under the annotator, while dropping it afterwards
-        would shrink the batch without saying so.
+        not the whole manifest, since a pick outside the movie filter could only
+        be honoured by changing that filter under the annotator.
         """
         if self.suggester is None or not order:
             return []
         try:
             # `.iloc`, because `order` holds POSITIONS into the manifest, not
-            # labels. `ClipStore` happens to end with `reset_index(drop=True)`,
-            # so the two coincide today and `.loc` worked by luck; a manifest
-            # that is ever filtered or re-indexed without a reset would turn
-            # that into a KeyError, or worse into a silently misaligned pool
-            # scored against the wrong clip_ids.
+            # labels. A manifest re-indexed without a reset would otherwise give
+            # a KeyError, or a pool scored against the wrong clip_ids.
             batch = list(self.suggester.selection_batch(
                 self.store.manifest.iloc[order],
                 self.annotations.done_ids,
@@ -491,17 +468,13 @@ class AnnotationWidget(QWidget):
                         f"a selection record names no clip_id ({record!r}), so "
                         "there is no clip to queue it against"
                     )
-                # The same encoder `store.record` will use, run HERE, where a
-                # record it refuses costs one batch instead of aborting the save
-                # of a label somebody has just typed. `selection_batch` already
-                # translates the one non-finite float `select` produces today;
-                # this is what keeps the next rule's from reaching a keypress.
+                # The same encoder `store.record` will use, run HERE, so a record
+                # it refuses costs one batch instead of aborting the save of a
+                # label somebody has just typed.
                 encode_provenance(record)
         except Exception as exc:
-            # Said out loud and the annotator keeps working: shuffle order is a
-            # worse queue, not a broken one, while a selector that silently stops
-            # selecting is a selector nobody ever fixes - and every row written
-            # afterwards would carry a reason that was no longer true.
+            # Said out loud, and the annotator keeps working: shuffle order is a
+            # worse queue, not a broken one.
             message = f"clip selection is off - {type(exc).__name__}: {exc}"
             print(f"[trackanno] {message}")
             self._status(message, 10000)
@@ -511,24 +484,18 @@ class AnnotationWidget(QWidget):
     def _provenance_for(self, clip_id: str) -> dict | None:
         """Why this clip was in front of the annotator, or ``None`` for *not recorded*.
 
-        Three answers, kept apart because collapsing any two of them is the lie
-        ``selected_by`` was added to make impossible:
+        Three answers, kept apart:
 
         * the selector put this clip in the queue -> its own record, the rule and
           score that chose it;
         * a batch has been served and this clip is not in it -> the annotator
-          navigated here, which is a FACT about how the sample was drawn and not
-          the absence of one;
-        * no batch has ever been served in this session -> nothing, which the
-          store spells as *not recorded*.
+          navigated here;
+        * no batch has ever been served in this session -> nothing.
 
-        The third case is deliberately the WEAKER claim, and it has to be:
-        ``selection_batch`` returns ``[]`` for "selection is switched off", "the
-        model is not ready" and "nothing left to choose" alike, so from here those
-        three are indistinguishable. Writing ``annotator_navigated`` on an empty
-        return would assert that a selector was running and was deviated from,
-        which is only one of the three - and it would also change what today's
-        default config writes into the CSV, which must stay byte-identical.
+        The third is the weaker claim on purpose. ``selection_batch`` returns
+        ``[]`` for "selection is switched off", "the model is not ready" and
+        "nothing left to choose" alike, so ``annotator_navigated`` would assert
+        a selector was running when only one of the three says so.
         """
         if not self._served:
             return None
@@ -537,14 +504,11 @@ class AnnotationWidget(QWidget):
     def _refresh_selection(self) -> None:
         """Re-queue after the model changed, without disturbing the clip on screen.
 
-        Hooked to a refit COMPLETING rather than to each label. Between refits the
-        ranking has nothing new to say - it is a function of the model - so
-        re-ranking per label would only shuffle the queue under an annotator who
-        is halfway through it, and every clip pushed behind the cursor by that
-        shuffle is unreachable.
+        Hooked to a refit COMPLETING rather than to each label: the ranking is a
+        function of the model, so between refits it has nothing new to say.
 
-        Nothing here calls ``_load``: the clip on screen keeps its pixels, its
-        half-typed note and its dwell clock, and only what comes AFTER it moves.
+        Nothing here calls ``_load``, so the clip on screen keeps its pixels, its
+        half-typed note and its dwell clock; only what comes AFTER it moves.
         """
         if not self.order:
             return
@@ -553,8 +517,7 @@ class AnnotationWidget(QWidget):
         self.order = self._queue_with_batch(self.order, anchor)
         if self.order == before:
             # Selection is off, the refit produced nothing to re-queue, or every
-            # pick was already where it needed to be. Saying "re-queued" here
-            # would report a move that did not happen.
+            # pick was already in place. Nothing moved, so say nothing.
             return
         self.position = self.order.index(anchor)
         # The queue after the cursor is new, so the clips being read ahead are the
@@ -778,9 +741,8 @@ class AnnotationWidget(QWidget):
                 train(cfg, verbose=False)
                 self.suggester.load()
                 # AFTER load(), so the batch the slot goes on to ask for is
-                # ranked by the new model and not the one it replaced. Emitted
-                # rather than called: this is not the UI thread, and `order` and
-                # every widget below belong to it.
+                # ranked by the new model. Emitted rather than called: this is
+                # not the UI thread.
                 self.model_refreshed.emit()
             except Exception as exc:
                 print(f"[trackanno] background retrain failed: {exc}")
@@ -799,8 +761,7 @@ class AnnotationWidget(QWidget):
     def _why_no_suggestion(self, clip_id: str) -> str:
         """One line explaining an empty suggestion, or "" to stay silent. Only
         spoken when ``suggest.audit_visible`` is on, because knowing a clip is
-        audited changes how carefully it is judged - the influence the holdout
-        exists to exclude."""
+        audited is the influence the holdout exists to exclude."""
         if self._current_suggestion or self.suggester is None:
             return ""
         if not self.cfg.suggest.audit_visible:
@@ -813,10 +774,10 @@ class AnnotationWidget(QWidget):
         return "the model has nothing to say about this clip"
 
     def apply_view_settings(self, cfg) -> None:
-        """Adopt the display-only settings from a freshly reloaded config. They
-        change what is drawn, not what is loaded, so they must not go through a
-        panel rebuild, which would discard the clip and the filter. The config
-        object is swapped in: the panel reads ui settings at paint time."""
+        """Adopt the display-only settings from a freshly reloaded config.
+
+        They change what is drawn, not what is loaded, so they must not go
+        through a panel rebuild, which would discard the clip and the filter."""
         ui = cfg.ui
         changed = (ui.kymo_field != self.cfg.ui.kymo_field
                    or ui.kymo_sign != self.cfg.ui.kymo_sign
@@ -835,8 +796,8 @@ class AnnotationWidget(QWidget):
             self._update_kymograph(self._boxes)
 
     def _warm_spline_import(self) -> None:
-        """Import scipy off the UI thread: a kymograph costs ~15 ms once scipy is
-        loaded, but the first call also pays ~0.5 s to import it."""
+        """Import scipy off the UI thread, so the first kymograph does not pay
+        for it."""
         if not self._kymograph_wanted():
             return
         import threading
@@ -851,8 +812,7 @@ class AnnotationWidget(QWidget):
                          daemon=True).start()
 
     def _update_kymograph(self, boxes) -> None:
-        """Recompute for the clip now on screen. One spline per frame over a
-        50-frame clip costs a few milliseconds, so it runs inline."""
+        """Recompute for the clip now on screen. Cheap enough to run inline."""
         if not self._kymograph_wanted():
             return
         from ..kymograph import chain_from_edges, kymograph_from_boxes
@@ -883,8 +843,8 @@ class AnnotationWidget(QWidget):
 
     def reload_suggester(self) -> str:
         """Pick up a model that was just (re)trained, without losing your place.
-        The panel is rebuilt only when something it is *built from* changes, and
-        the model is not one of those, so reload it in place."""
+        The model is not part of what the panel is built from, so it is reloaded
+        in place rather than by rebuilding."""
         if not self.cfg.suggest.enabled:
             self.suggester = None
             return "suggestions are switched off in the config"
@@ -901,9 +861,8 @@ class AnnotationWidget(QWidget):
                 self.suggester.suggest(clip_id) if self.suggester.ready else {}
             )
             self.categories.set_suggestion(self._current_suggestion)
-        # A model trained from the Model page is the same event as a background
-        # refit finishing, so the queue is re-ranked the same way: already on the
-        # UI thread, so called rather than emitted.
+        # The same event as a background refit finishing, so the queue is
+        # re-ranked the same way. Called, not emitted: already on the UI thread.
         self._refresh_selection()
         return self.suggester.status_line()
 

@@ -50,7 +50,7 @@ def gray_to_rgb(img: np.ndarray) -> np.ndarray:
     """Grayscale -> RGB for a single (H, W) frame or a whole (T, H, W) stack.
 
     Always writable - the caller draws into it and the clip cache hands out
-    read-only memmaps. cv2.cvtColor beats np.repeat ~16x (1.7 vs 27 ms, 50x240x240).
+    read-only memmaps.
     """
     import cv2
 
@@ -170,8 +170,8 @@ def _kpts_from_row(row, n_kpts: int) -> np.ndarray:
 
 
 def _kpt_columns(frame, n_kpts: int) -> np.ndarray | None:
-    """(N, K, 2) keypoint array pulled from the DataFrame in one shot: ~30x
-    cheaper than per-row lookups for a clip with a few hundred box rows."""
+    """(N, K, 2) keypoint array pulled from the DataFrame in one shot, rather
+    than by per-row lookup."""
     if n_kpts <= 0:
         return None
     xcols = [f"kp_x_{k}" for k in range(n_kpts)]
@@ -195,8 +195,7 @@ def render_clip_rgb(
     show_skeleton: bool = True,
     show_context: bool = False,
 ) -> np.ndarray:
-    """(T, S, S) uint8 -> (T, S, S, 3) uint8 RGB with the overlay burned in
-    (~2 ms for a 50x160x160 clip)."""
+    """(T, S, S) uint8 -> (T, S, S, 3) uint8 RGB with the overlay burned in."""
     rgb = np.ascontiguousarray(gray_to_rgb(clip))
     if not show_boxes or boxes is None or len(boxes) == 0:
         return rgb

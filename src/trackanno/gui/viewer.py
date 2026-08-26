@@ -1,11 +1,10 @@
 """Clip viewers behind one small interface.
 
-``SimpleViewer`` is a self-contained player (canvas + QTimer + slider) that does
-two things a generic array viewer cannot. The overlay is never rasterised: the
-cached clip stays grayscale and the marker is vector graphics over the zoomed
-frame, one hairline wide at 1x or 8x. Centring and zoom are display-time
-transforms of a :class:`~trackanno.overlay.ClipView`, unclamped, so a clip
-cropped at the movie border still shows the animal dead centre.
+``SimpleViewer`` is a self-contained player: canvas, QTimer and slider. The
+overlay is never rasterised, so the cached clip stays grayscale and the marker
+is vector graphics one hairline wide at any zoom. Centring and zoom are
+display-time transforms of a :class:`~trackanno.overlay.ClipView`, unclamped, so
+a clip cropped at the movie border still shows the animal dead centre.
 """
 
 from __future__ import annotations
@@ -194,9 +193,8 @@ class ClipCanvas(QWidget):
             self._paint_skeleton(painter, view.kpts[t], to_screen, dim)
 
     def _paint_reticle(self, painter, rect: QRectF, dim: bool) -> None:
-        """Four corner brackets plus a whisper of a box, in screen space: the pen
-        stays 1.6 px at any zoom, so the marker never grows into the animal.
-        """
+        """Four corner brackets plus a faint box, in screen space: the pen stays
+        1.6 px at any zoom, so the marker never grows into the animal."""
         arm = max(5.0, min(rect.width(), rect.height()) * 0.26)
         x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
         corners = [
@@ -213,7 +211,7 @@ class ClipCanvas(QWidget):
                 painter.drawLine(QPointF(cx, cy), QPointF(cx, cy + dy))
 
         # Dark halo first: the crop is bright where the animal is and near-black
-        # around it, so a single-colour marker is invisible on one or the other.
+        # around it, so a single-colour marker vanishes on one or the other.
         halo = QPen(QColor(0, 0, 0, 140), 4.0)
         halo.setCapStyle(Qt.RoundCap)
         strokes(halo)
@@ -338,8 +336,8 @@ class SimpleViewer(ClipViewer):
         return self._timer.isActive()
 
     def seek(self, frame: int) -> None:
-        """Jump to a frame. Drive the slider, not ``_frame``: it is what keeps
-        the counter and ``frame_changed`` consistent."""
+        """Jump to a frame. Drives the slider, not ``_frame``, which is what
+        keeps the counter and ``frame_changed`` consistent."""
         if self._array is None:
             return
         self._slider.setValue(max(0, min(int(frame), self._array.shape[0] - 1)))

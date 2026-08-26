@@ -1,140 +1,32 @@
 """Which clips a human should annotate next, and the recorded reason for each.
 
-Clips currently reach the annotator in manifest order, which is the order the
-window grid happened to produce - effectively arbitrary with respect to what the
-model does or does not know. Most clips are easy, the model already agrees with
-the answer, and the label teaches it nothing; the annotator's hour is the scarce
-resource here and manifest order spends it uniformly.
+Manifest order spends the annotator's time uniformly, mostly on clips the model
+already gets right. This module ranks a candidate pool instead and records, per
+clip, which rule chose it, what it scored and where it ranked.
 
-A-SOiD's answer is to show the clips the model is unsure about, its rule being
-"no class scores above 0.5". That rule is a THRESHOLDED SPECIAL CASE of
-least-confidence sampling, and thresholding is where it goes wrong twice. It
-degrades with the class count - with six classes the uniform posterior is
-1/6 = 0.167, so a top score of 0.45 is 2.7 times uniform and is not an unsure
-prediction, yet the rule flags it - and being a flag rather than a score it
-cannot ORDER the clips it flags, so which of them the human sees first is again
-arbitrary. This module scores instead of flagging, and adds the corrections the
-flag does not make: redundancy, determinism, provenance, a candidate mask, and a
-reserved random stratum that keeps the audit holdout honest.
+Probabilities must be raw ``predict_proba`` output over the FULL candidate pool,
+one row per clip, and not
+:meth:`trackanno.suggest.Suggester.suggest` output: that returns ``{}`` for an
+audit clip and drops anything under ``cfg.suggest.min_confidence``, which is the
+low-confidence end uncertainty sampling exists to find.
 
-Where the probabilities must come from
---------------------------------------
-Raw ``predict_proba`` output over the FULL candidate pool, one row per clip.
-Specifically NOT :meth:`trackanno.suggest.Suggester.suggest` output, for two
-reasons that both make it the wrong source: it returns ``{}`` for an audit clip,
-so the audit stratum below would have nothing to draw from, and it drops any
-prediction under ``cfg.suggest.min_confidence`` - which is the low-confidence end
-of the pool, the exact clips uncertainty sampling exists to find. (That filter is
-inert at its 0.0 default, so the bug it would cause is one that appears the day
-somebody raises the setting.)
+Five rules, all returning one score per row with higher meaning more worth
+annotating. Three read a posterior: :func:`least_confidence` (the top
+probability alone, on a scale that moves with the class count), :func:`margin`
+(the top-two gap, the default) and :func:`entropy` (the whole vector, normalised
+into [0, 1]). Two take a starved class instead: :func:`target_confident` fills
+the class fastest, :func:`target_runner_up` picks clips on its current boundary.
+Both targeting rules skew the label marginals, which is what the reliability
+gate in ``suggest.train_group`` is computed against.
 
-The scoring rules, and what each actually prioritises
------------------------------------------------------
-All five return one score per row, HIGHER MEANS MORE WORTH ANNOTATING, so one
-ranking path serves all of them.
-
-* :func:`least_confidence` looks at the TOP probability and nothing else. It
-  answers "how weak is the model's best answer", and is blind to whether the
-  remaining mass sits on one rival or is smeared over five. Its ceiling depends
-  on the class count - a uniform row scores ``1 - 1/n_classes`` - so the same
-  number means different things in a 2-class and a 6-class project.
-* :func:`margin` looks at the TOP TWO and nothing else: ``1 - (p1 - p2)``. That
-  gap is the quantity a label actually resolves - it is how much evidence the
-  model's answer has over its nearest rival - and its scale does not move with
-  the class count.
-* :func:`entropy` uses the whole vector, normalised by ``log(n_classes)`` so it
-  lands in [0, 1] at any class count. It prefers mass spread over MANY classes,
-  which means its ranking is largely decided by the TAIL.
-
-They rank differently, and a caller choosing between them deserves the grounds.
-Three rows over five classes, each of which one rule ranks first:
-
-    A  [0.30, 0.25, 0.25, 0.20, 0.00]   weakest top answer, but a clear leader
-    B  [0.35, 0.35, 0.30, 0.00, 0.00]   two tied leaders, dead tail
-    C  [0.34, 0.165, 0.165, 0.165, 0.165]   flattest overall, widest top-two gap
-
-Least-confidence takes A (its 0.30 is the lowest maximum), margin takes B (its
-top two are tied, so the gap it scores is 0), entropy takes C (its tail is
-uniform, and entropy is maximised by flatness). None of the three is wrong; they
-are answering different questions. ``margin`` is the default here on the grounds
-that the annotation resolves a contest between two candidate labels, so the
-top-two gap is the quantity the human's answer actually settles - and because
-entropy's ranking rests on the relative sizes of tail probabilities that no
-boosted tree is calibrated to get right.
-
-Class-targeted selection, and the trade-off between its two rules
------------------------------------------------------------------
-Uncertainty sampling has nothing to say about a class with four labels: whether
-those four are enough is a fact about the label COUNTS, not about any clip's
-posterior. Both rules take a starved class and both are implemented, because
-they buy different things:
-
-* :func:`target_confident` picks clips the model predicts as the starved class
-  with HIGH confidence. It fills the class fastest - most of those clips really
-  are that class - but every one of them sits in the middle of the region the
-  model ALREADY calls that class, so the labels only ever confirm the model's
-  existing notion of it. The class gets bigger; its BOUNDARY never moves.
-* :func:`target_runner_up` picks clips where the starved class is the model's
-  SECOND choice, ranked by how close it came. Those clips are rarer, and a good
-  share of them will turn out to be the other class - so it fills the count more
-  slowly and wastes more of the human's time - but each one lands exactly where
-  the boundary between the starved class and its rival currently is, which is
-  the only place a label can move it.
-
-Neither is the right default for every project, so neither is hard-coded:
-``target_rule`` selects, and the choice is recorded per clip. Both carry a
-consequence outside the training set, spelled out in their docstrings: they
-change the label MARGINALS, which is what the reliability gate is computed
-against.
-
-The corrections that are the reason this module exists
--------------------------------------------------------
-**Redundancy.** Pure uncertainty sampling returns near-duplicates. The most
-uncertain clip and the second most uncertain are frequently adjacent windows of
-one track, which is a run of the same animal doing the same thing a few frames
-later: they teach the model one thing and charge the human twice. The batch
-enforces a minimum separation - see ``min_frame_gap`` in :func:`select_batch` -
-and what it costs is stated there.
-
-**Determinism.** Identical probability rows are routine on easy clips, so ties
-are common, and a tie broken by ROW ORDER makes the batch depend on the order
-the feature table came out of a groupby. Every ranking here is broken by
-``clip_id``, which is stable and unique, and the random stratum draws from a
-pool sorted by ``clip_id`` under a seeded generator - so the batch is a function
-of the pool's CONTENTS and its seed, never of its arrangement.
-
-**Provenance.** Every selection carries the rule that chose it, the score that
-earned it, and its rank. This is not decoration. Once selection stops being
-random the labelled set stops being a random sample of the data, and any
-accuracy computed on it afterwards is an accuracy on a set assembled to be hard -
-lower than the truth, by an amount nobody can estimate without knowing how it was
-assembled. The records are plain scalars so they can be persisted next to the
-label, and ``rule == "audit_random"`` is what partitions the labelled set into
-"chosen at random" and "chosen because the model asked" long after the fact.
-
-**A candidate mask.** Already-annotated clips must be excludable. This module
-does not decide that policy: it takes a boolean mask and refuses to proceed if
-the mask leaves fewer candidates than the caller asked for.
-
-**A reserved random stratum, which protects the only unbiased number here.**
-Audit clips (:func:`trackanno.suggest.is_audit_clip`) are held out of training
-and out of the suggestion display, but they are NOT held out of the annotation
-queue - the queue filters on existence, movie and done-ness and nothing else - so
-a human labels them like any other clip, and ``audit_accuracy`` is computed over
-whichever of them happen to have been labelled. Rank the whole pool by
-uncertainty and the labelled audit subset stops being a random sample of the
-audit set: it fills up with hard clips, and the one unbiased accuracy estimate in
-the tool drifts DOWNWARD as the selector gets better at its job. Nothing
-downstream would notice.
-
-So the batch is stratified. Audit clips are excluded from the ranked pool
-entirely, and a reserved share of the slots is drawn UNIFORMLY AT RANDOM from
-the audit pool (``audit`` and ``audit_share`` in :func:`select_batch`). The
-labelled audit subset therefore stays a random sample of the audit set whatever
-the ranking does, and the price is that those slots do not go to the most
-informative clip available. The random draws carry their own ``rule`` and are
-exempt from the diversity rule, because a draw that can be suppressed is no
-longer uniform.
+:func:`select_batch` assembles the batch: a candidate mask keeps annotated clips
+out, ``min_frame_gap`` keeps near-duplicate windows of one track out, every tie
+is broken by ``clip_id`` so the answer does not depend on row order, and a
+reserved share of the slots is drawn uniformly at random from the audit holdout
+(:func:`trackanno.suggest.is_audit_clip`). That stratum keeps the labelled audit
+subset a random sample of the audit set, which is what makes ``audit_accuracy``
+an unbiased estimate; a uniform draw carries no score, and is exempt from the
+diversity rule because a draw that can be suppressed is no longer uniform.
 
 Numpy only, no config, no file I/O: plain arrays in, plain dicts out.
 """
@@ -149,29 +41,23 @@ __all__ = [
     "rank_by", "starved_classes", "select_batch",
 ]
 
-# How far a row's probabilities may drift from summing to 1 before it is refused.
-# Loose enough for float32 predict_proba output accumulated over a few hundred
-# trees, tight enough that a row missing a class, doubled, or built from decision
-# scores that were never softmaxed cannot pass.
+# How far a row's probabilities may drift from summing to 1 before it is refused:
+# loose enough for float32 predict_proba output, tight enough that a row missing
+# a class or built from unsoftmaxed decision scores cannot pass.
 _SUM_TOL = 1e-6
 
-# A target rule scores 0 for a row that does not qualify at all - the starved
-# class is not the runner-up, or the model gives it no mass. Those rows are not
-# candidates for that rule: filling the slot with one would hand the annotator a
-# clip picked for no reason while claiming it was picked to feed a class.
+# A target rule scores 0 for a row that does not qualify at all, and those rows
+# are not candidates for it.
 _TARGET_FLOOR = 0.0
 
-# The recorded reason for a clip drawn at random from the audit pool. A distinct
-# string, and not a rule anyone can ask for: it is the label that lets someone
-# later split the annotations into the ones chosen because the model asked and
-# the ones chosen by a coin, and compute an honest accuracy over the second
-# group alone.
+# The recorded reason for a clip drawn at random from the audit pool, and not a
+# rule a caller can ask for. It is what later splits the annotations into the
+# ones a coin chose and the ones the model asked for.
 AUDIT_RULE = "audit_random"
 
-# Share of a batch reserved for that draw. Matches the 0.10 default of
+# Share of a batch reserved for that draw. Matches the default of
 # `suggest.audit_fraction`, so the labelled set keeps the same audit proportion
-# as the clip population does and the audit count grows in step with the rest
-# rather than stalling or swamping the batch.
+# as the clip population.
 DEFAULT_AUDIT_SHARE = 0.10
 
 
@@ -181,15 +67,9 @@ DEFAULT_AUDIT_SHARE = 0.10
 def _as_proba(proba, clip_ids=None) -> np.ndarray:
     """The shared guard: a real probability matrix or a refusal naming the row.
 
-    Everything downstream reads these numbers as a posterior - subtracts them,
-    takes logs of them, compares them across rows - and every one of those
-    operations returns something plausible for input that is not a posterior at
-    all. Decision-function scores that were never softmaxed, a row that lost a
-    class to a filter, a row doubled by a bad merge: all of them rank, and the
-    batch that comes out looks exactly like a good one.
-
-    ``clip_ids`` is optional and only improves the message. A row number is not
-    something the caller can act on when the rows came out of a join.
+    Input that is not a posterior still ranks, and the batch it produces looks
+    like a good one, so it is refused here rather than renormalised. ``clip_ids``
+    is optional and only names the offending row in the message.
     """
     proba = np.asarray(proba, dtype=float)
     if proba.ndim != 2:
@@ -257,15 +137,10 @@ def _class_index(classes, name) -> int:
 def least_confidence(proba) -> np.ndarray:
     """``1 - max(p)``: how weak the model's best answer is.
 
-    Reads only the top probability. Two rows with the same maximum score the same
-    however their remaining mass is arranged, so this cannot tell a genuine
-    two-way contest from mass smeared thinly over classes nobody is considering.
-
-    The scale moves with the class count: a uniform row over ``n_classes`` scores
-    ``1 - 1/n_classes``, so 0.55 is nearly the ceiling in a 2-class project and
-    is middling in a 6-class one. That dependence is exactly what makes A-SOiD's
-    fixed 0.5 threshold on the same quantity fragile - and this returns a score,
-    so the clips a threshold would lump together are still ordered.
+    Reads only the top probability, so it cannot tell a two-way contest from mass
+    smeared over classes nobody is considering. The scale moves with the class
+    count - a uniform row scores ``1 - 1/n_classes`` - so the same number means
+    different things in a 2-class and a 6-class project.
     """
     proba = _as_proba(proba)
     return 1.0 - proba.max(axis=1)
@@ -274,14 +149,10 @@ def least_confidence(proba) -> np.ndarray:
 def margin(proba) -> np.ndarray:
     """``1 - (p1 - p2)``: how contested the top two classes are.
 
-    The gap between first and second is what a label resolves - it is the
-    evidence the model's answer holds over its nearest rival - so this ranks
-    clips by how little it would take to change the answer. Blind to the tail by
-    construction: ``[0.5, 0.4, 0.1]`` and ``[0.5, 0.4, 0.05, 0.05]`` score the
-    same, which is right if the decision in doubt is between the first two.
-
-    Bounded in [0, 1] at every class count, unlike :func:`least_confidence`, and
-    exactly 1 for a tie. This is the default rule in :func:`select_batch`.
+    Blind to the tail by construction: ``[0.5, 0.4, 0.1]`` and
+    ``[0.5, 0.4, 0.05, 0.05]`` score the same. Bounded in [0, 1] at every class
+    count, unlike :func:`least_confidence`, and exactly 1 for a tie. The default
+    rule in :func:`select_batch`.
     """
     proba = _as_proba(proba)
     # Partition rather than a full sort: the top two are all that is read, and
@@ -293,16 +164,10 @@ def margin(proba) -> np.ndarray:
 def entropy(proba) -> np.ndarray:
     """Shannon entropy over the row, divided by ``log(n_classes)``.
 
-    Uses every probability, so unlike the other two it distinguishes mass on one
-    rival from mass spread over four - which also means its ranking is decided
-    largely by the TAIL, and tail probabilities are the part of a boosted tree's
-    output least likely to be calibrated. Maximised by the uniform row.
-
-    Normalised by ``log(n_classes)`` so the answer is in [0, 1] whatever the class
-    count and a threshold set on one project means the same on the next.
-    ``0 * log 0`` is taken as 0, its limit, so a one-hot row scores exactly 0
-    rather than NaN - a class the model rules out entirely is a legitimate
-    posterior, not a defect.
+    Uses every probability, so its ranking is decided largely by the tail.
+    Maximised by the uniform row, and normalised so the answer is in [0, 1]
+    whatever the class count. ``0 * log 0`` is taken as its limit 0, so a one-hot
+    row scores exactly 0 rather than NaN.
     """
     proba = _as_proba(proba)
     positive = proba > 0.0
@@ -316,21 +181,13 @@ def entropy(proba) -> np.ndarray:
 def target_confident(proba, class_index: int) -> np.ndarray:
     """``p[class]``: clips the model most confidently calls the starved class.
 
-    Fills a class fast, because most of these clips really are that class. What
-    it cannot do is move the class BOUNDARY: a clip the model already scores 0.9
-    for the class sits in the middle of the region the model already assigns to
-    it, so the label agrees with the model and the decision surface does not
-    move. Use it when a class is below ``min_per_class`` and the model needs
-    examples at all; :func:`target_runner_up` is the other half of the trade-off.
+    Fills a class fast, but cannot move its boundary: these clips sit inside the
+    region the model already assigns to the class, so the labels agree with it.
 
-    Both targeting rules deliberately skew the label marginals, and that reaches
-    further than the training set. ``suggest.train_group`` gates the model on
-    Cohen's kappa and on the majority-class baseline, both of which are computed
-    against the marginals of the LABELLED set: over-sampling a rare class raises
-    the chance-agreement floor kappa is corrected against, so kappa falls on a
-    model that has not changed, and ``reliable`` can flip to False - which turns
-    the suggester off for the annotator. Targeting is worth doing; it is not free,
-    and it is not free in a place anyone would look.
+    Targeting skews the label marginals, and ``suggest.train_group`` gates the
+    model on Cohen's kappa and the majority-class baseline, both computed against
+    those marginals - so over-sampling a rare class can flip ``reliable`` to
+    False on a model that has not changed.
     """
     proba = _as_proba(proba)
     return proba[:, int(class_index)].copy()
@@ -339,29 +196,19 @@ def target_confident(proba, class_index: int) -> np.ndarray:
 def target_runner_up(proba, class_index: int) -> np.ndarray:
     """``1 - (p_top - p[class])`` where the class is the model's SECOND choice, else 0.
 
-    These are the clips sitting on the boundary between the starved class and
-    whatever currently outranks it: the model is considering the class and
-    deciding against it, and a human's answer either way moves the surface. Each
-    label is worth more than a :func:`target_confident` one and a good share of
-    them will come back as the OTHER class, so the count grows more slowly - that
-    is the trade-off, and it is why both rules exist.
+    These clips sit on the boundary between the starved class and whatever
+    outranks it, so a label either way moves the decision surface, but a good
+    share come back as the other class and the count grows more slowly than under
+    :func:`target_confident`.
 
     Rows where the class is not the runner-up score exactly 0 and are not
     eligible for this rule in :func:`select_batch`. That includes every row the
-    class WINS: a clip the model calls the starved class is not on its boundary,
-    it is inside the class, and it is what :func:`target_confident` is for. Were
-    winners admitted they would all score the maximum 1.0 - their gap to the top
-    is zero by definition - and this rule would collapse into that one.
+    class WINS - those are inside the class, not on its boundary, and admitting
+    them would collapse this rule into :func:`target_confident`. A class tied
+    with the top without winning the argmax scores the maximum, a tie being the
+    boundary exactly.
 
-    Ties are counted generously at the other end: a class tied with the top
-    without winning the argmax scores the maximum, because a tie is the boundary
-    exactly.
-
-    The same warning as :func:`target_confident` applies, and applies harder here
-    because this rule deliberately picks clips the model will often be wrong
-    about: skewing the label marginals moves Cohen's kappa and the majority
-    baseline in ``suggest.train_group``, and those decide whether the suggester
-    speaks at all.
+    The marginals warning on :func:`target_confident` applies here too.
     """
     proba = _as_proba(proba)
     k = int(class_index)
@@ -393,12 +240,9 @@ TARGET_RULES = {
 def rank_by(scores, clip_ids) -> np.ndarray:
     """Row indices, best score first, ties broken by ``clip_id``.
 
-    The tiebreak is the whole point. Easy clips produce identical probability
-    rows in numbers, so identical scores are routine, and breaking those ties by
-    position would make the batch depend on the order the pool arrived in - a
-    property of a groupby upstream, not of the data. ``clip_id`` is unique and
-    stable across runs, so the same pool always yields the same order however it
-    is arranged.
+    Identical scores are routine on easy clips. Breaking those ties by position
+    would make the batch depend on the order the pool arrived in; ``clip_id`` is
+    unique and stable, so the same pool always yields the same order.
     """
     scores = np.asarray(scores, dtype=float)
     ids = np.asarray(clip_ids, dtype=str)
@@ -414,9 +258,8 @@ def rank_by(scores, clip_ids) -> np.ndarray:
 def starved_classes(class_counts, classes, quota: int) -> list[str]:
     """Classes with fewer than ``quota`` labels, scarcest first, ties by name.
 
-    A class ABSENT from ``class_counts`` counts as zero rather than being skipped.
-    Skipping it would hide the most starved class of all behind a missing key,
-    and a class with no labels is precisely the one a batch should be spent on.
+    A class absent from ``class_counts`` counts as zero rather than being
+    skipped, since a class with no labels is the most starved one there is.
     """
     names = [str(c) for c in classes]
     counts = {str(k): int(v) for k, v in dict(class_counts).items()}
@@ -432,18 +275,12 @@ def _plan_slots(
 ) -> list[tuple[str, str]]:
     """``(rule, target_class)`` for each of the ``n`` ranked slots, in order.
 
-    Starved classes are served first and round-robin: the slot goes to whichever
-    class is scarcest, that class's count is incremented, and the next slot
-    re-asks - so two classes on 3 and 5 labels against a quota of 6 get the
-    pattern 3, 3, 4, 5 rather than one class taking every slot. Once every class
-    projects to reach the quota the remaining slots go to ``rule``.
-
-    The projection counts a REQUEST, not a label. A targeted clip is not
-    guaranteed to come back as that class - under ``target_runner_up`` a good
-    share of them will not, which is the point of it - so this over-counts, and
-    the correction arrives with the real counts on the next batch. Assuming the
-    labels instead would either under- or over-fill; assuming nothing would spend
-    the whole batch on one class.
+    Starved classes are served first and round-robin: each slot goes to whichever
+    class is scarcest and increments its projected count, so two classes on 3 and
+    5 labels against a quota of 6 get 3, 3, 4, 5 rather than one class taking
+    every slot. Once every class projects to reach the quota the rest go to
+    ``rule``. The projection counts a REQUEST rather than a label, so it
+    over-counts, and the real counts correct it on the next batch.
     """
     if not class_counts or int(quota) <= 0:
         return [(rule, "")] * n
@@ -463,10 +300,9 @@ def _plan_slots(
 def _audit_slots(n: int, reserved: int) -> set[int]:
     """Which positions in a batch of ``n`` belong to the random stratum.
 
-    Spread evenly rather than parked at the end, because a batch is not always
-    finished: an annotator who stops after six of twenty clips should still have
-    labelled the audit draws in proportion, and draws at the end would simply
-    never happen. Evenly means the midpoint of each equal share of the batch.
+    The midpoint of each equal share of the batch, rather than the end, so an
+    annotator who stops part way through has still labelled the draws in
+    proportion.
     """
     slots: list[int] = []
     for j in range(reserved):
@@ -500,158 +336,45 @@ def select_batch(
 ) -> list[dict]:
     """The ordered batch a human should annotate next, with a reason per clip.
 
-    Parameters
-    ----------
-    proba
-        ``(n_clips, n_classes)`` posteriors, in the model's own class order, from
-        ``predict_proba`` over the whole pool - see the module docstring on why
-        ``Suggester.suggest`` is the wrong source. Refused if any row is not a
-        distribution.
-    clip_ids
-        One id per row. Must be unique - they are the tiebreak that makes the
-        answer independent of row order, and a duplicate would both break that
-        and let one clip be handed out twice in a batch.
-    classes
-        One name per column, in the model's order (``model.classes_``).
-    n
-        How many clips to select. The returned batch may be SHORTER (see below)
-        but is never longer and never repeats a clip.
-    rule
-        One of :data:`UNCERTAINTY_RULES`. Default ``"margin"``; the module
-        docstring gives the grounds and what the alternatives prioritise.
-    candidates
-        Optional boolean mask, ``True`` where a clip may be selected. This is how
-        already-annotated clips stay out of the pool. The POLICY is the caller's;
-        the refusal when the mask leaves fewer candidates than the caller asked
-        for is not.
-    audit
-        Optional boolean mask marking the audit holdout
-        (:func:`trackanno.suggest.is_audit_clip`). Those clips are removed from
-        the ranked pool and form the pool the random stratum draws from. Passing
-        ``None`` asserts the project HAS no holdout: it does not disable a
-        holdout that exists, it hides it, and the ranked pool then eats audit
-        clips by difficulty - which is the failure the stratum exists to prevent.
-    audit_share
-        Share of the batch reserved for uniform random draws from the audit pool,
-        default :data:`DEFAULT_AUDIT_SHARE`. The slot count is
-        ``int(audit_share * n + 0.5)``, so a batch of 10 at the default reserves
-        1 and a batch of 4 reserves none - the share is over clips, not over
-        batches, and small batches simply draw less often.
-    seed
-        Seeds the random stratum. The same seed, pool and batch size give the
-        same draw, on any machine and whatever order the rows arrive in.
-    class_counts
-        ``{class name: labels so far}``. Only spends slots with ``target_quota``,
-        but a name with no column in ``proba`` is refused whether it does or not.
-    target_quota
-        Labels a class needs before it stops being starved. Ranked slots are
-        spent on starved classes first, scarcest first, round-robin. ``0`` (the
-        default) disables targeting and every ranked slot comes from ``rule``.
-    target_rule
-        One of :data:`TARGET_RULES`, defaulting to ``"target_runner_up"`` - the
-        boundary-moving one. See the module docstring for the trade-off against
-        ``"target_confident"``, and both rules' docstrings for what targeting
-        does to the reliability gate.
-    track_ids, frames
-        Per-row track identity and clip start frame (``f_start``). Required when
-        ``min_frame_gap`` is set, and unused otherwise.
-    min_frame_gap
-        No two RANKED clips in one batch may come from the same track less than
-        this many frames apart. Pairs exactly ``min_frame_gap`` apart are
-        allowed, so setting it to the clip length admits adjacent-but-non-
-        overlapping windows and anything larger excludes them too.
+    ``proba`` is ``(n_clips, n_classes)`` from ``predict_proba`` over the whole
+    pool, in the model's class order; ``clip_ids`` names one row each and must be
+    unique; ``classes`` names one column each; ``n`` is how many clips to select.
+    ``rule`` is a key of :data:`UNCERTAINTY_RULES`. ``candidates`` is an optional
+    boolean mask of rows that may be selected, which is how already-annotated
+    clips stay out. ``audit`` is an optional boolean mask of the audit holdout
+    (:func:`trackanno.suggest.is_audit_clip`); ``audit_share`` of the slots,
+    rounded to ``int(audit_share * n + 0.5)``, are then drawn uniformly at random
+    from it under ``seed`` while the rest of the audit clips stay out of the
+    ranked pool. Passing ``audit=None`` asserts the project has no holdout rather
+    than disabling one that exists. ``class_counts`` and ``target_quota`` spend
+    ranked slots on classes under the quota first, scarcest first and
+    round-robin, using ``target_rule`` from :data:`TARGET_RULES`.
+    ``min_frame_gap`` forbids two RANKED clips of one track less than that many
+    frames apart, needing ``track_ids`` and ``frames`` (``f_start``) to say which
+    those are; pairs exactly ``min_frame_gap`` apart are allowed, so setting it
+    to the clip length admits adjacent non-overlapping windows.
 
-    Returns
-    -------
-    A list of dicts, in the order to annotate, each with:
+    Returns a list of dicts in annotation order, each holding ``clip_id``,
+    ``index`` (its row in ``proba``), ``rank``, ``rule``, ``score``,
+    ``target_class``, ``predicted_class``, ``predicted_proba`` and ``pool_size``
+    (the ranked pool for a ranked pick, the audit pool for a random draw). Every
+    value is a plain ``str``/``int``/``float``, so a record serialises unchanged.
+    ``rule`` is always the rule that actually chose the clip: a slot planned for
+    a starved class whose rule finds no eligible clip falls back to ``rule``
+    rather than picking an arbitrary clip in that class's name. A random draw
+    carries no score, so its ``score`` is NaN rather than an invented 0.0.
 
-    ``clip_id``, ``index``
-        The clip, and its row in the ``proba`` that was passed in.
-    ``rank``
-        0-based position in the batch.
-    ``rule``
-        Which rule chose this clip - a key of :data:`UNCERTAINTY_RULES` or
-        :data:`TARGET_RULES`, or :data:`AUDIT_RULE` for a random draw. Always the
-        rule that ACTUALLY chose it, which is not always the one the plan asked
-        for (see below).
-    ``score``
-        Its score under that rule, and NaN for a random draw - which has no
-        score, and would be misread as a score of zero if one were invented.
-    ``target_class``
-        The starved class the slot was spent on, ``""`` otherwise.
-    ``predicted_class``, ``predicted_proba``
-        The model's own answer for the clip at selection time. Recorded because
-        the useful question afterwards is not only "was this clip hard" but "was
-        the model wrong about it", and the posterior that produced the batch is
-        gone by then.
-    ``pool_size``
-        Candidates this clip was chosen from: the ranked pool for a ranked pick,
-        the AUDIT pool for a random draw. Per row rather than per batch because
-        the batch structure is lost once these are written beside individual
-        labels - and for a random draw it is half of the inclusion probability,
-        without which the sample cannot be weighted afterwards.
+    Refuses a ``proba`` that is not a distribution, duplicate ids, a mismatch
+    between rows, ids and class names, an unknown rule, a class name with no
+    column, a mask that leaves fewer candidates than the ranked slots need, and
+    an audit pool too small to fill its reserved slots - topping those up from
+    the ranked pool would turn the unbiased sample into a selected one.
 
-    Every value is a plain ``str``/``int``/``float``, so a record serialises into
-    one CSV cell or JSON object unchanged.
-
-    The random stratum
-    ------------------
-    Audit clips are excluded from the ranked pool and ``int(audit_share * n +
-    0.5)`` slots are drawn uniformly at random from the audit pool instead. That
-    keeps the LABELLED audit subset a random sample of the audit set, which is
-    what makes ``suggest``'s ``audit_accuracy`` an unbiased estimate; rank those
-    clips by uncertainty and the estimate silently becomes "accuracy on hard
-    audit clips", drifting down as the selector improves.
-
-    Those draws are exempt from the diversity rule and cannot be suppressed by
-    it - a draw that can be vetoed is not a uniform draw any more - and they
-    neither block nor are blocked by ranked picks, so which informative clip the
-    human sees is never decided by the seed. If the audit pool cannot fill its
-    reserved slots this refuses, rather than topping up from the ranked pool:
-    quietly converting audit slots into ranked ones is precisely the failure
-    being guarded against.
-
-    Diversity, and what it costs
-    ----------------------------
-    Uncertainty is smooth along a track: the most uncertain clip and the next are
-    frequently adjacent windows of the same animal, and labelling both charges
-    the human twice for one piece of information. Ranked candidates are therefore
-    taken greedily in score order and one is SKIPPED if a ranked clip already in
-    the batch is from the same track less than ``min_frame_gap`` frames away.
-
-    The cost is real and is paid on purpose: a genuinely informative clip is
-    sometimes skipped. If an animal changes behaviour twice inside the gap, the
-    batch sees one of the two transitions and the other waits for the next round.
-    That is the deliberate trade - the skipped clip is still in the pool, while a
-    duplicated one is spent human time that cannot be recovered.
-
-    What it does NOT catch is redundancy between different tracks: two cells in
-    one field of view doing the same thing at the same time are just as
-    correlated, and this rule cannot see it. Catching that needs a distance in
-    feature space (a greedy max-min, or a k-means over the clip features), which
-    is deliberately not done here: this module is handed posteriors, not
-    features, and a posterior is a poor proxy for similarity - two clips with
-    identical class probabilities can be entirely different behaviours, since
-    those few numbers are what the model kept, not what the clip contains. The
-    frame rule is the one relation this codebase can assert with certainty, since
-    two windows of one track within a clip length are literally the same footage.
-    Doing better means passing the features in, and should be a deliberate change
-    with a number behind it.
-
-    A SHORT batch is a result, not an error. When diversity forbids the rest,
-    fewer than ``n`` records come back and the batch is never padded with a
-    near-duplicate; ``len()`` is the signal, and it is deterministic. That is
-    deliberately different from too few candidates, which raises: the pool size is
-    something the caller knows before it calls, because it built the mask, so
-    asking for more than it holds is a bug in the caller, while what the
-    diversity rule will permit depends on the ranking and cannot be known in
-    advance.
-
-    A slot planned for a starved class whose rule finds NO eligible clip - no
-    remaining candidate has that class as its runner-up, say - falls back to
-    ``rule`` for that slot rather than picking an arbitrary clip in the starved
-    class's name. The record then names the rule that really chose it, so the
-    provenance stays true even when the plan could not be honoured.
+    A SHORT batch is a result rather than an error: when the diversity rule
+    forbids the rest, fewer than ``n`` records come back and the batch is never
+    padded with a near-duplicate. What that rule cannot see is redundancy between
+    different tracks, which would need a distance in feature space; this module
+    is handed posteriors, not features.
     """
     ids = np.asarray(clip_ids, dtype=str)
     names = [str(c) for c in classes]
@@ -757,8 +480,7 @@ def select_batch(
         if pick is None:
             # Nothing left that diversity permits. Uncertainty rules make every
             # remaining candidate eligible, so no later ranked slot could be
-            # filled either - this is the short batch the docstring promises. The
-            # reserved draws still stand: they are a measurement, not a ranking.
+            # filled either. The reserved draws still stand.
             exhausted = True
             continue
         row = int(ranked_pool[pick])
@@ -869,10 +591,8 @@ def _draw_audit(
 ) -> np.ndarray:
     """``reserved`` rows drawn uniformly without replacement from the audit pool.
 
-    The pool is sorted by ``clip_id`` before the draw so the result depends on
-    the pool's CONTENTS and the seed alone. Drawing straight from the array order
-    would make the sample depend on the order the rows arrived in, which is the
-    one thing a random draw and a deterministic module must both be free of.
+    Sorted by ``clip_id`` before the draw, so the sample depends on the pool's
+    contents and the seed alone rather than on the order the rows arrived in.
     """
     if reserved == 0:
         return np.zeros(0, dtype=np.int64)
@@ -913,12 +633,8 @@ def _first_admissible(order, scores, taken, placed, tracks, starts, pool, gap, f
     """Best-ranked pool position that is untaken, above ``floor``, and far enough.
 
     ``floor`` is ``None`` for the uncertainty rules, where every candidate is
-    eligible however confident the model is: a batch bigger than the number of
-    genuinely uncertain clips should still be filled, and the recorded score says
-    plainly that the last few were easy.
-
-    ``placed`` holds the RANKED rows already in the batch - not the random draws,
-    which are outside this relation in both directions.
+    eligible however confident the model is. ``placed`` holds the RANKED rows
+    already in the batch; random draws are outside this relation both ways.
     """
     for position in order:
         position = int(position)

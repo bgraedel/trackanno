@@ -196,10 +196,9 @@ def build_series(
     cols["area"] = cols["box_w"] * cols["box_h"]
     # READ `area` AND `aspect` WITH CARE: the box is AXIS-ALIGNED, so they move
     # when the cell TURNS even though its shape has not changed (extent L at
-    # angle t gives a box L|cos t| x L|sin t|). 98.8% of aspect_mean's variance
-    # is orientation, so it is an orientation readout, not a shape one;
-    # area_mean is size-dominated (unique-to-size R2 0.76 vs orientation 0.18)
-    # but still contaminated. They stay because `detection.task: detect` has no
+    # angle t gives a box L|cos t| x L|sin t|). `aspect_mean` is therefore an
+    # orientation readout rather than a shape one, and `area_mean` is
+    # contaminated by it. They stay because `detection.task: detect` has no
     # keypoints; where keypoints exist, prefer the shape_* columns below.
     cols["aspect"] = np.where(
         cols["box_h"] > 1e-6, cols["box_w"] / np.maximum(cols["box_h"], 1e-6), np.nan
@@ -255,8 +254,8 @@ def build_series(
             xs, ys = px[i, ok], py[i, ok]
             extent[i] = float(np.hypot(xs[:, None] - xs, ys[:, None] - ys).max())
             pts = np.stack([xs - xs.mean(), ys - ys.mean()], axis=1)
-            # `np.cov(pts.T)` spelled out - same maths - because np.cov spends 12
-            # of its 28 us per call on argument handling for a 2x2.
+            # `np.cov(pts.T)` spelled out - same maths, without np.cov's
+            # per-call argument handling on a 2x2.
             cov = np.array(pts.T)
             cov -= cov.mean(axis=1)[:, None]
             cov = cov @ cov.T
@@ -358,7 +357,7 @@ def _window(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, np.ndar
     Positional, not ``reindex``: the index is a contiguous frame range by
     construction, and hashing frame numbers per window would cost more than every
     reducer together. One ``to_numpy`` on the whole frame, not ``series[c]`` per
-    column (460x slower).
+    column.
     """
     n_rows = len(series.index)
     if n_rows == 0:

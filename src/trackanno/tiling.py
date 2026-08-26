@@ -27,10 +27,8 @@ def cuda_status() -> tuple[bool, str]:
 
     ``torch.cuda.is_available()`` answers False for a CPU-only wheel, an absent
     driver, a card asleep behind hybrid graphics and a driver that has fallen
-    over - and says which only in a warning it raises on the way past, which no
-    GUI ever shows. Swallowing that leaves "this machine has no GPU", which is
-    the one reading that needs nothing done about it. So catch the warning and
-    hand the reason back to whoever can put it on screen.
+    over alike, and says which only in a warning it raises on the way past. That
+    warning is caught here so the reason can be put on screen.
     """
     try:
         import torch
@@ -47,9 +45,9 @@ def cuda_status() -> tuple[bool, str]:
     if usable and count > 0:
         return True, ""
     if usable:
-        # The two ask different layers and are allowed to disagree; CUDA_VISIBLE_DEVICES
-        # is read by only one of them. Nothing can be run on a device that cannot
-        # be enumerated, so this counts as no GPU - said out loud, not assumed.
+        # The two ask different layers and are allowed to disagree; only one of
+        # them reads CUDA_VISIBLE_DEVICES. Nothing can run on a device that
+        # cannot be enumerated, so this counts as no GPU.
         return False, ("torch reports CUDA available but can enumerate no device "
                        "(CUDA_VISIBLE_DEVICES is the usual cause)")
 
@@ -76,9 +74,8 @@ def cuda_status() -> tuple[bool, str]:
 def _driver_sees() -> str:
     """What ``nvidia-smi`` lists, or "" if it is absent or says nothing.
 
-    Only ever called once torch has already said no, so the happy path spawns
-    nothing. Bounded and fully guarded: a diagnosis must not be able to hang or
-    break the thing it is diagnosing.
+    Only called once torch has already said no, so the happy path spawns
+    nothing. Bounded and fully guarded, a diagnosis being no use if it can hang.
     """
     import subprocess
 
@@ -96,11 +93,8 @@ def _driver_sees() -> str:
 def cuda_devices() -> list[int]:
     """The CUDA indices this machine can actually be told to use.
 
-    The one place either half of the app asks. The settings list counted devices
-    while ``resolve_device`` only asked whether CUDA was available at all and
-    then assumed device 0 - so the page could offer no GPU while ``auto`` picked
-    one anyway, which is a run quietly landing somewhere the person was never
-    shown.
+    The one place either half of the app asks, so the settings list and
+    ``resolve_device`` cannot disagree about what is on offer.
     """
     usable, _why = cuda_status()
     if not usable:
@@ -205,9 +199,8 @@ def device_label(device: str) -> str:
 def describe_auto() -> str:
     """One sentence on what ``auto`` picks here, and - if it is the CPU - why.
 
-    A settings page that lists only ``cpu`` looks identical whether the machine
-    has no GPU, the driver is asleep or the installed torch is the CPU-only
-    wheel. Those need different answers from the person, so say which it is.
+    No GPU, a sleeping driver and a CPU-only torch wheel need different answers
+    from the person, so they are told apart rather than all reading as ``cpu``.
     """
     resolved = resolve_device("auto")
     if resolved != "cpu":
@@ -282,10 +275,9 @@ def read_model_info(model_path) -> dict:
 
     task = args.get("task") or getattr(model, "task", None)
     if not task and head is not None:
-        # Same rule ultralytics uses: the head module names the task. Worth
-        # getting right rather than defaulting to detect - a segment or classify
-        # checkpoint reported as a detector fails much later and much less
-        # clearly.
+        # Same rule ultralytics uses: the head module names the task. A segment
+        # or classify checkpoint reported as a detector would fail much later
+        # and much less clearly.
         kind = type(head).__name__.lower()
         for candidate in ("pose", "segment", "classify", "obb", "detect"):
             if candidate in kind:
@@ -473,10 +465,9 @@ class TiledDetector:
         from ultralytics import YOLO
 
         self.cfg = cfg
-        # Resolved once, here, so every predict call and every log line agree.
-        # Said out loud every time, not only when it changed: "auto" on its own
-        # never tells you whether a slow run is on the GPU or the CPU, and the
-        # GUI log is the only place most people would ever see it.
+        # Resolved once, here, so every predict call and every log line agree,
+        # and logged every time: "auto" on its own never tells you whether a slow
+        # run is on the GPU or the CPU.
         self.device = resolve_device(cfg.detection.device)
         wanted = str(cfg.detection.device).strip()
         told = f"detection.device {wanted!r} -> {device_label(self.device)}"
@@ -585,11 +576,10 @@ class TiledDetector:
         results, feats = [], []
         for i in range(0, len(crops), batch):
             chunk = crops[i : i + batch]
-            # Drop the previous chunk's maps BEFORE predicting. Without this, a
-            # forward pass that never reaches the head - an exception, an export
-            # backend, ultralytics' `embed=` path - leaves the last chunk's maps
-            # in place, and pooled() returns the PREVIOUS tile's features:
-            # correctly shaped, correctly row-counted, and completely wrong.
+            # Drop the previous chunk's maps BEFORE predicting: a forward pass
+            # that never reaches the head would otherwise leave them in place and
+            # pooled() would return the PREVIOUS tile's features, correctly
+            # shaped and correctly row-counted.
             self.extractor.reset()
             chunk_results = self.model.predict(chunk, **kwargs)
             results.extend(chunk_results)
@@ -671,9 +661,7 @@ class TiledDetector:
         crops = [np.ascontiguousarray(frame_rgb[y0:y1, x0:x1]) for x0, y0, x1, y1 in tiles]
         # Always run at detection.imgsz, tiled or not. `tiling.tile` says how the
         # frame is CUT; `detection.imgsz` says at what resolution each piece is
-        # SEEN. Running tiles at their native size while whole frames were
-        # upscaled to imgsz meant the model saw objects at different scales on
-        # the two paths, so --self-test compared incomparable runs.
+        # SEEN, so the tiled and untiled paths show the model the same scale.
         imgsz = self.cfg.detection.imgsz
         if self.extractor is not None:
             results, feat_blocks = self._predict_with_features(crops, imgsz)

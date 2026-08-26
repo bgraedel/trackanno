@@ -1,48 +1,21 @@
 """Is one label actually several behaviours, and which clips would show that?
 
-One class swallows most of an annotation project - almost everything is
-"swimming" - and a label the schema never split apart is not evidence that it is
-one behaviour. This module takes the feature rows of the clips already carrying
-a single label and asks whether they fall into groups, then names the clips a
-human should watch in order to decide what those groups are.
-
-The idea is A-SOiD's; the pipeline deliberately is not. Two departures:
-
-* **The clustering runs in the linear feature basis, never in an embedding.**
-  Handing a density-based clusterer the coordinates of a UMAP or t-SNE
-  projection makes it cluster densities the PROJECTION produced: both optimise a
-  neighbourhood-preservation objective that is free to move points closer or
-  further apart than the data has them, so a blob in the picture is not
-  necessarily a blob in the measurement. The ``wave_*`` block is a least-squares
-  projection of the amplitude, phase and static profiles onto shifted Legendre
-  polynomials (:func:`trackanno.wavespectra._legendre_batch`) and the ``cnn*``
-  block a PCA of the detector embeddings - both LINEAR maps of measured
-  quantities, so a distance between two rows is a distance between two
-  measurements, and it is already fitted. An embedding is a good way to DRAW an
-  answer; it is not a thing to compute one from. If a caller wants a scatter
-  plot, project the rows AFTER :func:`subcluster` has run and colour it by
-  ``labels`` - never the other way round.
-* **The clusterer is** :class:`sklearn.cluster.HDBSCAN`, already a dependency.
-  ``umap-learn`` and the standalone ``hdbscan`` package add nothing this needs.
+Takes the feature rows of the clips carrying a single label, asks whether they
+fall into groups, and names the clips a human should watch to decide what those
+groups are. The clusterer is :class:`sklearn.cluster.HDBSCAN`, run in the linear
+feature basis the caller passes rather than in an embedding, so a distance
+between two rows is a distance between two measurements.
 
 Noise is an answer, not a failure. HDBSCAN's ``-1`` says "this clip resembles
-nothing else here", which for a clip pulled out of a dominant class is a
-substantive finding and is preserved throughout - noise rows keep their ids in
+nothing else here", and noise rows keep their ids in
 :attr:`SubClusters.noise_ids` rather than being tidied into a nearest cluster.
 
-HDBSCAN returns *something* on almost anything, and an annotator sent to label a
-partition of noise has lost the afternoon and poisoned the next model with a
-class that does not exist. Two things stand between the caller and that, and
-they catch different failures - neither is sufficient alone:
-
-* :data:`DEFAULT_MIN_CLUSTER_SIZE` keeps a gapless cloud from being carved up in
-  the first place. Set high enough it is what stops unstructured data producing
-  clusters at all, and the module refuses by name when nothing survives it.
-* :attr:`Cluster.stability` asks whether a group that WAS found survives being
-  shown a different 80% of the rows. That catches a group held together by a
-  handful of clips; it does not catch a reproducible split of a cloud that has
-  no groups in it, and :func:`subcluster` says so at length. Read that section
-  before gating on the number.
+Two things stand between a caller and a partition of unstructured data, and they
+catch different failures. :data:`DEFAULT_MIN_CLUSTER_SIZE`, not the stability
+score, is what keeps a gapless cloud from being carved up in the first place.
+:attr:`Cluster.stability` then asks whether a group that WAS found survives
+being shown a different 80% of the rows, which catches a group held together by
+a handful of clips.
 
 Everything here takes plain arrays. No :class:`~trackanno.config.Config`, no
 file paths, no table: the ids are whatever the caller uses to name a row and
@@ -67,33 +40,20 @@ __all__ = [
 # are different statements about a row.
 NOISE = -1
 
-# The bar a cluster has to clear before a human is sent to annotate it. This is
-# Hennig's rule of thumb for bootstrap cluster stability (Hennig 2007,
-# "Cluster-wise assessment of cluster stability"): at or below 0.5 the cluster is
-# dissolved, 0.6 to 0.75 indicates a pattern without strong support, above 0.75
-# is a valid stable cluster and above 0.85 a highly stable one. It is a
-# convention, not a measurement of this data, and a project with expensive
-# annotation should raise it rather than lower it - see `tests/test_subcluster.py`
-# for where planted and unstructured data actually land.
+# The bar a cluster has to clear before a human is sent to annotate it: Hennig's
+# rule of thumb for bootstrap cluster stability (Hennig 2007, "Cluster-wise
+# assessment of cluster stability"). A convention, not a measurement of this
+# data.
 STABLE = 0.75
 
-# The smallest group that counts as a discovery. A discovered sub-cluster is only
-# useful if it can become a LABEL, and the suggester refuses a class with fewer
-# than `suggest.min_per_class` (5) examples while cross-validating in folds
-# GROUPED by (movie, track) - so those examples have to come from several animals
-# before a fold split can even score the new class. Three times the classifier's
-# floor is the smallest number that plausibly survives that. That part is a
-# judgement, not a measurement, and it is the first thing to change on a project
-# whose clips are scarce.
+# The smallest group that counts as a discovery. A sub-cluster is only useful if
+# it can become a LABEL, and the suggester refuses a class with fewer than
+# `suggest.min_per_class` examples while cross-validating in folds GROUPED by
+# (movie, track), so the examples have to come from several animals.
 #
-# It is also, and this was NOT expected, the module's first defence against
-# inventing structure - a stronger one than the stability score. A 400-row
-# Gaussian with no structure in it at all comes back entirely as noise at this
-# setting on 35 of the 36 draws `tests/test_subcluster.py` makes across 3, 6 and
-# 12 columns, because excess-of-mass selection will not carve a cloud with no gap
-# in it into groups this large; the one draw that got past scored 0.0 stability,
-# i.e. dissolved completely. Drop to 5 and every one of those clouds yields
-# clusters. Lower it knowingly.
+# It is also the module's first defence against inventing structure, and a
+# stronger one than the stability score: excess-of-mass selection will not carve
+# groups this large out of a cloud with no gap in it. Lower it knowingly.
 DEFAULT_MIN_CLUSTER_SIZE = 15
 
 SCALINGS = ("robust", "none")
@@ -124,9 +84,7 @@ class Cluster:
     def stable(self) -> bool:
         """Whether this cluster clears :data:`STABLE`.
 
-        NaN is False. An unmeasured cluster is not a stable one, and the whole
-        point of the score is that a cluster does not get the benefit of the
-        doubt.
+        NaN is False: an unmeasured cluster is not a stable one.
         """
         return bool(self.stability >= STABLE)
 
@@ -141,12 +99,10 @@ class SubClusters:
     clusters: list[Cluster]
     noise_ids: list
     scaling: str
-    # The per-column divisor actually used, so the scaling is inspectable rather
-    # than a thing that happened. A column whose scale is far off its neighbours'
-    # is the column that decided the answer.
+    # The per-column divisor actually used. A column whose scale is far off its
+    # neighbours' is the column that decided the answer.
     column_scale: np.ndarray
-    # Every number that produced this. A discovery is a claim about a procedure
-    # as much as about the data, and two runs are not comparable unless these
+    # Every number that produced this. Two runs are not comparable unless these
     # match.
     settings: dict = field(default_factory=dict)
 
@@ -170,26 +126,17 @@ class SubClusters:
 def _robust_scale(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-column median and interquartile range, with the degenerate cases named.
 
-    Returns ``(centre, scale)``, both ``(n_features,)``.
-
-    The IQR rather than the standard deviation because these columns have long
-    tails by construction: :mod:`trackanno.wavespectra` records
-    ``wave_wavelength_ratio`` running to 53.5 with a p90 of 7.6, since the
-    wavelength blows up whenever a phase profile is not linear. One such row sets
-    the standard deviation for the whole column and squashes every other row into
-    a point, which deletes the column from the distance - the IQR does not move.
+    Returns ``(centre, scale)``, both ``(n_features,)``. The IQR rather than the
+    standard deviation because these columns have long tails by construction, and
+    one extreme row would otherwise squash every other row into a point.
 
     Two degenerate cases, both explicit because a divisor of zero would turn
-    every distance into NaN and the clusterer would refuse the matrix outright:
+    every distance into NaN:
 
-    * IQR zero but the column varies - a near-binary column such as
-      ``wave_direction`` where one value holds more than half the rows. There is
-      no bulk spread left to protect, so the full range is used. An outlier CAN
-      set the scale of such a column; a column whose middle half is a single
-      value has nothing better to offer.
-    * a constant column - scale 1.0, which is exact rather than a fallback: every
-      scaled value is then 0 and the column contributes 0 to every distance,
-      whatever divisor is chosen.
+    * IQR zero but the column varies, as in a near-binary column where one value
+      holds more than half the rows: the full range is used instead.
+    * a constant column: scale 1.0, exact rather than a fallback, since every
+      scaled value is then 0 whatever divisor is chosen.
     """
     centre = np.median(X, axis=0)
     q1, q3 = np.percentile(X, [25, 75], axis=0)
@@ -202,50 +149,19 @@ def _robust_scale(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _scaled(X: np.ndarray, scaling: str) -> tuple[np.ndarray, np.ndarray]:
     """Put the columns on a common footing, or deliberately decline to.
 
-    Returns ``(Z, column_scale)``, ``Z`` always a fresh array.
+    Returns ``(Z, column_scale)``, ``Z`` always a fresh array. ``"robust"``, the
+    default, divides each column by its own interquartile range
+    (:func:`_robust_scale`); these columns span pixels, ``[-1, 1]`` and
+    ``{-1, +1}``, so an unscaled Euclidean distance would be the widest column
+    and nothing else. ``"none"`` is for a caller whose matrix is already
+    commensurate, and has to be asked for. Centring changes no Euclidean
+    distance and is here only to keep the subtraction well conditioned.
 
-    THE DECISION, since it changes the answer and there is no neutral option.
-    ``"robust"`` divides each column by its own interquartile range
-    (:func:`_robust_scale`). It is the default, chosen against two alternatives:
-
-    * **Leaving the columns alone.** ``wave_wavelength_px`` is hundreds of
-      pixels, ``wave_static_cos`` lives in ``[-1, 1]`` and ``wave_direction`` in
-      ``{-1, +1}``. A Euclidean distance over that is the wavelength column and
-      nothing else, so HDBSCAN would be clustering one feature while appearing to
-      use twenty-five. Offered as ``"none"`` anyway, for a caller whose matrix is
-      already commensurate - PCA scores, say - but it has to be asked for.
-    * **Whitening**, i.e. decorrelating and giving every DIRECTION unit variance.
-      That is the one this deliberately does not do. The ``wave_*`` columns are
-      strongly related by construction - the amplitude Legendre coefficients move
-      with the amplitude mean, the wave speed is the wavelength times the
-      frequency - so the covariance's smallest eigen-directions carry almost
-      nothing but measurement noise, and dividing by the square root of a
-      near-zero eigenvalue promotes that noise to the same footing as the beat
-      frequency. For a DENSITY-based clusterer that is not a cosmetic error: an
-      inflated noise direction dilutes every neighbourhood along it and dissolves
-      real clusters into the background. Per-column scaling equalises the columns
-      while leaving the correlations - and so the fact that some directions
-      genuinely carry more variance than others - exactly where they were.
-
-    Centring is not part of the decision. A Euclidean distance is unchanged by
-    it; it is here only to keep the subtraction well conditioned, since a column
-    sitting at 1e6 +- 1 spends about six of float64's sixteen digits before the
-    difference is taken.
-
-    THE PRICE, because per-column scaling is not free either. A column that is
-    bimodal BECAUSE of the split being hunted has an interquartile range that
-    spans the gap, so dividing by it shrinks exactly the column carrying the
-    signal down onto the same footing as a column carrying only noise. Three
-    blobs planted in two of six columns, with the other four pure noise, are
-    recovered at an adjusted Rand index of 1.00 when only those two columns are
-    passed and under 0.05 when all six are - measured in
-    `tests/test_subcluster.py`, which asserts both. Nor is the loss confined to
-    the score: at all six columns HDBSCAN reports two groups where three were
-    planted. The mitigation is the caller's and it is not a scaling
-    choice: hand this function the columns the split is expected to live in
-    rather than every column there is. Whitening does not help here either; it
-    equalises directions rather than columns, so it dilutes the signal in the
-    same way while additionally amplifying the noise directions.
+    The price: a column that is bimodal BECAUSE of the split being hunted has an
+    interquartile range spanning the gap, so scaling shrinks the column carrying
+    the signal onto the same footing as one carrying only noise. The mitigation
+    is the caller's - pass the columns the split is expected to live in rather
+    than every column there is.
     """
     if scaling == "none":
         return np.array(X, dtype=float), np.ones(X.shape[1])
@@ -259,26 +175,16 @@ def _scaled(X: np.ndarray, scaling: str) -> tuple[np.ndarray, np.ndarray]:
 def _fit(Z: np.ndarray, min_cluster_size: int, min_samples: int) -> np.ndarray:
     """One HDBSCAN run. Deterministic: nothing in it draws a random number.
 
-    It is deterministic but not quite permutation-invariant, which is worth
-    knowing before a caller re-sorts a table and reads the difference as a
-    change in the data. Reordering the rows leaves the GROUPS identical - the
-    rows both runs put in a cluster are partitioned exactly the same way - while
-    a row sitting on the boundary between a cluster and noise can cross it: one
-    row in four hundred, on the planted data in `tests/test_subcluster.py`, which
-    asserts both halves of that. So membership of a boundary clip is not a fact
-    to build on - and a cluster whose SHAPE depends on such rows is what
-    :func:`_stability` is built to catch, since resampling removes them a fifth
-    at a time.
+    Deterministic but not quite permutation-invariant. Reordering the rows leaves
+    the groups identical while a row on the boundary between a cluster and noise
+    can cross it, so membership of a boundary clip is not a fact to build on.
 
-    ``allow_single_cluster`` is left at its default of off. The question this
-    module asks is whether a class is SEVERAL things, and "all of it, one group"
-    is the null answer rather than a discovery; with the flag off that answer
-    arrives as an all-noise result, which :func:`subcluster` refuses by name
-    instead of handing an annotator the class they already had.
+    ``allow_single_cluster`` is left off: "all of it, one group" is the null
+    answer to the question this module asks, and with the flag off it arrives as
+    an all-noise result that :func:`subcluster` refuses by name.
 
-    ``copy=False`` is safe because every matrix that reaches here was allocated
-    by :func:`_scaled` - the estimator is allowed to overwrite its input, and the
-    caller's array is never the thing being overwritten.
+    ``copy=False`` is safe because every matrix reaching here was allocated by
+    :func:`_scaled`, so the caller's array is never overwritten.
     """
     return HDBSCAN(
         min_cluster_size=int(min_cluster_size),
@@ -293,10 +199,8 @@ def _max_jaccard(reference: np.ndarray, found: np.ndarray, n_reference: int) -> 
     Both arrays label the SAME rows - the rows a resample drew - with ``NOISE``
     for a row in no cluster. Returns ``(n_reference,)``.
 
-    Noise is never a candidate to match against. A reference cluster whose
-    members all came back as noise scores 0, which is the correct reading: the
-    group dissolved. Scoring it against the noise "cluster" would reward a
-    clustering for consistently failing to find anything.
+    Noise is never a candidate to match against, so a reference cluster whose
+    members all came back as noise scores 0: the group dissolved.
     """
     n_found = int(found.max()) + 1 if found.size and found.max() >= 0 else 0
     reference_size = np.bincount(
@@ -319,30 +223,20 @@ def _stability(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resampling stability per cluster: ``(score, n_trials)``, both ``(n_clusters,)``.
 
-    Each trial draws ``subsample_frac`` of the rows without replacement, runs the
-    WHOLE procedure again on them - scaling included, since the scale is
-    estimated from the data and a score that reused the full-data scale would
-    understate how much the answer depends on which rows were drawn - and asks,
-    for each cluster of the reference clustering, how well its surviving members
-    are recovered as a group. The measure is the Jaccard overlap with the
-    best-matching cluster of the rerun, and the score is the mean of that over
-    the trials. This is Hennig's bootstrap cluster stability with subsampling in
-    place of the bootstrap; subsampling because HDBSCAN is density-based and a
-    bootstrap's duplicated rows are stacks of coincident points, which is a
-    density spike the estimator would read as structure.
+    Each trial draws ``subsample_frac`` of the rows without replacement, reruns
+    the whole procedure on them including the scaling, and takes each reference
+    cluster's Jaccard overlap with the best-matching cluster of the rerun; the
+    score is the mean over trials. This is Hennig's bootstrap cluster stability
+    with subsampling in place of the bootstrap, since a bootstrap's duplicated
+    rows are coincident points a density-based clusterer reads as structure.
 
-    A trial where fewer than two of a cluster's members were drawn says nothing
-    about that cluster and is skipped rather than scored as a failure, which is
-    why the trial count comes back beside the score.
+    A trial that drew fewer than two of a cluster's members says nothing about it
+    and is skipped rather than scored as a failure, which is why the trial count
+    comes back beside the score.
 
-    The drawn indices are kept in their original order. Tie-breaking inside a
-    clusterer can depend on row order, and a stability score that moved when the
-    rows were shuffled would not be a property of the data.
-
-    Determinism: the only randomness is the draw, and each trial's generator is
-    seeded from ``(seed, trial)`` so the whole sequence is fixed by ``seed``
-    alone - independently of how many trials were run before it, so raising
-    ``n_resamples`` extends the answer rather than replacing it.
+    The drawn indices keep their original order, so a shuffle of the rows cannot
+    move the score. Each trial's generator is seeded from ``(seed, trial)``, so
+    raising ``n_resamples`` extends the answer rather than replacing it.
     """
     n_rows = X.shape[0]
     drawn_size = max(2, int(round(subsample_frac * n_rows)))
@@ -371,12 +265,7 @@ def _medoid(Z: np.ndarray) -> int:
     """Row minimising the total distance to every other row. Ties to the lowest index.
 
     The medoid rather than the mean, because the answer has to be a CLIP the
-    annotator can watch; the mean of a group of waveforms is not a waveform
-    anybody recorded.
-
-    Chunked, so the ``m x m`` distance matrix is never held: one dominant class
-    is easily thousands of clips and the square of that is the memory failure
-    this exists to avoid.
+    annotator can watch. Chunked, so the ``m x m`` distance matrix is never held.
     """
     if Z.shape[0] == 1:
         return 0
@@ -389,18 +278,12 @@ def _medoid(Z: np.ndarray) -> int:
 def _spread(Z: np.ndarray, start: int, k: int) -> list[int]:
     """``start``, then repeatedly whichever row is furthest from everything chosen.
 
-    NOT the ``k`` rows nearest the medoid. Those are ``k`` views of the same
-    clip: they show the annotator the most typical member several times over and
-    hide the cluster's extent, which is the only evidence that could tell them
-    the group is really two things wearing one label. The max-min traversal
-    starts at the centre and then covers the group - the extremes come out first,
-    and each later pick fills the largest remaining hole - so the panel spans
-    what the cluster contains.
+    A max-min traversal rather than the ``k`` rows nearest the medoid, so the
+    panel spans the cluster's extent: that extent is the evidence that could tell
+    an annotator the group is really two things wearing one label.
 
     Stops early rather than returning a row at distance 0 from one already
-    chosen: a second identical panel tells the annotator nothing. Ties go to the
-    lowest index, so the panel is fixed by the row order and not by an ordering
-    inside the search.
+    chosen. Ties go to the lowest index.
     """
     chosen = [int(start)]
     if Z.shape[0] == 1:
@@ -430,106 +313,40 @@ def subcluster(
 ) -> SubClusters:
     """Split one class's feature rows into candidate sub-behaviours, with evidence.
 
-    Parameters
-    ----------
-    features
-        ``(n_rows, n_features)`` float, all finite. See the refusals below for
-        why NaN is not accepted here even though it is the codebase's ordinary
-        way of saying "undefined".
-    ids
-        One id per row, matched by POSITION - typically ``clip_id``. They are
-        opaque: they come back in ``member_ids``, ``medoid_id`` and
-        ``representative_ids`` exactly as handed in.
-    min_cluster_size
-        The smallest group that counts as a discovery. See
-        :data:`DEFAULT_MIN_CLUSTER_SIZE`.
-    min_samples
-        How conservative the density estimate is; ``None`` means
-        ``min_cluster_size``, which is scikit-learn's default and the
-        conservative end. Raising it moves more rows into noise.
-    scaling
-        ``"robust"`` or ``"none"``; the choice is documented in :func:`_scaled`
-        and recorded in the result.
-    seed
-        Fixes the resampling. A discovery that changes between runs is not a
-        discovery, so this is the only source of randomness in the module and
-        every other step is deterministic.
-    n_resamples
-        Trials behind the stability score. ``0`` skips the measurement entirely
-        and every ``stability`` comes back NaN - which is "nobody looked", never
-        "unstable", and :attr:`Cluster.stable` is False for it either way.
-    subsample_frac
-        Share of the rows each trial draws.
-    n_representatives
-        Rows to name per cluster, medoid included.
-
-    Returns
-    -------
-    :class:`SubClusters`. ``labels`` is aligned with ``ids`` and carries
+    ``features`` is ``(n_rows, n_features)`` float and must be all finite; ``ids``
+    names one row each, matched by POSITION, and comes back untouched in
+    ``member_ids``, ``medoid_id`` and ``representative_ids``. ``min_cluster_size``
+    is the smallest group that counts as a discovery
+    (:data:`DEFAULT_MIN_CLUSTER_SIZE`), ``min_samples`` how conservative the
+    density estimate is (``None`` means ``min_cluster_size``; raising it moves
+    more rows into noise), ``scaling`` ``"robust"`` or ``"none"``
+    (:func:`_scaled`), ``seed`` the module's only source of randomness,
+    ``n_resamples`` the trials behind the stability score (``0`` skips the
+    measurement and every ``stability`` is NaN, "nobody looked" rather than
+    "unstable"), ``subsample_frac`` the share of rows a trial draws and
+    ``n_representatives`` the rows named per cluster, medoid included. Returns a
+    :class:`SubClusters` whose ``labels`` is aligned with ``ids`` and carries
     :data:`NOISE` for a row in no cluster.
 
-    THE STABILITY SCORE, which is the part worth reading twice. It is the mean,
-    over resamples, of the Jaccard overlap between a cluster's surviving members
-    and the best-matching cluster of a rerun on those rows alone
-    (:func:`_stability`). What it IS evidence of: that the grouping is a property
-    of the data rather than of which rows happened to be labelled - a cluster
-    that scores well would still have been found with a different 80% of the
-    clips. It also penalises both failure modes rather than one, because a
-    cluster that keeps being swallowed by a larger group scores its own share of
-    that group and not 1: the members did stay together, but not as a group of
-    their own.
+    The stability score (:func:`_stability`) is evidence that a grouping is a
+    property of the data rather than of which rows happened to be labelled. It is
+    not evidence that a group exists at all: resampling varies which rows are
+    present, not the clusterer, so a split a smooth cloud provokes by its shape
+    alone recurs trial after trial and scores highly. ``min_cluster_size``, not
+    this score, is what keeps a gapless cloud from being carved up. Nor is it
+    evidence that a cluster is a BEHAVIOUR, since clips from one movie or animal
+    cluster tightly on the recording and are perfectly stable; nor a p-value; nor
+    a statement about clips absent from ``features``. Scores are comparable only
+    at the same ``subsample_frac`` and ``min_cluster_size``.
 
-    What it is NOT evidence of, none of which it can see:
-
-    * that a group exists at all. This is the one that matters and it is easy to
-      read the wrong way round. Resampling varies WHICH ROWS are present; it does
-      not vary the clusterer, so a split that a smooth unimodal cloud provokes by
-      its shape alone comes back trial after trial and scores highly. Measured:
-      a plain two-column Gaussian clustered at ``min_cluster_size=5`` is cut into
-      three, and those pieces score 0.78, 0.91 and 0.95 - all above
-      :data:`STABLE` - in `tests/test_subcluster.py`, which asserts it so nobody
-      has to find out later. Stability rules out "this group is an accident
-      of which clips happened to be labelled". It does not rule out "this group
-      is an artefact of what a density clusterer does to a cloud with no gap in
-      it", and nothing here does: what keeps that out is
-      :data:`DEFAULT_MIN_CLUSTER_SIZE`, which refuses to carve groups that large
-      out of a gapless cloud in the first place.
-    * that the cluster is a BEHAVIOUR. Clips from one movie, one animal, or one
-      recording session share illumination, focus and body size, cluster tightly
-      on that, and are perfectly stable. This module is handed a bare matrix and
-      cannot check; the caller can, and should look at the movie and track
-      composition of a cluster before sending anyone to annotate it. The
-      re-identification warning on the ``cnn*`` features in
-      :mod:`trackanno.clipfeatures` is the same trap in a different place.
-    * significance. There is no null distribution here and the score is not a
-      p-value; :data:`STABLE` is a convention.
-    * anything about clips not in ``features``. It resamples the rows present, so
-      it measures reproducibility over this labelled set and not generalisation
-      to the class as a whole.
-    * anything comparable across settings. Fewer rows per trial means every
-      cluster is thinner and ``min_cluster_size`` bites harder, so scores only
-      mean the same thing at the same ``subsample_frac`` and
-      ``min_cluster_size``.
-
-    Refusals. Each of these is a case where an answer could be produced and would
-    mislead:
-
-    * a non-finite value anywhere. NaN means "undefined" throughout this codebase
-      and HDBSCAN has no way to read it. The caller must drop the row or the
-      column and decide which, because imputing - the obvious silent fix - would
-      put every clip nobody could measure at the column median, i.e. would
-      manufacture a dense group out of exactly the rows we know least about, and
-      that group would then be stable.
-    * ``ids`` not matching the rows, or repeating. Representatives are reported
-      as ids, so a duplicate makes the answer ambiguous about which clip to show.
-    * too few rows for the question. Below two groups of ``min_cluster_size``
-      there is nothing to find, and below two of them in a RESAMPLE every
-      stability trial is forced to answer "one cluster" and the score measures
-      the arithmetic rather than the data.
-    * every row classed as noise. That is HDBSCAN saying it found no group at
-      this setting; it is a real answer, but it is not one that can be returned
-      as a list of clusters without the caller having to guess what an empty list
-      meant, so it is raised with the numbers that produced it.
+    Refused: a non-finite value anywhere, because imputing would put every clip
+    nobody could measure at the column median and manufacture a dense, perfectly
+    stable group out of the rows we know least about, so the caller must drop the
+    row or the column and decide which; ``ids`` not matching the rows or
+    repeating, which leaves it ambiguous which clip to show; too few rows to hold
+    two groups of ``min_cluster_size``, in the data or in a RESAMPLE, where every
+    trial would be forced to answer "one cluster"; and every row classed as
+    noise, which is a real answer but not one returnable as a list of clusters.
     """
     X = np.asarray(features, dtype=float)
     ids = list(ids)

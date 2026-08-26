@@ -551,9 +551,8 @@ class ConfigPage(Page):
         # Probed off the UI thread: importing torch costs a second or two.
         self._device_probe: TaskRunner | None = None
         QTimer.singleShot(0, self._probe_devices)
-        # A laptop GPU asleep behind hybrid graphics, or a driver that has just
-        # been reset, answers "no CUDA here" once and differently a minute
-        # later. Without this the only way to ask again is to restart the app.
+        # A GPU asleep behind hybrid graphics, or a driver that has just been
+        # reset, answers "no CUDA here" once and differently a minute later.
         self.recheck_btn = QPushButton("Re-check")
         self.recheck_btn.setToolTip(
             "Ask torch again what this machine has. Worth a click if a GPU you "
@@ -627,10 +626,9 @@ class ConfigPage(Page):
     def _use_local_model(self, path: str) -> None:
         """Browsing to a .pt means run THAT file, shared model or not.
 
-        ``model.source`` outranks ``paths.model`` everywhere downstream, so
-        leaving it set would keep running the downloaded weights while the field
-        showed the file just picked. Picking one is the one unambiguous signal
-        that the shared model is no longer wanted.
+        ``model.source`` outranks ``paths.model`` everywhere downstream, so it
+        is cleared here; picking a file is the one unambiguous signal that the
+        shared model is no longer wanted.
         """
         spec = getattr(self.cfg, "model", None) if self.cfg else None
         if spec is None or not spec.is_remote:
@@ -771,9 +769,8 @@ class ConfigPage(Page):
         if self._device_probe is not None:
             if not again or self._device_probe.isRunning():
                 return
-            # Worth re-running: torch caches a device count only once it is
-            # non-zero, so a card that was asleep the first time is found by
-            # asking again, in this same process.
+            # torch caches a device count only once it is non-zero, so a card
+            # that was asleep the first time is found by asking again.
             self._device_probe = None
 
         def work(reporter):
@@ -789,8 +786,7 @@ class ConfigPage(Page):
             "detection.device", f"could not ask torch what this machine has: {message}"))
         self._device_probe = runner
         # Until it answers, the list holds only the two entries every machine
-        # has. Saying so is what separates "still looking" from "no GPU here",
-        # which are otherwise identical for the ten seconds torch takes to load.
+        # has, which is what "no GPU here" looks like too.
         self.form.set_status(
             "detection.device", "checking this machine for GPUs (a few seconds)...")
         runner.start()
@@ -992,9 +988,8 @@ class ConfigPage(Page):
 class ModelRegistryDialog(QDialog):
     """Pick shared weights, and set where this machine looks for them.
 
-    The registry URL is edited here rather than in ``config.yaml`` on purpose: a
-    project someone sends you may name a model, but must not be able to decide
-    which server the weights come from.
+    The registry URL lives here rather than in ``config.yaml``: a project
+    someone sends you may name a model, but not the server it comes from.
     """
 
     def __init__(self, parent=None):
@@ -1167,9 +1162,8 @@ class PreparePage(Page):
         movies_box = QGroupBox("Movies")
         movies_layout = QVBoxLayout(movies_box)
         movies_layout.addLayout(movie_bar)
-        # Under the buttons, not beside them: what is wrong is usually a
-        # sentence, and a sentence in the space left over by four buttons
-        # wraps to three cramped lines.
+        # Under the buttons, not beside them: what is wrong is usually a whole
+        # sentence and needs the width.
         movies_layout.addWidget(self.scan_state)
         movies_layout.addWidget(self.movies)
 
@@ -1566,9 +1560,8 @@ class ModelPage(Page):
         self.predict_note = _muted(QLabel(""))
         self.predict_note.setWordWrap(True)
 
-        # Reviewing what came out is a separate question from making it, and the
-        # only gate it needs is the file: a run whose model has since been
-        # gated off still wrote rows somebody has to be able to look at.
+        # The only gate reviewing needs is the file: a run whose model has since
+        # been gated off still wrote rows somebody has to be able to look at.
         self._has_predictions = False
         self._review: BoutReviewDialog | None = None
         self.review_button = QPushButton("Review predictions...")
@@ -1622,8 +1615,8 @@ class ModelPage(Page):
         )
         # Cached too: a reliable model appears only when one is trained.
         self.predict_button.setEnabled(not self._predict_blocker and not self.tasks.busy)
-        # Cached for the same reason - this runs on the annotation keystroke
-        # path and must not stat predictions.parquet there.
+        # Cached for the same reason: this must not stat predictions.parquet on
+        # the annotation keystroke path.
         self.review_button.setEnabled(self._has_predictions and not self.tasks.busy)
 
     def on_project(self) -> None:
@@ -1631,9 +1624,8 @@ class ModelPage(Page):
         self._refresh_predict_gate()
         self.refresh_gate()
         self._load_report()
-        # Only while it is on screen. A labelling run ends in reload_project, so
-        # this is what stops an open review window describing the rows the
-        # previous run wrote; closed, it re-reads on the next open anyway.
+        # Only while it is on screen, so an open review window stops describing
+        # the rows the previous run wrote. Closed, it re-reads on the next open.
         if self._review is not None and self._review.isVisible():
             self._review.panel.set_config(self.cfg)
 
@@ -1661,8 +1653,8 @@ class ModelPage(Page):
 
     def _count_orphans(self) -> None:
         """How many labels point at a clip_id the cache no longer has. Cheap on
-        purpose, because a project reload happens on every autosave; the real
-        plan is built on a worker in :meth:`_repair_links`."""
+        purpose, since a project reload happens on every autosave; the real plan
+        is built on a worker in :meth:`_repair_links`."""
         self._orphans, key = 0, None
         if self.cfg is None or not self.cfg.paths.csv.exists():
             self._orphan_key = None
@@ -1824,9 +1816,10 @@ class ModelPage(Page):
 
     # -- labelling everything with the model --------------------------------- #
     def _label_all(self) -> None:
-        """Score every clip with the trained model, off the UI thread. Never
-        touches the annotation CSV: predictions land in predictions.parquet, so
-        a hand label stays distinguishable from a guess."""
+        """Score every clip with the trained model, off the UI thread.
+
+        Never touches the annotation CSV: predictions land in
+        predictions.parquet, so a hand label stays distinguishable from a guess."""
         if self.cfg is None or self.tasks.busy:
             return
         self._refresh_predict_gate()
@@ -1854,11 +1847,9 @@ class ModelPage(Page):
     def _review_predictions(self) -> None:
         """Open the timeline over predictions.parquet.
 
-        One dialog, reused: a second press on a window already open would leave
-        two views of a file that can change under both, and the older one would
-        go on showing rows that are no longer on disk. That matters more now the
-        window can write - two open copies would each hold their own idea of a
-        track's corrections and each save would erase the other's.
+        One dialog, reused: two views of a file both can write would each hold
+        their own idea of a track's corrections, and each save would erase the
+        other's.
         """
         if self.cfg is None:
             return
@@ -1900,8 +1891,8 @@ class ModelPage(Page):
         self.hub.reload_project()
         if not ok:
             return
-        # reload_project does NOT reach the live annotation panel - the model is
-        # not part of its fingerprint - so hand the new model over explicitly.
+        # The model is not part of the annotation panel's fingerprint, so
+        # reload_project does not reach it: hand the new model over explicitly.
         annotate = self.hub.page(AnnotatePage)
         panel = getattr(annotate, "panel", None)
         if panel is not None:
@@ -2171,11 +2162,7 @@ def _read_annotation_rows(cfg):
 
 
 def _reveal(path) -> str:
-    """Open a folder in the desktop's file manager. Returns "" or why it failed.
-
-    The rendered movies are files somebody then does something else with, and
-    hunting for the folder that the GUI already knows the path of is busywork.
-    """
+    """Open a folder in the desktop's file manager. Returns "" or why it failed."""
     import subprocess
     import sys as _sys
 
@@ -2374,11 +2361,9 @@ class ExportPage(Page):
     def _predicted_movies(self) -> tuple[dict, str]:
         """({movie_id: row count}, what one row is). Never raises, like annotated_movies.
 
-        The unit comes back with the counts rather than being written beside the
-        call, because a prediction row is a dense WINDOW or a decoded BOUT
-        depending on the run that wrote the file, and only the file knows which -
-        see :func:`trackanno.render.prediction_unit`. Calling either of them a
-        clip was the old wording and was true of neither.
+        The unit comes back with the counts because a prediction row is a dense
+        WINDOW or a decoded BOUT depending on the run that wrote the file, and
+        only the file knows which (:func:`trackanno.render.prediction_unit`).
         """
         from ..predict import load_predictions
         from ..render import prediction_unit
@@ -2560,8 +2545,8 @@ class Hub(QMainWindow):
         return True
 
     def page(self, kind):
-        """The page of a given class - never by index, which shifts when a step
-        is inserted and silently reaches for the wrong page."""
+        """The page of a given class. Never by index: that shifts when a step is
+        inserted."""
         return next((p for p in self.pages if isinstance(p, kind)), None)
 
     def reload_project(self, skip: "Page | None" = None) -> None:

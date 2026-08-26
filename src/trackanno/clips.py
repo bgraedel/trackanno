@@ -66,10 +66,12 @@ class ClipSpec:
 # planning
 # --------------------------------------------------------------------------- #
 def clip_id_for(movie_id: str, track_id: int, f_start: int) -> str:
-    """The identity of a (movie, track, window), as everything downstream reads it.
+    """The join key for a (movie, track, window).
 
-    A join key for the annotation CSV, the manifest and the feature tables, so a
-    grid built elsewhere must produce byte-identical ids or labels stop landing.
+    Used by the annotation CSV, the manifest and the feature tables, so a grid
+    built elsewhere must produce byte-identical ids. It embeds the track id, so
+    re-running detection renumbers tracks and changes every id (see
+    :mod:`trackanno.reassociate`).
     """
     return f"{movie_id}__t{int(track_id):04d}__f{int(f_start):06d}"
 
@@ -122,8 +124,7 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config) 
     """Turn a movie's tracks table into clip specs. Reads no pixels.
 
     Crop size comes from the *per-frame* box (``crop_from: bbox``), not the
-    track's whole excursion: over 50 frames at 100 fps a union crop is mostly
-    empty background. A tight crop has to move, and ``clips.follow`` says how:
+    track's whole excursion, so the crop has to move. ``clips.follow`` says how:
 
     ``track``   re-centred every frame - smallest crop, but translation becomes
                 invisible, so "swimming" and "immotile" look identical.
@@ -437,9 +438,12 @@ def write_clip_cache(
             del thumbs
     except BaseException:
         # Cancelled, killed, or the share went away: discard the staged files.
-        del cache
-        if thumbs is not None:
-            del thumbs
+        # Rebinding rather than `del`, which is what this used to do: on the
+        # happy path `cache` is deleted before the flushes that can fail, so an
+        # unconditional `del` raises NameError over the real error and skips the
+        # discard. Windows cannot unlink a mapped file, so the references do
+        # have to go before `staged.discard()`.
+        cache = thumbs = None  # noqa: F841 - releases the memmaps for discard()
         staged.discard()
         raise
 
@@ -450,9 +454,9 @@ def write_clip_cache(
 class StagedWrite:
     """Write beside the real names, then rename everything into place at once.
 
-    ``os.replace`` is atomic per file, not across files: a crash *between* the
-    renames can still interleave old and new. That window is microseconds, and
-    ``ClipStore`` rejects the result because manifest and header disagree.
+    ``os.replace`` is atomic per file, not across files, so a crash between the
+    renames can still interleave old and new; ``ClipStore`` rejects that,
+    manifest and header disagreeing.
     """
 
     SUFFIX = ".part"

@@ -1,9 +1,9 @@
 """Background clip prefetch.
 
-The cache is an uncompressed memmap, so "loading" a clip is really "is this 1 MB
-already in the OS page cache". Touching upcoming clips on a worker thread turns
-almost every navigation into a warm read; numpy releases the GIL during the copy,
-so a plain daemon thread is enough - no Qt threading required."""
+The cache is an uncompressed memmap, so loading a clip is really a question of
+whether it is already in the OS page cache. Touching upcoming clips on a worker
+thread turns almost every navigation into a warm read, and numpy releases the
+GIL during the copy, so a plain daemon thread is enough."""
 
 from __future__ import annotations
 
