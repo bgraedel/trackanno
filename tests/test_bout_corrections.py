@@ -816,7 +816,7 @@ def test_a_multi_select_group_refuses_rather_than_half_works(app, root) -> None:
     app.processEvents()
     check("the multi group is refused with the reason",
           "multi-select" in widget.status.text()
-          and "not built rather than half built" in widget.status.text(),
+          and "not supported" in widget.status.text(),
           widget.status.text())
     check("...and it offers no classes to pick from, rather than the halves of a "
           "combination", widget.klass.count() == 0)

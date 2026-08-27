@@ -199,7 +199,7 @@ def test_a_track_with_no_predictions_is_a_normal_state(app, synthetic) -> None:
     app.processEvents()
     check("the empty timeline paints without raising", ink(painted(panel.timeline)) > 0)
     check("and the words on it say the outcome is normal",
-          "normal outcome" in panel.timeline._nothing_here(),
+          "That is normal, not an error" in panel.timeline._nothing_here(),
           panel.timeline._nothing_here())
     panel.close()
     app.processEvents()

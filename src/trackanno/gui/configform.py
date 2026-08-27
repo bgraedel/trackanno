@@ -77,37 +77,36 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
      "Where the movies are, and where everything this project makes is written.",
      [
          ("paths", "video_dir", "dir", "video folder",
-          "Folder containing the movies. .tif/.tiff and .nd2 are both read natively.", {}),
+          "Folder holding the movies. .tif, .tiff and .nd2 are all read directly.", {}),
          ("paths", "model", "file", "detection model",
           "YOLO weights used for detection (and pose, if detection.task is 'pose').",
           {"filter": "PyTorch weights (*.pt);;All files (*)"}),
          ("paths", "work_dir", "dir", "clip cache",
-          "Clip cache and per-movie tables. Keep this on a LOCAL disk: the GUI does "
-          "~1 MB random reads per clip and network latency is what you feel.", {}),
+          "Clip cache and per-movie tables. Keep it on a local disk: the GUI reads "
+          "about 1 MB per clip and network latency shows.", {}),
          ("paths", "csv", "file", "annotation csv",
-          "The annotation log; one row per annotated clip. This file is the state - "
-          "any clip whose id appears in it is done.",
+          "The annotation log, one row per annotated clip. A clip whose id appears "
+          "here is done.",
           {"filter": "CSV (*.csv);;All files (*)", "save": True}),
          ("paths", "patterns", "strlist", "file patterns",
           "Which files in the video folder count as movies.", {}),
      ]),
 
-    ("Finding the animals",
-     "One detector pass per frame, and what it runs on.",
+    ("Detection",
+     "How the detector finds animals in each frame, and what it runs on.",
      [
          ("detection", "task", "choice", "task",
           "'pose' if the model predicts keypoints, 'detect' if it only gives boxes. "
-          "Choosing 'pose' needs the keypoint names below; the button fills them in "
-          "from the model file.",
+          "'pose' needs the keypoint names below; the button reads them from the "
+          "model file.",
           {"options": ["detect", "pose"]}),
          ("detection", "device", "choice", "compute device",
-          "'auto' picks the best available and falls back to the CPU if there is no "
-          "GPU here, which is what makes a project portable between machines. The "
-          "list is filled in from this computer.",
+          "'auto' uses a GPU where there is one and the CPU otherwise, so the "
+          "project moves between machines. The list comes from this computer.",
           {"options": ["auto", "cpu"]}),
          ("detection", "imgsz", "int", "inference size",
           "The resolution each tile is seen at. Match what the model was trained "
-          "for - changing it changes what the model detects.",
+          "at; another value changes what it detects.",
           {"min": 64, "max": 4096, "step": 32}),
          ("detection", "conf", "float", "confidence",
           "Minimum detection confidence.", {"min": 0.0, "max": 1.0, "step": 0.05}),
@@ -122,16 +121,15 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Half-precision inference. Faster on most GPUs, unsupported on CPU.", {}),
      ]),
 
-    ("Frames larger than the model",
-     "A frame wider than one tile is cut up, run as a batch and merged back "
-     "together. 'tile size' is how the frame is CUT; 'inference size' above is "
-     "the resolution each tile is SEEN at.",
+    ("Tiling",
+     "Frames wider than one tile are cut up, run as a batch and merged back.",
      [
          ("tiling", "enabled", "tristate", "tiling",
           "'auto' tiles only frames larger than one tile; on and off force it.", {}),
          ("tiling", "tile", "int", "tile size",
-          "How the frame is cut. Keep the ratio to the inference size that the "
-          "model was trained for.", {"min": 64, "max": 4096, "step": 32}),
+          "How wide each tile is cut from the frame. Inference size, under "
+          "Detection, is the resolution it is then seen at.",
+          {"min": 64, "max": 4096, "step": 32}),
          ("tiling", "overlap", "float", "tile overlap",
           "Fraction of a tile shared with its neighbour.",
           {"min": 0.0, "max": 0.89, "step": 0.05}),
@@ -140,32 +138,29 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           {"min": 0.0, "max": 1.0, "step": 0.05}),
      ]),
 
-    ("Joining detections into tracks",
-     "One track is one animal followed through the movie. Every clip is cut "
-     "from a single track, so a tracker that swaps two animals cuts a clip of "
-     "both.",
+    ("Tracking",
+     "Linking detections across frames, so one track follows one animal.",
      [
          ("tracking", "backend", "choice", "tracker",
-          "tracktrack is built for crowded scenes with frequent occlusion; greedy is "
-          "a nearest-centroid fallback that is adequate at high frame rates.",
+          "tracktrack handles crowded scenes with frequent occlusion; greedy is a "
+          "nearest-centroid fallback, adequate at high frame rates. A tracker that "
+          "swaps two animals cuts a clip of both.",
           {"options_from": _trackers}),
          ("tracking", "min_track_length", "int", "min track length",
-          "Drop tracks seen in fewer frames than this. Must not exceed the number of "
-          "frames actually processed.", {"min": 1, "max": 100000}),
+          "Drop tracks seen in fewer frames than this. Must not be more than the "
+          "frames processed.", {"min": 1, "max": 100000}),
          ("tracking", "greedy_max_dist_px", "float", "greedy max distance",
           "Only used by the greedy fallback tracker.", {"min": 1.0, "max": 500.0, "step": 5.0}),
      ]),
 
     # -- cutting clips ------------------------------------------------------- #
     ("Clip windows",
-     "A clip is 'clip length' frames of one track, and the grid steps by "
-     "'stride'. The two together decide how much of each movie you are asked "
-     "about, and they are also what the dense prediction grid under Bulk "
-     "labelling defaults to.",
+     "How long the clips cut from each track are, and how far apart they start.",
      [
          ("clips", "frames", "int", "clip length",
-          "Frames per clip - the unit you actually judge, and the window length the "
-          "suggestion model is fitted at.", {"min": 2, "max": 10000}),
+          "Frames per clip. Also the window length the suggestion model is fitted "
+          "at, and what the dense grid under Bulk labelling defaults to.",
+          {"min": 2, "max": 10000}),
          ("clips", "stride", "int", "stride",
           "Spacing between windows. Equal to the clip length means non-overlapping.",
           {"min": 1, "max": 10000}),
@@ -180,7 +175,7 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "0 means unlimited.", {"min": 0, "max": 10000}),
      ]),
 
-    ("What a clip shows",
+    ("Crop and contrast",
      "The crop that follows the animal, and how raw frames become 8-bit.",
      [
          ("clips", "follow", "choice", "crop follows",
@@ -191,9 +186,9 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Crop side = the per-frame box extent times this.",
           {"min": 1.0, "max": 8.0, "step": 0.1}),
          ("clips", "crop_size", "autonum", "cache crop size",
-          "'auto' takes the 99th percentile of the required sizes, rounded to a "
-          "multiple of 16, and is only known once the movies have been scanned. "
-          "A number forces it.", {"min": 16, "max": 1024, "step": 16}),
+          "'auto' is the 99th percentile of the sizes needed, rounded to a multiple "
+          "of 16, and is known only once the movies are scanned. A number forces it.",
+          {"min": 16, "max": 1024, "step": 16}),
          ("clips", "max_size", "int", "max crop size",
           "Cap for auto. Larger crops are downscaled and their scale recorded.",
           {"min": 32, "max": 1024, "step": 16}),
@@ -214,7 +209,7 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
 
     # -- annotating ---------------------------------------------------------- #
     ("Annotating",
-     "How the clips are handed over, and who is judging them.",
+     "Who is labelling, the order the clips arrive in, and how the window behaves.",
      [
          ("ui", "annotator", "text", "annotator name",
           "Written into every row of the CSV.", {}),
@@ -225,8 +220,8 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "One keypress labels the clip and jumps to the next, once every required "
           "group is filled.", {}),
          ("ui", "shuffle", "bool", "shuffle clip order",
-          "Seeded random order. Going movie-by-movie invites order effects - you "
-          "calibrate on the first movie and drift.", {}),
+          "Seeded random order, so your judgement does not drift movie by movie.",
+          {}),
          ("ui", "resume", "choice", "on open, go to",
           "Where the session resumes.",
           {"options": ["first_unannotated", "last_position"]}),
@@ -235,8 +230,8 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           {"options": ["dark", "light", "system"]}),
      ]),
 
-    ("What is drawn on the clip",
-     "Which animal the clip is about, and how closely the view follows it.",
+    ("Clip view",
+     "How the clip is framed on screen, and what is drawn over the animal.",
      [
          ("ui", "follow", "choice", "view follows",
           "centred: one view on the track's median position, all motion visible. "
@@ -248,58 +243,54 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
          ("ui", "show_overlay", "bool", "show the marker",
           "Outline the animal this clip is about.", {}),
          ("ui", "show_context_tracks", "bool", "outline neighbours too",
-          "Off by default: the marker's job is to say which animal is being judged.", {}),
+          "Outline the other tracks in the crop as well. Off by default, so the "
+          "marker names one animal.", {}),
          ("ui", "show_skeleton", "bool", "show keypoints",
           "Draw the pose skeleton on top of the marker.", {}),
      ]),
 
     ("Curvature kymograph",
-     "The flagellum's shape along its length against time, drawn under the "
-     "clip. Needs keypoints, so it only appears on a pose project.",
+     "The flagellum's shape along its length against time, drawn under the clip.",
      [
          ("ui", "show_kymograph", "bool", "show curvature kymograph",
-          "Plot the flagellum's curvature along its length against time, under the "
-          "clip. Needs keypoints, so it only appears on a pose project.", {}),
+          "Draw the kymograph under the clip. Needs keypoints, so it only appears "
+          "on a pose project.", {}),
          ("ui", "kymo_field", "choice", "kymograph shows",
-          "curvature (dpsi/ds, a second derivative: sharper but noisier) or the "
-          "tangent angle psi itself (first order, unwrapped along the flagellum and "
-          "over time). They are the same beat seen two standard ways.",
+          "curvature (dpsi/ds, sharper but noisier) or the tangent angle psi itself, "
+          "unwrapped along the flagellum and over time. The same beat, two standard "
+          "views.",
           {"options": ["curvature", "tangent"]}),
          ("ui", "kymo_sign", "choice", "kymograph sign",
-          "A 2D image cannot tell a cell from its mirror image, so the same beat can "
-          "come out blue in one clip and red in the next. 'canonical' flips each clip "
-          "so its static curvature is positive when that is decidable, 'raw' leaves "
-          "it as measured, 'absolute' drops the sign entirely.",
+          "canonical flips each clip so its static curvature is positive, raw leaves "
+          "it as measured, absolute drops the sign. A 2D view cannot tell a cell "
+          "from its mirror image, so raw sign flips between clips.",
           {"options": ["canonical", "raw", "absolute"]}),
          ("ui", "kymo_interpolate", "bool", "smooth the kymograph",
-          "Filter the kymograph when it is drawn. Off shows the raw sample grid - "
-          "one hard-edged block per frame - which is what you want when judging "
-          "whether a track is noisy.", {}),
+          "Filter the kymograph when it is drawn. Off shows one hard-edged block per "
+          "frame, which is what you want when judging whether a track is noisy.", {}),
          ("ui", "kymo_smooth_px", "float", "kymograph fit tolerance",
-          "How far the fitted centreline may pull away from each keypoint, in "
-          "pixels. Curvature is a second derivative, so too little turns tracking "
-          "jitter into stripes that are not there and too much flattens a real beat.",
+          "How far the fitted centreline may sit from each keypoint, in pixels. Too "
+          "little turns tracking jitter into stripes, too much flattens a real beat.",
           {"min": 0.0, "max": 5.0, "step": 0.1}),
      ]),
 
     # -- training the suggester ---------------------------------------------- #
-    ("Suggesting a label",
-     "A classifier trained on your own labels, shown beside the clip and never "
-     "pre-selected. It stays silent until it clears the bars below.",
+    ("Suggestions",
+     "A classifier trained on your labels, shown beside the clip as a suggestion.",
      [
          ("suggest", "enabled", "bool", "suggest labels",
           "Show what a classifier trained on your labels predicts. Displayed only, "
           "never pre-selected.", {}),
          ("suggest", "model", "choice", "classifier",
-          "catboost, the default, handles the lopsided label distribution and NaN "
+          "catboost, the default, handles lopsided label counts and missing values "
           "natively; hist is scikit-learn's HistGradientBoosting.",
           {"options": ["catboost", "hist"]}),
          ("suggest", "feature_groups", "groups", "features the model may use",
           "Which families of measurement the classifier is allowed to see. Groups "
           "that this project cannot compute are disabled with the reason.", {}),
          ("suggest", "min_confidence", "float", "minimum confidence",
-          "A near-uniform posterior is noise with a number attached, and it still "
-          "anchors the annotator. Below this, say nothing.",
+          "Below this confidence nothing is shown. A near-even guess still anchors "
+          "whoever is labelling.",
           {"min": 0.0, "max": 1.0, "step": 0.05}),
          ("suggest", "retrain_every", "int", "retrain every N labels",
           "How many new labels trigger a background refit.", {"min": 1, "max": 1000}),
@@ -312,16 +303,15 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Fixes the cross-validation split and the model fit.", {"min": 0, "max": 10**6}),
      ]),
 
-    ("How the model is fitted",
-     "Hyperparameters, shared by both classifiers so switching model does not "
-     "quietly change the fit as well.",
+    ("Model fitting",
+     "Hyperparameters for the classifier, the same ones for either model.",
      [
          ("suggest", "iterations", "int", "boosting iterations",
-          "More iterations fit harder. 400 is a sensible default for a few hundred "
-          "labelled clips.", {"min": 10, "max": 5000, "step": 50}),
+          "More iterations fit harder. 400 suits a few hundred labelled clips.",
+          {"min": 10, "max": 5000, "step": 50}),
          ("suggest", "depth", "int", "tree depth",
-          "CatBoost trees are symmetric, so depth alone sets the width: 2**depth "
-          "leaves. Past 6 it overfits a hand-labelled set fast.", {"min": 1, "max": 10}),
+          "CatBoost trees are symmetric, so depth sets the width too: 2**depth "
+          "leaves. Past 6 it overfits a hand-labelled set.", {"min": 1, "max": 10}),
          ("suggest", "learning_rate", "float", "learning rate",
           "Smaller learns more slowly and generalises better, given enough "
           "iterations.", {"min": 0.005, "max": 1.0, "step": 0.01, "decimals": 3}),
@@ -329,144 +319,114 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Higher values penalise large leaf values, which helps on small label "
           "sets.", {"min": 0.0, "max": 30.0, "step": 0.5}),
          ("suggest", "balance_classes", "bool", "balance the classes",
-          "Weight the loss by inverse class frequency. Without it the model answers "
-          "a lopsided label set by predicting the dominant state.", {}),
+          "Weight the loss by inverse class frequency, so a lopsided label set does "
+          "not train the model to answer with the common state.", {}),
          ("suggest", "pca_components", "int", "CNN components",
-          "The CNN embeddings are reduced to this many components before they meet "
-          "the labels. Only used when the CNN group is selected.",
+          "CNN embeddings are reduced to this many components before fitting. Only "
+          "used when the CNN group is selected.",
           {"min": 2, "max": 256, "step": 2}),
      ]),
 
-    ("Measuring the model against yourself",
-     "A share of clips that never shows a suggestion and is never trained on, "
-     "so human-vs-model agreement stays measurable on clips the model has not "
-     "seen. This is why a confident model still says nothing on roughly one "
-     "clip in ten.",
+    ("Accuracy check",
+     "Clips held back from the suggester, so its agreement with you stays "
+     "measurable.",
      [
          ("suggest", "audit_fraction", "float", "audit holdout",
-          "Share of clips that never show a suggestion and are never trained on, so "
-          "human-vs-model agreement stays measurable. Set it to 0 to suggest on "
-          "every clip and give up the measure.",
+          "Share of clips that never show a suggestion and are never trained on. 0 "
+          "suggests on every clip and gives up the measure.",
           {"min": 0.0, "max": 0.9, "step": 0.05}),
          ("suggest", "audit_visible", "bool", "say when a clip is held out",
-          "Mark held-out clips on screen instead of just showing nothing. Off by "
-          "default: knowing a clip is being audited can change how carefully it is "
-          "judged, which is the very influence the holdout exists to exclude. Turn "
-          "it on if silent clips are more confusing than that bias is costly.", {}),
+          "Mark held-out clips on screen instead of showing nothing. Off by default, "
+          "since knowing a clip is audited can change how it is judged.", {}),
      ]),
 
-    ("Which clip you are asked about next",
-     "'off' hands clips over in the GUI's shuffled order, so the labelled set "
-     "stays a random sample of the project. Any rule lets the model choose "
-     "instead: fewer labels for the same model, and a labelled set assembled to "
-     "be HARD, so accuracy measured on it reads lower than the truth.",
+    ("Clip order",
+     "Whether the model chooses which clip you are asked about next, and how.",
      [
          ("suggest", "select_rule", "choice", "choose the next clip by",
-          "'off' hands clips over in the GUI's own shuffled order, so the labelled "
-          "set stays a random sample of the project and every number computed over "
-          "it - the class balance, the cross-validated F1 - is a statement about "
-          "your data. Any other value lets the model pick instead: it ranks the "
-          "unlabelled clips by how unsure it is and gives you the ones a label would "
-          "teach it most, which saves your time and makes the labelled set one "
-          "assembled to be HARD, so accuracy measured on it reads lower than the "
-          "truth by an amount nobody can work out afterwards. margin reads the gap "
-          "between the model's top two answers, least_confidence only the top one, "
-          "entropy the whole vector and so mostly its tail.",
+          "'off' hands clips over in the GUI's shuffled order, so the labelled set "
+          "stays a random sample of the project. Any rule lets the model pick the "
+          "clips it is least sure of: fewer labels for the same model, but accuracy "
+          "measured on that set reads low. margin uses the gap between the top two "
+          "answers, least_confidence the top one, entropy the whole vector.",
           {"options_from": _uncertainty_rules}),
          ("suggest", "select_batch_size", "int", "clips per batch",
           "How many clips one ranking pass hands over. Twice 'retrain every N "
-          "labels' by default, so a batch outlives the refit that produced it, and "
-          "big enough that the audit share below is a whole slot rather than "
-          "rounding to no draw at all.", {"min": 1, "max": 1000}),
+          "labels' is a good default, so a batch outlives the refit that made it.",
+          {"min": 1, "max": 1000}),
          ("suggest", "select_audit_share", "autonum", "audit share of a batch",
           "Share of each batch drawn at random from the audit holdout instead of "
-          "being ranked. 'auto' is the audit holdout above, so the labelled audit "
-          "set keeps growing at the rate the project holds audit clips; anything "
-          "else and the one unbiased accuracy in the tool starts describing a "
-          "differently composed sample from the one it names.",
+          "being ranked. 'auto' is the audit holdout above, which keeps the audit "
+          "set growing at the same rate.",
           {"numeric": "float", "min": 0.0, "max": 1.0, "step": 0.05}),
          ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
-          "Two clips of the same track must start this many frames apart before "
-          "both can be in one batch. 'auto' is the clip length: closer than that "
-          "they overlap, which is the same footage judged twice. 0 turns it off.",
+          "Two clips of one track must start this many frames apart to be in the "
+          "same batch. 'auto' is the clip length, so no footage is judged twice. "
+          "0 turns it off.",
           {"min": 0, "max": 100000}),
          ("suggest", "select_target_quota", "int", "labels a class is chased to",
           "Labels a class needs before batch slots go hunting for it. 0 is off, and "
-          "off even with a rule set: filling a rare class deliberately skews the "
-          "label balance, and the reliability gate (Cohen's kappa, the majority "
-          "baseline) is computed against that balance - so a targeted run can turn "
-          "the suggester silent on a model that has not changed.",
+          "the default even with a rule set: chasing a rare class skews the label "
+          "balance the reliability gate is measured against.",
           {"min": 0, "max": 100000}),
          ("suggest", "select_target_rule", "choice", "how a starved class is chased",
           "target_runner_up picks clips where the starved class is the model's "
-          "SECOND choice - the boundary between it and its rival, the only place a "
-          "label moves the decision surface - and fills the class slowly, since many "
-          "come back as the other class. target_confident picks clips the model "
-          "already calls that class: fastest to fill the count, and it only ever "
-          "confirms what the model already believes.",
+          "second choice, which fills slowly but is where a label moves the "
+          "decision. target_confident picks clips the model already calls that "
+          "class: fast, and it only confirms what the model believes.",
           {"options_from": _target_rules}),
      ]),
 
     # -- predicting ---------------------------------------------------------- #
     ("Bulk labelling",
-     "One decision, not nine. The window length, how far the grid steps, how "
-     "many lengths it is scored at and what turns the result back into one "
-     "label per frame all have to agree: a tiling grid needs no decode, while "
-     "overlapping windows and several scales each need one, and several scales "
-     "also need a model fitted on columns that do not scale with the window. "
-     "The project refuses to open on any combination that does not, naming "
-     "whichever key it reached first.",
+     "How the model labels every frame of every track, and how windows become "
+     "bouts.",
      [
          ("predict", "coverage", "choice", "what is scored",
-          "dense lays its own window grid over every frame of every track. manifest "
-          "scores exactly the clips that were cut for annotation, so everything "
-          "between two annotation windows stays unlabelled and unpainted.",
+          "dense lays a window grid over every frame of every track. manifest scores "
+          "only the clips cut for annotation, leaving the gaps between them "
+          "unlabelled.",
           {"options": ["dense", "manifest"]}),
          ("predict", "window_frames", "autonum", "dense window length",
-          "Frames per dense prediction window. 'auto' is min(clip length, stride), "
-          "which only resolves while the clips tile; with overlapping clips write "
-          "the clip length here. Changing it changes what the features MEAN, so a "
-          "length the model was not fitted at is train/serve skew.",
+          "Frames per dense window. Use the length the model was fitted at, since "
+          "another length changes what the features mean. 'auto' is min(clip "
+          "length, stride) and needs the clips to tile.",
           {"min": 1, "max": 100000}),
          ("predict", "window_stride", "autonum", "dense window stride",
-          "How far the dense grid advances. 'auto' follows the window length, which "
-          "tiles. Anything smaller overlaps and needs a decode; anything larger is "
-          "refused, since it leaves unscored gaps.", {"min": 1, "max": 100000}),
+          "How far the dense grid advances. 'auto' matches the window length, which "
+          "tiles. Smaller overlaps and needs a decode; larger leaves unscored gaps "
+          "and is refused.", {"min": 1, "max": 100000}),
          ("predict", "window_scales", "intlist", "extra window lengths",
-          "Every window LENGTH to score at, the dense window length included. Empty "
-          "is the single length above. A shorter scale finds a behaviour too brief "
-          "for one window; a longer one stops a long bout being cut into verdicts "
-          "that disagree. Costs a feature build per scale, needs a decode, and needs "
-          "the length-invariant feature scope below.",
+          "Every window length to score at, the dense length included; empty is that "
+          "one length. A short scale catches a brief behaviour, a long one holds a "
+          "long bout together. Each extra scale needs a decode and the "
+          "length-invariant scope below.",
           {"min": 1, "placeholder": "empty, or 25, 50, 100"}),
          ("suggest", "feature_scope", "choice", "columns the model is fitted on",
-          "all: every column the feature groups selected. length_invariant: only "
-          "the columns whose value does not scale with the window length, which is "
-          "what lets ONE model be scored at several window lengths. It costs real "
-          "signal, so it is opted into. Changing it means retraining.",
+          "all: every column the feature groups produce. length_invariant: only the "
+          "columns that do not scale with the window length, which is what lets one "
+          "model be scored at several lengths. Changing it means retraining.",
           {"options": ["all", "length_invariant"]}),
          ("predict", "decode", "choice", "turn windows into bouts",
           "none: one row per window. min_bout: absorb runs shorter than the floor "
           "below. viterbi: the most likely label sequence under a sticky prior.",
           {"options": ["none", "min_bout", "viterbi"]}),
          ("predict", "min_bout_frames", "int", "shortest bout",
-          "Frames a bout must reach under min_bout. A claim about the ANIMAL: the "
-          "briefest episode you would accept as real. Must be at least 2; 0 and 1 "
-          "exclude nothing.", {"min": 0, "max": 100000}),
+          "Frames a bout must reach under min_bout: the briefest episode you would "
+          "accept as real. Must be at least 2, since 0 and 1 exclude nothing.",
+          {"min": 0, "max": 100000}),
          ("predict", "self_transition", "autonum", "stickiness",
-          "viterbi only: the probability that a frame keeps the previous frame's "
-          "label. 'auto' is 1 - 1/shortest bout, the stickiness whose average run "
-          "is that long. 0 and 1 are both refused.",
+          "viterbi only: the chance a frame keeps the previous frame's label. 'auto' "
+          "is 1 - 1/shortest bout, whose average run is that long. 0 and 1 are both "
+          "refused.",
           {"numeric": "float", "min": 0.001, "max": 0.999, "step": 0.01, "decimals": 3}),
          ("predict", "min_frames", "int", "detections a window needs",
-          "Detections a dense window needs before its features mean anything. 2 is "
-          "the floor at which any motion feature can exist. Not the clip minimum, "
-          "which exists to give an annotator a watchable video.",
+          "Detections a dense window needs before it is scored. 2 is the least any "
+          "motion feature needs.",
           {"min": 1, "max": 100000}),
          ("predict", "save_posteriors", "bool", "keep the per-frame posterior",
           "Write the per-frame posterior beside the predictions. One row per frame "
-          "per track rather than one per window, so it dwarfs predictions.parquet; "
-          "mostly worth keeping while tuning a decode.", {}),
+          "per track, so the file is far larger; useful while tuning a decode.", {}),
      ]),
 
     # -- exporting ----------------------------------------------------------- #
@@ -565,7 +525,7 @@ class ConfigForm(QScrollArea):
             for section, key, kind, label, tip, extra in chosen:
                 dotted = f"{section}.{key}"
                 if dotted in NEEDS_REPREPARE:
-                    tip += ("\n\nChanging this means the clips have to be cut again "
+                    tip += ("\n\nChanging this means cutting the clips again "
                             "(Detect & crop, with 'redo' ticked).")
                 widget = self._make_widget(kind, extra)
                 widget.setToolTip(tip)
@@ -578,8 +538,8 @@ class ConfigForm(QScrollArea):
 
         note = QLabel(
             "Settings marked <b>*</b> describe how the clips were cut. Changing one "
-            "means re-running Detect &amp; crop with 'redo' ticked before it takes "
-            "effect; everything else applies immediately."
+            "takes effect after Detect &amp; crop is re-run with 'redo' ticked; "
+            "everything else applies at once."
         )
         note.setWordWrap(True)
         note.setProperty("role", "muted")
@@ -1066,8 +1026,8 @@ class _IntListField(QWidget):
             if frames < self._min:
                 return None, f"{frames} is below the smallest allowed, {self._min}"
             if frames in out:
-                return None, (f"{frames} is listed twice. Every entry carries the "
-                              "same weight, so a repeat would quietly count double")
+                return None, (f"{frames} is listed twice, and a repeated length "
+                              "would be scored twice")
             out.append(frames)
         return out, ""
 
@@ -1151,9 +1111,9 @@ class _GroupPicker(QWidget):
         usable = [g for g in chosen if not self._available.get(g)]
         if chosen and not usable and self._available:
             self.note.setText(
-                "None of the ticked groups can be computed for this project - "
+                "None of the ticked groups can be computed for this project: "
                 + "; ".join(f"{g} {self._available[g]}" for g in chosen)
-                + ". Training would have no inputs at all."
+                + ". Training would have no inputs."
             )
             self.note.setVisible(True)
         else:
@@ -1541,8 +1501,8 @@ class KeypointEditor(QWidget):
         self.read_button = QPushButton("Read from model file")
         self.read_button.setProperty("accent", "true")
         self.read_button.setToolTip(
-            "Load the checkpoint and take the count from it. The model is the "
-            "authority on how many; the names are yours to choose."
+            "Read the number of keypoints from the checkpoint. The names are yours "
+            "to choose."
         )
         self.read_button.clicked.connect(self.count_requested)
 
@@ -1569,9 +1529,9 @@ class KeypointEditor(QWidget):
         order_note = QLabel(
             "<b>Order matters, names do not.</b> The pose features read keypoints by "
             "position: <b>0</b> is the head, <b>1</b> the base (the body-frame origin), "
-            "and <b>1</b> onwards the flagellum chain. A model that predicts them in a "
-            "different order will still produce body-length and beat numbers, and they "
-            "will be meaningless."
+            "and <b>1</b> onwards the flagellum chain. A model that predicts them in "
+            "another order still gives body-length and beat numbers, but they mean "
+            "nothing."
         )
         order_note.setWordWrap(True)
         order_note.setProperty("role", "muted")
@@ -1606,8 +1566,8 @@ class KeypointEditor(QWidget):
         skeleton_box = QGroupBox("Skeleton (optional)")
         skeleton_layout = QVBoxLayout(skeleton_box)
         hint = QLabel(
-            "Only drawn on screen and written to the SLEAP export. It has no effect "
-            "on detection, tracking or the features."
+            "Only drawn on screen and written to the SLEAP export. It does not "
+            "affect detection, tracking or the features."
         )
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")

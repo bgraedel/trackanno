@@ -38,6 +38,7 @@ and cache belong to the annotation flow and are never touched here.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -51,10 +52,10 @@ from ..annotate.clips import FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrit
 from ..config import Config
 
 __all__ = [
-    "DENSE_FEATURES_FILE", "DENSE_META_COLUMNS", "window_length", "window_stride",
-    "window_scales", "scale_stride", "scale_grid",
-    "window_grid", "plan_dense_windows", "plan_scaled_windows",
-    "build_dense_features", "dense_features_path", "coverage",
+    "DENSE_FEATURES_FILE", "DENSE_META_COLUMNS", "DensePlan", "window_length",
+    "window_stride", "window_scales", "scale_stride", "scale_grid",
+    "window_grid", "plan_dense_windows", "plan_scaled_windows", "plan_windows",
+    "plan_dense_run", "build_dense_features", "dense_features_path", "coverage",
 ]
 
 DENSE_FEATURES_FILE = "dense_clip_features.parquet"
@@ -277,6 +278,33 @@ def plan_scaled_windows(
     return out
 
 
+def _movie_frames(header_frames: int, tracks: pd.DataFrame) -> int:
+    """How many frames the grid spans, given what the header says the movie holds.
+
+    The header's count is what the movie HOLDS; the tracks' last frame is what
+    was actually processed (``prepare.py --limit-frames`` stops early). Take the
+    larger, so the grid covers every detection even if the two disagree.
+    """
+    if tracks.empty:
+        return int(header_frames)
+    return max(int(header_frames), int(tracks["frame"].max()) + 1)
+
+
+def _header_frames(movie_dir: Path) -> int:
+    """What ``cache.json`` says the movie holds, or 0 if it cannot be asked.
+
+    Tolerant where :func:`build_dense_features` is strict, because a plan is
+    drawn over projects that are half prepared and a run is not.
+    """
+    header = movie_dir / HEADER_FILE
+    if not header.exists():
+        return 0
+    try:
+        return int(json.loads(header.read_text(encoding="utf-8"))["movie"]["n_frames"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+
+
 def _dense_clip_id(
     movie_id: str, track_id: int, f_start: int, length: int, base_length: int
 ) -> str:
@@ -371,14 +399,9 @@ def build_dense_features(
     for d in movie_dirs:
         tracks = pd.read_parquet(d / TRACKS_FILE)
         header = json.loads((d / HEADER_FILE).read_text(encoding="utf-8"))
-        # The header's frame count is what the movie holds; the tracks' last
-        # frame is what was actually processed (prepare.py --limit-frames stops
-        # early). Take the larger, so the grid covers every detection even if the
-        # two disagree.
-        n_frames = int(header["movie"]["n_frames"])
-        if not tracks.empty:
-            n_frames = max(n_frames, int(tracks["frame"].max()) + 1)
-        windows = plan_scaled_windows(tracks, n_frames, grid)
+        windows = plan_scaled_windows(
+            tracks, _movie_frames(header["movie"]["n_frames"], tracks), grid
+        )
         for spans in windows.values():
             total += len(spans)
             for _, _, scale in spans:
@@ -605,6 +628,109 @@ def _summary(
 
 
 # --------------------------------------------------------------------------- #
+# saying what it will be, before it is
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class DensePlan:
+    """The grid this config resolves to, counted before any of it is built.
+
+    Every number is measured off ``tracks.parquet``, never estimated:
+    ``n_windows`` is the row count :func:`build_dense_features` produces, and
+    ``windows_per_frame`` is what :func:`coverage` reports over the same plan.
+    ``n_windows`` is 0 when nothing is prepared yet, and the two coverage fields
+    are then ``nan`` and 0.
+
+    ``length`` and ``stride`` are the BASE grid; ``grid`` is every
+    ``(length, stride)`` pair the run lays down, base first, which is the same
+    thing whenever ``predict.window_scales`` is empty.
+    """
+
+    length: int
+    stride: int
+    grid: tuple[tuple[int, int], ...]
+    n_movies: int
+    n_windows: int
+    detected_frames: int
+    uncovered: int
+    windows_per_frame: float
+    windows_per_frame_max: int
+
+
+def plan_windows(cfg: Config) -> pd.DataFrame:
+    """Every window a dense run would score, without measuring one.
+
+    The same grid :func:`build_dense_features` lays down, planned from
+    ``tracks.parquet`` and the frame count alone, so ``len`` of this IS that
+    run's row count rather than an approximation of it. The columns are the four
+    :func:`coverage` reads, plus the scale each window belongs to.
+
+    Cheap next to the run - no pixels, no features, no model - but it is still
+    one parquet read per movie, so a caller on a UI thread has to move it off.
+    """
+    columns = ["movie_id", "track_id", "f_start", "f_end", "scale"]
+    work = cfg.paths.work_dir
+    if not work.exists():
+        return pd.DataFrame(columns=columns)
+    grid = scale_grid(cfg)
+    rows: list[dict] = []
+    movie_dirs = sorted(
+        p for p in work.iterdir() if p.is_dir() and (p / TRACKS_FILE).exists()
+    )
+    for d in movie_dirs:
+        # Two columns, because that is all the plan is built from; the feature
+        # build reads the rest.
+        tracks = pd.read_parquet(d / TRACKS_FILE, columns=["track_id", "frame"])
+        windows = plan_scaled_windows(
+            tracks, _movie_frames(_header_frames(d), tracks), grid
+        )
+        rows.extend(
+            {"movie_id": d.name, "track_id": int(track_id), "f_start": int(f_start),
+             "f_end": int(f_end), "scale": int(scale)}
+            for track_id in sorted(windows)
+            for f_start, f_end, scale in windows[track_id]
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def plan_dense_run(cfg: Config) -> DensePlan:
+    """What a dense labelling run under this config would cover, and at what size.
+
+    ``predict.window_frames``, ``window_stride`` and ``window_scales`` each move
+    these numbers and none of them states one, so the size of a run is otherwise
+    only learnt by starting it. Halving the stride roughly doubles ``n_windows``,
+    and ``n_windows`` is what the cost tracks.
+
+    :func:`coverage` does the counting, over the plan instead of over a finished
+    table: it is the one place that knows how many windows reach a frame, and
+    the answer is mode-dependent (1 while the grid tiles, about
+    ``length / stride`` under overlap, times the number of scales).
+    """
+    plan = plan_windows(cfg)
+    grid = tuple((int(scale), int(step)) for scale, step in scale_grid(cfg))
+    length, stride = window_length(cfg), window_stride(cfg)
+    if plan.empty:
+        return DensePlan(length, stride, grid, 0, 0, 0, 0, float("nan"), 0)
+    reach = coverage(cfg, plan)
+    detected = int(reach["detected_frames"].sum())
+    # Per movie, mean x detected is that movie's total hits, so the weighted mean
+    # is the project's. A movie with no detections contributes nan x 0.
+    hits = float(
+        (reach["windows_per_frame_mean"].fillna(0.0) * reach["detected_frames"]).sum()
+    )
+    return DensePlan(
+        length=length,
+        stride=stride,
+        grid=grid,
+        n_movies=int(plan["movie_id"].nunique()),
+        n_windows=int(len(plan)),
+        detected_frames=detected,
+        uncovered=int(reach["uncovered"].sum()),
+        windows_per_frame=hits / detected if detected else float("nan"),
+        windows_per_frame_max=int(reach["windows_per_frame_max"].max()),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # checking it
 # --------------------------------------------------------------------------- #
 def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
@@ -620,8 +746,9 @@ def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
     refuses. ``uncovered`` is a bug either way: a detected frame no window speaks
     for comes back unlabelled and unpainted.
 
-    Called by ``tests/test_dense_grid.py``, because a grid that quietly stops
-    covering everything shows up as a missing row rather than as an error.
+    Called by :func:`plan_dense_run` over a plan and by ``tests/test_dense_grid.py``
+    over a built one, because a grid that quietly stops covering everything shows
+    up as a missing row rather than as an error.
     """
     out = []
     for movie_id, group in frame.groupby("movie_id", sort=True):

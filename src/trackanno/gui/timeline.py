@@ -165,13 +165,12 @@ class Resolution:
             return (
                 "A boundary is resolved to the window grid, not to the frame: "
                 "about a quarter of the window stride out on average and half of "
-                f"it at worst. {self.provenance}, so that cannot be said in "
-                "frames here and no band is drawn - the edges below are sharper "
-                "than the method is."
+                f"it at worst. {self.provenance}, so no band is drawn and the "
+                "edges below look sharper than they are."
             )
         out = (
             f"Boundaries are resolved to the {self.stride}-frame window stride, "
-            f"not to the frame: {self.mean_error:.1f} frames out on average and "
+            f"not to the frame: {self.mean_error:.1f} frames out on average, "
             f"{self.worst_error:.0f} at worst, measured against a planted "
             f"transition. The band at each edge is that worst case. {self.provenance}."
         )
@@ -181,9 +180,7 @@ class Resolution:
             out += (
                 f" This run scored at {len(self.scales)} window lengths "
                 f"({listed}), and the band is the COARSEST grid's: a boundary is "
-                "no better placed than the widest window that voted on it, and a "
-                "band drawn at the finest grid would claim the short windows had "
-                "the long ones' agreement."
+                "no better placed than the widest window that voted on it."
             )
         return out
 
@@ -250,8 +247,8 @@ def measure_stride(cfg: Config) -> Resolution:
     where = f"Measured from the window grid in {path.name}"
     if rebuilt:
         where += (
-            ", which was rebuilt after these predictions were written - so it may "
-            "not be the grid they came off"
+            ", rebuilt after these predictions were written, so it may not be the "
+            "grid they came off"
         )
     return Resolution(max(grids.values()), where, scales)
 
@@ -413,10 +410,9 @@ class PredictionReader:
         if not track.bouts:
             track.edit_problem = (
                 "these rows are fixed windows off a grid, not decoded bouts. A "
-                "window's edges are multiples the predictor chose, so moving one "
-                "corrects nothing about the animal - and a window relabelled by "
-                "hand is a clip label, which belongs in annotations.csv. Set "
-                "predict.decode and label again to get bouts."
+                "window's edges are multiples the predictor chose, and a window "
+                "relabelled by hand is a clip label, which belongs in "
+                "annotations.csv. Set predict.decode and label again to get bouts."
             )
             return
         store = self.corrections
@@ -585,18 +581,17 @@ def caption_lines(
     lines: list[str] = []
     if track.bouts:
         lines.append(
-            "Each bar is one decoded bout - a run of frames between two inferred "
+            "Each bar is one decoded bout: a run of frames between two inferred "
             "behavioural boundaries. Bar height is the bout's mean posterior for "
             "its own class, so a marginal bout is a short bar, not a pale one."
         )
         lines.append(resolution.sentence())
     else:
         lines.append(
-            f"This file holds {track.unit}: fixed-length windows off the grid the "
-            "predictor laid down, NOT decoded bouts. Every edge below is a "
-            "multiple of the window length and says nothing about when the "
-            "animal changed what it was doing. Set predict.decode in the config "
-            "and label again to cut bouts."
+            f"This file holds {track.unit}: fixed-length windows off the "
+            "predictor's grid, NOT decoded bouts. Every edge below is a multiple "
+            "of the window length, not a moment the animal changed. Set "
+            "predict.decode and label again to cut bouts."
         )
 
     hand = [s for lane in track.lanes.values() for s in lane
@@ -605,27 +600,27 @@ def caption_lines(
         lines.append(
             f"{len(hand)} span(s) are hatched: they overlap frames you labelled "
             "by hand, which trained this model, so agreement there is not "
-            "evidence about it. The fraction is the union over every predicted "
-            "group's labels, so it over-reports for any one of them."
+            "evidence about it. The fraction covers every predicted group at "
+            "once, so it over-reports for any one of them."
         )
 
     thin = [s for lane in track.lanes.values() for s in lane
             if np.isfinite(s.n_covering) and s.n_covering < 2.0]
     if thin:
         lines.append(
-            f"{len(thin)} span(s) rest on fewer than two windows per frame. Near "
-            "a track's ends only one window reaches, so the posterior there is a "
-            "single window's opinion rather than an average of several."
+            f"{len(thin)} span(s) rest on fewer than two windows per frame: near "
+            "a track's ends only one window reaches, so the posterior there is "
+            "one window's opinion."
         )
 
     if track.partitions:
         corrected = track.n_corrected
         lines.append(
             "The lower lane of each pair is THE RECORD: the model's bouts with "
-            "your corrections laid over them. A corrected span is filled solid "
-            "and outlined; a span still the model's is faded and dashed. The "
-            "record lane carries no bar height, because what is now asserted "
-            "about a stretch of frames is not a posterior over it."
+            "your corrections over them. A corrected span is filled solid and "
+            "outlined, a span still the model's is faded and dashed. The record "
+            "lane has no bar height, because what a person asserts about a "
+            "stretch of frames is not a posterior over it."
         )
         lines.append(
             f"{corrected} span(s) on this track are yours." if corrected else
@@ -634,27 +629,22 @@ def caption_lines(
         )
         if corrected:
             lines.append(
-                "A boundary you placed is drawn as a hairline and a boundary the "
-                "decode placed keeps its band: yours is exact to the frame you "
-                "chose, and only the decode's is uncertain to the window stride. "
-                "That is a statement about where the number came from, not about "
-                "whether you were right."
+                "A boundary you placed is a hairline, one the decode placed keeps "
+                "its band: yours is exact to the frame you chose, and only the "
+                "decode's is uncertain to the window stride."
             )
     if track.orphans:
         lines.append(
             f"{len(track.orphans)} saved correction(s) cover frames these "
-            "predictions have no row for - the run that wrote them decoded a "
-            "different span. They are kept in bout_corrections.csv and are not "
-            "drawn; nothing has been deleted."
+            "predictions have no row for, because the run that wrote them decoded "
+            "a different span. They stay in bout_corrections.csv and are not drawn."
         )
     if track.partly_shown:
         listed = ", ".join(f"{c.f_start}-{c.f_end}" for c in track.partly_shown[:4])
         lines.append(
             f"{len(track.partly_shown)} saved correction(s) reach past what these "
             f"predictions cover ({listed}) and are drawn cut short at frame "
-            f"{track.f_lo} or {track.f_hi}. The file keeps their real ends: "
-            "clipping is how they are DRAWN, never how they are saved, so a "
-            "re-run over a shorter span costs a picture and not a judgement."
+            f"{track.f_lo} or {track.f_hi}. The file keeps their real ends."
         )
     if track.edit_problem and not track.empty:
         lines.append(f"Not correctable here: {track.edit_problem}")
@@ -662,14 +652,12 @@ def caption_lines(
     if min_confidence > 0 and track.bouts:
         lines.append(
             f"The dashed line is suggest.min_confidence ({min_confidence:g}), the "
-            "bar this project already applies before showing a suggestion to an "
-            "annotator."
+            "bar this project applies before showing a suggestion."
         )
     if track.bouts and not has_trace:
         lines.append(
             "predict.save_posteriors was off for this run, so the per-frame "
-            "posterior each bar is the mean of is not on disk and only the mean "
-            "is drawn."
+            "posterior behind each bar is not on disk and only the mean is drawn."
         )
     return lines
 
@@ -853,8 +841,8 @@ class BoutTimeline(QWidget):
         return (
             f"No {self.track.unit or 'predicted rows'} for track "
             f"{self.track.track_id} of {self.track.movie_id}.\n\n"
-            "That is a normal outcome, not an error: a track the model could not "
-            "be given a single featurisable window over gets no row at all."
+            "That is normal, not an error: a track with no featurisable window "
+            "over it gets no row at all."
         )
 
     def _paint_lane(self, painter, t, group, segments, y, gutter, scale) -> None:
@@ -1196,8 +1184,8 @@ class BoutTimeline(QWidget):
             if segment.human_frac > 0:
                 lines.append(
                     f"{100 * segment.human_frac:.0f}% of these frames were labelled "
-                    "by hand and trained this model, so agreement here is not a "
-                    "measurement of it (the fraction unions every predicted group)"
+                    "by hand and trained this model, so agreement here measures "
+                    "nothing (the fraction covers every predicted group)"
                 )
             else:
                 lines.append("no hand-labelled frames overlap this span")
@@ -1229,15 +1217,14 @@ class BoutTimeline(QWidget):
         ]
         if span.corrected:
             lines.append(
-                "asserted by a person. This is not a measurement and carries no "
-                "confidence; the model's own answer for these frames is the lane "
-                "above, unchanged."
+                "asserted by a person, so it carries no confidence. The model's "
+                "own answer for these frames is the lane above, unchanged."
             )
         elif span.label:
             lines.append(
-                "the model's, uncorrected. Where it has been cut short by a "
-                "correction beside it, the confidence in the lane above is still "
-                "the mean over the WHOLE bout it came from, not over this part."
+                "the model's, uncorrected. Where a correction has cut it short, "
+                "the confidence in the lane above is still the mean over the whole "
+                "bout it came from."
             )
         else:
             lines.append(
@@ -2072,14 +2059,14 @@ class TrackFootage(QWidget):
         return (
             "Every frame is cut from the movie, never from the clip cache: the "
             "cache is cut per movie and centred per annotation window, so a "
-            "picture taken from both changes size and centring wherever a "
-            "window runs out.\n\n"
+            "picture taken from both would change size and centring wherever a "
+            "window ran out.\n\n"
             f"The crop is {crop.source if crop else 'not measured yet'}. It "
-            "follows a moving average of the track over the whole track, so a "
-            "frame is cut the same way in every read, and the view re-centres "
-            "on the animal every frame.\n\n"
+            "follows a moving average over the whole track, so a frame is cut the "
+            "same way in every read, and the view re-centres on the animal every "
+            "frame.\n\n"
             "The normalisation and the marker are the annotation window's. The "
-            "crop and the view are not, and those are the only two differences."
+            "crop and the view are the only two differences."
         )
 
     def clear(self, reason: str = "") -> None:
@@ -2214,9 +2201,8 @@ class BoutReviewPanel(QWidget):
 
         self.apply_button = QPushButton("Set class")
         self.apply_button.setToolTip(
-            "Assert that these frames are this class. Every other gesture here - "
-            "moving a boundary, splitting a bout, merging two - is this same "
-            "assertion over a different range."
+            "Record that these frames are this class. Moving a boundary, splitting "
+            "a bout and merging two are the same thing over a different range."
         )
         self.apply_button.clicked.connect(self._on_apply)
         self.merge_left = QPushButton("Merge into previous")
@@ -2234,8 +2220,7 @@ class BoutReviewPanel(QWidget):
         self.derive_button = QPushButton("Derived labels...")
         self.derive_button.setToolTip(
             "Show which annotation windows these corrections would label, and "
-            "which straddle a boundary and cannot be labelled at all. Writes "
-            "nothing."
+            "which straddle a boundary and cannot be labelled. Writes nothing."
         )
         self.derive_button.clicked.connect(self._on_derive)
 
@@ -2468,8 +2453,8 @@ class BoutReviewPanel(QWidget):
             return (
                 f"{group} is a multi-select group: one of its predictions is a "
                 "COMBINATION of options, not one of them, and this control can "
-                "only assert a single class. Correcting a multi-select group is "
-                "not built rather than half built."
+                "only set a single class. Correcting a multi-select group is not "
+                "supported."
             )
         return ""
 
@@ -2521,9 +2506,8 @@ class BoutReviewPanel(QWidget):
         if not source.label:
             self.status.setText(
                 f"frames {source.f_start}-{source.f_end} have no class: no window "
-                "over them could be featurised. Dragging a boundary into them "
-                "would spread 'nothing scored this' over frames something did - "
-                "set a class over the range instead."
+                "over them could be featurised. Set a class over the range instead "
+                "of dragging a boundary into it."
             )
             return
         self.status.setText(self.assert_class(f_start, f_end, source.label, group))
@@ -2559,7 +2543,7 @@ class BoutReviewPanel(QWidget):
         if not other.label:
             self.status.setText(
                 f"frames {other.f_start}-{other.f_end} have no class: nothing could "
-                "score them, and merging into them would assert that nothing can"
+                "score them, so there is nothing to merge into"
             )
             return
         self.status.setText(
@@ -2589,8 +2573,8 @@ class BoutReviewPanel(QWidget):
             # class the config has since dropped, because that row records what
             # a person judged. Only a NEW judgement is refused.
             return (
-                f"{group} declares no class called {str(label)!r}, so a correction "
-                "to it could not be coloured, trained on or exported. Add it to "
+                f"{group} declares no class called {str(label)!r}, so nothing else "
+                "in the project could colour, train on or export it. Add it to "
                 "config.yaml first, or pick one of: "
                 + ", ".join(o.name for o in spec.options)
             )
@@ -2670,9 +2654,9 @@ class BoutReviewPanel(QWidget):
             self, "Delete corrections",
             f"Delete all {len(saved)} correction(s) on track {track.track_id} of "
             f"{track.movie_id} ({group})?\n\nThe model's own bouts come back. "
-            "Nothing else is changed and no prediction is rewritten."
+            "Nothing else changes and no prediction is rewritten."
             + (f"\n\n{unseen} of them cover frames these predictions have no row "
-               "for, so they are not on the timeline - they are deleted too."
+               "for, so they are not on the timeline. They are deleted too."
                if unseen else ""),
         )
         if answer != QMessageBox.Yes:

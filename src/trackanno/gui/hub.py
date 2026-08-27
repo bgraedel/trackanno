@@ -29,7 +29,7 @@ from qtpy.QtWidgets import (
     QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from ..annotate.clips import MANIFEST_FILE, ClipStore
+from ..annotate.clips import MANIFEST_FILE, TRACKS_FILE, ClipStore
 from ..config import ConfigError, load_config
 from ..project import (
     CONFIG_NAME, _exists, config_path_for, create_project, project_status, recent_projects,
@@ -1538,6 +1538,134 @@ class AnnotatePage(Page):
 # --------------------------------------------------------------------------- #
 # 5. model
 # --------------------------------------------------------------------------- #
+def _headline(message: str) -> str:
+    """The claim a refusal opens with. Everything after it is the argument for it.
+
+    ConfigError writes a paragraph, because whoever hits it in a traceback needs
+    the whole case and the two coherent answers. A status line has room for the
+    sentence that names the keys, and the window has already shown the rest in
+    the dialog that refused to open the project.
+    """
+    stripped = str(message).strip()
+    if not stripped:
+        return ""
+    first = stripped.splitlines()[0].strip()
+    head, sentence_end, _rest = first.partition(". ")
+    return f"{head}." if sentence_end else first
+
+
+def _and_list(items) -> str:
+    """a / a and b / a, b and c."""
+    items = [str(i) for i in items]
+    if len(items) < 2:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _grid_phrase(grid) -> str:
+    """How the windows are laid out, one clause per window LENGTH.
+
+    Several scales walk their own grids at their own strides, so one stride
+    cannot speak for all of them; the clauses are joined instead. Named per
+    scale only where the strides differ from a tiling, which is the case a
+    single number would misreport.
+    """
+    if len(grid) == 1:
+        length, stride = grid[0]
+        if stride >= length:
+            return f"{length}-frame windows, tiled"
+        if stride == 1:
+            return f"{length}-frame windows starting on every frame"
+        return f"{length}-frame windows every {stride} frames"
+    if all(stride >= length for length, stride in grid):
+        return f"{_and_list(length for length, _ in grid)}-frame windows, each tiled"
+    return _and_list(
+        f"{length}-frame windows " + (
+            "on every frame" if stride == 1 else f"every {stride} frames")
+        for length, stride in grid
+    )
+
+
+def predict_plan_line(config_path) -> str:
+    """What "Label all clips with the model" would do under the settings on disk.
+
+    Five keys constrain each other - ``predict.coverage``, ``window_frames``,
+    ``window_stride``, ``window_scales`` and ``decode`` - and none of them says
+    on its own how finely the run scores or how much of it there is. This does,
+    exactly: the counts come from
+    :func:`trackanno.infer.densepredict.plan_dense_run`, which lays the real grid
+    over the real tracks.
+
+    Read from the FILE rather than from the open Config, because a config that no
+    longer loads has no plan at all: it gets the refusal's headline instead, and
+    a plan drawn from the previous values would describe a run that cannot start.
+
+    Never a wall time. That depends on the machine and on the movies, neither of
+    which this has measured; the window count is what the cost tracks.
+    """
+    from ..infer.densepredict import plan_dense_run
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:
+        # ConfigError carries a message written for exactly this pairing of keys,
+        # and a YAML syntax error is the same news to whoever has to fix the file.
+        return f"these settings will not load: {_headline(exc)}"
+
+    if cfg.predict.coverage != "dense":
+        return _manifest_plan_line(cfg)
+
+    plan = plan_dense_run(cfg)
+    grid = _grid_phrase(plan.grid)
+    if not plan.n_windows:
+        return f"{grid}. Nothing is prepared yet, so there is nothing to plan over."
+
+    parts = [
+        f"{grid}.",
+        ("One window per frame" if plan.windows_per_frame_max == 1
+         else f"{plan.windows_per_frame:.1f} windows per frame on average")
+        + f", {plan.n_windows:,} in this project.",
+    ]
+    if cfg.predict.decode == "min_bout":
+        parts.append(
+            f"Decoded into bouts of at least {cfg.predict.min_bout_frames} frames."
+        )
+    elif cfg.predict.decode == "viterbi":
+        # A prior, not a floor: self_transition sets the MEAN run length, so the
+        # line says "around" and the decode may still cut a shorter bout.
+        stay = cfg.predict.resolved_self_transition()
+        parts.append(
+            f"Viterbi decoded, favouring bouts around {1 / (1 - stay):.0f} frames."
+        )
+    if plan.uncovered:
+        parts.append(f"{plan.uncovered:,} detected frame(s) reach no window.")
+    return " ".join(parts)
+
+
+def _manifest_plan_line(cfg) -> str:
+    """The other coverage: the clips cut for annotation, and the holes between them.
+
+    A manifest run scores ``clip_features.parquet``, one row per clip, so the
+    count is that table's length. Absent, the sentence drops the number rather
+    than guessing at it from the manifests.
+    """
+    import pandas as pd
+
+    from ..measure.clipfeatures import CLIP_FEATURES_FILE
+
+    try:
+        rows = pd.read_parquet(
+            cfg.paths.work_dir / CLIP_FEATURES_FILE, columns=["clip_id"]
+        )
+        count = f"{len(rows):,} "
+    except (OSError, ValueError, KeyError):
+        count = ""
+    return (
+        f"Scoring the {count}annotation clips only, so frames between two clips "
+        "stay unlabelled. predict.coverage: dense lays a grid over every frame."
+    )
+
+
 class ModelPage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
@@ -1575,7 +1703,15 @@ class ModelPage(Page):
         # Labelling everything shares the task panel below; only the gate differs.
         self._job = "train"
         self._predict_blocker = "no project open"
+        self._predict_state = "no project open"
         self._predict_summary = ""
+        # The plan the config resolves to, stated before the run. Built on a
+        # worker - it reads tracks.parquet per movie - and cached against the
+        # files it read, because a project reload happens on every autosave.
+        self._plan_line = ""
+        self._plan_key: tuple | None = None
+        self._plan_runner: TaskRunner | None = None
+        self._closing = False
         self.predict_button = QPushButton("Label all clips with the model")
         self.predict_button.setEnabled(False)
         self.predict_button.setToolTip(
@@ -1585,6 +1721,12 @@ class ModelPage(Page):
         self.predict_button.clicked.connect(self._label_all)
         self.predict_note = _muted(QLabel(""))
         self.predict_note.setWordWrap(True)
+        self.predict_note.setToolTip(
+            "What the settings on the Configure page resolve to: how long each "
+            "prediction window is, how far apart the windows start, how many of "
+            "them speak for one frame, and how many there are in this project. "
+            "Halving predict.window_stride roughly doubles that count."
+        )
 
         # The only gate reviewing needs is the file: a run whose model has since
         # been gated off still wrote rows somebody has to be able to look at.
@@ -1656,26 +1798,111 @@ class ModelPage(Page):
             self._review.panel.set_config(self.cfg)
 
     def _refresh_predict_gate(self) -> None:
-        """Re-read whether any group cleared the reliability bar. Only from
-        :meth:`on_project` and when a job finishes - never from
+        """Re-read whether any group cleared the reliability bar, and re-plan.
+        Only from :meth:`on_project` and when a job finishes - never from
         :meth:`refresh_gate`, which runs on the annotation keystroke path."""
         if self.cfg is None:
             self._predict_blocker = "no project open"
             self._has_predictions = False
+            # A project that failed to LOAD is explained by the plan line below,
+            # which carries the refusal; "no project open" would bury it.
+            self._predict_state = "" if self._plan_source() else self._predict_blocker
         else:
             from ..infer.predict import prediction_blocker, predictions_path, staleness
 
             self._predict_blocker = prediction_blocker(self.cfg)
             self._has_predictions = predictions_path(self.cfg).exists()
+            self._predict_state = self._predict_blocker
             if not self._predict_blocker and self._has_predictions:
                 stale = staleness(self.cfg)
-                self.predict_note.setText(
+                self._predict_state = (
                     f"predictions.parquet exists but {stale}" if stale
                     else "predictions.parquet is up to date; the Export page can "
                          "colour movies by it"
                 )
-                return
-        self.predict_note.setText(self._predict_blocker)
+        self._paint_predict_note()
+        self._plan_preview()
+
+    def _paint_predict_note(self) -> None:
+        """Where the run stands, then what it would do. Either may be empty."""
+        self.predict_note.setText(
+            "\n".join(line for line in (self._predict_state, self._plan_line) if line)
+        )
+
+    # -- what the settings resolve to ---------------------------------------- #
+    def _plan_source(self) -> Path | None:
+        """The config to plan from: the open one, or the one that would not open.
+
+        A refusal is precisely the case with no Config to read, and it is the one
+        this line most has to explain, so the hub's last attempted path stands in.
+        """
+        if self.cfg is not None:
+            return self.cfg.path
+        return getattr(self.hub, "config_path", None)
+
+    def _plan_fingerprint(self, path: Path) -> tuple:
+        """Everything the plan is read from: the config's CONTENT, and every
+        tracks.parquet by name and stamp.
+
+        Content rather than a timestamp because two saves inside one clock tick
+        share an mtime on Windows, and the second one is exactly the edit this
+        line exists to report. Costs one small read that ``load_config`` has just
+        made anyway. An empty tuple means the project moved under us mid-answer.
+        """
+        import hashlib
+
+        try:
+            work = self.cfg.paths.work_dir if self.cfg is not None else None
+            tracks = sorted(work.glob(f"*/{TRACKS_FILE}")) if work is not None else []
+            stamps = [(str(p), p.stat()) for p in tracks]
+            return (
+                hashlib.blake2b(path.read_bytes(), digest_size=16).digest(),
+                tuple((name, s.st_mtime_ns, s.st_size) for name, s in stamps),
+            )
+        except OSError:
+            return ()
+
+    def _plan_preview(self) -> None:
+        """State the plan off the UI thread, once per change of the files it reads."""
+        if self._closing:
+            return
+        path = self._plan_source()
+        if path is None:
+            self._plan_key, self._plan_line = None, ""
+            self._paint_predict_note()
+            return
+        key = self._plan_fingerprint(path)
+        if key == self._plan_key or (
+            self._plan_runner is not None and self._plan_runner.isRunning()
+        ):
+            return
+        self._plan_key = key
+
+        def work(reporter):
+            reporter.raise_if_cancelled()
+            return predict_plan_line(path)
+
+        runner = TaskRunner(work, self)
+        runner.succeeded.connect(self._on_plan_line)
+        runner.failed.connect(lambda message: self._on_plan_line(
+            f"could not work out what these settings would do: {message}"))
+        runner.finished.connect(self._on_plan_finished)
+        runner.finished.connect(runner.deleteLater)
+        self._plan_runner = runner
+        # A previous answer stays up while this one is worked out; only the first
+        # pass has nothing to show.
+        if not self._plan_line:
+            self._on_plan_line("working out what these settings would do...")
+        runner.start()
+
+    def _on_plan_line(self, line: str) -> None:
+        self._plan_line = str(line)
+        self._paint_predict_note()
+
+    def _on_plan_finished(self) -> None:
+        # The config may have been saved again while this one was in flight.
+        self._plan_runner = None
+        self._plan_preview()
 
     def _count_orphans(self) -> None:
         """How many labels point at a clip_id the cache no longer has. Cheap on
@@ -1929,6 +2156,7 @@ class ModelPage(Page):
         self._load_report()      # the report is HTML built from theme colours
 
     def shutdown(self) -> None:
+        self._closing = True
         self.tasks.shutdown()
         # A dialog parented to this page outlives it otherwise, and it holds a
         # Config and two loaded parquet tables belonging to a project that is
@@ -1937,12 +2165,12 @@ class ModelPage(Page):
             self._review.close()
             self._review.deleteLater()
             self._review = None
-        # Wait for it: a QThread still running at teardown aborts the process.
-        runner = self._repair_runner
-        if runner is not None:
-            runner.cancel()
-            runner.wait(5000)
-            self._repair_runner = None
+        # Wait for them: a QThread still running at teardown aborts the process.
+        for runner in (self._repair_runner, self._plan_runner):
+            if runner is not None:
+                runner.cancel()
+                runner.wait(5000)
+        self._repair_runner = self._plan_runner = None
 
     def _load_report(self) -> None:
         if self.cfg is None:
@@ -2462,6 +2690,9 @@ class Hub(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(1280, 860)
         self.cfg = None
+        # The config.yaml last opened, whether or not it loaded. A page that has
+        # to explain a refusal needs the file, and `cfg` is None exactly then.
+        self.config_path: Path | None = None
         self.status = None
         # Set while a job is rewriting the clip cache: release_caches() runs once,
         # before the worker, so this is what stops Annotate re-mapping those files.
@@ -2556,6 +2787,7 @@ class Hub(QMainWindow):
             if not quiet:
                 QMessageBox.warning(self, "Not found", f"No {CONFIG_NAME} at {path}")
             return False
+        self.config_path = path
         try:
             self.cfg = load_config(path)
         except Exception as exc:  # a broken config must not take the window down
