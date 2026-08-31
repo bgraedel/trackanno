@@ -491,12 +491,14 @@ def _pose(
         if turn.size:
             out["body_rotation_speed"] = _safe(np.nanmean(np.abs(turn)) / dt)
 
-    # Compacted, not gridded, and therefore gap-bridging: the unwrap walks
-    # consecutive samples, so a NaN in the middle would end it there and leave
-    # the rest of the window on a different 2*pi branch.
+    # Same discipline as body_rotation_speed: unwrap on the gap-filled grid so
+    # a gap does not fold the branch, then keep only steps whose BOTH endpoints
+    # were really detected, so no bridged rotation reaches the rate.
     tip = win["tip_ang"]
-    tip = tip[np.isfinite(tip)]
-    if tip.size >= 8:
-        tip = np.unwrap(tip)
-        out["tip_angle_std"] = _safe(np.std(tip))
-        out["tip_angular_speed"] = _safe(np.mean(np.abs(np.diff(tip))) / dt)
+    tip_valid = np.isfinite(tip)
+    if tip_valid.sum() >= 8:
+        ang = np.unwrap(_interp_nan(tip[:, None])[:, 0])
+        out["tip_angle_std"] = _safe(np.std(ang[tip_valid]))
+        step = np.diff(ang)[tip_valid[1:] & tip_valid[:-1]]
+        if step.size:
+            out["tip_angular_speed"] = _safe(np.mean(np.abs(step)) / dt)

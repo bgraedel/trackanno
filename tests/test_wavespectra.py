@@ -379,6 +379,48 @@ def test_beat_stability() -> None:
           f"{wander['wave_freq_drift_hz'].median():.3f}")
 
 
+def test_stability_is_undefined_when_every_window_is_censored() -> None:
+    """A beat that wanders entirely below the floor is unmeasured, not steady.
+
+    Every censored window reports the band edge, and the band edge does not
+    move. Feeding those numbers to the spread makes the wildest cell in the
+    dish the steadiest thing in the table: sd 0.0, drift 0.0, both perfectly
+    confident and both about the estimator rather than the cell.
+    """
+    n, window, hop = 500, 75, DEFAULT_HOP
+    t = np.arange(n) / FPS
+    # 1 to 3 Hz, against a 3 / 0.75 = 4 Hz floor: a real beat, wandering by a
+    # factor of three, with not one window able to resolve it.
+    instantaneous = 2.0 + 1.0 * np.sin(2.0 * np.pi * 0.6 * t)
+    phase = np.cumsum(2.0 * np.pi * instantaneous / FPS)
+    n_seg, length = N_KEYPOINTS - 2, 60.0
+    ds = length / n_seg
+    s_mid = (np.arange(n_seg) + 0.5) * ds
+    psi = np.pi + 0.6 * np.sin(phase[:, None] - (2.0 * np.pi / length) * s_mid[None, :])
+    x = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
+    y = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
+    px = np.zeros((n, N_KEYPOINTS))
+    py = np.zeros((n, N_KEYPOINTS))
+    px[:, 1:], py[:, 1:] = x, y
+    px[:, 0] = 20.0
+    series = spectral_series(px, py, FPS, window, hop)
+
+    measured = series["wave_censored"].dropna()
+    check("the sub-floor beat is measured, and every window of it is censored",
+          len(measured) > 0 and bool((measured == 1.0).all()),
+          f"{len(measured)} usable windows, {float(measured.mean()):.3f} censored")
+    check("each of them reports the floor it ran into, not a frequency",
+          np.isclose(float(series["wave_resolvable_hz"].iloc[0]), 4.0)
+          and np.allclose(series["wave_freq_hz"].dropna(), 4.0),
+          f"got {sorted(set(series['wave_freq_hz'].dropna()))}")
+    check("so the track frequency spread is NaN, not a confident 0.0",
+          bool(series["wave_freq_track_sd_hz"].isna().all()),
+          f"got {sorted(set(series['wave_freq_track_sd_hz'].dropna()))}")
+    check("and the local drift is NaN too",
+          bool(series["wave_freq_drift_hz"].isna().all()),
+          f"got {sorted(set(series['wave_freq_drift_hz'].dropna()))}")
+
+
 def test_window_values() -> None:
     """Reading one annotation window out of the series."""
     px, py = travelling_wave(400, noise_px=0.3, seed=4)

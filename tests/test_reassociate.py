@@ -226,18 +226,77 @@ def test_two_orphans_on_one_clip_are_both_refused() -> None:
     check("two equally close candidates are refused too",
           tie.matched == [] and len(tie.ambiguous) == 1, str(tie))
 
-    # Nudge one candidate a single pixel closer and the tie is broken. Stated so
-    # that "ambiguous" is known to mean equidistant, not merely crowded.
-    broken = plan_reassociation(
+    # Nudge one candidate a single pixel closer and it is still refused: a pixel
+    # is what the crop moves by anyway, so that is not what broke the tie.
+    nudged = plan_reassociation(
         tie_labels,
         make_manifest([manifest_row("MOVIE_A", 40, 0, 91, 100),
                        manifest_row("MOVIE_A", 41, 0, 110, 100)]),
     )
-    check("one pixel of difference resolves it",
+    check("one pixel of difference does not resolve it",
+          nudged.matched == [] and len(nudged.ambiguous) == 1, str(nudged))
+
+    # A lead wider than that movement does resolve it. Stated so that "ambiguous"
+    # is known to mean too close to call, not merely crowded.
+    broken = plan_reassociation(
+        tie_labels,
+        make_manifest([manifest_row("MOVIE_A", 40, 0, 96, 100),
+                       manifest_row("MOVIE_A", 41, 0, 110, 100)]),
+    )
+    check("a lead the crop could not have drifted resolves it",
           len(broken.matched) == 1 and not broken.ambiguous,
           str(broken.matched))
     check("...in favour of the nearer clip",
           broken.matched[0].new_clip_id == clip_id("MOVIE_A", 40, 0))
+
+
+def test_a_lead_shorter_than_the_crops_own_drift_decides_nothing() -> None:
+    """The premise the whole module rests on is that a crop moves a pixel or two
+    between runs. A winner picked by one pixel is therefore picked by that drift,
+    and with a second animal nearby the drift hands the label to the wrong one:
+    here the labelled animal's own crop moved 2 px while a neighbour sits 1 px
+    from where it used to be, and nearest-wins would re-link onto the neighbour,
+    confidently and for good."""
+    from trackanno.annotate.reassociate import plan_reassociation
+
+    labelled = manifest_row("MOVIE_A", 3, 0, 105, 100)
+    same_animal = manifest_row("MOVIE_A", 71, 0, 107, 100)   # 2 px of drift
+    neighbour = manifest_row("MOVIE_A", 72, 0, 104, 100)     # a different animal
+    labels = pd.DataFrame([label_row(labelled, "immotile")])
+
+    plan = plan_reassociation(labels, make_manifest([same_animal, neighbour]))
+    check("the closer clip does not win by a pixel", plan.matched == [],
+          str([(m.new_clip_id, m.distance_px) for m in plan.matched]))
+    check("...the orphan is reported as ambiguous",
+          plan.ambiguous == [labelled["clip_id"]], str(plan.ambiguous))
+    check("...and is not quietly filed as unmatched instead", plan.unmatched == [])
+
+    # 2 px and 5 px from the old centre: a 3 px lead, which the crop cannot have
+    # drifted, so the nearest is a real answer and the runner-up does not block it.
+    separated = plan_reassociation(
+        labels,
+        make_manifest([same_animal, manifest_row("MOVIE_A", 72, 0, 110, 100)]),
+    )
+    check("a runner-up beyond the margin does not block the match",
+          len(separated.matched) == 1 and not separated.ambiguous, str(separated))
+    check("...and the nearest clip is the one taken",
+          separated.matched[0].new_clip_id == clip_id("MOVIE_A", 71, 0))
+
+    # The margin compares rivals; it is not a second threshold on the distance.
+    alone = plan_reassociation(labels, make_manifest([same_animal]))
+    check("a lone candidate inside the radius still matches",
+          len(alone.matched) == 1 and not alone.ambiguous, str(alone))
+    check("...at the distance the plan reports", alone.matched[0].distance_px == 2.0,
+          str(alone.matched[0].distance_px))
+
+    # Turned off, only a bit-exact tie refuses - the caller gets nearest-wins back
+    # rather than an argument the code cannot decide by itself.
+    off = plan_reassociation(labels, make_manifest([same_animal, neighbour]),
+                             min_margin_px=0.0)
+    check("min_margin_px=0 falls back to refusing exact ties only",
+          len(off.matched) == 1 and not off.ambiguous, str(off))
+    check("...and then the nearest clip wins by its pixel",
+          off.matched[0].new_clip_id == clip_id("MOVIE_A", 72, 0))
 
 
 def test_a_clip_that_is_already_labelled_is_not_stolen() -> None:

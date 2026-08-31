@@ -176,6 +176,37 @@ def circular_track(n_frames: int, n_kpts: int, radius: float = 200.0, w: float =
                  12.0, 6.0, n_kpts, f0)
 
 
+def spinning_tip_track(n_frames: int, n_kpts: int, w: float = 0.1, f0: int = 0,
+                       seg: float = 6.0, head_ahead: float = 20.0) -> pd.DataFrame:
+    """The flagellum chain rotating about a fixed Base at ``w`` rad/frame.
+
+    Box, Head and Base are all stationary; only the chain turns. ``tip_ang`` is
+    Base -> most distal node, so it is exactly ``w * i`` and wraps several times
+    over a hundred frames, which is what makes the unwrap load-bearing.
+    """
+    i = np.arange(n_frames, dtype=float)
+    ang = w * i
+    cx, cy = 200.0, 200.0
+    data = {
+        "frame": (f0 + np.arange(n_frames)).astype(np.int32),
+        "track_id": np.full(n_frames, 1, dtype=np.int32),
+        "x1": np.full(n_frames, cx - 40.0, dtype=np.float32),
+        "y1": np.full(n_frames, cy - 40.0, dtype=np.float32),
+        "x2": np.full(n_frames, cx + 40.0, dtype=np.float32),
+        "y2": np.full(n_frames, cy + 40.0, dtype=np.float32),
+        "conf": np.full(n_frames, 0.8, dtype=np.float32),
+        "kp_x_0": np.full(n_frames, cx + head_ahead, dtype=np.float32),
+        "kp_y_0": np.full(n_frames, cy, dtype=np.float32),
+        "kp_c_0": np.full(n_frames, 0.9, dtype=np.float32),
+    }
+    for k in range(1, n_kpts):
+        r = seg * (k - 1)
+        data[f"kp_x_{k}"] = (cx + r * np.cos(ang)).astype(np.float32)
+        data[f"kp_y_{k}"] = (cy + r * np.sin(ang)).astype(np.float32)
+        data[f"kp_c_{k}"] = np.full(n_frames, 0.9, dtype=np.float32)
+    return pd.DataFrame(data)
+
+
 def close(got, expected, tol: float = 1e-6) -> bool:
     return bool(np.isfinite(got)) and abs(float(got) - float(expected)) <= tol
 
@@ -503,6 +534,42 @@ def test_analytic_values_at_every_window(cfg) -> None:
           worst <= 1e-6, f"worst {worst:.3e} on {worst_note}")
     check("analytic: the sweep actually covered several window lengths",
           n_windows >= 40, str(n_windows))
+
+
+def test_tip_rotation_is_not_inflated_by_a_gap(cfg) -> None:
+    """A constant tip rotation reads the same rate across a long gap.
+
+    ``tip_angular_speed`` is a rate, so the frames the tracker lost must cost it
+    samples and nothing else. Compacting the angle before differencing makes the
+    gap one step, the unwrap folds that step into ``(-pi, pi]``, and the rate is
+    read off a rotation that never happened.
+    """
+    if cfg.n_keypoints < 3:
+        return
+    n, w, fps, dt = 100, 0.1, 100.0, 0.01
+    sub = spinning_tip_track(n, cfg.n_keypoints, w)
+    got = aggregate_window(build_series(sub, cfg, fps, 0, n), 0, n, fps, cfg)
+    check("gapless: a constant tip rotation comes back in rad/s",
+          close(got["tip_angular_speed"], w / dt, 1e-4),
+          f"{got['tip_angular_speed']} vs {w / dt}")
+    # Evenly spaced angles, so the spread is w * sd(0..n-1).
+    check("gapless: the unwrapped tip angle has the closed-form spread",
+          close(got["tip_angle_std"], w * np.std(np.arange(n)), 1e-4),
+          f"{got['tip_angle_std']} vs {w * np.std(np.arange(n))}")
+
+    gone = np.arange(40, 80)
+    gapped = sub[~sub["frame"].isin(gone)]
+    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
+    # 41 frames of true rotation is 4.1 rad; folded it is 4.1 - 2*pi, and the 59
+    # compacted steps then average to 13.53 rad/s instead of 10.
+    folded = (58 * w + abs(4.1 - 2 * np.pi)) / 59 / dt
+    check("a 40-frame gap does not inflate the tip rotation rate",
+          close(got["tip_angular_speed"], w / dt, 1e-3),
+          f"{got['tip_angular_speed']} vs {w / dt}; a folded bridge gives {folded:.2f}")
+    kept = np.concatenate([np.arange(40), np.arange(80, n)])
+    check("and the angle spread is still the one over the frames that were seen",
+          close(got["tip_angle_std"], w * np.std(kept), 1e-4),
+          f"{got['tip_angle_std']} vs {w * np.std(kept)}")
 
 
 def test_window_is_independent_of_the_series_around_it(cfg) -> None:

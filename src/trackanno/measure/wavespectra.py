@@ -518,7 +518,7 @@ def spectral_series(
     # Both measured only on windows that resolved a frequency: a censored window
     # reports the band edge, which does not move, so including them makes every
     # wandering cell look steady.
-    freq = out["wave_freq_hz"]
+    freq = np.where(out["wave_censored"] == 1.0, np.nan, out["wave_freq_hz"])
     out["wave_freq_drift_hz"] = _local_spread(freq, max(1, m // hop))
     good = freq[np.isfinite(freq)]
     if good.size >= 3:

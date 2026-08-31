@@ -14,6 +14,12 @@ the movie's frame grid, not to each track's start, so a near-match would pair
 adjacent windows - then the nearest crop centre within ``max_centre_px``, the
 crop moving a pixel or two between runs but never across the frame.
 
+That same jitter decides how near is near enough to win: the closest clip is
+taken only if the runner-up is at least ``min_margin_px`` further off. A lead of
+a pixel is no evidence when the crop itself moves a pixel, so a bucket that
+crowded is called ambiguous rather than settled on a difference the geometry
+cannot support.
+
 Refuse rather than guess: a mis-link is trained on and never questioned again,
 while an orphan is merely ignored.
 """
@@ -34,9 +40,15 @@ __all__ = [
     "Match", "Reassociation", "plan_reassociation", "apply_reassociation",
     "backup_labels", "write_labels",
     "GEOMETRY_COLUMNS", "REQUIRED_COLUMNS", "DEFAULT_MAX_CENTRE_PX",
+    "DEFAULT_MIN_MARGIN_PX",
 ]
 
 DEFAULT_MAX_CENTRE_PX = 12.0
+
+# How much closer the nearest clip has to be than the next one before the answer
+# counts as read off the geometry rather than off its noise. The crop shifts a
+# pixel or two between runs, so anything under that is a coin toss.
+DEFAULT_MIN_MARGIN_PX = 3.0
 
 # What the match itself is made of. Both frames must carry all of it.
 REQUIRED_COLUMNS = ["clip_id", "movie_id", "f_start", "crop_x0", "crop_y0", "crop_w", "crop_h"]
@@ -48,8 +60,9 @@ GEOMETRY_COLUMNS = ["track_id", "f_end", "crop_x0", "crop_y0", "crop_w", "crop_h
 
 _INTEGER_GEOMETRY = {"track_id", "f_end", "crop_x0", "crop_y0", "crop_w", "crop_h"}
 
-# Distances come from integer pixel coordinates, so genuinely equidistant
-# candidates come out bit-identical; this only absorbs the last ulp of the hypot.
+# The floor under the margin, for a caller who asks for none: distances come from
+# integer pixel coordinates, so genuinely equidistant candidates come out
+# bit-identical, and this only absorbs the last ulp of the hypot.
 _TIE_TOLERANCE = 1e-9
 
 
@@ -72,7 +85,7 @@ class Reassociation:
     matched: list[Match]
     unmatched: list[str]        # no candidate at all, or none close enough
     already_valid: int          # label rows whose clip_id is still in the manifest
-    ambiguous: list[str]        # two candidates equally close, or two orphans one clip
+    ambiguous: list[str]        # two candidates too alike to separate, or two orphans one clip
     # Orphans whose clip is already labelled. Re-linking anyway would duplicate a
     # clip_id or overwrite the newer judgement with the older one.
     conflicted: list[str] = field(default_factory=list)
@@ -121,14 +134,20 @@ def plan_reassociation(
     labels_df: pd.DataFrame,
     manifest_df: pd.DataFrame,
     max_centre_px: float = DEFAULT_MAX_CENTRE_PX,
+    min_margin_px: float = DEFAULT_MIN_MARGIN_PX,
 ) -> Reassociation:
     """Work out which orphaned labels belong to which clips. Changes nothing.
+
+    A candidate wins only by ``min_margin_px`` or more. Any rival inside that
+    margin makes the orphan ambiguous instead, the lead being no larger than the
+    crop's own movement between runs. Pass 0 to refuse near-exact ties only.
 
     Deterministic: the answer depends on the contents of the two frames, never
     on their row order, so the plan shown in a dialog is the plan applied.
     """
     _require(labels_df, "annotation table")
     _require(manifest_df, "clip manifest")
+    margin = max(float(min_margin_px), _TIE_TOLERANCE)
 
     manifest_ids = manifest_df["clip_id"].astype(str).to_numpy()
     known = set(manifest_ids.tolist())
@@ -188,13 +207,17 @@ def plan_reassociation(
         if not np.isfinite(best) or best > max_centre_px:
             unmatched.append(old)
             continue
-        tied = index[distance <= best + _TIE_TOLERANCE]
-        if len(tied) > 1:
-            # Two clips equidistant from the old crop centre: one is the animal
-            # that was labelled, and nothing in the CSV says which.
+        # A rival inside the margin is a contender, not a runner-up: the crop
+        # moves a pixel or two between runs, so a lead that small is noise and
+        # the nearest clip is as likely to be the other animal. NaN distances
+        # fail the comparison and so never contend.
+        contenders = index[distance < best + margin]
+        if len(contenders) > 1:
+            # Two clips at much the same remove from the old crop centre: one is
+            # the animal that was labelled, and nothing in the CSV says which.
             ambiguous.append(old)
             continue
-        tentative[old] = (int(tied[0]), best)
+        tentative[old] = (int(contenders[0]), best)
 
     # Two orphans landing on one clip means at least one of them is wrong, and
     # the arbitration would be nothing but row order. Refuse both.

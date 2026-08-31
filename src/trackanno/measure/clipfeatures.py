@@ -22,7 +22,7 @@ import pandas as pd
 from ..annotate.clips import FEATURES_FILE, MANIFEST_FILE, TRACKS_FILE
 from ..config import Config
 
-__all__ = ["build_clip_features", "CLIP_FEATURES_FILE", "PCA_FILE"]
+__all__ = ["build_clip_features", "grid_delta", "CLIP_FEATURES_FILE", "PCA_FILE"]
 
 CLIP_FEATURES_FILE = "clip_features.parquet"
 PCA_FILE = "feature_pca.joblib"
@@ -120,6 +120,29 @@ def _interp_nan(values: np.ndarray) -> np.ndarray:
         i = np.arange(col.size)
         col[~good] = np.interp(i[~good], i[good], col[good])
     return out
+
+
+def grid_delta(values: np.ndarray, offsets: np.ndarray, span: int) -> np.ndarray:
+    """Mean absolute step per column, measured ON THE FRAME GRID.
+
+    ``offsets`` are in-window frame offsets for the rows of ``values``, already
+    restricted to ``[0, span)``. Only adjacent-frame pairs contribute: differencing
+    the present rows alone compares distant frames as though they were neighbours,
+    which is the gap-bridging ``_on_grid`` exists to prevent. Zeros where no
+    adjacent pair survives, since the quantity is a summed change and there was
+    none to measure.
+
+    Shared with the dense table, which must form this column identically or the
+    model is scored on a feature it was not fitted on.
+    """
+    grid = np.full((int(span), values.shape[1]), np.nan)
+    grid[np.asarray(offsets, dtype=int)] = values
+    steps = np.abs(np.diff(grid, axis=0))
+    if not np.isfinite(steps).any():
+        return np.zeros(values.shape[1])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nan_to_num(np.nanmean(steps, axis=0))
 
 
 def _beat_estimate(lateral: np.ndarray, fps: float) -> dict:
@@ -239,7 +262,7 @@ def _shifted_legendre(s: np.ndarray, order: int) -> np.ndarray:
 def _body_frame_motion(px: np.ndarray, py: np.ndarray, dt: float = 1.0) -> dict:
     """Flagellum motion after removing translation and body rotation.
 
-    Node 0 is Head and node 1 is Base, so Head->Base defines the body axis.
+    Node 0 is Head and node 1 is Base, so Base->Head defines the body axis.
     Expressing the flagellum in that frame isolates beating from swimming: a cell
     held in place can beat hard, and a drifting dead cell can translate without
     beating.
@@ -512,28 +535,18 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
                     entry.update({f"cnn{i}_mean": float(v) for i, v in enumerate(codes.mean(axis=0))})
                     entry.update({f"cnn{i}_std": float(v) for i, v in enumerate(codes.std(axis=0))})
 
-                    # Frame-to-frame change, measured ON THE FRAME GRID. np.diff
-                    # over present rows alone compares distant frames as though
-                    # adjacent - the gap-bridging _on_grid exists to prevent.
+                    # Frame-to-frame change on the frame grid. `grid_delta` is
+                    # shared with the dense table so the two cannot drift.
                     span = int(spec.f_end - spec.f_start)
                     offsets = sub["frame"].to_numpy(dtype=int) - int(spec.f_start)
                     inside = (offsets >= 0) & (offsets < span)
-
-                    def _grid_delta(values: np.ndarray) -> np.ndarray:
-                        grid = np.full((span, values.shape[1]), np.nan)
-                        grid[offsets[inside]] = values[inside]
-                        steps = np.abs(np.diff(grid, axis=0))
-                        if not np.isfinite(steps).any():
-                            return np.zeros(values.shape[1])
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", RuntimeWarning)
-                            return np.nan_to_num(np.nanmean(steps, axis=0))
-
-                    delta = _grid_delta(codes)
+                    delta = grid_delta(codes[inside], offsets[inside], span)
                     entry.update({f"cnn{i}_delta": float(v) for i, v in enumerate(delta)})
 
                     # Same aggregation, un-reduced, for fold-wise PCA at CV time.
-                    raw_delta = _grid_delta(block).astype(np.float32)
+                    raw_delta = grid_delta(
+                        block[inside], offsets[inside], span
+                    ).astype(np.float32)
                     raw_rows.append(
                         np.concatenate([block.mean(axis=0), block.std(axis=0), raw_delta])
                     )
@@ -580,7 +593,9 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
 # 2  spectral columns measured on a centred window (config `spectral`); no
 #    significance gating; straightness bounded by construction; lag-based turn
 #    rates; rotation-invariant shape_*; circular static mode as cos/sin
-FEATURE_VERSION = 2
+# 3  censored windows excluded from wave_freq_drift_hz / wave_freq_track_sd_hz;
+#    tip_angular_speed no longer bridges gaps
+FEATURE_VERSION = 3
 
 # Carried in the table, never fed to a model: `n_windows` and `centre_offset`
 # describe HOW the series was read out, not the cell, so a model given them
