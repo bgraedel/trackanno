@@ -27,8 +27,8 @@ import numpy as np
 import pandas as pd
 from harness import check
 from trackanno.infer.transitions import (
-    TRANSITIONS_FILE, analyse, compute, kaplan_meier, movie_fps, summarise,
-    write_report,
+    TRANSITIONS_FILE, analyse, compute, exponential_fit, kaplan_meier,
+    movie_fps, summarise, write_report,
 )
 
 GROUP = "behaviour"
@@ -78,6 +78,10 @@ def pairs(report: dict, group: str = GROUP) -> dict:
 
 def dwell(report: dict, name: str, group: str = GROUP) -> dict:
     return report["groups"][group]["dwell"]["per_class"][name]
+
+
+def markov(report: dict, group: str = GROUP) -> dict:
+    return report["groups"][group]["markov"]
 
 
 # --------------------------------------------------------------------------- #
@@ -315,32 +319,194 @@ def test_kaplan_meier_is_the_textbook_estimate() -> None:
           kaplan_meier([], [])["restricted_mean"] is None)
 
 
-def test_rates_are_probabilities_divided_by_the_mean_dwell() -> None:
-    """Planted so both the probability and the mean dwell are exact."""
-    frame = table(plant([
-        ("swim", 20), ("turn", 50), ("swim", 20), ("turn", 50),
-        ("swim", 20), ("turn", 50), ("swim", 20),
-    ]))
-    report = analyse(frame, fps=100.0, decode="none", min_bout_frames=0)
-    rates = report["groups"][GROUP]["rates"]
+ALTERNATING = [
+    ("swim", 20), ("turn", 50), ("swim", 20), ("turn", 50),
+    ("swim", 20), ("turn", 50), ("swim", 20),
+]
 
-    check("swim dwells 0.2 s and turn 0.5 s at 100 fps",
-          abs(dwell(report, "swim")["km_seconds"]["restricted_mean"] - 0.2) < TOL
-          and abs(dwell(report, "turn")["km_seconds"]["restricted_mean"] - 0.5) < TOL)
-    check("the exit rate is one over the mean dwell in seconds",
-          abs(rates["per_second"]["swim"]["exit_per_second"] - 5.0) < TOL
-          and abs(rates["per_second"]["turn"]["exit_per_second"] - 2.0) < TOL)
-    check("a directed rate is the jump probability over the mean dwell",
-          abs(rates["per_second"]["swim"]["to"]["turn"] - 5.0) < TOL
-          and abs(rates["per_second"]["turn"]["to"]["swim"] - 2.0) < TOL)
-    check("the exponential assumption behind a rate is stated",
-          "exponential" in rates["basis"])
+
+def test_a_lifetime_is_the_time_at_risk_over_the_ends_seen() -> None:
+    """The exponential fit of Fig. 1h, planted so it is exact.
+
+    Seven alternating bouts on one track. The first has no seen start and is
+    dropped; the last runs off the end of the track and contributes its time
+    without an end. So swim offers 3 x 0.2 s against 2 ends and turn 3 x 0.5 s
+    against 3, and the two means come apart by exactly that censoring.
+    """
+    frame = table(plant(ALTERNATING))
+    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+
+    check("the lifetimes are in seconds where a frame rate is known",
+          m["unit"] == "seconds")
+    check("swim was seen to end twice over 0.6 s at risk",
+          m["lifetime"]["swim"]["n_ends"] == 2
+          and abs(m["lifetime"]["swim"]["at_risk"] - 0.6) < TOL)
+    check("swim's fitted lifetime is 0.6 s over 2 ends",
+          abs(m["lifetime"]["swim"]["mean"] - 0.3) < TOL)
+    check("turn's fitted lifetime is 1.5 s over 3 ends",
+          abs(m["lifetime"]["turn"]["mean"] - 0.5) < TOL)
+    check("a censored bout lifts the fit above the mean it was censored out of",
+          m["lifetime"]["swim"]["mean"] > m["lifetime"]["swim"]["km_restricted_mean"])
+    check("the fit is carried beside the measured curve it is judged against",
+          len(m["survival"]["turn"]["t"]) == len(m["survival"]["turn"]["fit"])
+          and m["survival"]["turn"]["p"][0] == 1.0
+          and m["lifetime"]["turn"]["fit_max_deviation"] is not None)
+
+
+def test_the_exponential_fit_is_the_textbook_estimate() -> None:
+    """Two ends over ten units at risk is a mean of five, censoring included."""
+    fit = exponential_fit([1.0, 2.0, 3.0, 4.0], [True, False, True, False])
+    check("the mean is the total time at risk over the number of ends",
+          abs(fit["mean"] - 5.0) < TOL and fit["n_ends"] == 2)
+    check("the rate is one over that mean", abs(fit["rate"] - 0.2) < TOL)
+    check("nothing having ended leaves the mean unstated",
+          exponential_fit([1.0, 2.0], [False, False])["mean"] is None)
+
+
+def test_a_rate_is_a_jump_probability_over_a_lifetime() -> None:
+    """q(i->j) = P(next=j | in i) / lifetime(i), on the same planted bouts."""
+    frame = table(plant(ALTERNATING))
+    report = analyse(frame, fps=100.0, decode="none", min_bout_frames=0)
+    m = markov(report)
+    probabilities = report["groups"][GROUP]["transitions"]["probabilities"]
+
+    check("turn always follows swim here, and swim always follows turn",
+          abs(m["jump"]["swim"]["turn"]["p"] - 1.0) < TOL
+          and abs(m["jump"]["turn"]["swim"]["p"] - 1.0) < TOL)
+    check("the jump matrix is the transition matrix, counted once",
+          m["jump"]["swim"]["turn"]["p"] == probabilities["swim"]["turn"])
+    check("a directed rate is that probability over the lifetime",
+          abs(m["rates"]["swim"]["turn"]["q"] - 1.0 / 0.3) < TOL
+          and abs(m["rates"]["turn"]["swim"]["q"] - 2.0) < TOL)
+    check("the exit rate is one over the lifetime",
+          abs(m["exit_rate"]["swim"] - 1.0 / 0.3) < TOL
+          and abs(m["exit_rate"]["turn"] - 2.0) < TOL)
     check("with no floor imposed the rates are not called lower bounds",
-          "LOWER BOUNDS" not in rates["caveat"])
+          "LOWER BOUNDS" not in m["caveat"])
 
     floored = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
     check("with a floor imposed the rates are called lower bounds",
-          "LOWER BOUNDS" in floored["groups"][GROUP]["rates"]["caveat"])
+          "LOWER BOUNDS" in markov(floored)["caveat"])
+
+
+def test_the_steady_state_weights_a_state_by_how_long_it_is_held() -> None:
+    """The occupancies of Fig. 1i: time spent, not bouts counted.
+
+    Swim and turn alternate, so each is entered as often as the other and the
+    jump chain alone puts them at a half each. Weighted by a lifetime of 0.3 s
+    against 0.5 s they come to 3/8 and 5/8.
+    """
+    frame = table(plant(ALTERNATING))
+    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+    steady = m["steady_state"]
+
+    check("the steady state is stated",
+          steady is not None and m["steady_state_refusal"] is None)
+    check("it is time-weighted and not a count of bouts",
+          abs(steady["swim"]["p"] - 0.375) < TOL
+          and abs(steady["turn"]["p"] - 0.625) < TOL)
+    check("it sums to one", abs(sum(v["p"] for v in steady.values()) - 1.0) < TOL)
+    check("the share measured off the record is reported beside it",
+          abs(m["occupancy_observed"]["swim"] - 80.0 / 230.0) < TOL
+          and abs(m["occupancy_observed"]["turn"] - 150.0 / 230.0) < TOL)
+
+
+def test_a_state_with_no_successor_has_no_steady_state_and_says_so() -> None:
+    """Three classes in a row that never returns has no stationary law."""
+    frame = table(plant([("a", 10), ("b", 10), ("c", 10)]))
+    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+
+    check("no steady state is invented", m["steady_state"] is None)
+    check("the refusal names the reason",
+          "no observed successor" in m["steady_state_refusal"])
+    check("the transitions that were seen are still reported",
+          abs(m["jump"]["a"]["b"]["p"] - 1.0) < TOL)
+
+
+def test_the_error_bars_come_from_resampling_whole_tracks() -> None:
+    """One track cannot support an error bar; eight unequal ones can."""
+    one = markov(analyse(table(plant(ALTERNATING)), fps=100.0, decode="none",
+                         min_bout_frames=0))
+    check("a single track leaves every error unstated",
+          one["lifetime"]["turn"]["se"] is None
+          and one["bootstrap"]["n_tracks"] == 1)
+
+    spread = table(*[
+        plant([("swim", 20), ("turn", 30 + 10 * t), ("swim", 20),
+               ("turn", 30 + 10 * t), ("swim", 20)], track=t)
+        for t in range(8)
+    ])
+    m = markov(analyse(spread, fps=100.0, decode="none", min_bout_frames=0))
+    check("eight tracks are eight bootstrap units", m["bootstrap"]["n_tracks"] == 8)
+    check("the resampling unit is named", m["bootstrap"]["unit"] == "track")
+    check("a lifetime that differs between tracks carries an error bar",
+          m["lifetime"]["turn"]["se"] > 0.0)
+    check("so does a steady state probability",
+          m["steady_state"]["swim"]["se"] > 0.0)
+
+    again = markov(analyse(spread, fps=100.0, decode="none", min_bout_frames=0))
+    check("the same bouts and the same seed give the same error bar",
+          again["lifetime"]["turn"]["se"] == m["lifetime"]["turn"]["se"])
+
+
+def test_a_simulated_chain_comes_back_with_its_own_parameters() -> None:
+    """Ground truth by simulation rather than by planting: a memoryless chain
+    with known lifetimes and jump matrix, cut into 400 short tracks, must come
+    back with those parameters. Geometric dwells are the discrete memoryless
+    case, so the censored fit (time at risk over ends) is consistent for the
+    true mean, while the complete-bouts-only mean shows the truncation bias
+    the censoring exists to remove.
+    """
+    names = ("A", "B", "C")
+    tau = np.array([20.0, 60.0, 40.0])                 # mean dwell, frames
+    rho = np.array([[0.0, 0.7, 0.3],
+                    [0.5, 0.0, 0.5],
+                    [0.2, 0.8, 0.0]])
+    values, vectors = np.linalg.eig(rho.T)
+    nu = np.real(vectors[:, np.argmin(np.abs(values - 1.0))])
+    nu = nu / nu.sum()
+    pi = nu * tau / float((nu * tau).sum())
+
+    rng = np.random.default_rng(7)
+    blocks = []
+    for track in range(400):
+        spec, f, s = [], 0, int(rng.choice(3, p=pi))
+        while f < 300:
+            n = min(int(rng.geometric(1.0 / tau[s])), 300 - f)
+            spec.append((names[s], n))
+            f += n
+            s = int(rng.choice(3, p=rho[s]))
+        blocks.append(plant(spec, track=track))
+    report = analyse(table(*blocks), n_bootstrap=50, bootstrap_seed=0)
+    m = markov(report)
+
+    est = np.array([m["lifetime"][name]["mean"] for name in names])
+    se = np.array([m["lifetime"][name]["se"] for name in names])
+    check("every lifetime is within three bootstrap errors of the truth",
+          bool(np.all(np.abs(est - tau) < 3.0 * se)),
+          f"{est.round(1)} vs {tau} +- {se.round(1)}")
+
+    naive = np.array([dwell(report, name)["frames"]["mean"] for name in names])
+    check("the complete-bouts-only mean sits below the censored fit",
+          bool(np.all(naive < est)) and naive[1] < 0.9 * tau[1],
+          f"complete-only {naive.round(1)} vs fitted {est.round(1)}")
+
+    jump = np.array([[(m["jump"].get(a, {}).get(b) or {}).get("p") or 0.0
+                      for b in names] for a in names])
+    check("the jump matrix is the one simulated",
+          float(np.abs(jump - rho).max()) < 0.03,
+          f"max error {float(np.abs(jump - rho).max()):.4f}")
+
+    steady = np.array([m["steady_state"][name]["p"] for name in names])
+    occupancy = np.array([m["occupancy_observed"][name] for name in names])
+    check("the steady state and the observed occupancy both recover pi",
+          float(np.abs(steady - pi).max()) < 0.02
+          and float(np.abs(occupancy - pi).max()) < 0.02,
+          f"steady {steady.round(3)} vs true {pi.round(3)}")
+
+    worst = max(m["lifetime"][name]["fit_max_deviation"] for name in names)
+    check("a genuinely memoryless chain fits its exponential closely",
+          worst < 0.05, f"worst gap {worst:.3f}")
 
 
 def test_seconds_come_from_each_movies_own_frame_rate() -> None:
@@ -459,8 +625,8 @@ def test_the_report_says_these_are_predictions_and_points_at_the_confusion() -> 
           f"got {silent['caveats']}")
 
 
-def test_the_printed_summary_answers_the_three_questions() -> None:
-    """What follows what, how long each state lasts, and on what evidence."""
+def test_the_printed_summary_answers_the_four_questions() -> None:
+    """What follows what, how long, how much of the record, and on what evidence."""
     frame = table(
         plant([("swim", 20), ("turn", 30), ("swim", 40), ("turn", 50),
                ("swim", 60)], track=0),
@@ -482,8 +648,17 @@ def test_the_printed_summary_answers_the_three_questions() -> None:
           " f  " in text and " s " in text, text)
     check("the evidence behind the counts is printed",
           "pair(s) counted of" in text and "track-final bout(s)" in text, text)
-    check("the exit rates are printed with their units",
-          "exit rates per second" in text, text)
+    check("the fitted chain is printed with the unit its lifetimes are in",
+          "the Markov chain fitted to those bouts   lifetimes in seconds" in text,
+          text)
+    check("the printed form asks how much of the record each state holds",
+          "how much of the record each state holds" in text, text)
+    check("the steady state is printed beside the share measured off the record",
+          "steady state" in text and "measured" in text, text)
+    check("the rates are printed with their unit",
+          "what follows what, and how fast   rates per second" in text, text)
+    check("an error bar says what it was resampled over",
+          "bootstrap resamples of the 2 track(s)" in text, text)
 
 
 def test_the_report_is_json_with_no_nan_in_it() -> None:
