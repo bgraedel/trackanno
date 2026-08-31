@@ -46,9 +46,12 @@ import numpy as np
 import pandas as pd
 
 from ..measure.clipfeatures import (
-    CLIP_FEATURES_FILE, FEATURE_VERSION, PCA_FILE, window_features,
+    CLIP_FEATURES_FILE, FEATURE_VERSION, PCA_FILE, grid_delta, window_features,
 )
-from ..annotate.clips import FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrite, clip_id_for
+from ..annotate.clips import (
+    FEATURES_FILE, HEADER_FILE, TRACKS_FILE, StagedWrite, clip_id_for,
+    drop_border_tracks,
+)
 from ..config import Config
 
 __all__ = [
@@ -290,18 +293,49 @@ def _movie_frames(header_frames: int, tracks: pd.DataFrame) -> int:
     return max(int(header_frames), int(tracks["frame"].max()) + 1)
 
 
-def _header_frames(movie_dir: Path) -> int:
-    """What ``cache.json`` says the movie holds, or 0 if it cannot be asked.
+def _movie_size(header: dict) -> tuple[int, int] | None:
+    """``(height, width)`` out of a ``cache.json`` body, or None if it is absent."""
+    movie = (header or {}).get("movie") or {}
+    try:
+        return int(movie["height"]), int(movie["width"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
-    Tolerant where :func:`build_dense_features` is strict, because a plan is
-    drawn over projects that are half prepared and a run is not.
-    """
+
+def _read_header(movie_dir: Path) -> dict:
+    """``cache.json``, or ``{}`` where a project is only half prepared."""
     header = movie_dir / HEADER_FILE
     if not header.exists():
-        return 0
+        return {}
     try:
-        return int(json.loads(header.read_text(encoding="utf-8"))["movie"]["n_frames"])
-    except (OSError, ValueError, KeyError, TypeError):
+        return json.loads(header.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _without_border_tracks(tracks: pd.DataFrame, header: dict, cfg: Config
+                           ) -> pd.DataFrame:
+    """``tracks`` under ``tracking.border_margin_px``.
+
+    Applied to dense coverage and not only to clip planning: a keypoint placed
+    against an animal half outside the frame is as wrong for a predicted bout as
+    for a clip somebody looks at.
+
+    Passes everything through where the header cannot say how big the frame is.
+    A plan is drawn over projects that are half prepared, and refusing one movie
+    would refuse the whole preview.
+    """
+    if int(cfg.tracking.border_margin_px) <= 0 or _movie_size(header) is None:
+        return tracks
+    kept, _ = drop_border_tracks(tracks, _movie_size(header), cfg)
+    return kept
+
+
+def _header_frames(header: dict) -> int:
+    """What a ``cache.json`` body says the movie holds, or 0 if it cannot say."""
+    try:
+        return int((header or {})["movie"]["n_frames"])
+    except (KeyError, TypeError, ValueError):
         return 0
 
 
@@ -351,15 +385,18 @@ def _load_pca(cfg: Config, reporter):
     return joblib.load(path)
 
 
-def _cnn_block(pca, block: np.ndarray) -> dict[str, float]:
-    """The clip-level CNN aggregate, exactly as ``build_clip_features`` forms it."""
+def _cnn_block(pca, block: np.ndarray, offsets: np.ndarray, span: int) -> dict[str, float]:
+    """The clip-level CNN aggregate, exactly as ``build_clip_features`` forms it.
+
+    ``offsets`` are the in-window frame offsets of ``block``'s rows. The delta
+    comes from the SHARED :func:`grid_delta`, not a diff over present rows: a
+    gappy window differenced row-wise bridges the gap, and the training table
+    does not, which is a difference in the feature the model is scored on.
+    """
     codes = pca.transform(block)
     out = {f"cnn{i}_mean": float(v) for i, v in enumerate(codes.mean(axis=0))}
     out.update({f"cnn{i}_std": float(v) for i, v in enumerate(codes.std(axis=0))})
-    delta = (
-        np.abs(np.diff(codes, axis=0)).mean(axis=0)
-        if codes.shape[0] > 1 else np.zeros(codes.shape[1])
-    )
+    delta = grid_delta(codes, offsets, span)
     out.update({f"cnn{i}_delta": float(v) for i, v in enumerate(delta)})
     return out
 
@@ -399,6 +436,11 @@ def build_dense_features(
     for d in movie_dirs:
         tracks = pd.read_parquet(d / TRACKS_FILE)
         header = json.loads((d / HEADER_FILE).read_text(encoding="utf-8"))
+        # instance_features.npy is aligned to the UNFILTERED table, so the
+        # row-alignment check below needs the count from before the border drop.
+        # The row LABELS survive the filter, so the lookups into it still land.
+        n_rows = len(tracks)
+        tracks = _without_border_tracks(tracks, header, cfg)
         windows = plan_scaled_windows(
             tracks, _movie_frames(header["movie"]["n_frames"], tracks), grid
         )
@@ -406,7 +448,7 @@ def build_dense_features(
             total += len(spans)
             for _, _, scale in spans:
                 per_scale[scale] += 1
-        plans.append((d, tracks, header, windows))
+        plans.append((d, tracks, n_rows, header, windows))
 
     # Halving the stride roughly doubles the run, so say the window count and the
     # stride BEFORE spending them: a run several times slower than the last one
@@ -439,7 +481,7 @@ def build_dense_features(
     # that could be featurised reaches. Accumulated here rather than summed out
     # of n_present afterwards, which counts a frame once per window holding it.
     covered = usable = 0
-    for d, tracks, header, windows in plans:
+    for d, tracks, n_rows, header, windows in plans:
         movie_id = d.name
         fps = float(header["movie"]["fps"])
         feats = np.load(d / FEATURES_FILE) if (d / FEATURES_FILE).exists() else None
@@ -458,14 +500,14 @@ def build_dense_features(
                 "detection weights as the others, or retrain without the "
                 "embedding features."
             )
-        if feats is not None and len(feats) != len(tracks):
+        if feats is not None and len(feats) != n_rows:
             # instance_features.npy is written row-aligned with tracks.parquet.
             # Asserted rather than trusted: these vectors re-identify individuals
             # almost perfectly, so a mis-pairing shows up not as reduced accuracy
             # but as a model that tests well and fails later.
             raise RuntimeError(
                 f"{movie_id}: instance_features.npy has {len(feats)} rows but "
-                f"tracks.parquet has {len(tracks)}; features are not row-aligned"
+                f"tracks.parquet has {n_rows}; features are not row-aligned"
             )
         if pca is not None and feats is not None and feats.shape[1] != pca.n_features_in_:
             # A different detector checkpoint has different channel widths, so
@@ -529,9 +571,12 @@ def build_dense_features(
                 featurised |= sel
                 entry.update(features)
                 if rows_in_feats is not None:
-                    entry.update(
-                        _cnn_block(pca, feats[rows_in_feats[sel]].astype(np.float32))
-                    )
+                    # f_end can be clipped short of the nominal window; the span
+                    # only has to cover the offsets it is handed.
+                    entry.update(_cnn_block(
+                        pca, feats[rows_in_feats[sel]].astype(np.float32),
+                        frames[sel] - int(f_start), int(f_end) - int(f_start),
+                    ))
                 rows.append(entry)
             covered += int(reached.sum())
             usable += int(featurised.sum())
@@ -678,10 +723,16 @@ def plan_windows(cfg: Config) -> pd.DataFrame:
     )
     for d in movie_dirs:
         # Two columns, because that is all the plan is built from; the feature
-        # build reads the rest.
-        tracks = pd.read_parquet(d / TRACKS_FILE, columns=["track_id", "frame"])
+        # build reads the rest. The border rule needs the box corners too, so
+        # under it the read is six columns rather than two.
+        wanted = ["track_id", "frame"]
+        if int(cfg.tracking.border_margin_px) > 0:
+            wanted += ["x1", "y1", "x2", "y2"]
+        header = _read_header(d)
+        tracks = pd.read_parquet(d / TRACKS_FILE, columns=wanted)
+        tracks = _without_border_tracks(tracks, header, cfg)
         windows = plan_scaled_windows(
-            tracks, _movie_frames(_header_frames(d), tracks), grid
+            tracks, _movie_frames(_header_frames(header), tracks), grid
         )
         rows.extend(
             {"movie_id": d.name, "track_id": int(track_id), "f_start": int(f_start),
@@ -752,7 +803,10 @@ def coverage(cfg: Config, frame: pd.DataFrame) -> pd.DataFrame:
     """
     out = []
     for movie_id, group in frame.groupby("movie_id", sort=True):
-        tracks = pd.read_parquet(cfg.movie_dir(str(movie_id)) / TRACKS_FILE)
+        movie_dir = cfg.movie_dir(str(movie_id))
+        tracks = _without_border_tracks(
+            pd.read_parquet(movie_dir / TRACKS_FILE), _read_header(movie_dir), cfg
+        )
         spans = {
             int(t): list(zip(g["f_start"].astype(int), g["f_end"].astype(int)))
             for t, g in group.groupby("track_id", sort=False)

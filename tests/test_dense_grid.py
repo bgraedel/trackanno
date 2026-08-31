@@ -300,3 +300,110 @@ def test_coverage_reports_what_is_true_in_both_modes(cfg) -> None:
           f"{int(row['covered_once'])} of {int(row['detected_frames'])}")
     check("both modes agree on how many detections there are",
           int(row["detected_frames"]) == int(tiled.iloc[0]["detected_frames"]))
+
+
+# --------------------------------------------------------------------------- #
+# the two tables have to agree about what a feature IS
+# --------------------------------------------------------------------------- #
+class IdentityPCA:
+    """Stands in for the saved PCA. The delta must not depend on the map."""
+
+    def transform(self, block):
+        return np.asarray(block, dtype=float)
+
+
+def test_the_dense_cnn_delta_is_the_one_the_model_was_fitted_on() -> None:
+    """`cnn*_delta` is a mean over ADJACENT-FRAME steps, in both tables.
+
+    The dense side used to diff consecutive PRESENT rows, which bridges every
+    gap: a window missing four frames in the middle contributes one large step
+    the training table never sees. Same column name, different quantity, and
+    nothing raises - the model is simply scored on a feature it was not fitted
+    on. The two now share one function, so they cannot drift apart again.
+    """
+    from trackanno.infer.densepredict import _cnn_block
+    from trackanno.measure.clipfeatures import grid_delta
+
+    span = 10
+    offsets = np.array([0, 1, 2, 7, 8])
+    values = np.array([[0.0, 5.0], [1.0, 4.0], [3.0, 4.0], [10.0, 0.0], [14.0, -1.0]])
+    # Adjacent pairs are (0,1), (1,2) and (7,8); (2,7) is a gap and contributes
+    # nothing. Column 0: (1 + 2 + 4) / 3. Column 1: (1 + 0 + 1) / 3.
+    want = np.array([7.0 / 3.0, 2.0 / 3.0])
+    # What differencing the present rows alone would say, gap bridged: column 0
+    # gains a step of 7 and column 1 one of 4.
+    bridged = np.abs(np.diff(values, axis=0)).mean(axis=0)
+
+    got = grid_delta(values, offsets, span)
+    check("grid_delta averages the adjacent-frame steps and only those",
+          np.allclose(got, want), f"{got} vs {want}")
+    check("...which is not what bridging the gap would give",
+          not np.allclose(bridged, want), f"bridged {bridged}")
+
+    block = _cnn_block(IdentityPCA(), values, offsets, span)
+    check("the dense cnn block forms cnn*_delta the same way",
+          np.isclose(block["cnn0_delta"], want[0])
+          and np.isclose(block["cnn1_delta"], want[1]),
+          f"{block['cnn0_delta']}, {block['cnn1_delta']} vs {want}")
+    check("...and its mean and std are still over the present rows",
+          np.isclose(block["cnn0_mean"], values[:, 0].mean())
+          and np.isclose(block["cnn0_std"], values[:, 0].std()),
+          f"{block['cnn0_mean']}, {block['cnn0_std']}")
+
+    # A window with no adjacent pair at all has measured no change, which is 0
+    # rather than undefined: the quantity is a sum of steps and there were none.
+    lonely = grid_delta(values[:2], np.array([0, 5]), span)
+    check("no adjacent pair means zero change, not NaN",
+          np.allclose(lonely, 0.0), str(lonely))
+
+
+def test_a_border_dropped_track_does_not_break_feature_alignment(root) -> None:
+    """instance_features.npy is row-aligned with the UNFILTERED tracks table.
+
+    `build_dense_features` drops border tracks before it plans, so checking the
+    feature count against the FILTERED table refuses a perfectly healthy project
+    the moment `tracking.border_margin_px` costs it a track. The row LABELS
+    survive the filter, so the lookups into the array were always right; only
+    the count they were checked against was wrong.
+    """
+    import json
+
+    from trackanno.infer.densepredict import build_dense_features
+    from trackanno.project import create_project, write_config
+
+    height, width, n_frames = 200, 200, 120
+    path = create_project(root / "border")
+    write_config(path, {
+        "predict.window_frames": 30,
+        "tracking.border_margin_px": 20,
+        "tracking.border_max_frac": 0.5,
+    })
+    border_cfg = load_config(path)
+    movie = border_cfg.movie_dir(MOVIE)
+    movie.mkdir(parents=True, exist_ok=True)
+    (movie / "cache.json").write_text(json.dumps({"movie": {
+        "n_frames": n_frames, "fps": 100.0, "height": height, "width": width,
+    }}), encoding="utf-8")
+
+    # One track well inside the frame, one hugging the left edge in every frame.
+    frames = np.arange(n_frames)
+    boxes = {WHOLE: (80.0, 80.0, 120.0, 120.0), MIDGRID: (0.0, 0.0, 40.0, 40.0)}
+    rows = []
+    for track_id, (x1, y1, x2, y2) in boxes.items():
+        rows.append(pd.DataFrame({
+            "track_id": track_id, "frame": frames,
+            "x1": x1 + frames * 0.1, "y1": y1, "x2": x2 + frames * 0.1, "y2": y2,
+            "conf": 0.8,
+        }))
+    tracks = pd.concat(rows, ignore_index=True)
+    tracks.to_parquet(movie / "tracks.parquet", index=False)
+    # Aligned with the file on disk, as prepare.py writes it: one row per
+    # detection, border track included.
+    np.save(movie / "instance_features.npy",
+            np.zeros((len(tracks), 8), dtype=np.float32))
+
+    out = build_dense_features(border_cfg)
+    check("a project whose border rule drops a track still builds",
+          len(out) > 0, f"{len(out)} rows")
+    check("...and the dropped track is absent from the dense table",
+          set(out["track_id"]) == {WHOLE}, str(sorted(set(out["track_id"]))))

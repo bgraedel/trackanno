@@ -28,7 +28,8 @@ import pandas as pd
 from ..config import Config
 
 __all__ = [
-    "ClipSpec", "clip_id_for", "plan_clips", "choose_crop_size", "finalise_geometry",
+    "ClipSpec", "clip_id_for", "plan_clips", "border_share", "drop_border_tracks",
+    "choose_crop_size", "finalise_geometry",
     "build_box_table", "write_clip_cache", "ClipStore", "StagedWrite",
 ]
 
@@ -120,7 +121,65 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     )
 
 
-def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config) -> list[ClipSpec]:
+BORDER_BOX_COLUMNS = ("x1", "y1", "x2", "y2")
+
+
+def border_share(tracks: pd.DataFrame, frame_size, margin_px: int) -> "pd.Series":
+    """Per track, the share of its detections whose box comes within
+    ``margin_px`` of any side of the frame. Empty without the box columns or the
+    frame size."""
+    if tracks.empty or frame_size is None:
+        return pd.Series(dtype=float)
+    if any(c not in tracks.columns for c in BORDER_BOX_COLUMNS):
+        return pd.Series(dtype=float)
+    height, width = int(frame_size[0]), int(frame_size[1])
+    m = float(margin_px)
+    x1 = pd.to_numeric(tracks["x1"], errors="coerce").to_numpy(dtype=float)
+    y1 = pd.to_numeric(tracks["y1"], errors="coerce").to_numpy(dtype=float)
+    x2 = pd.to_numeric(tracks["x2"], errors="coerce").to_numpy(dtype=float)
+    y2 = pd.to_numeric(tracks["y2"], errors="coerce").to_numpy(dtype=float)
+    at_edge = (
+        (x1 <= m) | (y1 <= m) | (x2 >= width - m) | (y2 >= height - m)
+    )
+    return pd.Series(at_edge, index=tracks.index).groupby(
+        tracks["track_id"].to_numpy()
+    ).mean()
+
+
+def drop_border_tracks(tracks: pd.DataFrame, frame_size, cfg: Config
+                       ) -> tuple[pd.DataFrame, dict[int, float]]:
+    """``tracks`` without the ones that live at the frame edge, and which went.
+
+    At the edge the box is truncated by the frame rather than by the animal
+    ending, so a pose model places its keypoints against a shape that is not all
+    there. Off unless ``tracking.border_margin_px`` says otherwise, and refuses
+    rather than passing everything through when the frame size is unknown.
+    """
+    margin = int(cfg.tracking.border_margin_px)
+    if margin <= 0 or tracks.empty:
+        return tracks, {}
+    if frame_size is None:
+        raise ValueError(
+            "tracking.border_margin_px is set, so tracks at the frame edge are "
+            "to be discarded, but this caller did not say how big the frame is "
+            "and the rule cannot be applied without it"
+        )
+    share = border_share(tracks, frame_size, margin)
+    if share.empty:
+        raise ValueError(
+            "tracking.border_margin_px is set, but this tracks table carries no "
+            f"{', '.join(BORDER_BOX_COLUMNS)} columns, so how near the edge a "
+            "detection sits cannot be measured. Re-run detection to rebuild it"
+        )
+    limit = float(cfg.tracking.border_max_frac)
+    dropped = {int(t): float(v) for t, v in share.items() if v > limit}
+    if not dropped:
+        return tracks, {}
+    return tracks[~tracks["track_id"].isin(dropped)], dropped
+
+
+def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
+               frame_size=None) -> list[ClipSpec]:
     """Turn a movie's tracks table into clip specs. Reads no pixels.
 
     Crop size comes from the *per-frame* box (``crop_from: bbox``), not the
@@ -131,6 +190,10 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config) 
     ``smooth``  moving average of the centre - drift removed, local motion kept.
                 Default.
     ``fixed``   one crop for the window - all motion visible, biggest crop.
+
+    ``frame_size`` is ``(height, width)`` and is only needed by
+    ``tracking.border_margin_px``; without it that setting cannot be applied and
+    refuses rather than passing everything through.
     """
     if tracks.empty:
         return []
@@ -138,6 +201,10 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config) 
     counts = tracks.groupby("track_id").size()
     keep = counts[counts >= cfg.tracking.min_track_length].index
     tracks = tracks[tracks["track_id"].isin(keep)]
+    if tracks.empty:
+        return []
+
+    tracks, _ = drop_border_tracks(tracks, frame_size, cfg)
     if tracks.empty:
         return []
 

@@ -338,6 +338,10 @@ class Tracking:
     tracker_cfg: str = ""            # "" -> the backend's bundled yaml
     min_track_length: int = 50
     greedy_max_dist_px: float = 25.0
+    # How close to the frame edge counts as being at it, and how much of a
+    # track may be there before the whole track is discarded. 0 px is off.
+    border_margin_px: int = 0
+    border_max_frac: float = 0.0
     overrides: dict = field(default_factory=dict)
 
     @classmethod
@@ -345,7 +349,8 @@ class Tracking:
         from .detect.tracking import TRACKERS
 
         _known("tracking", d,
-               ["backend", "tracker_cfg", "min_track_length", "greedy_max_dist_px", "overrides"])
+               ["backend", "tracker_cfg", "min_track_length", "greedy_max_dist_px",
+                "border_margin_px", "border_max_frac", "overrides"])
         backend = str(d.get("backend", "tracktrack"))
         allowed = sorted(TRACKERS) + ["greedy"]
         if backend not in allowed:
@@ -353,11 +358,28 @@ class Tracking:
         overrides = d.get("overrides") or {}
         if not isinstance(overrides, dict):
             raise ConfigError("tracking.overrides must be a mapping of tracker parameters")
+        margin = int(d.get("border_margin_px", 0))
+        if margin < 0:
+            raise ConfigError(
+                f"tracking.border_margin_px must be 0 or more (got {margin}); it is "
+                "how far from the frame edge still counts as being at it, and "
+                "'do not discard border tracks at all' is written as 0"
+            )
+        border_frac = float(d.get("border_max_frac", 0.0))
+        if not 0.0 <= border_frac <= 1.0:
+            raise ConfigError(
+                f"tracking.border_max_frac must be in [0, 1] (got {border_frac}); it "
+                "is the share of a track's detections allowed within "
+                "tracking.border_margin_px of the edge, so 0 discards a track that "
+                "reaches the edge at all and 1 discards none"
+            )
         return cls(
             backend=backend,
             tracker_cfg=str(d.get("tracker_cfg", "") or ""),
             min_track_length=int(d.get("min_track_length", 50)),
             greedy_max_dist_px=float(d.get("greedy_max_dist_px", 25.0)),
+            border_margin_px=margin,
+            border_max_frac=border_frac,
             overrides=dict(overrides),
         )
 
@@ -403,11 +425,18 @@ class Suggest:
     audit_seed: int = 12345
     min_confidence: float = 0.0
     # Hyperparameters, shared by both backends so switching model does not
-    # silently change the fit as well.
-    iterations: int = 400
-    depth: int = 5
-    learning_rate: float = 0.05
+    # silently change the fit as well. The values are CatBoost's own defaults,
+    # which are tuned against far more datasets than this project has, and
+    # `learning_rate: auto` is the one that cannot be written as a number:
+    # CatBoost derives it from the row count and the iteration count, and the
+    # right rate for 200 labelled clips is not the right rate for 5000.
+    iterations: int = 1000
+    depth: int = 6
+    learning_rate: float | str = "auto"
     l2_leaf_reg: float = 3.0
+    # NOT a CatBoost default, and deliberately so: it describes this data
+    # rather than the estimator. One behaviour dominates a behaviour log, and
+    # an unweighted model scores well by answering with it.
     balance_classes: bool = True
     # Which feature families the model may use: the CNN columns re-identify
     # individuals almost perfectly, so a project that wants behaviour rather
@@ -525,12 +554,13 @@ class Suggest:
         model = str(d.get("model", "catboost"))
         if model not in ("hist", "catboost"):
             raise ConfigError("suggest.model must be 'hist' or 'catboost'")
-        depth = int(d.get("depth", 5))
+        depth = int(d.get("depth", 6))
         if not 1 <= depth <= 10:
             raise ConfigError(
                 "suggest.depth must be 1-10. CatBoost trees are symmetric, so depth "
-                "alone sets the width (2**depth leaves) - past 6 it overfits a "
-                "hand-labelled set fast."
+                "alone sets the width: 2**depth leaves, 64 at the default 6. Past "
+                "that a few hundred hand-labelled clips are memorised rather than "
+                "learned, which the reliability gate then refuses to suggest from."
             )
         from .measure.clipfeatures import FEATURE_GROUPS
 
@@ -591,6 +621,17 @@ class Suggest:
                 "turns the diversity rule off, and a negative separation is not a "
                 "thing to require"
             )
+        rate = _optional_auto(
+            d.get("learning_rate", "auto"), "suggest.learning_rate",
+            "a rate or 'auto' (the estimator's own, which CatBoost derives from "
+            "the number of rows and iterations rather than fixing in advance)",
+        )
+        if rate is not None and not 0.0 < float(rate) <= 1.0:
+            raise ConfigError(
+                f"suggest.learning_rate must be in (0, 1], got {float(rate)}; it is "
+                "the share of each tree's correction that is kept, and 'let the "
+                "estimator choose' is written as 'auto'"
+            )
         quota = int(d.get("select_target_quota", 0))
         if quota < 0:
             raise ConfigError(
@@ -633,9 +674,9 @@ class Suggest:
             # silently redraw the audit set and invalidate it retroactively.
             audit_seed=int(d.get("audit_seed", 12345)),
             min_confidence=float(d.get("min_confidence", 0.0)),
-            iterations=max(10, int(d.get("iterations", 400))),
+            iterations=max(10, int(d.get("iterations", 1000))),
             depth=depth,
-            learning_rate=float(d.get("learning_rate", 0.05)),
+            learning_rate="auto" if rate is None else float(rate),
             l2_leaf_reg=float(d.get("l2_leaf_reg", 3.0)),
             balance_classes=bool(d.get("balance_classes", True)),
             feature_groups=groups,

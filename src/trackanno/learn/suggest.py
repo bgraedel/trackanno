@@ -22,7 +22,7 @@ import json
 import sys
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +38,12 @@ from ..annotate.store import AUDIT_COLUMN, decode_audit, read_audit_records
 
 MODEL_FILE = "suggest_model.joblib"
 REPORT_FILE = "suggest_report.json"
+# Per labelled clip, what a model fitted WITHOUT that clip's movie said about
+# it. The confusion matrix in the report is a tally of exactly these, and they
+# are the only honest thing to hold a label up against: the saved model was
+# fitted on every label, so its opinion of one is an opinion of a row it has
+# memorised.
+CV_PREDICTIONS_FILE = "cv_predictions.parquet"
 
 # Columns whose VALUE depends on how many frames the window spans, named in the
 # mismatch message because "the features mean something else now" is not
@@ -242,7 +248,7 @@ def labelled_rows(frame: pd.DataFrame, group: str) -> pd.DataFrame:
 __all__ = ["Suggester", "train", "main", "AuditHoldout",
            "labelled_rows", "is_length_invariant", "length_invariant_columns",
            "length_dependent_columns", "scoped_columns",
-           "MODEL_FILE", "REPORT_FILE"]
+           "MODEL_FILE", "REPORT_FILE", "CV_PREDICTIONS_FILE"]
 
 
 def _selection_slots(n: int, share: float, ranked: int, audit: int) -> int:
@@ -308,6 +314,21 @@ class GroupReport:
     top_features: list
     reliable: bool
     reason: str
+    # [[clip_id, predicted, confidence], ...] from the folds above. Lifted out
+    # by `train` into its own file rather than written into the report: it is
+    # one row per label, where everything else here is one number per group.
+    cv_predictions: list = field(default_factory=list)
+
+
+def _learning_rate(cfg: Config) -> dict:
+    """``learning_rate=...``, or nothing at all where it is left to the estimator.
+
+    Omitted rather than filled in with a number: CatBoost's own default is not
+    a constant but a rate derived from the row count and the iteration count,
+    and passing anything at all is what turns that off.
+    """
+    rate = cfg.suggest.learning_rate
+    return {} if isinstance(rate, str) else {"learning_rate": float(rate)}
 
 
 def _build_model(cfg: Config, n_classes: int):
@@ -326,14 +347,13 @@ def _build_model(cfg: Config, n_classes: int):
             return CatBoostClassifier(
                 iterations=cfg.suggest.iterations,
                 # CatBoost grows SYMMETRIC trees, so depth alone sets the width:
-                # 2**depth leaves, no separate knob, and depth 6 is already 64,
-                # which overfits fast on a few hundred hand-labelled clips.
+                # 2**depth leaves, no separate knob, and 64 at the default 6.
                 depth=cfg.suggest.depth,
-                learning_rate=cfg.suggest.learning_rate,
                 l2_leaf_reg=cfg.suggest.l2_leaf_reg,
                 loss_function="MultiClass" if n_classes > 2 else "Logloss",
                 auto_class_weights="Balanced" if cfg.suggest.balance_classes else None,
                 verbose=False, random_seed=cfg.suggest.seed, allow_writing_files=False,
+                **_learning_rate(cfg),
             )
         except ImportError:
             # catboost is an ordinary dependency, so this means a broken
@@ -349,13 +369,19 @@ def _build_model(cfg: Config, n_classes: int):
     return HistGradientBoostingClassifier(
         max_iter=cfg.suggest.iterations,
         max_depth=cfg.suggest.depth,
-        learning_rate=cfg.suggest.learning_rate,
         l2_regularization=cfg.suggest.l2_leaf_reg,
         # sklearn's equivalent of auto_class_weights; it has no "Balanced"
         # string for this estimator until 1.4, hence the guard.
         class_weight="balanced" if cfg.suggest.balance_classes else None,
         early_stopping=False, random_state=cfg.suggest.seed,
+        **_learning_rate(cfg),
     )
+
+
+def _rate_text(s) -> str:
+    """The learning rate, or what 'auto' will do instead of one."""
+    return ("auto (the estimator picks it from the rows and iterations)"
+            if isinstance(s.learning_rate, str) else f"{s.learning_rate}")
 
 
 def describe_model(cfg: Config, n_classes: int, n_rows: int, n_cols: int) -> str:
@@ -369,7 +395,7 @@ def describe_model(cfg: Config, n_classes: int, n_rows: int, n_cols: int) -> str
             import catboost  # noqa: F401
             backend = f"CatBoost {catboost.__version__}"
             shape = (f"depth {s.depth} (symmetric, {2 ** s.depth} leaves), "
-                     f"iterations {s.iterations}, lr {s.learning_rate}, "
+                     f"iterations {s.iterations}, lr {_rate_text(s)}, "
                      f"l2_leaf_reg {s.l2_leaf_reg}")
             loss = "MultiClass" if n_classes > 2 else "Logloss"
             weights = "Balanced" if s.balance_classes else "none"
@@ -377,12 +403,12 @@ def describe_model(cfg: Config, n_classes: int, n_rows: int, n_cols: int) -> str
         except ImportError:
             backend = "sklearn HistGradientBoosting (catboost not installed)"
             shape = (f"max_depth {s.depth}, max_iter {s.iterations}, "
-                     f"lr {s.learning_rate}, l2 {s.l2_leaf_reg}")
+                     f"lr {_rate_text(s)}, l2 {s.l2_leaf_reg}")
             extra = f", class weights {'balanced' if s.balance_classes else 'none'}"
     else:
         backend = "sklearn HistGradientBoosting"
         shape = (f"max_depth {s.depth}, max_iter {s.iterations}, "
-                 f"lr {s.learning_rate}, l2 {s.l2_leaf_reg}")
+                 f"lr {_rate_text(s)}, l2 {s.l2_leaf_reg}")
         extra = f", class weights {'balanced' if s.balance_classes else 'none'}"
     return (f"{backend}: {shape}{extra}, seed {s.seed} | "
             f"{n_rows} clips x {n_cols} features, {n_classes} classes")
@@ -441,6 +467,7 @@ def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int, raw_cnn=No
 
     reporter = reporter or NullReporter()
     pred = np.empty(len(y), dtype=object)
+    conf = np.full(len(y), np.nan, dtype=float)
     splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=cfg.suggest.seed)
     for fold, (train_idx, test_idx) in enumerate(splitter.split(X, y, groups=groups), start=1):
         held_out = sorted(set(np.asarray(groups)[test_idx]))
@@ -459,8 +486,20 @@ def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int, raw_cnn=No
         model = _build_model(cfg, len(np.unique(y)))
         _fit(model, x_train, y[train_idx], cfg, reporter,
              f"{label}fold {fold}/{n_splits}")
-        pred[test_idx] = model.predict(x_test).ravel()
-    return pred
+        fold_pred = model.predict(x_test).ravel()
+        pred[test_idx] = fold_pred
+        # The probability OF THE PREDICTED CLASS, not the maximum: taken as the
+        # maximum they could name different classes wherever `predict` and an
+        # argmax over the posterior disagree, and the number would then be the
+        # confidence in an answer nobody was given.
+        try:
+            proba = np.asarray(model.predict_proba(x_test), dtype=float)
+            where = {c: i for i, c in enumerate(np.asarray(model.classes_))}
+            columns = np.array([where[p] for p in fold_pred])
+            conf[test_idx] = proba[np.arange(len(columns)), columns]
+        except Exception:
+            pass          # a model without a posterior still gives predictions
+    return pred, conf
 
 
 def _feature_importance(model, X, y, columns, seed, n_repeats=5, top=15):
@@ -652,8 +691,9 @@ def train_group(
         + (f"; {len(audit_set)} of this project's {audit_population} audit clips are "
            "labelled and held out entirely" if len(audit_set) else "")
     )
-    pred = _grouped_cv_predictions(X_cv, y, groups, cfg, n_splits, raw_cnn=fold_cnn,
-                                   reporter=reporter, label=f"{group_name} ")
+    pred, pred_conf = _grouped_cv_predictions(
+        X_cv, y, groups, cfg, n_splits, raw_cnn=fold_cnn, reporter=reporter,
+        label=f"{group_name} ")
     macro_f1 = float(f1_score(y, pred, average="macro", labels=classes, zero_division=0))
     accuracy = float(accuracy_score(y, pred))
     baseline = float(max(counts.values()) / len(y))
@@ -749,6 +789,11 @@ def train_group(
         audit_accuracy=round(audit_acc, 4) if np.isfinite(audit_acc) else float("nan"),
         audit_kappa=round(audit_kappa, 4) if np.isfinite(audit_kappa) else float("nan"),
         confusion=confusion_matrix(y, pred, labels=classes).tolist(),
+        cv_predictions=[
+            [str(clip_id), str(answer), None if not np.isfinite(c) else round(float(c), 4)]
+            for clip_id, answer, c in zip(
+                merged["clip_id"].astype(str).to_numpy(), pred, pred_conf)
+        ],
         top_features=_feature_importance(model, X, y, columns, cfg.suggest.seed),
         reliable=reliable,
         reason=reason,
@@ -932,6 +977,7 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
     single = [g for g in cfg.categories if not g.is_multi]
     reporter.stage("fitting category groups", len(single))
     models, reports = {}, {}
+    cv_rows: list[dict] = []
     for group in single:
         # multi-select groups need a different (multi-label) formulation
         reporter.log(f"fitting {group.name}")
@@ -942,7 +988,13 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
             audit_population=audit_population,
         )
         reporter.advance()
-        reports[group.name] = asdict(report)
+        entry = asdict(report)
+        # Out of the report and into its own file: a row per label would swell
+        # a document that is otherwise a page of numbers per group.
+        for clip_id, answer, confidence in entry.pop("cv_predictions", None) or []:
+            cv_rows.append({"clip_id": clip_id, "group": group.name,
+                            "predicted": answer, "confidence": confidence})
+        reports[group.name] = entry
         reporter.log(
             f"{group.name}: n={report.n_labels}  kappa {report.kappa:+.3f} "
             f"[lo {report.kappa_lower:+.3f}]  macro-F1 {report.macro_f1:.3f}"
@@ -983,6 +1035,14 @@ def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
         f"(clips.frames), feature version {FEATURE_VERSION}"
     )
     (work / REPORT_FILE).write_text(json.dumps(reports, indent=2), encoding="utf-8")
+    # Written even when empty, and always: left behind, the previous run's file
+    # would be read as this model's opinion of labels this model never saw.
+    pd.DataFrame(cv_rows, columns=["clip_id", "group", "predicted", "confidence"]
+                 ).to_parquet(work / CV_PREDICTIONS_FILE, index=False)
+    reporter.log(
+        f"{len(cv_rows)} out-of-fold prediction(s) saved to {CV_PREDICTIONS_FILE}; "
+        "these are what a label can honestly be checked against"
+    )
     return reports
 
 
