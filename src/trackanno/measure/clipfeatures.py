@@ -380,7 +380,7 @@ def window_features(
     layout are amortised over the track, each window being a slice, but the
     `beat_*` block is not: :func:`_beat_on_window` pays a fresh mask over the
     whole track and a fresh FFT per window, so cost is linear in the window
-    count over a substantial constant. See the README for the timings.
+    count over a substantial constant. See docs/prediction.md for the timings.
     """
     from . import trackseries, wavespectra
 

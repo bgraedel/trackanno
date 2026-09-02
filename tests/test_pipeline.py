@@ -338,7 +338,7 @@ def test_pipeline(root, cfg, movie, tracks) -> None:
         idx = store.index_of(s.clip_id)
         check("unscaled clip is a byte-exact crop", cached_matches_original(s, store.clip(idx)) == 0)
 
-    # The contract in the README: original = crop_x0 + cache_x / scale.
+    # The contract in docs/annotation.md: original = crop_x0 + cache_x / scale.
     truth = movie.tracks()
     worst_px = 0.0
     for row in store.clip_boxes(index).itertuples(index=False):

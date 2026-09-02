@@ -572,9 +572,21 @@ class AnnotationStore:
             "annotator": self.cfg.ui.annotator,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "dwell_s": f"{dwell_s:.2f}",
-            "suggested": suggestion[0] if suggestion else "",
-            "suggest_conf": f"{suggestion[1]:.3f}" if suggestion else "",
-            "suggest_shown": "1" if suggestion_shown else "0",
+            # Same rule as the provenance column below: an edit with nothing to
+            # say about the model keeps what the row already said, because the
+            # suggestion visible now is not the one the first judgement was made
+            # under.
+            "suggested": (
+                suggestion[0] if suggestion else (previous or {}).get("suggested", "")
+            ),
+            "suggest_conf": (
+                f"{suggestion[1]:.3f}" if suggestion
+                else (previous or {}).get("suggest_conf", "")
+            ),
+            "suggest_shown": (
+                ("1" if suggestion_shown else "0") if suggestion
+                else (previous or {}).get("suggest_shown", "0")
+            ),
             # Encoded before anything is written: a decision that cannot be
             # serialised must stop the record outright, not land as a blank cell
             # that reads back as "this row does not know why it was shown".

@@ -423,6 +423,111 @@ def test_revising_a_label_keeps_the_reason_its_clip_was_shown(
         app.processEvents()
 
 
+def test_a_revision_keeps_its_reason_once_a_batch_has_been_served(
+    cfg, store, root, app,
+) -> None:
+    """The same guard, in the session it is actually at risk in.
+
+    ``_provenance_for`` answers *not recorded* only while no batch has been
+    served. Once one has, every clip outside it reads as ``annotator_navigated``
+    - so a review session would stamp that over the selector's own reason, and
+    the test above would not notice because it never serves a batch.
+    """
+    from trackanno.annotate.store import encode_provenance
+    from trackanno.gui.app import MANUAL_RULE
+
+    widget, annotations, path = build(cfg, store, root, "review-provenance-served")
+    try:
+        first = label(widget, app)
+        reason = encode_provenance({"rule": "margin", "score": 0.9, "rank": 0})
+        row = dict(annotations.get(first))
+        row[PROVENANCE_COLUMN] = reason
+        annotations.rows[first] = row
+        annotations.rewrite()
+
+        # A batch HAS been served this session, and this clip is not in it: the
+        # exact state in which the reason used to be overwritten.
+        widget._served["a-clip-from-some-other-batch"] = {"rule": "margin", "score": 0.1}
+        check("the clip about to be revised is not in that batch",
+              first not in widget._served)
+
+        set_mode(widget, app, "review")
+        group = cfg.categories[0]
+        widget.categories.toggle(group.name, group.options[-1].name)
+        widget._commit()
+        app.processEvents()
+
+        after = rows_of(path)[first]
+        check("the label was revised", after[group.name] == group.options[-1].name)
+        check("...and the selector's reason survived it",
+              after[PROVENANCE_COLUMN] == reason, after[PROVENANCE_COLUMN])
+        check("...rather than being replaced by the navigated marker",
+              MANUAL_RULE not in after[PROVENANCE_COLUMN], after[PROVENANCE_COLUMN])
+    finally:
+        widget.close()
+        app.processEvents()
+
+
+def test_a_revision_keeps_what_the_model_said_at_the_time(cfg, store, root, app) -> None:
+    """The suggestion columns describe the screen the first judgement was made
+    under. Today's model is a different model, and rewriting them would claim a
+    suggestion had been visible when none was."""
+    widget, annotations, path = build(cfg, store, root, "review-suggestion")
+    try:
+        first = label(widget, app)
+        before = rows_of(path)[first]
+        check("nothing was suggested when the label was made",
+              before["suggested"] == "" and before["suggest_shown"] == "0",
+              f"{before['suggested']!r}/{before['suggest_shown']!r}")
+
+        group = cfg.categories[0]
+        set_mode(widget, app, "review")
+        # AFTER the mode switch, which reloads the clip and would clear it: a
+        # model that now has an opinion about this clip, as a later fit would.
+        widget._current_suggestion = {group.name: (group.options[0].name, 0.91)}
+        widget.categories.toggle(group.name, group.options[-1].name)
+        widget._commit()
+        app.processEvents()
+
+        after = rows_of(path)[first]
+        check("the label was revised", after[group.name] == group.options[-1].name)
+        check("...and the row still says no suggestion was shown",
+              after["suggested"] == "" and after["suggest_shown"] == "0",
+              f"{after['suggested']!r}/{after['suggest_shown']!r}")
+    finally:
+        widget.close()
+        app.processEvents()
+
+
+def test_review_does_not_outline_the_model_that_was_fitted_on_the_label(
+    cfg, store, root, app,
+) -> None:
+    """Two model opinions on one screen, and the prominent one would be the
+    misleading one: the saved model reproduces a label it was trained on, while
+    the note beside the clip carries the held-out answer."""
+    from trackanno.gui.app import REVIEW_SUGGESTION_NOTE
+
+    widget, annotations, path = build(cfg, store, root, "review-no-outline")
+    try:
+        group = cfg.categories[0]
+        label(widget, app)
+        widget._current_suggestion = {group.name: (group.options[0].name, 0.91)}
+
+        widget.categories.set_suggestion(widget._current_suggestion, "")
+        check("an outline is painted while annotating",
+              widget.categories._suggested.get(group.name) == group.options[0].name)
+
+        set_mode(widget, app, "review")
+        check("but reviewing paints none",
+              not widget.categories._suggested, widget.categories._suggested)
+        check("...and says why, so the absence is a decision not a silence",
+              widget.categories.suggestion.text() == REVIEW_SUGGESTION_NOTE,
+              widget.categories.suggestion.text())
+    finally:
+        widget.close()
+        app.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # what the screen says about a label
 # --------------------------------------------------------------------------- #

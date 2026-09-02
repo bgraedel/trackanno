@@ -8,6 +8,7 @@ the mechanism entirely.
 
 from __future__ import annotations
 
+import sys
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
@@ -210,8 +211,15 @@ def describe_auto() -> str:
         return "auto uses the CPU here, though CUDA reports itself usable."
     extra = ""
     if "CPU-only build" in why:
-        extra = (' Reinstall with the GPU extra - uv tool install "trackanno[cuda]" - '
-                 "if this machine has an NVIDIA card.")
+        # The fix differs by platform: only Windows ships a CPU-only wheel on
+        # PyPI, so only there is an extra the answer. Elsewhere a CPU-only build
+        # means `[cpu]` was asked for, and the plain install is the way back.
+        extra = (
+            ' Reinstall with the GPU extra - uv tool install "trackanno[cuda]" - '
+            "if this machine has an NVIDIA card."
+            if sys.platform == "win32" else
+            " Reinstall without the [cpu] extra if this machine has an NVIDIA card."
+        )
     elif "could not initialise" in why or "visible to torch" in why:
         # The two states a click can change: a card asleep behind hybrid
         # graphics, and a driver that has just come back.

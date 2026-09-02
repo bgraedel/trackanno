@@ -177,23 +177,18 @@ class ProjectPage(Page):
             "Project",
             "Pick the folder to work in.",
             help="""
-<p>A <b>project</b> is a folder holding three things: <b>config.yaml</b>,
-<b>work/</b> (the clip cache) and <b>annotations.csv</b>. Everything else on
-this window operates on the open one.</p>
+<p>A <b>project</b> is a folder holding <b>config.yaml</b>, <b>work/</b> (the
+clip cache) and <b>annotations.csv</b>. This window operates on the open one.</p>
 
-<p><i>New project</i> writes a fully commented config.yaml with the paths filled
-in, so the file explains itself when you open it in an editor.</p>
+<p><i>New project</i> writes a fully commented config.yaml with the paths
+filled in.</p>
 
-<p><b>Templates.</b> Tuning the detector, the crop geometry and the category
-buttons is most of the setup for a dataset, and the next dataset usually wants
-the same answers. <i>Save as template</i> stores the open project's settings
-under a name, and <i>New project</i> then offers them under <b>start from</b>.</p>
+<p><b>Templates.</b> <i>Save as template</i> stores the open project's settings
+under a name, and <i>New project</i> offers them under <b>start from</b>.</p>
 
 <p>A template is a whole config.yaml, comments included, kept outside any
-project so it outlives the one it came from. It carries everything except the
-three paths that describe one project on one disk - video_dir, work_dir and csv
-are reset, since a template pointing at last month's movie folder is worse than
-one pointing nowhere.</p>
+project. It carries every setting except video_dir, work_dir and csv, which
+describe one project on one disk and are reset.</p>
 """,
         ))
         layout.addLayout(buttons)
@@ -353,8 +348,7 @@ class NewProjectDialog(QDialog):
             "The clip cache and annotations.csv are created inside the project "
             "folder.\n\n"
             "A template supplies every other setting. 'Save as template' on the "
-            "Project page makes one from a project you have already tuned, so "
-            "the next dataset starts from the same answers.\n\n"
+            "Project page makes one from a project you have already tuned.\n\n"
             "None of it is final: every setting is on the Configure page."
         )
 
@@ -572,16 +566,14 @@ class ConfigPage(Page):
             "Every setting for this project, saved as you type.",
             help="""
 <p>Edits are written <b>straight back into config.yaml</b>, comments and all,
-about 0.7 seconds after typing stops - so the file stays readable and
-hand-editable, and the two thirds of it that document each knob survive.</p>
+about 0.7 seconds after typing stops. The file stays readable and
+hand-editable.</p>
 
 <p>Settings <b>not shown here are left untouched</b>. A key the file does not
-mention keeps the loader's default rather than picking up whatever this form's
-spin box happens to start at.</p>
+mention keeps the loader's default.</p>
 
-<p>Every autosave is parsed by the real loader before it replaces anything. An
-edit that would not load is refused with the loader's own message and the file
-is not touched.</p>
+<p>Every autosave is parsed by the real loader first. An edit that would not
+load is refused with the loader's own message, and the file is untouched.</p>
 
 <p>Settings marked <b>*</b> describe how the clips were cut, so changing one
 takes effect only after detection is run again.</p>
@@ -600,7 +592,7 @@ takes effect only after detection is run again.</p>
         self.recheck_btn = QPushButton("Re-check")
         self.recheck_btn.setToolTip(
             "Ask torch again what this machine has. Worth a click if a GPU you "
-            "expect is missing from the list - a card asleep or a driver that "
+            "expect is missing from the list: a sleeping card or a driver that "
             "has just come back reports itself only when asked again."
         )
         self.recheck_btn.clicked.connect(lambda: self._probe_devices(again=True))
@@ -1265,21 +1257,19 @@ class PreparePage(Page):
             "Find the animals and cut them into clips.",
             help="""
 <p>Runs the detector over every frame, tracks the detections across frames, and
-cuts the per-track clips the annotator will see.</p>
+cuts the per-track clips.</p>
 
-<p>This is the <b>slow, GPU-bound step</b> - minutes to hours. It is
-<b>resumable</b>: each movie is committed on its own and a finished one is
-skipped on the next run, so a cancelled or killed run costs at most the movie in
-progress and never the cache already built.</p>
+<p>The <b>slow, GPU-bound step</b>, minutes to hours. It is <b>resumable</b>:
+each movie is committed on its own and a finished one is skipped next run, so a
+killed run costs at most the movie in progress.</p>
 
 <p>It runs in two halves, and only the first needs a GPU. A movie marked
-<b>[detected]</b> already has its tracks - from this machine, or from a GPU box
-whose <code>work/</code> folder was copied here - and only its clips still have
-to be cut. That half needs no model and no GPU, so this page opens and runs
-without one.</p>
+<b>[detected]</b> already has its tracks, from this machine or from a GPU box
+whose <code>work/</code> folder was copied here, and only its clips remain. That
+half needs no model, so this page opens without one.</p>
 
-<p>Cancel takes effect at the next frame rather than immediately, because the
-frame in flight is the one that would leave a half-written cache behind.</p>
+<p>Cancel takes effect at the next frame. The frame in flight would leave a
+half-written cache behind.</p>
 """,
         ))
         layout.addWidget(splitter, 1)
@@ -1850,8 +1840,8 @@ class ModelPage(Page):
         self.review_button.setEnabled(False)
         self.review_button.setToolTip(
             "Go to the Review page: one track's predicted spans along the frame "
-            "axis - where each begins and ends, which class, and how confident - "
-            "and the controls that correct them."
+            "axis, with their class and confidence, and the controls that "
+            "correct them."
         )
         self.review_button.clicked.connect(self._review_predictions)
 
@@ -1874,23 +1864,20 @@ class ModelPage(Page):
             "Learn from your labels, and label everything with what it learnt.",
             help="""
 <p>Fits a classifier on the labels so far and cross-validates it <b>leaving
-whole movies out</b>, so the score is performance on a movie the model has never
-seen rather than on frames next to ones it has.</p>
+whole movies out</b>, so the score is performance on an unseen movie.</p>
 
-<p>The suggestion it produces is <b>only ever displayed, never pre-selected</b>,
-and it stays silent unless agreement beats chance by a bootstrapped margin.
-Gating on Cohen's kappa and not on accuracy-vs-majority: accuracy rejects an
-informative model whose accuracy sits below the majority rate, and accepts a
-near-degenerate one that clears it by luck.</p>
+<p>The suggestion is <b>displayed, never pre-selected</b>, and stays silent
+unless agreement beats chance by a bootstrapped margin. The gate is Cohen's
+kappa: accuracy rejects an informative model sitting below the majority rate,
+and accepts a near-degenerate one that clears it by luck.</p>
 
-<p>About a tenth of clips are held out of the suggestion loop entirely - never
-trained on, never carrying a suggestion. How often you and the model agree on
-<i>those</i> is an honest measure rather than a measure of how much the
-suggestion nudged you.</p>
+<p>About a tenth of clips are held out of the suggestion loop entirely, never
+trained on and never carrying a suggestion. Your agreement with the model on
+<i>those</i> is the honest measure.</p>
 
-<p><b>Label every clip</b> writes predictions.parquet, which the Review,
-Distribution and Export pages read. It never writes to your annotation CSV: a
-model trained on its own output has lost the ground truth.</p>
+<p><b>Label every clip</b> writes predictions.parquet, read by the Review,
+Distribution and Export pages. It never writes to your annotation CSV: a model
+trained on its own output has lost the ground truth.</p>
 """,
         ))
         layout.addLayout(repair_row)
@@ -2497,16 +2484,14 @@ class DistributionPage(Page):
             "Distribution",
             "How your labels are spread, right now.",
             help="""
-<p>Worth a look before training or exporting. A class with almost nothing in it,
-or one that swallows everything, decides what the next step is actually
-worth.</p>
+<p>Worth a look before training or exporting. A class with almost nothing in
+it, or one that swallows everything, decides what the next step is worth.</p>
 
 <p>The summary flags: values with nothing labelled yet; values below
-<b>suggest.min_per_class</b>, which are dropped at training time; values
-appearing in only one movie, which grouped cross-validation cannot score because
-they cannot be held out; values present in the CSV but no longer in the config;
-and any value over 90% of the labels, where a constant predictor scores well and
-a good-looking accuracy means nothing.</p>
+<b>suggest.min_per_class</b>, dropped at training time; values appearing in only
+one movie, which grouped cross-validation cannot hold out; values in the CSV but
+no longer in the config; and any value over 90% of the labels, where a constant
+predictor scores well.</p>
 """,
         ))
         layout.addLayout(head)
@@ -2723,13 +2708,11 @@ class ExportPage(Page):
 its category. Works at any time, including on a half-finished CSV.</p>
 
 <p>Colour by <b>your own labels</b>, by the <b>model's predictions</b>, or by
-both. A predicted box is drawn <b>dashed and carries its confidence</b>, so it
-can never be mistaken for something you decided - which is the whole reason the
-two can be shown together at all.</p>
+both. A predicted box is <b>dashed and carries its confidence</b>, which is what
+lets the two be shown together.</p>
 
-<p>Frames no label or prediction covers are left as they were rather than
-painted a default colour, since a coloured box is a claim and there is none to
-make there.</p>
+<p>Frames no label or prediction covers are left as they were. A coloured box is
+a claim, and there is none to make there.</p>
 """,
         ))
         layout.addWidget(splitter, 1)

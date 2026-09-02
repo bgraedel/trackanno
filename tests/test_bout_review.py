@@ -286,7 +286,8 @@ def test_the_boundary_band_is_measured_off_the_grid_not_read_off_the_config(
 ) -> None:
     """A crisp edge would claim a precision the method does not have.
 
-    The README's measured error against a planted transition is ``stride/4`` on
+    The measured error against a planted transition (docs/prediction.md) is
+    ``stride/4`` on
     average and ``stride/2`` at worst, and the stride comes from the window grid
     on disk. Reading ``predict.window_stride`` instead would size the band from
     a setting anybody can edit between the run and this window opening - and

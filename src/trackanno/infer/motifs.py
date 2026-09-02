@@ -382,6 +382,9 @@ def label_windows(feats: pd.DataFrame, bouts: pd.DataFrame) -> pd.DataFrame:
     centre = ((feats["f_start"] + feats["f_end"]) // 2).to_numpy()
     spans = {}
     for key, rows in bouts.groupby(["movie_id", "track_id"]):
+        # searchsorted below needs ascending starts, and groupby preserves the
+        # table's own row order, which a bout table written per class does not.
+        rows = rows.sort_values("f_start")
         spans[(str(key[0]), int(key[1]))] = (
             rows["f_start"].to_numpy(), rows["f_end"].to_numpy(),
             rows["label"].to_numpy(object),

@@ -45,25 +45,29 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.optional-dependencies]
-# The GPU backend is chosen at INSTALL time, because torch ships one wheel per
-# backend rather than loading one at runtime. Pick with the extra, not with
-# `--with`, which installs a package rather than selecting an extra:
+# `detection.device: auto` picks CUDA, then MPS, then the CPU at RUNTIME, and a
+# CUDA-enabled torch runs perfectly on a machine with no GPU. So a plain install
+# is already right nearly everywhere:
 #
-#     uv tool install "trackanno[cuda]"      NVIDIA, Linux and Windows
-#     uv tool install "trackanno[mps]"       Apple Silicon
-#     uv tool install trackanno              CPU
+#     uv tool install trackanno              Linux -> CUDA, macOS -> MPS, Windows -> CPU
+#     uv tool install "trackanno[cuda]"      Windows only, where it is the ONLY route to a GPU
+#     uv tool install "trackanno[cpu]"       Linux, to skip ~2-3 GB of nvidia wheels
 #
-# `mps` resolves to the ordinary PyPI wheel, which on macOS arm64 already
-# carries Metal support; the marker keeps it from claiming anything elsewhere.
-# Either way `detection.device: auto` picks CUDA, then MPS, then the CPU, so a
-# config stays portable between machines.
+# The extras exist for the two cases the default gets wrong, and no others.
+# Windows: the PyPI wheel is 122 MB and CPU-only, so CUDA has to come from
+# PyTorch's own index. Linux: the PyPI wheel already pulls the CUDA runtime as
+# ordinary dependencies (nvidia-*, cuda-toolkit, triton), which is right on a GPU
+# box and multiple gigabytes of nothing on the laptop that only cuts clips.
+#
+# There is no `mps` extra: on macOS the ordinary PyPI wheel already carries
+# Metal, so an extra selecting it changed nothing.
 cuda = [
-    "torch>=2.2; sys_platform != 'darwin'",
-    "torchvision>=0.17; sys_platform != 'darwin'",
+    "torch>=2.2; sys_platform == 'win32'",
+    "torchvision>=0.17; sys_platform == 'win32'",
 ]
-mps = [
-    "torch>=2.2; sys_platform == 'darwin'",
-    "torchvision>=0.17; sys_platform == 'darwin'",
+cpu = [
+    "torch>=2.2",
+    "torchvision>=0.17",
 ]
 # `uv sync --extra sleap` adds the optional SLEAP .h5 export (keypoint-MoSeq compatibility).
 sleap = ["sleap-io>=0.1"]
@@ -95,26 +99,38 @@ packages = ["src/trackanno"]
 [tool.uv]
 override-dependencies = ["opencv-python; python_version < '3.0'"]
 
-# The two GPU extras must resolve to different torch builds, so declare them in
-# conflict: without this the lock pins one torch for every platform and extra,
-# and the +cu124 build it picks has no macOS wheel, which breaks a plain install
-# on a Mac before any extra is asked for.
-conflicts = [[{ extra = "cuda" }, { extra = "mps" }]]
+# The two extras resolve to different torch builds, so declare them in conflict:
+# without this the lock pins one torch for every extra, and neither index
+# publishes macOS wheels, which would break a plain install on a Mac before any
+# extra is asked for.
+conflicts = [[{ extra = "cuda" }, { extra = "cpu" }]]
 
-# Only the cuda extra is redirected, and only off macOS: the cu124 index
-# publishes no macOS wheels, so without the marker `[cuda]` on a Mac fails to
-# resolve instead of falling back.
+# Each extra is redirected only where it means anything: cuda on Windows, which
+# is the one platform whose PyPI wheel has no CUDA in it, and cpu wherever
+# somebody asks for the small install. Everywhere else the default PyPI wheel is
+# already the right one.
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform != 'darwin'" },
+    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cpu", extra = "cpu" },
 ]
 torchvision = [
-    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform != 'darwin'" },
+    { index = "pytorch-cuda", extra = "cuda", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cpu", extra = "cpu" },
 ]
 
+# cu128 rather than the newest: CUDA 12.8 runs on an older driver than CUDA 13
+# does, and a shared GPU box is not always on the current driver. Bump this to
+# cu130 when yours is. NOT cu124 - that channel stopped at torch 2.6.0 while
+# PyPI is many versions past it, so pinning it froze the whole install.
 [[tool.uv.index]]
 name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu124"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 # ---------------------------------------------------------------------------

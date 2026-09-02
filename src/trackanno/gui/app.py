@@ -60,6 +60,10 @@ ZOOM_STEPS = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0)
 # split into the model's picks and the human's own detours.
 MANUAL_RULE = "annotator_navigated"
 
+# Said once per review clip, in place of a suggestion, so the absence reads as a
+# decision rather than a model that has nothing to say.
+REVIEW_SUGGESTION_NOTE = "no suggestion here: this model was fitted on this label"
+
 
 class AnnotationWidget(QWidget):
     """Everything on the annotation screen. Hostable anywhere."""
@@ -169,8 +173,7 @@ class AnnotationWidget(QWidget):
             "review labelled walks the ones already labelled, oldest first, "
             "with who judged each and where the model would say otherwise.\n"
             "review disagreements walks ONLY the labels the model argues with, "
-            "the ones it is surest about first. A wrong label is what teaches "
-            "the next model to be wrong, and this is the shortlist."
+            "the ones it is surest about first."
         )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
@@ -186,8 +189,8 @@ class AnnotationWidget(QWidget):
 
         self.context_box = QCheckBox("neighbours")
         self.context_box.setToolTip(
-            "also outline other tracks in the crop. Off by default: the point of "
-            "the marker is to say which animal is being judged."
+            "also outline other tracks in the crop. Off by default, so the "
+            "marker says which animal is being judged."
         )
         self.context_box.setChecked(self.show_context)
         self.context_box.setFocusPolicy(Qt.NoFocus)
@@ -451,6 +454,8 @@ class AnnotationWidget(QWidget):
     def _empty_reason(self) -> str:
         """Why there is nothing to show, which is a different sentence per mode."""
         if self.mode == "review":
+            if self.annotations.done_ids:
+                return "nothing labelled in the current filter"
             return "nothing labelled here yet - switch back to annotate"
         if self.mode != "disagree":
             return "no clips match the current filter"
@@ -460,6 +465,11 @@ class AnnotationWidget(QWidget):
             return self._agreement_problem
         if not self._answers:
             return "no cross-validated predictions to compare against"
+        # The filter emptied the queue, not the model. Saying otherwise would
+        # make a claim about the whole project out of one movie's worth of it.
+        hidden = len({d.clip_id for d in self._disagreements})
+        if hidden:
+            return f"{hidden} label(s) the folds disagree with, none in this filter"
         # Only now: every label here was scored by a model that had not seen it,
         # and none of them came out differently. Said apart from the three
         # states above, which are all "nothing was compared".
@@ -624,7 +634,15 @@ class AnnotationWidget(QWidget):
         """
         if not self._served:
             return None
-        return self._served.get(clip_id) or {"rule": MANUAL_RULE}
+        served = self._served.get(clip_id)
+        if served:
+            return served
+        # A revisit says nothing: "the annotator navigated here" is true of every
+        # correction, and writing it would overwrite the reason the clip was first
+        # shown, which is the one thing a revisit cannot reconstruct.
+        if self.annotations.get(clip_id) is not None:
+            return None
+        return {"rule": MANUAL_RULE}
 
     def _refresh_selection(self) -> None:
         """Re-queue after the model changed, without disturbing the clip on screen.
@@ -703,7 +721,14 @@ class AnnotationWidget(QWidget):
         self._suppress_advance = True
         self.categories.set_values(existing)
         # AFTER set_values: it repaints every button, wiping the dashed outline.
-        self.categories.set_suggestion(self._current_suggestion, self._suggestion_note)
+        # Nothing is outlined while reviewing. The suggester was fitted ON these
+        # labels, so its opinion of one reproduces it rather than testing it, and
+        # the outline would land on the label already chosen beside a note saying
+        # the held-out model disagreed. Only the note means anything here.
+        if self.reviewing:
+            self.categories.set_suggestion({}, REVIEW_SUGGESTION_NOTE)
+        else:
+            self.categories.set_suggestion(self._current_suggestion, self._suggestion_note)
         self.uncertain_box.setChecked(bool(existing and existing.get("uncertain") == "1"))
         self.notes.setText((existing or {}).get("notes", ""))
         self._suppress_advance = False
@@ -902,8 +927,11 @@ class AnnotationWidget(QWidget):
             return False
 
         # Record the model's answer and whether it was visible: agreement is not
-        # influence unless the two are recorded apart.
-        primary = next(
+        # influence unless the two are recorded apart. A revision records neither:
+        # the suggestion on screen now comes from today's model, and the original
+        # judgement was not made under it.
+        revising = self.annotations.get(str(meta["clip_id"])) is not None
+        primary = None if revising else next(
             ((g.name, self._current_suggestion[g.name])
              for g in self.cfg.categories if g.name in self._current_suggestion),
             None,

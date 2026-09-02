@@ -57,7 +57,7 @@ __all__ = [
     "BoutTimeline", "BoutReviewPanel",
 ]
 
-# The README's measured boundary error, as divisors of the window stride.
+# The measured boundary error from docs/prediction.md, as divisors of the stride.
 # Divisors rather than frames, because the stride is a per-project setting.
 MEAN_ERROR_DIVISOR = 4.0
 WORST_ERROR_DIVISOR = 2.0
@@ -620,7 +620,7 @@ REVIEW_HELP = """
 <h3>What the lanes are</h3>
 <p>Each bar is one decoded <b>bout</b>: a run of frames between two inferred
 behavioural boundaries. Bar height is the bout's mean posterior for its own
-class, so a marginal bout is a <i>short</i> bar rather than a pale one.</p>
+class, so a marginal bout is a <i>short</i> bar, never a pale one.</p>
 
 <p>Every category group gets <b>two lanes</b>. The upper one is the model's
 bouts. The lower one is <b>the record</b>: the same bouts with your corrections
@@ -628,39 +628,38 @@ laid over them, a corrected span filled solid and outlined, a span still the
 model's faded and dashed. The record lane has no bar height, because what a
 person asserts about a stretch of frames is not a posterior over it.</p>
 
-<p>A boundary <b>you</b> placed is drawn as a hairline; one the <b>decode</b>
-placed keeps its error band. Yours is exact to the frame you chose, and only
-the decode's is uncertain to the window stride.</p>
+<p>A boundary <b>you</b> placed is a hairline; one the <b>decode</b> placed keeps
+its error band, since only the decode's is uncertain to the window stride.</p>
 
 <h3>Correcting one</h3>
 <p>Drag a boundary, or type a frame range and press <b>Set class</b>. Dragging,
-splitting, merging and relabelling are one operation - <i>name a class over a
-frame range</i> - with different arguments, so the run-length encoding stays
-gapless whatever you do to it.</p>
+splitting, merging and relabelling are one operation, <i>name a class over a
+frame range</i>, with different arguments, so the run-length encoding stays
+gapless.</p>
 
 <p>Every accepted edit is saved immediately to <b>bout_corrections.csv</b>,
 beside annotations.csv. There is no Save button to forget, and nothing is lost
 by navigating away. <b>predictions.parquet and your annotation CSV are never
 written to.</b></p>
 
-<p>A file of <b>fixed windows</b> cannot be corrected at all, and offers no
-controls rather than dead ones: a window's edges are stride multiples the
-predictor chose, so moving one corrects nothing about the animal, and a window
-relabelled by hand is a clip label, which the annotation CSV already holds.</p>
+<p>A file of <b>fixed windows</b> cannot be corrected, and offers no controls.
+A window's edges are stride multiples the predictor chose, so moving one
+corrects nothing about the animal, and a window relabelled by hand is a clip
+label, which the annotation CSV already holds.</p>
 
 <h3>Where the model and a label disagree</h3>
 <p>The <b>&lt; disagreement</b> and <b>disagreement &gt;</b> buttons walk every
-annotation window whose recorded label is not what a model fitted <i>without
-that window's movie</i> predicted for it, surest first. Those are the same
-predictions the report's confusion matrix is a tally of.</p>
+annotation window whose recorded label differs from what a model fitted
+<i>without that window's movie</i> predicted, surest first. Those are the same
+predictions the report's confusion matrix tallies.</p>
 
 <p>It has to be a held-out prediction. The saved model was fitted on every label
-there is, so its opinion of one is an opinion of a row it memorised - it
+there is, so its opinion of one is an opinion of a row it memorised, and it
 reproduces almost all of them however wrong they are.</p>
 
 <p>To <b>change</b> a label, use <i>review disagreements</i> on the Annotate
-page, which walks the same list where the label can be edited. This walk is for
-seeing where the boundary sits around one.</p>
+page, which walks the same list and can edit it. This walk is for seeing where
+the boundary sits around one.</p>
 
 <h3>Hatching and thin spans</h3>
 <p>A <b>hatched</b> span overlaps frames you labelled by hand, which trained
@@ -672,15 +671,15 @@ end, where only one window reaches: the posterior there is one window's
 opinion.</p>
 
 <p>A correction reaching past what these predictions cover is drawn cut short at
-the ends of the track. <b>The file keeps its real ends</b> - nothing is
-truncated by being displayed.</p>
+the ends of the track. <b>The file keeps its real ends</b>, nothing is truncated
+by being displayed.</p>
 
 <p>With <b>predict.save_posteriors</b> off, the per-frame posterior behind each
 bar was never written, so only the bout's mean is available to draw.</p>
 
 <h3>The video</h3>
 <p>Every frame is cut from the movie, never from the clip cache, at one crop for
-the whole session. It has no scrubber of its own - the lanes are the frame axis,
+the whole session. It has no scrubber of its own: the lanes are the frame axis,
 and they span the whole track.</p>
 """
 
@@ -2860,8 +2859,8 @@ class BoutReviewPanel(QWidget):
         neighbour = index + direction
         if not 0 <= neighbour < len(partition):
             self.status.setText(
-                "there is no bout on that side to merge into - this one is at the "
-                "end of the track"
+                "no bout on that side to merge into: this one is at the end of "
+                "the track"
             )
             return
         span, other = partition.spans[index], partition.spans[neighbour]

@@ -140,9 +140,15 @@ def survival(markov: dict, palette: dict, *, group: str = ""):
     for k, name in enumerate(classes):
         ax = axes[k // cols][k % cols]
         s = markov["survival"][name]
-        t = np.asarray([x for x in s["t"] if x is not None], float)
-        p = np.asarray([x for x in s["p"] if x is not None], float)
-        f = np.asarray([x for x in s["fit"] if x is not None], float)
+        # One mask for all three. Filtering each list on its own Nones shifts
+        # them against each other, and a KM point is (t, p) or nothing.
+        raw_t, raw_p, raw_f = s["t"], s["p"], s["fit"]
+        keep = [i for i, (a, b) in enumerate(zip(raw_t, raw_p))
+                if a is not None and b is not None]
+        t = np.asarray([raw_t[i] for i in keep], float)
+        p = np.asarray([raw_p[i] for i in keep], float)
+        fitted = len(raw_f) == len(raw_t) and all(raw_f[i] is not None for i in keep)
+        f = np.asarray([raw_f[i] for i in keep] if fitted else [], float)
         life = markov["lifetime"][name]
         if t.size:
             ax.plot(t, p, ".", ms=5, color=palette[name], label="measured (KM)")
