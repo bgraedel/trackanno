@@ -680,6 +680,37 @@ def test_detections_from_a_different_config_are_refused(root: Path) -> None:
         check("cutting clips from stale detections is refused", False)
 
 
+def test_border_discards_are_reported_by_the_planner(root: Path) -> None:
+    """The warning names the tracks plan_clips actually dropped.
+
+    It used to be produced by re-running the border test over a hand-copy of
+    plan_clips' own min_track_length filter, so the two could count different
+    sets. The planner reports them instead.
+    """
+    from trackanno.detect.prepare import prepare_movie
+    from trackanno.progress import CallbackReporter
+
+    # Track 1 comes within 60px of the left edge; track 2 stays 181px clear.
+    config = PREPARE_CONFIG.replace(
+        "tracking: {backend: greedy, min_track_length: 40, greedy_max_dist_px: 30}",
+        "tracking: {backend: greedy, min_track_length: 40, greedy_max_dist_px: 30,\n"
+        "           border_margin_px: 70}",
+    )
+    cfg, movie, frames = _prep_project(root, "border", config)
+    check("the margin reached the config", cfg.tracking.border_margin_px == 70)
+
+    logs: list[str] = []
+    info = prepare_movie(
+        movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60,
+        reporter=CallbackReporter(on_log=lambda m, level: logs.append(m)),
+    )
+    warned = [m for m in logs if "discarded for reaching within" in m]
+    check("the discard is reported once", len(warned) == 1, str(logs))
+    check("...naming how many tracks went", warned and warned[0].startswith("1 track(s)"),
+          warned[0] if warned else "")
+    check("the track that stayed clear still became clips", info["n_clips"] > 0)
+
+
 def test_a_handoff_that_cannot_account_for_itself_is_refused(root: Path) -> None:
     """A record with no fingerprint cannot say which settings produced it, which
     is the one thing the check exists to establish."""

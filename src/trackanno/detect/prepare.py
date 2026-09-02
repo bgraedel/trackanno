@@ -45,7 +45,7 @@ import pandas as pd
 from ..annotate.clips import (
     DETECT_FILE, DONE_FILE, FEATURES_FILE, MANIFEST_FILE, NORM_FILE, TRACKS_FILE,
     BOXES_FILE,
-    StagedWrite, build_box_table, choose_crop_size, drop_border_tracks,
+    StagedWrite, build_box_table, choose_crop_size,
     finalise_geometry, plan_clips,
     specs_to_frame, write_clip_cache,
 )
@@ -357,26 +357,21 @@ def cut_movie(
 
     n_frames = int(detected.get("n_frames") or movie.n_frames)
     frame_size = (movie.height, movie.width)
-    if cfg.tracking.border_margin_px > 0 and not tracks.empty:
-        # Over the tracks that were still candidates for a clip: plan_clips
-        # applies min_track_length first, so counting before it reports
-        # discards that changed nothing.
-        counts = tracks.groupby("track_id").size()
-        long_enough = counts[counts >= cfg.tracking.min_track_length].index
-        _, at_border = drop_border_tracks(
-            tracks[tracks["track_id"].isin(long_enough)], frame_size, cfg
+    # Reported by plan_clips as it goes, since it decides which tracks were
+    # candidates and counting them here would restate that rule.
+    at_border: dict = {}
+    specs = plan_clips(tracks, movie.id, n_frames, cfg, frame_size=frame_size,
+                       discarded=at_border)
+    if at_border:
+        worst = max(at_border.values())
+        reporter.log(
+            f"{len(at_border)} track(s) discarded for reaching within "
+            f"{cfg.tracking.border_margin_px}px of the frame edge "
+            f"(tracking.border_margin_px); the worst spent "
+            f"{100 * worst:.0f}% of its life there. Their rows are still in "
+            f"{TRACKS_FILE}, they just become no clips",
+            "warning",
         )
-        if at_border:
-            worst = max(at_border.values())
-            reporter.log(
-                f"{len(at_border)} track(s) discarded for reaching within "
-                f"{cfg.tracking.border_margin_px}px of the frame edge "
-                f"(tracking.border_margin_px); the worst spent "
-                f"{100 * worst:.0f}% of its life there. Their rows are still in "
-                f"{TRACKS_FILE}, they just become no clips",
-                "warning",
-            )
-    specs = plan_clips(tracks, movie.id, n_frames, cfg, frame_size=frame_size)
     size = choose_crop_size(specs, cfg)
     origins = finalise_geometry(specs, size, cfg.clips.frames)
 

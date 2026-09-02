@@ -144,11 +144,18 @@ def test_a_track_at_the_frame_edge_can_be_discarded(cfg, movie) -> None:
           str(dropped))
 
     cfg.tracking.border_max_frac = 0.0
+    at_border: dict = {}
     specs = plan_clips(tracks, movie.id, cfg.clips.frames, cfg,
-                       frame_size=frame_size)
+                       frame_size=frame_size, discarded=at_border)
     check("and no clip is cut for a discarded track",
           sorted({s.track_id for s in specs}) == [1],
           str(sorted({s.track_id for s in specs})))
+    # prepare warns from this dict, so it has to be what was actually dropped:
+    # a caller recomputing it would have to restate which tracks were candidates.
+    check("plan_clips reports what it discarded, and only that",
+          sorted(at_border) == [2, 3], str(at_border))
+    check("...with the share of its life each spent at the edge",
+          at_border[2] == 1.0 and 0.0 < at_border[3] < 1.0, str(at_border))
 
 
 def test_the_border_rule_refuses_rather_than_silently_passing_everything(

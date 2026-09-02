@@ -183,7 +183,7 @@ def drop_border_tracks(tracks: pd.DataFrame, frame_size, cfg: Config
 
 
 def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
-               frame_size=None) -> list[ClipSpec]:
+               frame_size=None, discarded: dict | None = None) -> list[ClipSpec]:
     """Turn a movie's tracks table into clip specs. Reads no pixels.
 
     Crop size comes from the *per-frame* box (``crop_from: bbox``), not the
@@ -198,6 +198,11 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
     ``frame_size`` is ``(height, width)`` and is only needed by
     ``tracking.border_margin_px``; without it that setting cannot be applied and
     refuses rather than passing everything through.
+
+    ``discarded``, when given, is filled with ``{track_id: border share}`` for
+    the tracks dropped at the frame edge. A caller wanting to report them takes
+    them from here, since recomputing the number means restating which tracks
+    were candidates in the first place.
     """
     if tracks.empty:
         return []
@@ -208,7 +213,9 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
     if tracks.empty:
         return []
 
-    tracks, _ = drop_border_tracks(tracks, frame_size, cfg)
+    tracks, at_border = drop_border_tracks(tracks, frame_size, cfg)
+    if discarded is not None:
+        discarded.update(at_border)
     if tracks.empty:
         return []
 
