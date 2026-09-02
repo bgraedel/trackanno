@@ -107,15 +107,27 @@ def test_interrupted_rebuild_cannot_mislabel(root: Path) -> None:
 
 def test_forced_rebuild_clears_the_done_marker(root: Path) -> None:
     """C1. prepare_movie kept the old marker, so an interrupted redo still
-    reported the movie as prepared and was never retried."""
+    reported the movie as prepared and was never retried. Each stage now owns a
+    marker and must clear its own before it writes anything."""
     import inspect
 
     from trackanno.detect import prepare
 
-    source = inspect.getsource(prepare.prepare_movie)
-    body = source.split("if done_path.exists() and not force:")[1]
-    check("the marker is unlinked before any artefact is written",
-          "done_path.unlink(missing_ok=True)" in body.split("normalizer =")[0],
+    detect = inspect.getsource(prepare.detect_movie)
+    body = detect.split("if handoff_path.exists() and not force:")[1].split("normalizer =")[0]
+    check("stage 1 unlinks its marker before any artefact is written",
+          "handoff_path.unlink(missing_ok=True)" in body,
+          "unlink is missing or happens too late")
+    # Re-detecting invalidates any clips already cut from the old tracks, so the
+    # prepared marker has to go with it or the movie reads as done with a cache
+    # that describes different detections.
+    check("stage 1 also clears the prepared marker",
+          "(out_dir / DONE_FILE).unlink(missing_ok=True)" in body)
+
+    cut = inspect.getsource(prepare.cut_movie)
+    cut_body = cut.split("if done_path.exists() and not force:")[1].split("staged = StagedWrite")[0]
+    check("stage 2 unlinks its marker before any artefact is written",
+          "done_path.unlink(missing_ok=True)" in cut_body,
           "unlink is missing or happens too late")
 
 

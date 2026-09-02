@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from qtpy.QtCore import QEvent, Qt, Signal
 from qtpy.QtGui import QKeySequence
 
@@ -37,6 +38,9 @@ from qtpy.QtWidgets import (
 
 from ..annotate.clips import ClipStore
 from ..config import Config, load_config
+from ..infer.agreement import (
+    differs, find as find_disagreements, load_cv_predictions,
+)
 from ..view.overlay import FOLLOW_LABELS, FOLLOW_MODES, build_clip_view
 from ..annotate.store import AnnotationStore, encode_provenance
 from ..learn.suggest import Suggester
@@ -75,6 +79,18 @@ class AnnotationWidget(QWidget):
         # Shortcuts use WidgetWithChildrenShortcut so a bare "1" cannot be stolen
         # by another page - which only works if this widget can hold focus.
         self.setFocusPolicy(Qt.StrongFocus)
+
+        # "annotate" walks the clips still to do; "review" walks the ones
+        # already labelled, in the order they were labelled, so a session can be
+        # read back; "disagree" walks only those the model would have labelled
+        # otherwise, which is the shortlist of labels that might be wrong.
+        # Everything else on this screen is shared.
+        self.mode = "annotate"
+        # What the model says about each labelled clip, asked once per model
+        # rather than once per clip, and the disagreements ranked out of it.
+        self._answers: dict[str, dict] = {}
+        self._disagreements: list = []
+        self._agreement_problem = ""
 
         self.show_overlay = cfg.ui.show_overlay
         self.show_context = cfg.ui.show_context_tracks
@@ -143,6 +159,21 @@ class AnnotationWidget(QWidget):
         self.movie_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.movie_combo.currentIndexChanged.connect(lambda _: self._apply_filters())
 
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("annotate", "annotate")
+        self.mode_combo.addItem("review labelled", "review")
+        self.mode_combo.addItem("review disagreements", "disagree")
+        self.mode_combo.setFocusPolicy(Qt.NoFocus)
+        self.mode_combo.setToolTip(
+            "annotate walks the clips still to do.\n"
+            "review labelled walks the ones already labelled, oldest first, "
+            "with who judged each and where the model would say otherwise.\n"
+            "review disagreements walks ONLY the labels the model argues with, "
+            "the ones it is surest about first. A wrong label is what teaches "
+            "the next model to be wrong, and this is the shortlist."
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+
         self.unannotated_only = QCheckBox("unannotated only")
         self.unannotated_only.setFocusPolicy(Qt.NoFocus)
         self.unannotated_only.stateChanged.connect(lambda _: self._apply_filters())
@@ -174,6 +205,11 @@ class AnnotationWidget(QWidget):
         help_btn.clicked.connect(self._show_help)
 
         top = QHBoxLayout()
+        # Labelled like every other control in this row. Unlabelled it read as
+        # part of the movie filter beside it, and nobody found it.
+        top.addWidget(QLabel("mode"))
+        top.addWidget(self.mode_combo)
+        top.addSpacing(12)
         top.addWidget(QLabel("movie"))
         top.addWidget(self.movie_combo, 1)
         top.addWidget(self.unannotated_only)
@@ -202,6 +238,16 @@ class AnnotationWidget(QWidget):
         self.notes.returnPressed.connect(self._leave_notes)
 
         self.metadata = MetadataPanel()
+
+        # Who judged this clip and when, and where the model would disagree.
+        # Only in review mode: during annotation it would be the annotator's own
+        # name under every clip, and a suggestion already has its own outline.
+        self.review_note = QLabel("")
+        self.review_note.setWordWrap(True)
+        self.review_note.setTextFormat(Qt.RichText)
+        self.review_note.setProperty("role", "muted")
+        self.review_note.setVisible(False)
+
         self.minimap = MinimapWidget()
         self.minimap.setVisible(self.show_minimap)
 
@@ -216,6 +262,7 @@ class AnnotationWidget(QWidget):
         side_layout.addSpacing(8)
         side_layout.addWidget(source_title)
         side_layout.addWidget(self.metadata)
+        side_layout.addWidget(self.review_note)
         side_layout.addWidget(self.minimap)
         side = QWidget()
         side.setLayout(side_layout)
@@ -286,7 +333,7 @@ class AnnotationWidget(QWidget):
         for seq in keys["prev"]:
             bind(seq, self.previous_clip)
         for seq in keys["next_unannotated"]:
-            bind(seq, self.next_unannotated)
+            bind(seq, self._on_next_gap)
         for seq in keys["first_unannotated"]:
             bind(seq, lambda: self.goto_first_unannotated(wrap=True))
         for seq in keys["play_pause"]:
@@ -336,7 +383,9 @@ class AnnotationWidget(QWidget):
         movie_id = self.movie_combo.currentData()
         if movie_id:
             mask &= manifest["movie_id"] == movie_id
-        if self.unannotated_only.isChecked():
+        if self.reviewing:
+            mask &= manifest["clip_id"].isin(self.annotations.done_ids)
+        elif self.unannotated_only.isChecked():
             done = self.annotations.done_ids
             mask &= ~manifest["clip_id"].isin(done)
 
@@ -344,19 +393,41 @@ class AnnotationWidget(QWidget):
         # filtered list would re-randomise the order on every filter change and
         # strand clips behind the cursor, since navigation only scans forward.
         selected = set(manifest.index[mask].tolist())
-        self.order = [i for i in self._shuffled_index if i in selected]
+        if self.mode == "disagree":
+            # Only the clips the model argues with, the ones it is surest about
+            # first. One entry per clip even where two groups disagree about it:
+            # the thing on screen is a clip, and it would otherwise come round
+            # twice.
+            wanted = list(dict.fromkeys(d.clip_id for d in self._disagreements))
+            self.order = [
+                index for index in map(self.store.index_of, wanted)
+                if index in selected
+            ]
+        elif self.mode == "review":
+            # The order they were labelled in. A review reads a session back,
+            # and the shuffle would scatter that session through the whole
+            # project; the selector's batch is not spliced in either, because
+            # nothing here is waiting to be chosen.
+            self.order = [
+                index for index in map(self.store.index_of,
+                                       self.annotations.labelled_order)
+                if index in selected
+            ]
+        else:
+            self.order = [i for i in self._shuffled_index if i in selected]
         if not self.order:
             self._show_empty()
             return
 
         index = self.store.index_of(current_id) if current_id is not None else None
         anchor = index if index in selected else None
-        self.order = self._queue_with_batch(self.order, anchor)
+        if not self.reviewing:
+            self.order = self._queue_with_batch(self.order, anchor)
 
         self.position = 0
-        if anchor is not None:
+        if anchor is not None and anchor in self.order:
             self.position = self.order.index(anchor)
-        elif initial:
+        elif initial and not self.reviewing:
             self.position = self._resume_position()
         self._load()
 
@@ -377,10 +448,83 @@ class AnnotationWidget(QWidget):
                 return pos
         return 0
 
+    def _empty_reason(self) -> str:
+        """Why there is nothing to show, which is a different sentence per mode."""
+        if self.mode == "review":
+            return "nothing labelled here yet - switch back to annotate"
+        if self.mode != "disagree":
+            return "no clips match the current filter"
+        if not self.annotations.done_ids:
+            return "nothing labelled here yet, so nothing to disagree with"
+        if self._agreement_problem:
+            return self._agreement_problem
+        if not self._answers:
+            return "no cross-validated predictions to compare against"
+        # Only now: every label here was scored by a model that had not seen it,
+        # and none of them came out differently. Said apart from the three
+        # states above, which are all "nothing was compared".
+        return "every label here matches what the folds predicted for it"
+
     def _show_empty(self) -> None:
-        self.counter.setText("no clips match the current filter")
+        self.counter.setText(self._empty_reason())
         self.progress.setValue(0)
         self.kymo_view.clear()
+
+    @property
+    def reviewing(self) -> bool:
+        """True in either review mode: the queue is labels, not work to do."""
+        return self.mode in ("review", "disagree")
+
+    def _refresh_disagreements(self) -> None:
+        """Rank the labels the last fit's folds disagreed with.
+
+        Read from ``cv_predictions.parquet`` and never from the saved model,
+        which was fitted on these labels and so reproduces them. A clip with no
+        fold prediction is not in the shortlist: the audit holdout, a clip with
+        no features, and one labelled since the last fit.
+        """
+        self._answers, self._disagreements = {}, []
+        self._agreement_problem = ""
+        done = self.annotations.labelled_order
+        if not done:
+            return
+        try:
+            self._answers, self._agreement_problem = load_cv_predictions(self.cfg)
+            if not self._answers:
+                return
+            rows = [self.annotations.get(c) for c in done]
+            table = pd.DataFrame([r for r in rows if r])
+            self._disagreements = find_disagreements(
+                table, self._answers, [g.name for g in self.cfg.categories]
+            )
+        except Exception as exc:                     # noqa: BLE001
+            # A model that will not answer is a status line, never a traceback
+            # out of a mode switch.
+            self._answers, self._disagreements = {}, []
+            self._agreement_problem = f"the fold predictions could not be read ({exc})"
+
+    def _on_mode_changed(self, _index: int) -> None:
+        self.mode = self.mode_combo.currentData() or "annotate"
+        # Meaningless while reviewing: every clip in either review queue is
+        # annotated by construction.
+        self.unannotated_only.setEnabled(not self.reviewing)
+        self.review_note.setVisible(self.reviewing)
+        if self.reviewing:
+            self._refresh_disagreements()
+        self._apply_filters()
+        self._status({
+            "annotate": "annotating the clips still to do",
+            "review": (
+                "reading back the labels already recorded, oldest first. A pick "
+                "rewrites the label rather than advancing; Tab jumps to the "
+                "next one the model disagrees with"
+            ),
+            "disagree": (
+                f"{len(self._disagreements)} label(s) the model would have made "
+                "differently, the ones it is surest about first. Change the "
+                "label or leave it; a pick rewrites without advancing"
+            ),
+        }[self.mode], 10000)
 
     # ------------------------------------------------------------ selection -- #
     def _queue_with_batch(self, order: list[int], anchor: int | None) -> list[int]:
@@ -493,6 +637,12 @@ class AnnotationWidget(QWidget):
         """
         if not self.order:
             return
+        if self.reviewing:
+            # A new model has new opinions, so the shortlist is a different
+            # list. Recomputed, but the queue is left alone: re-ordering under
+            # a reviewer mid-clip would lose their place.
+            self._refresh_disagreements()
+            return
         anchor = self.order[self.position]
         before = self.order
         self.order = self._queue_with_batch(self.order, anchor)
@@ -559,10 +709,69 @@ class AnnotationWidget(QWidget):
         self._suppress_advance = False
         self._current_values = self.categories.values()
 
+        self._paint_review_note(clip_id, existing)
+
         self._loaded_at = time.time()
         self._update_progress(index, meta, (time.perf_counter() - started) * 1000)
         self.prefetcher.around(self.order, self.position)
-        self._save_state(str(meta["clip_id"]))
+        # Only from annotate mode: the resume point is where the work stopped,
+        # and a detour through the labels already done is not where to come back.
+        if not self.reviewing:
+            self._save_state(str(meta["clip_id"]))
+
+    def _disagreement(self, clip_id: str, suggestion: dict | None = None) -> list[str]:
+        """Groups where the recorded label is not what the folds predicted.
+
+        The comparison itself lives in :func:`trackanno.infer.agreement.differs`,
+        which the review page's own walk uses too: two ideas of what counts as a
+        disagreement would sooner or later disagree with each other.
+
+        Empty for a clip no fold scored - the audit holdout, a clip with no
+        features, or one labelled since the last fit.
+        """
+        row = self.annotations.get(clip_id)
+        if row is None:
+            return []
+        if suggestion is None:
+            suggestion = self._answers.get(clip_id) or {}
+        return differs(row, suggestion)
+
+    def _paint_review_note(self, clip_id: str, existing: dict | None) -> None:
+        """Who judged this clip and when, and where the folds said otherwise.
+
+        ``existing`` is a label row with the buttons' current values laid over
+        it, so the disagreement clears as the label is changed.
+        """
+        if not self.reviewing:
+            return
+        if not existing:
+            self.review_note.setText("no label recorded for this clip")
+            return
+        who = existing.get("annotator") or "an unrecorded annotator"
+        when = (existing.get("timestamp_utc") or "")[:16].replace("T", " ")
+        line = f"labelled by {who}" + (f" on {when} UTC" if when else "")
+        if existing.get("uncertain") == "1":
+            line += ", marked uncertain"
+
+        # The fold prediction, from a model fitted without this clip's movie.
+        folds = self._answers.get(clip_id) or {}
+        disagrees = {entry.split(":", 1)[0] for entry in differs(existing, folds)}
+        if disagrees:
+            body = ", ".join(
+                f"{group} <b>{value}</b>"
+                + ("" if confidence is None else f" ({confidence:.0%} sure)")
+                for group, (value, confidence) in folds.items()
+                if group in disagrees
+            )
+            line += (
+                f"<br><b>held out, the model said</b> {body}"
+                "<br>One of the two is wrong. This clip is what says which."
+            )
+        elif folds:
+            line += "<br>held out, the model agreed with this label"
+        else:
+            line += "<br><i>no held-out prediction for this clip</i>"
+        self.review_note.setText(line)
 
     def _refresh_view(self) -> None:
         """Re-centre / re-zoom / re-mark without re-reading the clip."""
@@ -579,12 +788,22 @@ class AnnotationWidget(QWidget):
         done_here = sum(1 for i in self.order if self._clip_ids[i] in done)
         total = len(self.order)
         self.progress.setRange(0, max(1, total))
-        self.progress.setValue(done_here)
-        mark = "OK" if str(meta["clip_id"]) in self.annotations.done_ids else "--"
-        self.counter.setText(
-            f"[{mark}]  clip {self.position + 1} / {total}   |   {done_here} labelled "
-            f"({done_here / max(1, total):.0%})"
-        )
+        if self.reviewing:
+            # Everything here is labelled, so the bar is how far through the
+            # review this is rather than how much of it is done.
+            self.progress.setValue(self.position + 1)
+            self.counter.setText(
+                f"disagreement {self.position + 1} / {total}"
+                if self.mode == "disagree" else
+                f"reviewing {self.position + 1} / {total} labelled"
+            )
+        else:
+            mark = "OK" if str(meta["clip_id"]) in done else "--"
+            self.progress.setValue(done_here)
+            self.counter.setText(
+                f"[{mark}]  clip {self.position + 1} / {total}   |   {done_here} labelled "
+                f"({done_here / max(1, total):.0%})"
+            )
         self.counts_changed.emit(done_here, total)
         if self._pending_message:
             self._status(self._pending_message, 6000)
@@ -614,6 +833,18 @@ class AnnotationWidget(QWidget):
         ]
         self._current_values = values
 
+        # Reviewing is checking, not labelling: the clip being judged must not
+        # be yanked away by the keypress that judged it, since the next thing
+        # the reviewer usually does is look at it again.
+        if self.reviewing:
+            # Repaint against what is on the buttons NOW, not against the row on
+            # disk: the point of changing a label here is to watch the
+            # disagreement clear, and it has not been committed yet.
+            clip_id = self._clip_ids[self.order[self.position]]
+            self._paint_review_note(
+                clip_id, {**(self.annotations.get(clip_id) or {}), **values}
+            )
+            return
         if not self.cfg.ui.auto_advance or not changed_single:
             return
         # Only a single-choice pick advances; a checkbox never yanks the clip away.
@@ -902,6 +1133,38 @@ class AnnotationWidget(QWidget):
         self.position -= 1
         self._load()
 
+    def _on_next_gap(self) -> None:
+        """Tab: the next clip worth stopping at, which is not the same question
+        in each mode. Annotating, it is the next one with no label; reviewing,
+        the next one whose label the model would not have chosen."""
+        if self.reviewing:
+            self.next_disagreement()
+        else:
+            self.next_unannotated()
+
+    def next_disagreement(self) -> None:
+        """The next labelled clip the FOLDS labelled differently.
+
+        Where to start a review: a label a held-out model reproduced is evidence
+        about neither of them, and one it contradicted is either a mistake or
+        the thing the model still has to learn.
+        """
+        self._commit()
+        if not self._answers:
+            self._status(
+                self._agreement_problem
+                or "no held-out predictions to hold these labels up against. "
+                   "Train the model on the Model page", 6000)
+            return
+        for pos in range(self.position + 1, len(self.order)):
+            if self._disagreement(self._clip_ids[self.order[pos]]):
+                self.position = pos
+                self._load()
+                return
+        self._status(
+            "the model agrees with every label after this one, or has nothing "
+            "to say about them", 4000)
+
     def next_unannotated(self) -> None:
         self._commit()
         done = self.annotations.done_ids
@@ -1030,6 +1293,15 @@ class AnnotationWidget(QWidget):
                     f"<td>&nbsp;{group.name}: {option.name}</td></tr>"
                 )
         lines.append("</table>")
+
+        lines.append(
+            "<br><b>Two modes, same keys</b><br>"
+            "<i>annotate</i> walks the clips still to do. <i>review labelled</i> "
+            "walks the ones already done, oldest first, showing who judged each "
+            "and where the model would now say otherwise. There a pick rewrites "
+            "the label instead of advancing, and Tab jumps to the next label the "
+            "model argues with."
+        )
 
         # Why a confident model shows nothing on some clips. Explained HERE and
         # not on the clip: knowing it is audited is the influence to exclude.

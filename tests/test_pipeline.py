@@ -90,6 +90,97 @@ class SyntheticMovie(MovieSource):
 
 
 # --------------------------------------------------------------------------- #
+def test_a_track_at_the_frame_edge_can_be_discarded(cfg, movie) -> None:
+    """Pose is the reason, so the rule is about the box reaching the frame.
+
+    At the edge the box is cut off by the picture rather than by the animal
+    ending, and a keypoint model places its parts against a shape that is not
+    all there. Nothing downstream reports it - the detector is confident about
+    the part it can see - so the track has to be excluded rather than detected.
+    """
+    from trackanno.annotate.clips import border_share, drop_border_tracks
+
+    frame_size = (movie.height, movie.width)
+    rows = []
+    for f in range(cfg.clips.frames):
+        # 1 stays in the middle, 2 is pinned against the left edge, 3 grazes
+        # the bottom on one frame out of the window.
+        rows.append({"frame": f, "track_id": 1, "x1": 200.0, "y1": 100.0,
+                     "x2": 220.0, "y2": 120.0, "conf": 0.9})
+        rows.append({"frame": f, "track_id": 2, "x1": 0.0, "y1": 100.0,
+                     "x2": 20.0, "y2": 120.0, "conf": 0.9})
+        low = f == 0
+        rows.append({
+            "frame": f, "track_id": 3, "x1": 200.0,
+            "y1": float(movie.height - 20) if low else 100.0,
+            "x2": 220.0,
+            "y2": float(movie.height) if low else 120.0, "conf": 0.9,
+        })
+    tracks = pd.DataFrame(rows)
+    cfg.tracking.min_track_length = 1
+    cfg.clips.min_clip_frames = 1
+
+    shares = border_share(tracks, frame_size, 4)
+    check("a track in the middle never reaches the edge", shares[1] == 0.0)
+    check("one pinned against it always does", shares[2] == 1.0)
+    check("one that grazes it reports the share, not a yes or no",
+          abs(shares[3] - 1.0 / cfg.clips.frames) < 1e-9, str(shares[3]))
+
+    check("off by default, so an existing project plans what it always did",
+          cfg.tracking.border_margin_px == 0
+          and drop_border_tracks(tracks, frame_size, cfg)[0] is tracks)
+
+    cfg.tracking.border_margin_px = 4
+    kept, dropped = drop_border_tracks(tracks, frame_size, cfg)
+    check("with no tolerance, any frame at the edge takes the track",
+          sorted(dropped) == [2, 3], str(dropped))
+    check("...and the middle one survives",
+          sorted(kept["track_id"].unique()) == [1])
+
+    cfg.tracking.border_max_frac = 0.5
+    kept, dropped = drop_border_tracks(tracks, frame_size, cfg)
+    check("a tolerance keeps a track that only grazes it",
+          sorted(dropped) == [2] and sorted(kept["track_id"].unique()) == [1, 3],
+          str(dropped))
+
+    cfg.tracking.border_max_frac = 0.0
+    specs = plan_clips(tracks, movie.id, cfg.clips.frames, cfg,
+                       frame_size=frame_size)
+    check("and no clip is cut for a discarded track",
+          sorted({s.track_id for s in specs}) == [1],
+          str(sorted({s.track_id for s in specs})))
+
+
+def test_the_border_rule_refuses_rather_than_silently_passing_everything(
+    cfg, movie, tracks,
+) -> None:
+    """Not knowing the frame size is not the same as nothing being at its edge.
+
+    A caller that cannot say how big the frame is cannot apply this rule, and
+    quietly planning every clip anyway is the failure that looks like success.
+    """
+    from trackanno.annotate.clips import drop_border_tracks
+
+    cfg.tracking.border_margin_px = 8
+    try:
+        drop_border_tracks(tracks, None, cfg)
+        raised = ""
+    except ValueError as exc:
+        raised = str(exc)
+    check("no frame size is refused, and the message says which setting",
+          "border_margin_px" in raised and "how big the frame is" in raised,
+          raised or "nothing raised")
+
+    try:
+        drop_border_tracks(tracks.drop(columns=["x1"]), (movie.height, movie.width), cfg)
+        raised = ""
+    except ValueError as exc:
+        raised = str(exc)
+    check("a tracks table with no boxes is refused too",
+          "x1" in raised and "Re-run detection" in raised,
+          raised or "nothing raised")
+
+
 def test_tile_grid() -> None:
     tiles = tile_grid(2048, 3000, 640, 0.25)
     check("tile_grid covers the frame", max(t[2] for t in tiles) == 3000

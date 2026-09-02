@@ -510,6 +510,15 @@ class AnnotationStore:
         return set(self.rows)
 
     @property
+    def labelled_order(self) -> list[str]:
+        """Clip ids in the order they were first labelled.
+
+        A review reads a session back, and a session happened in an order. The
+        set ``done_ids`` returns cannot say what came after what.
+        """
+        return list(self._order)
+
+    @property
     def last_clip_id(self) -> str | None:
         return self._order[-1] if self._order else None
 
@@ -569,7 +578,16 @@ class AnnotationStore:
             # Encoded before anything is written: a decision that cannot be
             # serialised must stop the record outright, not land as a blank cell
             # that reads back as "this row does not know why it was shown".
-            PROVENANCE_COLUMN: encode_provenance(selected_by),
+            #
+            # An EDIT that says nothing keeps what the row already said. The
+            # default is "not recorded", and nobody revising a label months
+            # later has a selector to ask, so writing the default over the
+            # original would quietly turn every corrected row into one that
+            # cannot say whether the model chose it.
+            PROVENANCE_COLUMN: (
+                encode_provenance(selected_by) if selected_by is not None
+                else (previous or {}).get(PROVENANCE_COLUMN, "")
+            ),
             AUDIT_COLUMN: encode_audit(self._audit_membership(clip_id, previous)),
         }
         for group in self.cfg.categories:

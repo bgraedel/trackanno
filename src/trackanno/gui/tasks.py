@@ -15,7 +15,7 @@ import traceback
 from typing import Callable
 
 from qtpy.QtCore import QThread, Signal
-from qtpy.QtGui import QFont, QTextCursor
+from qtpy.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from qtpy.QtWidgets import (
     QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
@@ -118,21 +118,43 @@ class TaskPanel(QWidget):
     def busy(self) -> bool:
         return self._runner is not None and self._runner.isRunning()
 
+    def set_run_label(self, text: str) -> None:
+        """Rename the run button. Also the label restored when a run finishes,
+        which is why it cannot just be `run_button.setText`."""
+        self._run_label = text
+        if not self.busy:
+            self.run_button.setText(text)
+
     def set_work(self, build_work: Callable | None) -> None:
         """``build_work()`` returns the ``work(reporter)`` callable, or None to
         refuse the run (after the page has explained why)."""
         self._build_work = build_work
 
     def append(self, message: str, level: str = "info") -> None:
+        """One message in its level's colour, and nothing else in that colour.
+
+        red = failed, amber = carried on but worth knowing, green = finished,
+        plain = ordinary progress. Written through an explicit character format,
+        because appendHtml and appendPlainText take theirs from the visible
+        cursor and so carry a colour forward.
+        """
         palette = tokens()
         colour = {"error": palette["danger"], "warning": palette["warning"],
                   "good": palette["success"]}.get(level)
+        document = self.log.document()
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.End)
+        if not document.isEmpty():
+            cursor.insertBlock()
+        # Set, not merge: an empty format is what puts an ordinary line back to
+        # the widget's own colour after a coloured one.
+        fmt = QTextCharFormat()
         if colour:
-            self.log.appendHtml(
-                f'<span style="color:{colour};">{_escape(message)}</span>'
-            )
-        else:
-            self.log.appendPlainText(message)
+            fmt.setForeground(QColor(colour))
+        cursor.setCharFormat(fmt)
+        # Newlines inside the message become blocks of their own, each carrying
+        # this format, so a traceback is red the whole way down.
+        cursor.insertText(message)
         self.log.moveCursor(QTextCursor.End)
 
     def start(self, work: Callable, throttle: int = 5) -> None:
@@ -151,7 +173,10 @@ class TaskPanel(QWidget):
         runner.overall.connect(self._on_overall)
         runner.succeeded.connect(lambda _r: self._on_done(True, "finished"))
         runner.failed.connect(lambda message: self._on_done(False, message))
-        runner.was_cancelled.connect(lambda: self._on_done(False, "cancelled"))
+        # Amber and not red: stopping a job is something the user did, not
+        # something that went wrong.
+        runner.was_cancelled.connect(
+            lambda: self._on_done(False, "cancelled", "warning"))
         self._runner = runner
         self.started.emit()
         runner.start()
@@ -191,14 +216,14 @@ class TaskPanel(QWidget):
         self.overall_bar.setValue(int(done))
         self.overall_bar.setFormat(f"movie %v / %m   {label}")
 
-    def _on_done(self, ok: bool, message: str) -> None:
+    def _on_done(self, ok: bool, message: str, level: str | None = None) -> None:
         self.bar.setRange(0, 1)
         self.bar.setValue(1 if ok else 0)
         self.bar.setFormat(message)
         self.stage_label.setText(message)
         self.run_button.setText(self._run_label)
         self.run_button.setEnabled(True)
-        self.append(message, "good" if ok else "error")
+        self.append(message, level or ("good" if ok else "error"))
         self._runner = None
         self.finished.emit(ok)
 
@@ -224,10 +249,3 @@ class TaskPanel(QWidget):
         runner.finished.connect(runner.deleteLater)
         self._runner = None
         return False
-
-
-def _escape(text: str) -> str:
-    return (
-        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        .replace("\n", "<br>")
-    )

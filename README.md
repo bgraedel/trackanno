@@ -57,6 +57,11 @@ Both paths call the same functions (`prepare_all`, `train`, `predict_all`,
 exposes them as `trackanno-prepare`, `trackanno-annotate`, `trackanno-suggest`,
 `trackanno-predict` and `trackanno-render`.
 
+Step 1 splits further: `--stage detect` is the half that needs the GPU, and
+`--stage clips` the half that needs only the movie, so the two can run on
+different machines. See [Detecting on one machine, annotating on
+another](#detecting-on-one-machine-annotating-on-another).
+
 Everything is driven by `config.yaml` in the project folder.
 
 ---
@@ -68,7 +73,7 @@ trackanno                      # reopens the last project
 trackanno path/to/project
 ```
 
-Seven steps down the left, in the order the work happens. Each carries its state
+Eight steps down the left, in the order the work happens. Each carries its state
 (`*` done, `>` next, `!` something missing) and a count.
 
 | step | purpose |
@@ -78,11 +83,20 @@ Seven steps down the left, in the order the work happens. Each carries its state
 | **3 Detect & crop** | find the animals, cut them into clips |
 | **4 Annotate** | watch each clip, press one key |
 | **5 Model** | train on the labels, suggest the next one |
-| **6 Distribution** | inspect the label distribution before exporting |
-| **7 Export** | put the labels back onto the original movies |
+| **6 Review** | check where the model put each boundary, and move it |
+| **7 Distribution** | inspect the label distribution before exporting |
+| **8 Export** | put the labels back onto the original movies |
 
 Each page states its prerequisites up front and offers a **Next:** bar at the
 bottom.
+
+**Explanation lives under a `?`.** What is permanently on screen is a line: a
+page's subtitle says what the page is for, a caption under a picture is the
+fields that are true of *that* track and no others, and every one of them is
+short enough to read past. The reasoning behind it - what a bar is, why a
+held-out prediction is the only fair comparison, what the two lanes mean - is
+one button away and closes again. A paragraph pinned above the work is height
+taken from it on every visit, and it is read once.
 
 **A project** is a folder holding `config.yaml`, `work/` (the clip cache) and
 `annotations.csv`. *New project* writes a fully commented `config.yaml` with the
@@ -104,7 +118,7 @@ normally reused, and the New Project form overrides it when a model is chosen.
 Saving copies the file rather than re-serialising it, so the comments survive,
 and the result is parsed by the real loader before it is stored: a template that
 would not load cannot be saved. They live under the state directory
-(`%APPDATA%	rackanno	emplates`, or `~/.config/trackanno/templates`), one
+(`%APPDATA%\trackanno\templates`, or `~/.config/trackanno/templates`), one
 `.yaml` each, so a template can be handed to somebody else as a file.
 
 From the API:
@@ -195,12 +209,19 @@ available, and `greedy` selects a nearest-centroid tracker that is adequate at
 | file | contents |
 |---|---|
 | `tracks.parquet` | every detection, in original full-frame coordinates |
+| `instance_features.npy` | `(N, D)` CNN features, row-aligned with `tracks.parquet` |
 | `clips.parquet` | one row per clip, with its crop rectangle and scale |
 | `clip_boxes.parquet` | overlay geometry (target and neighbours) in cache coordinates |
 | `clips.dat` | pre-cropped pixels, uncompressed `uint8` memmap |
 | `thumbs.dat` | optional full-frame thumbnails for the minimap |
 | `norm.json` | the movie's fixed intensity mapping |
+| `detect_done.json` | the detection stage's marker, and what the clip stage cannot work out for itself |
 | `prepare_done.json` | resume marker; re-running skips finished movies |
+
+`tracks.parquet`, `instance_features.npy`, `norm.json` and `detect_done.json` are
+everything the detection half produces, and the only files that have to travel
+when detection runs on another machine - see [Detecting on one machine,
+annotating on another](#detecting-on-one-machine-annotating-on-another).
 
 **The cache is uncompressed** so that loading a clip is one contiguous ~1 MB read
 with no decoding. Keep `paths.work_dir` on a local disk; over a network share
@@ -213,6 +234,30 @@ more than `clips.crop_size` px are downscaled with their `scale` recorded, so
 every cached pixel maps back to an exact original coordinate. The crop is
 zero-padded where it overhangs the movie border; clamping it inside would park
 every border-swimming animal against the edge of its own crop.
+
+**Discarding tracks at the frame edge.** `tracking.border_margin_px` is 0 by
+default, which keeps every track. Set it and a track is discarded when its box
+comes within that many pixels of any side of the frame.
+
+The reason is pose, and it is not fixable downstream. At the edge the box is cut
+off by the picture rather than by the animal ending, so a keypoint model places
+its parts against a shape that is not all there - and everything built on those
+keypoints, curvature and wave direction and body length, is then wrong in a way
+nothing reports, because the detector is confident about the part it can see.
+There is no confidence score for "the rest of the animal is outside the frame".
+
+`tracking.border_max_frac` is how much of a track's life may be spent there
+before the whole track goes. `0.0`, the default once the margin is on, discards
+a track that reaches the edge at all; `0.1` lets one that passes through it
+survive. Detection reports how many tracks went and how much of the worst one's
+life was at the edge, so the pair can be tuned against a real movie rather than
+guessed.
+
+Rows are **not** removed from `tracks.parquet` - that file stays row-aligned with
+`instance_features.npy` - the track simply becomes no clips. The rule is applied
+to dense prediction as well, which is the one place `tracking.min_track_length`
+is deliberately *not* applied: that threshold is about annotation units, while
+this one is about whether the measurement means anything at all.
 
 **One commit per movie.** Pixels, manifest, box table and cache header are
 written beside their real names and renamed into place at the end, so a
@@ -297,6 +342,59 @@ convenience feature.
   miss with no connection fails naming the id, the digest and the directory it
   looked in.
 
+### Detecting on one machine, annotating on another
+
+Detection wants a GPU; annotation wants to be where you are. **Detect & crop runs
+in two halves**, and only the first needs the model:
+
+| stage | what it writes | needs |
+|---|---|---|
+| `--stage detect` | `norm.json`, `tracks.parquet`, `instance_features.npy`, `detect_done.json` | the model, a GPU |
+| `--stage clips` | `clips.dat`, `clips.parquet`, `clip_boxes.parquet`, `cache.json`, `prepare_done.json` | the movie |
+
+Only the first group crosses the network - a few MB of parquet plus the instance
+features. `clips.dat` is the big one (`n_clips × clips.frames × crop²`, routinely
+gigabytes) and it is written where it is read, which is what
+`paths.work_dir` has always wanted anyway.
+
+```bash
+# on the GPU box - same registry, so model.source + sha256 give identical weights
+export TRACKANNO_MODEL_REGISTRY="github://you/your-models"
+trackanno-prepare --config /data/proj/config.yaml --stage detect --device 0
+
+# back where you annotate: copy the four small files per movie, then just work
+rsync -a server:/data/proj/work/ ./work/
+trackanno
+```
+
+**No second command.** Without `--stage`, each movie gets whatever it is still
+missing, so step 3 finds the tracks already there and only cuts the clips. The
+movie list marks it `[detected]` and the button reads **Cut clips**. That half
+needs no model, so the page opens on a machine that has no `.pt` at all.
+
+**Paths differ between machines**, and `Browse` writes an absolute one. Override
+them per run rather than editing `config.yaml`:
+
+```bash
+trackanno-prepare --config ./config.yaml --stage detect \
+    --video-dir /mnt/scope/run7 --work-dir /scratch/run7
+```
+
+`--model` does the same for the weights and clears `model.source`, since naming a
+file is an unambiguous statement that the shared model is not wanted.
+
+**Detections are refused if the settings that produced them changed.**
+`detect_done.json` carries a digest of the `detection`, `tiling`, `tracking`,
+`features`, `normalize`, `nd2` and `tiff` sections; cutting clips against a
+different one fails naming the section rather than pairing new geometry with old
+boxes. `detection.device` and `detection.batch` are deliberately excluded - where
+the work ran is not what it found - so a CUDA box and a laptop agree.
+
+The handoff also carries the **keypoint names**, which a pose checkpoint resolves
+at load time (`kpt_shape`) and `config.yaml` may never list. The machine cutting
+the clips never loads the checkpoint, so without them a pose project would write a
+box table with no keypoint columns and say nothing about it.
+
 ### Pose models
 
 Set `detection.task: pose`. A checkpoint stores `kpt_shape`, so the keypoint
@@ -365,7 +463,7 @@ value in a single-choice group commits the row and moves on once every
 | `1`…`5`, `q`/`w`/`e` | category values (defined per option in `config.yaml`) |
 | `→` / `Enter` | commit and next clip |
 | `←` | previous clip |
-| `Tab` | next unannotated clip |
+| `Tab` | next unannotated clip (in either review mode: next label the model argues with) |
 | `Ctrl+U` | first unannotated clip |
 | `Space` | play / pause |
 | `o` | marker on/off |
@@ -448,6 +546,91 @@ done. On startup the GUI jumps to the first unannotated clip
 is appended and `fsync`ed immediately, so a crash costs at most the clip on
 screen. Annotated clips reopen with their labels loaded, and edits rewrite the
 CSV atomically.
+
+### Reviewing what you labelled
+
+The **mode** combo at the top left of the annotation screen switches between
+three queues over the same widgets, the same keys and the same video.
+
+| mode | the queue |
+|---|---|
+| **annotate** | the clips still to do |
+| **review labelled** | the ones already done, oldest first |
+| **review disagreements** | only the labels a **held-out** model made differently, the ones it was surest about first |
+
+#### review labelled
+
+Where a session is read back. Four things change, and nothing else does.
+
+* **The queue is the labels, in the order they were made.** Not the seeded
+  shuffle: reading three labels back would otherwise mean scrolling through the
+  hundreds of clips between them. The selector's batch is not spliced in either,
+  since nothing here is waiting to be chosen.
+* **A keypress rewrites the label and stays put.** Auto-advance is for
+  labelling; reviewing, the next thing you do after changing a label is look at
+  the clip again, so the key that changed it must not take it away. `→`
+  advances, as always.
+* **The side panel says whose judgement this is** - the annotator and the
+  timestamp off the row, plus *marked uncertain* where that was ticked - and
+  **where the model would now say otherwise**, naming the class it would pick.
+  Nothing is shown for a clip in the audit holdout: the suggester refuses to
+  answer about those on purpose, and a model's opinion of the last unbiased
+  sample there is must not reach a reviewer.
+* **`Tab` jumps to the next label the model argues with.** That is where to
+  start: a label the model agrees with is evidence about neither of them, and
+  one it does not is either a mistake or the thing the model still has to learn.
+
+#### review disagreements
+
+**A wrong label is what teaches the next model to be wrong**, and a model that
+has already been trained is the cheapest thing you have for finding one. This
+mode queues only the annotation windows the model labelled differently, surest
+first, and leaves you on the annotation screen where the label can be changed:
+pick a value and the note under the metadata says the two now agree, without the
+clip moving.
+
+> **It has to be a held-out prediction, and this is the whole subtlety.** The
+> saved model was fitted on every label there is. Ask it about one of them and
+> it is answering about a row it has memorised - it reproduces essentially all
+> of them however wrong they are. A shortlist built that way comes back empty
+> beside a confusion matrix full of off-diagonal counts, which is exactly the
+> contradiction it is supposed to surface.
+>
+> So the comparison uses the **cross-validated** predictions instead: for each
+> labelled clip, what a model fitted **without that clip's movie** said about
+> it. Those are the same predictions the report's confusion matrix is a tally
+> of, so the number in this queue and the off-diagonal of that matrix are one
+> number. `cv_predictions.parquet` is where a training run leaves them; on a
+> model trained before this build existed the screen says to train again rather
+> than quietly falling back on the model's own memory.
+
+**Surest first** is the order because it is the order they are worth opening in.
+A label a held-out model contradicted at 0.95 is either a label to fix or a model
+failure worth understanding; one at 0.4 is the model shrugging, and putting those
+first would bury the rest.
+
+The shortlist is **recomputed when a background refit lands** - a new model saw
+different folds, so it is a different list - and the queue on screen is left
+where it is, since re-ordering under a reviewer mid-clip loses their place.
+
+An empty queue is **four different facts**, and the screen says which: nothing
+labelled yet, no saved fold predictions, no clip scored by a fold, or every label
+reproduced by the fold that was held out from it. Only the last one means the
+labels are in good shape.
+
+A clip **no fold scored** is not in the queue, and there are three ways to be
+one. A clip in the **audit holdout**, which is never trained on, so a wrong label
+there is not one the model learnt from. A clip whose features are missing, which
+nothing scored. And a clip **labelled since the last fit**, which the next fit
+will cover.
+
+#### In both review modes
+
+Reviewing does not move the resume point, and it does not touch `selected_by`.
+That column is the selector's own account of why a clip was put in front of
+somebody, and nobody revising a label months later has a selector to ask; an
+edit that says nothing about it keeps what the row already said rather than
+overwriting it with *not recorded*.
 
 ### Which clip comes next
 
@@ -573,11 +756,31 @@ this data:
   stationary track. CatBoost splits on missingness natively; filling with 0.0
   would present those as real extremes, straightness 0.0 being a perfect circle.
 
+**The hyperparameter defaults are CatBoost's own** - `iterations: 1000`,
+`depth: 6`, `l2_leaf_reg: 3.0` - rather than numbers picked here, which were
+guesses tuned against one dataset where CatBoost's are tuned against many.
+`learning_rate: auto` is the one that cannot be written as a number: CatBoost
+derives the rate from the row count and the iteration count, and the right rate
+for 200 labelled clips is not the right rate for 5000. Give it a number and that
+goes away.
+
+The cost is real and worth knowing: 1000 iterations is about **four times the
+fitting time** of the 400 this used to default to, on every cross-validation fold
+and every background refit. Refits happen on a worker thread and annotation
+carries on through them, but a project that retrains often can set
+`suggest.iterations` back down.
+
 CatBoost trees are symmetric, so `suggest.depth` alone sets the width at
-2<sup>depth</sup> leaves. The default 5 is 32 leaves; 6 is 64, which overfits a
-few-hundred-clip hand-labelled set quickly. Feature importances come from the fit
-rather than from column shuffling. `suggest.model: hist` selects scikit-learn's
-HistGradientBoosting with matched hyperparameters.
+2<sup>depth</sup> leaves - 64 at the default 6. Past that a few-hundred-clip
+hand-labelled set is memorised rather than learned, which is a failure the
+reliability gate catches rather than one that reaches the annotator. Feature
+importances come from the fit rather than from column shuffling.
+`suggest.model: hist` selects scikit-learn's HistGradientBoosting with matched
+hyperparameters, `auto` there meaning sklearn's own default rate.
+
+`suggest.balance_classes` is deliberately **not** a CatBoost default: it
+describes this data rather than the estimator, and is on because one behaviour
+dominates a behaviour log.
 
 **Feature families.** `suggest.feature_groups` selects what the model may see.
 The Configure page disables families this project cannot compute and states why.
@@ -639,8 +842,10 @@ stale model. `suggest.audit_visible: true` makes the panel state which.
 detection renumbers the tracks and orphans every label written beforehand;
 `train` inner-joins on `clip_id` and drops those rows silently. The Model page's
 **Repair label links** matches orphans back onto the current clips by movie,
-frame window and crop position. It declines ambiguous cases: two candidate clips
-equidistant from the old crop centre are both left alone, and a clip already
+frame window and crop position. It declines ambiguous cases: a nearest clip that
+leads the next one by less than `min_margin_px` (3 px, the crop's own movement
+between runs) is not close enough to name, two orphans landing on one clip are
+both left alone, and a clip already
 carrying a newer label is never overwritten. The CSV is backed up before writing,
 and unmatched labels are reported rather than dropped.
 
@@ -874,8 +1079,9 @@ config alone must not.
 ### Correcting a bout
 
 A decoded boundary is a claim about when an animal changed what it was doing,
-and the review window (**Model -> Review predictions...**) is where you can see
-whether it is in the right place. You can also move it. What you say is written
+and the **Review** page - step 6, or the *Review predictions* button on the Model
+page, which goes there - is where you can see whether it is in the right place.
+You can also move it. What you say is written
 to **`bout_corrections.csv`, beside `annotations.csv`** - never into
 `predictions.parquet` and never into the annotation CSV.
 
@@ -909,7 +1115,15 @@ are all the same edit - *name a class over a frame range* - with different
 arguments. Drag an edge in the record lane, or type a range and press **Set
 class**; **Merge into previous/next** takes the neighbour's class over the
 selection. Every edit is checked against the invariant and saved immediately, so
-there is no Save button to forget and nothing to lose by closing the window.
+there is no Save button to forget and nothing to lose by navigating away.
+
+It is a page rather than a window that floats over one because reviewing is a
+step of the work and not a lookup: it wants the whole width for the frame axis,
+it belongs in the sequence the sidebar states, and one panel per project is what
+keeps two views of `bout_corrections.csv` from each holding their own idea of a
+track and erasing the other's on save. Leaving the page is what lets go of the
+movie and the thread decoding it; coming back puts the footage on the frame it
+was left on.
 
 **Only what you touched is written.** Correct one boundary and one or two rows
 appear, not a transcript of the whole track. The rest of the track is still the
@@ -921,10 +1135,79 @@ bout you have cut in half no longer has one anybody measured. A boundary the
 decode placed keeps its stride error band; a boundary you placed is drawn as a
 hairline, because yours is exact to the frame you chose.
 
-Some things it refuses, and why. A file of fixed windows cannot be corrected at
-all - a window's edges are multiples the predictor chose, so moving one corrects
-nothing about the animal, and a window relabelled by hand is a clip label, which
-already has a file. A stretch no window could be featurised over cannot be
+**The player beside the lanes.** It reads frames straight from the movie, in
+chunks, and it has **no scrubber of its own**: the lanes are the frame axis and
+they span the whole track, while a slider under the picture would span only the
+chunk decoded so far - 50 frames, a number that means nothing in the project and
+which, read beside a clip length of 25, looks like one. Play, the view mode and
+the marker are its only controls.
+
+Three things it is careful about, each of which was a visible fault:
+
+* **The frame goes in with the pixels.** Handing the viewer a new chunk and then
+  seeking paints frame 0 of that chunk first, so every chunk boundary crossed by
+  a scrub flashed the wrong picture.
+* **The end of a track loops to the start of the track.** The viewer loops the
+  array it holds, which is one chunk, so playback used to restart part-way
+  through - at whatever frame the last chunk began on, and at a different place
+  depending only on how the chunks divided the track.
+* **The caption is one elided line while there is video**, with the whole of it
+  on hover. Wrapped, it was a different number of lines for every frame and
+  every track, and each of those took its line out of the picture: the video
+  changing size as you switched tracks reads as the recording changing.
+
+**Going to where a held-out model disagreed with the label.** A confusion
+matrix says a model confuses two classes. It does not say which clips, and the
+clips are what a person can look at. The **`< disagreement`** and
+**`disagreement >`** buttons walk every **annotation window** whose recorded
+label is not what a model fitted *without that window's movie* predicted for it,
+across every track and every movie, **surest first**. It is the same shortlist
+the annotation screen's *review disagreements* mode queues, out of the same
+`cv_predictions.parquet`.
+
+Each stop selects the track, puts the playhead in the middle of the window, aims
+the frame boxes at exactly its range so *Set class* is already loaded, and says
+what each side claims and how sure the model is of its half. One of the two is
+wrong, and the clip is the only thing that says which.
+
+**Most confident first** is the order, because that is the order in which they
+are worth opening. A disagreement at 0.95 is either a label to fix or a model
+failure worth understanding; one at 0.35 is the model shrugging, and putting
+those first would bury the rest.
+
+The unit is the annotation window and not the decoded bout, so there is no frame
+arithmetic between the two claims and nothing has to have been predicted: the
+walk works as soon as there is a model and something labelled.
+
+**Two numbers, not one.** The line above the lanes says how many labelled windows
+disagree *out of how many the model was asked about*, and separately **how many
+it would not answer about at all**. The suggester refuses a clip in the audit
+holdout and a clip with no feature row, and a count with no denominator beside it
+reads as a model that agrees with everything - including everything nobody asked
+it.
+
+The audit holdout being invisible here is deliberate. Those are the only labels
+the model's own score is still honest over, and a reviewer shown its opinion of
+them, who then revised one, would have spent the last unbiased sample the
+project has.
+
+The same comparison drives the annotation screen's **review disagreements**
+mode, which is where a label is actually *changed*; this walk is for seeing where
+the boundary sits around one. Both go through one definition, so they cannot
+drift into two ideas of what a disagreement is:
+
+```python
+from trackanno.infer.agreement import differs, find, summarise
+```
+
+Some things it refuses, and why. **A file of fixed windows cannot be corrected
+at all**, and offers no controls rather than dead ones: a window's edges are
+multiples the predictor chose, so moving one corrects nothing about the animal,
+and a window relabelled by hand is a clip label, which already has a file - the
+annotation CSV, reached from the Annotate page. That is the whole answer to
+"where do I edit the dense predictions": you do not, because a dense window is
+not a claim about when anything happened. Set `predict.decode` and the same
+pixels come back as bouts, which are. A stretch no window could be featurised over cannot be
 *extended*: "nothing scored this" is a fact about the run, not something a person
 is in a position to assert. A class `config.yaml` does not declare is refused on
 the way in - it could not be coloured, trained on or exported - while a class the
@@ -952,6 +1235,69 @@ Nothing in that report is written anywhere. A derived label is not a hand label 
 it is what your correction *implies* about a clip nobody looked at - and the
 moment the two are indistinguishable in `annotations.csv`, nobody can say again
 what a person actually judged.
+
+### Transitions, dwell times, and the chain they imply
+
+```bash
+python -m trackanno.infer.transitions --config config.yaml
+python -m trackanno.infer.transitions --plot chain.png --plot-survival curves.png
+```
+
+Reads `predictions.parquet` when it holds **bouts** and writes `transitions.json`
+beside it, printing the same numbers. A windows file is refused, naming the
+settings that turn a decode on: a transition is a change between two consecutive
+bouts, and a frame-to-frame count measures `predict.min_bout_frames` rather than
+the animal.
+
+**What is counted.** A pair is formed only inside one `(movie, track)` and only
+across touching bouts; a gap, a track end and a movie end each break the pair
+rather than joining across it. A bout running to a track end or into a gap is
+right-censored - its true length is at least what was seen, and Kaplan-Meier
+folds it in as a lower bound - while a bout whose own start was never seen is
+dropped from every duration. Every rate is emitted beside the count it came from.
+
+**The chain.** On top of those counts the report fits the continuous-time Markov
+chain of [Boggon et al. 2026](https://doi.org/10.1038/s41467-026-75076-8),
+Fig. 1h and 1i:
+
+| in `transitions.json` | what it is |
+|---|---|
+| `lifetime` | the mean of an exponential fitted to the durations by maximum likelihood: total time at risk over ends seen, so a censored bout contributes its time but not an end |
+| `survival` | the measured Kaplan-Meier curve P(T > t), with the fitted curve alongside it point for point |
+| `fit_max_deviation` | the widest gap between those two. Above about 0.1 the state does not leave at a constant rate, and one number cannot stand for its lifetime |
+| `jump` | rho(i->j) = P(next = j \| in i), which is what the counts give directly |
+| `rates` | q(i->j) = rho(i->j) / lifetime(i) |
+| `steady_state` | the share of **time** each state holds in the long run: p(i) proportional to nu(i) x lifetime(i), with nu the jump chain's own stationary law |
+| `occupancy_observed` | that same share, measured straight off the record |
+
+The last two are the pair worth reading together. `steady_state` is what the
+fitted chain predicts; `occupancy_observed` is what actually happened. They come
+apart exactly when the chain does not describe these bouts, and neither number
+says that on its own. A state entered rarely and held for a long time takes up
+most of the record, which is why this is not a count of bouts.
+
+A steady state is **refused rather than approximated** where the chain has no
+unique one - a class with no observed successor, or classes splitting into
+groups that never reach each other, each with a stationary law of its own - and
+the refusal names which.
+
+**Every `se` resamples whole tracks**, 200 times, not bouts. The bouts within one
+track are a dependent sequence, and resampling them would report an error bar far
+narrower than the data supports.
+
+**Two drawings**, both needing matplotlib, which the project does not depend on.
+`--plot` is the state diagram: node area is the steady-state share of time, edge
+width is rho, and each edge carries the rate behind it. `--plot-survival` is the
+survival panel: the measured curve as points, the exponential as a line over it,
+on a log axis where an exponential is a straight line and a state that does not
+have one bends visibly away.
+
+**These are decoded predictions, not ground truth.** Two classes the classifier
+confuses appear as transitions between them that the animal never made, and the
+report points at the confusion matrix in `suggest_report.json` where there is
+one. `predict.min_bout_frames` puts a floor under every duration, which lifts
+every lifetime, so the rates are lower bounds - the report says so, with the
+number.
 
 ---
 
@@ -1017,7 +1363,7 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_pipeline.py` | clip planning, crop geometry, cache round-trip, box table, `window_mode` |
 | `test_nd2.py` | ND2 axis, position, channel and z index arithmetic, against a mock `ND2File` |
 | `test_gui_headless.py` | the annotation window built offscreen and driven with real input |
-| `test_workflow.py` | projects, config editing, background jobs, the workflow window |
+| `test_workflow.py` | projects, config editing, background jobs, the workflow window, the two prepare stages |
 | `test_regressions.py` | one test per defect found by adversarial review |
 | `test_trackseries.py` | the per-frame series against closed-form motion, at every window |
 | `test_wavespectra.py` | the sliding beat spectrum against a wave of known f, lambda, direction |
@@ -1034,6 +1380,9 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_audit_stability.py` | the holdout is the same clips tomorrow that it is today |
 | `test_discover.py` | sub-behaviours found where they were planted, and the batch effect that is not one |
 | `test_bout_review.py` | reading decoded bouts back, including a file that holds windows instead |
+| `test_review_mode.py` | reading a labelling session back: the queue, the provenance that must survive an edit |
+| `test_agreement.py` | which annotation windows the folds contradicted, that this is the confusion matrix's own off-diagonal, and the walk through them |
+| `test_transitions.py` | transitions, dwell times and the fitted chain, against planted bouts |
 | `test_bouts.py` | frame posteriors and the two decoders, against closed forms |
 | `test_dense_grid.py` | the window grid at every stride, and the frames a plan must reach |
 | `test_select.py` | which clip to annotate next, and what the audit draw must ignore |

@@ -659,15 +659,29 @@ def train_group(
     groups_per_class = int(merged.groupby(group_name)["movie_id"].nunique().min())
     n_splits = int(min(5, groups_per_class, n_movies))
     if n_splits < 2:
+        if n_movies < 2:
+            # Every class trips the movie count here, so naming a "scarcest"
+            # one reads as a claim about its label count, which may be ample.
+            return bail(
+                f"all {len(merged)} training labels come from one movie "
+                f"({groups[0]!r}), and the score is leave-movie-out: with a "
+                "single movie nothing can be held out, so performance on an "
+                "unseen movie is not estimable however many labels each class "
+                "has. Annotate some clips in a second movie."
+            )
         # Name the constraint that actually binds: reporting `n_movies` sends a
         # user with four annotated movies off to annotate a fifth when the real
         # problem is a class confined to one movie.
-        scarcest = merged.groupby(group_name)["movie_id"].nunique().idxmin()
+        per_class = merged.groupby(group_name)["movie_id"].nunique()
+        confined = sorted(str(c) for c in per_class[per_class < 2].index)
+        noun = "class" if len(confined) == 1 else "classes"
+        verb = "appears" if len(confined) == 1 else "appear"
         return bail(
-            f"class {scarcest!r} appears in only {groups_per_class} of the "
-            f"{n_movies} annotated movie(s), so it cannot be held out; performance "
-            "on an unseen movie is not estimable. Annotate that class in another "
-            "movie, or accept that any score here is within-movie only."
+            f"{noun} {', '.join(map(repr, confined))} {verb} in only one of "
+            f"the {n_movies} annotated movies and so cannot be held out; "
+            "performance on an unseen movie is not estimable. Annotate the "
+            f"{noun} in another movie, or accept that any score here is "
+            "within-movie only."
         )
 
     from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, f1_score

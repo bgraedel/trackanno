@@ -43,6 +43,10 @@ THUMBS_FILE = "thumbs.dat"
 TRACKS_FILE = "tracks.parquet"
 NORM_FILE = "norm.json"
 DONE_FILE = "prepare_done.json"
+# The detection stage's marker. Separate from DONE_FILE because `project_status`
+# counts that one as "this movie has clips": a movie detected on a GPU box but
+# not yet cut must still read as unprepared.
+DETECT_FILE = "detect_done.json"
 
 
 @dataclass

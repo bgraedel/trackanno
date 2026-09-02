@@ -371,7 +371,12 @@ def test_the_picture_does_not_change_size_across_tracks_or_movies(
     check("...off the same crop object, measured once for the session",
           footage.crop is crop, str(footage.crop))
     check("and the line under the picture says what that crop is",
-          f"{crop.side} px crop" in footage.source.text(), footage.source.text())
+          f"{crop.side} px crop" in footage.caption, footage.caption)
+    check("...in full on hover, however much of it the label has room for",
+          footage.caption in footage.source.toolTip(), footage.source.toolTip())
+    check("...and the label shows the start of that same sentence",
+          footage.source.text().rstrip(chr(0x2026)).strip()
+          in footage.caption, footage.source.text())
 
 
 # --------------------------------------------------------------------------- #
@@ -819,6 +824,106 @@ def test_playback_carries_from_one_chunk_into_the_next(app, panel) -> None:
     footage.viewer.pause()
 
 
+def test_the_end_of_a_track_loops_to_the_start_of_the_track(app, panel) -> None:
+    """Not to the start of the chunk it happened to end in.
+
+    The viewer loops the array it holds, which is one decode chunk. Left to do
+    that at the end of a track, playback restarts part-way through - at whatever
+    frame the last chunk began on, so at a different place depending only on how
+    the chunks divided the track. Watched for a minute that reads as a player
+    that skips the beginning.
+    """
+    footage = panel.footage
+    f_lo, f_hi = footage._span
+    check("the track is longer than one chunk, or this proves nothing",
+          f_hi - f_lo > REVIEW_CHUNK_FOR_TEST(), f"{f_lo}-{f_hi}")
+
+    footage.show_frame(f_hi - 2)
+    settle(app, footage, f_hi - 2)
+    last_chunk = footage._loaded
+    check("the playhead is in the final chunk, not the first",
+          last_chunk > f_lo, f"{last_chunk} vs {f_lo}")
+
+    footage.viewer.play()
+    for _ in range(3000):
+        footage.viewer._advance()
+        app.processEvents()
+        if footage.position <= f_lo + 2:
+            break
+        time.sleep(0.001)
+    check("running off the end goes back to the first frame of the track",
+          f_lo <= footage.position <= f_lo + 2, str(footage.position))
+    check("...and not to the first frame of the last chunk",
+          footage.position < last_chunk, f"{footage.position} vs {last_chunk}")
+    check("...still playing", footage.viewer.is_playing)
+    footage.viewer.pause()
+
+
+def test_the_picture_does_not_resize_when_the_caption_does(app, panel) -> None:
+    """The caption under the picture takes its height out of the picture.
+
+    It changes on every frame and on every track switch - "reading frames..."
+    while a decode is out, a longer sentence once it lands - and wrapped, each
+    of those was a different number of lines and so a different size of video.
+    A picture that changes size while a track is switched reads as the recording
+    changing rather than as the sentence under it growing.
+    """
+    footage = panel.footage
+    footage.resize(360, 520)
+    app.processEvents()
+    settle(app, footage)
+    tall = footage.viewer.height()
+
+    footage._set_caption(
+        "a caption long enough to wrap several times over at this width, which "
+        "is what the note under the picture does once a crop sentence and a "
+        "skeleton complaint are both in it as well as the frame number"
+    )
+    app.processEvents()
+    check("a long caption is one line high", footage.source.height() <= tall,
+          f"caption {footage.source.height()} of {tall}")
+    check("...and the picture is the size it was",
+          footage.viewer.height() == tall,
+          f"{tall} -> {footage.viewer.height()}")
+    check("the whole of it is still readable",
+          footage.caption.endswith("as well as the frame number"), footage.caption)
+    check("...on hover", footage.caption in footage.source.toolTip()
+          or footage.source.text() in footage.caption, footage.source.toolTip())
+
+    footage._set_caption("short")
+    app.processEvents()
+    check("and a short one does not give the picture a line back either",
+          footage.viewer.height() == tall,
+          f"{tall} -> {footage.viewer.height()}")
+
+
+def test_the_player_has_no_scrubber_of_its_own(app, panel) -> None:
+    """One frame axis, and it is the one that spans the track.
+
+    The viewer's own slider spans the decoded chunk, which is 50 frames because
+    that is a convenient amount to read at once - a number with no meaning in
+    the project, and read beside a clip length of 25 it looks like one.
+    """
+    footage = panel.footage
+    settle(app, footage)
+    check("the video is showing", footage.showing == "movie")
+    check("but its slider is not", not footage.viewer._slider.isVisibleTo(footage))
+    check("nor its chunk-relative frame counter",
+          not footage.viewer._counter.isVisibleTo(footage))
+    check("play is still there, being about the video and not about frames",
+          footage.viewer._play_btn.isVisibleTo(footage))
+    check("and the lanes beside it are the frame axis, spanning the whole track",
+          panel.timeline.track.f_hi - panel.timeline.track.f_lo
+          > REVIEW_CHUNK_FOR_TEST(),
+          f"{panel.timeline.track.f_lo}-{panel.timeline.track.f_hi}")
+
+
+def REVIEW_CHUNK_FOR_TEST() -> int:
+    from trackanno.gui.timeline import REVIEW_CHUNK
+
+    return int(REVIEW_CHUNK)
+
+
 def test_clicking_a_bout_takes_you_to_it_and_still_selects_it(app, panel) -> None:
     """One press, both jobs, and neither may cost the other.
 
@@ -1043,47 +1148,47 @@ def test_a_track_the_detector_never_saw_says_so_rather_than_showing_nothing(
 # --------------------------------------------------------------------------- #
 # letting go
 # --------------------------------------------------------------------------- #
-def test_hiding_the_window_lets_go_and_showing_it_gets_the_video_back(
+def test_hiding_the_panel_lets_go_and_showing_it_gets_the_video_back(
     app, filmed,
 ) -> None:
-    """The Model page keeps one review dialog for the whole session.
+    """The Review page keeps one panel for the whole session.
 
     Holding a movie open and a decode thread running for that long is a file
     handle and a thread nobody is looking at, so both are dropped whenever the
-    window goes away - which means re-showing it has to put the footage back. A
-    window that came back with a sentence where the video was would look exactly
-    like a project that had lost its recordings.
+    panel goes away - which is what leaving the page does, and which means
+    coming back to it has to put the footage back. A page that returned with a
+    sentence where the video was would look exactly like a project that had
+    lost its recordings.
     """
-    from trackanno.gui.timeline import BoutReviewDialog
+    from trackanno.gui.timeline import BoutReviewPanel
 
     cfg, movie = filmed
-    dialog = BoutReviewDialog(cfg)
-    dialog.show()
+    panel = BoutReviewPanel(cfg)
+    panel.show()
     app.processEvents()
-    panel = dialog.panel
     try:
         select(panel, movie, TRACK)
         panel.timeline.resize(820, 260)
         painted(panel.timeline)
         click(panel.timeline, 72)
         settle(app, panel.footage, 72)
-        check("the dialog is showing the movie", panel.footage.showing == "movie"
+        check("the panel is showing the movie", panel.footage.showing == "movie"
               and panel.footage.position == 72, panel.footage.source.text())
 
-        dialog.hide()
+        panel.hide()
         app.processEvents()
         check("hiding it lets go of the movie and stops the decode thread",
               panel.footage._movie is None and not panel.footage._chunks,
               str(sorted(panel.footage._chunks)))
 
-        dialog.show()
+        panel.show()
         settle(app, panel.footage, 72)
         check("showing it again brings the video back",
               panel.footage.showing == "movie", panel.footage.source.text())
         check("...to the frame it was left on", panel.footage.position == 72,
               str(panel.footage.position))
     finally:
-        dialog.close()
+        panel.close()
         app.processEvents()
 
 

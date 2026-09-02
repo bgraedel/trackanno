@@ -374,10 +374,51 @@ def test_no_combo_offers_a_value_the_loader_refuses(app, root: Path) -> None:
           offered > 35, str(offered))
 
 
+def test_an_autonum_widget_takes_the_shape_its_setting_does(app) -> None:
+    """A field has to be able to represent what its setting accepts.
+
+    `_AutoField` builds an integer spin box unless the row says
+    `numeric: "float"`, so a setting declared `float | str` with that missing
+    loads 0.05 as 0. The next autosave writes the 0, the loader refuses it, and
+    the Configure page cannot save anything at all until the file is edited by
+    hand - which is how `suggest.learning_rate` shipped.
+
+    Read off the dataclass annotation rather than probed with a value, because
+    the value that exposes it differs per setting and a probe that suits one
+    is nonsense for the next.
+    """
+    from trackanno import config as config_module
+    from trackanno.gui.configform import FIELDS, ConfigForm
+
+    sections = {
+        "detection": "Detection", "tiling": "Tiling", "tracking": "Tracking",
+        "clips": "Clips", "suggest": "Suggest", "predict": "Predict",
+        "ui": "UI", "normalize": "Normalize", "features": "Features",
+        "paths": "Paths", "keypoints": "Keypoints",
+    }
+    form = ConfigForm("all")
+    checked = 0
+    for section, key, kind, *_ in FIELDS:
+        if kind != "autonum":
+            continue
+        holder = getattr(config_module, sections.get(section, ""), None)
+        annotation = str((getattr(holder, "__annotations__", {}) or {}).get(key, ""))
+        check(f"{section}.{key} is a real setting on a real section",
+              bool(annotation), f"no annotation for {section}.{key}")
+        wants_float = "float" in annotation
+        widget = form._widgets[f"{section}.{key}"]
+        check(f"{section}.{key} takes {'a rate' if wants_float else 'a whole number'}, "
+              f"and its box does too",
+              bool(widget._float) == wants_float,
+              f"declared {annotation!r}, widget float={widget._float}")
+        checked += 1
+    check("there were autonum fields to check", checked >= 4, str(checked))
+
+
 def test_a_key_the_file_never_mentions_is_not_invented(app, root: Path) -> None:
     """The generated config.yaml documents most settings and leaves the rest to
     their defaults. Writing every widget back turned each of those into whatever
-    its spin box range starts at - `suggest.iterations` 400 -> 10, `depth` 5 -> 1,
+    its spin box range starts at - `suggest.iterations` 1000 -> 10, `depth` 6 -> 1,
     `balance_classes` on -> off - on the first autosave of a new project, which
     is a different model with nothing on screen to say so."""
     from trackanno.config import load_config
@@ -400,7 +441,8 @@ def test_a_key_the_file_never_mentions_is_not_invented(app, root: Path) -> None:
     write_config(path, form.values())
     cfg = load_config(path)
     check("saving the form keeps the default the loader would have used",
-          cfg.suggest.iterations == 400 and cfg.suggest.depth == 5
+          cfg.suggest.iterations == 1000 and cfg.suggest.depth == 6
+          and cfg.suggest.learning_rate == "auto"
           and cfg.suggest.balance_classes,
           f"{cfg.suggest.iterations}, {cfg.suggest.depth}, {cfg.suggest.balance_classes}")
     check("...and the comments survive a save of every field",
@@ -417,4 +459,4 @@ def test_a_key_the_file_never_mentions_is_not_invented(app, root: Path) -> None:
     write_config(path, offered)
     written = load_config(path)
     check("the touched key reached the file", written.suggest.iterations == 1200)
-    check("...and the untouched one kept its default", written.suggest.depth == 5)
+    check("...and the untouched one kept its default", written.suggest.depth == 6)

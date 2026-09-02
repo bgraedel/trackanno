@@ -102,6 +102,47 @@ def project_config(root):
     return path
 
 
+def test_the_default_config_is_a_shipped_yaml_file(root) -> None:
+    """It is data, so it lives in a file rather than in a string in project.py.
+
+    Read through importlib.resources so an installed wheel finds it the same way
+    a checkout does. If it goes missing the failure has to name the file, not
+    surface as a project created with no settings.
+    """
+    from importlib import resources
+
+    import yaml
+
+    from trackanno.project import (
+        DEFAULT_CONFIG, DEFAULT_CONFIG_FILE, create_project,
+    )
+
+    shipped = resources.files("trackanno").joinpath(DEFAULT_CONFIG_FILE)
+    check("the package carries the file", shipped.is_file(), str(shipped))
+    check("...and it is the yaml, not a python string",
+          str(shipped).endswith(".yaml"), str(shipped))
+    check("what the module exposes is what the file holds",
+          DEFAULT_CONFIG == shipped.read_text(encoding="utf-8"))
+
+    parsed = yaml.safe_load(DEFAULT_CONFIG)
+    check("it parses as a mapping of sections", isinstance(parsed, dict)
+          and "paths" in parsed and "clips" in parsed, str(type(parsed)))
+    check("and it is commented, which is the point of shipping the text",
+          DEFAULT_CONFIG.count("#") > 100, str(DEFAULT_CONFIG.count("#")))
+
+    written = Path(create_project(root / "from-the-file")).read_text(encoding="utf-8")
+    check("a new project starts from it, comments and all",
+          written.count("#") == DEFAULT_CONFIG.count("#"),
+          f"{written.count('#')} vs {DEFAULT_CONFIG.count('#')}")
+
+    # A backslash in a python string is an escape; in the file it is a
+    # backslash. Nothing in here needs one today, and this is what says so if
+    # somebody pastes a Windows path in.
+    check("no stray tab or control character got in",
+          "\t" not in DEFAULT_CONFIG and "\x0c" not in DEFAULT_CONFIG,
+          repr(DEFAULT_CONFIG[:0]))
+
+
 def test_project(root, project_config) -> None:
     """Creation, the status readout, and an edit that must never reach disk."""
     from trackanno.config import load_config
@@ -461,6 +502,243 @@ def test_prepare_reports_and_cancels(root: Path) -> None:
         check("a cancelled prepare stops inside the movie", False)
 
 
+# --------------------------------------------------------------------------- #
+# the two prepare stages
+# --------------------------------------------------------------------------- #
+POSE_PREPARE_CONFIG = PREPARE_CONFIG.replace(
+    "detection: {task: detect, imgsz: 640, device: cpu}",
+    "detection: {task: pose, imgsz: 640, device: cpu}\n"
+    "keypoints: {nodes: [head, base], edges: [[head, base]]}",
+)
+
+
+class PoseStubDetector(StubDetector):
+    """As StubDetector, but hangs two keypoints off every box like a pose model."""
+
+    def detect(self, frame_rgb):
+        from trackanno.detect.tiling import Detections
+
+        xyxy, conf = self.by_frame[self.calls % self.n_frames]
+        self.calls += 1
+        mid = ((xyxy[:, 0] + xyxy[:, 2]) / 2).astype(np.float32)
+        seen = np.ones(len(conf), np.float32)
+        kpts = np.stack(
+            [np.stack([mid, xyxy[:, 1], seen], axis=1),
+             np.stack([mid, xyxy[:, 3], seen], axis=1)], axis=1
+        ).astype(np.float32)
+        return Detections(
+            xyxy=xyxy, conf=conf, cls=np.zeros(len(conf), np.int32), kpts=kpts
+        )
+
+
+def _prep_project(root: Path, name: str, config: str = PREPARE_CONFIG):
+    """A project folder, a synthetic movie and its ground truth, ready to run."""
+    from test_pipeline import SyntheticMovie
+
+    from trackanno.config import load_config
+
+    project = root / name
+    project.mkdir()
+    (project / "config.yaml").write_text(config, encoding="utf-8")
+    cfg = load_config(project / "config.yaml")
+    movie = SyntheticMovie()
+    by_frame = {
+        int(f): (df[["x1", "y1", "x2", "y2"]].to_numpy(np.float32),
+                 df["conf"].to_numpy(np.float32))
+        for f, df in movie.tracks().groupby("frame")
+    }
+    return cfg, movie, by_frame
+
+
+def _no_detector():
+    raise AssertionError("the clip stage built a detector, which needs the weights")
+
+
+def test_the_two_stages_match_one_pass(root: Path) -> None:
+    """Detecting and cutting separately must give the same cache as doing both at
+    once, or "detect there, cut here" quietly means something else."""
+    from trackanno.annotate.clips import ClipStore
+    from trackanno.detect.prepare import cut_movie, detect_movie, prepare_movie
+
+    one, movie, frames = _prep_project(root, "one-pass")
+    whole = prepare_movie(movie, StubDetector(frames, movie.n_frames), one, limit_frames=60)
+
+    split, movie2, frames2 = _prep_project(root, "split")
+    handoff = detect_movie(
+        movie2, StubDetector(frames2, movie2.n_frames), split, limit_frames=60
+    )
+    out = split.movie_dir(movie2.id)
+    check("stage 1 leaves a handoff", (out / "detect_done.json").exists())
+    check("stage 1 does NOT report the movie as prepared",
+          not (out / "prepare_done.json").exists())
+    check("stage 1 wrote the tracks and the intensity mapping",
+          (out / "tracks.parquet").exists() and (out / "norm.json").exists())
+    check("stage 1 wrote no clip pixels", not (out / "clips.dat").exists())
+    check("the handoff carries what stage 2 cannot work out for itself",
+          {"keypoint_nodes", "tiled", "n_tiles", "feature_dim", "n_frames",
+           "config_fingerprint"} <= set(handoff), str(sorted(handoff)))
+
+    part = cut_movie(movie2, split)
+    for field in ("n_clips", "crop_size", "n_tracks", "n_detections", "tiled", "n_tiles"):
+        check(f"both routes agree on {field}", part[field] == whole[field],
+              f"{part[field]} vs {whole[field]}")
+
+    a, b = ClipStore(one.paths.work_dir), ClipStore(split.paths.work_dir)
+    check("both caches hold the same clips", len(a) == len(b) and len(a) > 0)
+    check("and the same overlay geometry", len(a.clip_boxes(0)) == len(b.clip_boxes(0)))
+
+
+def test_a_run_started_elsewhere_is_finished_not_repeated(root: Path) -> None:
+    """The workflow window calls prepare_movie with no stage of any kind. Given a
+    movie detected on a GPU box, it must cut the clips and never reach for a
+    model this machine does not have."""
+    from trackanno.detect.prepare import detect_movie, prepare_movie
+    from trackanno.project import forget_path_probes, project_status
+
+    cfg, movie, frames = _prep_project(root, "from-gpu-box")
+    detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+
+    status = project_status(cfg)
+    check("a detected movie is not counted as prepared", status.n_prepared == 0)
+    check("and contributes no clips", status.n_clips == 0)
+    check("but is counted as detected", status.n_detected == 1)
+
+    info = prepare_movie(movie, _no_detector, cfg)
+    check("the clips were cut anyway", info["n_clips"] > 0)
+    check("using the tiling the detection stage recorded", info["n_tiles"] == 1)
+
+    # What PreparePage._on_run_finished does, and must: the status above cached a
+    # "no prepare_done.json here" verdict for the next half minute.
+    forget_path_probes()
+    after = project_status(cfg)
+    check("and now it is prepared", after.n_prepared == 1, str(after))
+    check("with its clips counted", after.n_clips == info["n_clips"])
+
+
+def test_pose_keypoint_names_survive_the_handoff(root: Path) -> None:
+    """The names come from the checkpoint, not config.yaml. A machine that never
+    loads the checkpoint would otherwise cut a box table with no keypoints in it
+    and say nothing at all."""
+    import pandas as pd
+
+    from trackanno.config import load_config
+    from trackanno.detect.prepare import cut_movie, detect_movie
+
+    cfg, movie, frames = _prep_project(root, "pose-handoff", POSE_PREPARE_CONFIG)
+    handoff = detect_movie(
+        movie, PoseStubDetector(frames, movie.n_frames), cfg, limit_frames=60
+    )
+    check("the handoff records the resolved names",
+          handoff["keypoint_nodes"] == ["head", "base"])
+
+    # What the annotating machine looks like: same project, but its config never
+    # learned the names because it never loaded the weights.
+    laptop = load_config(cfg.path)
+    laptop.keypoints.nodes = []
+    check("it starts out knowing no keypoints", laptop.n_keypoints == 0)
+
+    cut_movie(movie, laptop)
+    check("the names came back from the handoff",
+          list(laptop.keypoints.nodes) == ["head", "base"])
+    boxes = pd.read_parquet(cfg.movie_dir(movie.id) / "clip_boxes.parquet")
+    check("so the box table carries its keypoint columns",
+          {"kp_x_0", "kp_y_0", "kp_x_1", "kp_y_1"} <= set(boxes.columns),
+          str(sorted(c for c in boxes.columns if c.startswith("kp_"))))
+
+
+def test_detections_from_a_different_config_are_refused(root: Path) -> None:
+    """Settings that decide what the detector found may not change underneath the
+    clips cut from it. Naming the section is the whole value of the message."""
+    from trackanno.detect.prepare import (
+        cut_movie, detect_movie, handoff_is_fresh, read_handoff,
+    )
+
+    cfg, movie, frames = _prep_project(root, "stale")
+    detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+    check("a fresh handoff reads as fresh", handoff_is_fresh(cfg, movie.id))
+
+    # Where the work ran is not what it found, so this must NOT invalidate it.
+    cfg.detection.device = "cuda:0"
+    cfg.detection.batch = 32
+    check("the device and batch size do not invalidate detections",
+          handoff_is_fresh(cfg, movie.id))
+
+    cfg.detection.conf = 0.9
+    check("a changed confidence threshold does", not handoff_is_fresh(cfg, movie.id))
+    try:
+        read_handoff(cfg, movie.id)
+    except ValueError as exc:
+        check("and the refusal names the section that changed", "detection" in str(exc), str(exc))
+    else:
+        check("and the refusal names the section that changed", False)
+
+    try:
+        cut_movie(movie, cfg)
+    except ValueError:
+        check("cutting clips from stale detections is refused", True)
+    else:
+        check("cutting clips from stale detections is refused", False)
+
+
+def test_a_handoff_that_cannot_account_for_itself_is_refused(root: Path) -> None:
+    """A record with no fingerprint cannot say which settings produced it, which
+    is the one thing the check exists to establish."""
+    import json
+
+    from trackanno.detect.prepare import detect_movie, handoff_is_fresh, read_handoff
+
+    cfg, movie, frames = _prep_project(root, "no-fingerprint")
+    detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+
+    path = cfg.movie_dir(movie.id) / "detect_done.json"
+    for dropped, name in (({}, "no fingerprint at all"), ({"detection": "x"}, "only some sections")):
+        info = json.loads(path.read_text(encoding="utf-8"))
+        info["config_fingerprint"] = dropped
+        path.write_text(json.dumps(info), encoding="utf-8")
+        check(f"a handoff with {name} is not fresh", not handoff_is_fresh(cfg, movie.id))
+        try:
+            read_handoff(cfg, movie.id)
+        except ValueError:
+            check(f"and reading it is refused ({name})", True)
+        else:
+            check(f"and reading it is refused ({name})", False)
+
+
+def test_a_prepared_movie_never_asks_for_the_model(root: Path) -> None:
+    """A project prepared before the split has no handoff at all. Re-running must
+    not load the weights only to skip every movie."""
+    from trackanno.detect.prepare import (
+        _needs_detection, handoff_is_fresh, prepare_movie,
+    )
+
+    cfg, movie, frames = _prep_project(root, "old-project")
+    prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+
+    # What an old cache looks like: clips and a prepared marker, no handoff.
+    (cfg.movie_dir(movie.id) / "detect_done.json").unlink()
+    check("a prepared movie needs no detection", not _needs_detection(cfg, movie.id))
+    check("even though it has no handoff to be fresh",
+          not handoff_is_fresh(cfg, movie.id))
+    check("but --force means it does", _needs_detection(cfg, movie.id, force=True))
+    check("and a movie with neither does too",
+          _needs_detection(_prep_project(root, "untouched")[0], "synthetic"))
+
+
+def test_cutting_without_detections_says_what_to_do(root: Path) -> None:
+    """The one error a split workflow will actually hit."""
+    from trackanno.detect.prepare import cut_movie, handoff_is_fresh
+
+    cfg, movie, _ = _prep_project(root, "no-handoff")
+    check("nothing is fresh before detection runs", not handoff_is_fresh(cfg, movie.id))
+    try:
+        cut_movie(movie, cfg)
+    except FileNotFoundError as exc:
+        check("it names the missing file and the way out",
+              "detect_done.json" in str(exc) and "copy" in str(exc), str(exc))
+    else:
+        check("it names the missing file and the way out", False)
+
+
 def test_task_panel(app) -> None:
     from trackanno.gui.tasks import TaskPanel
 
@@ -493,6 +771,174 @@ def test_task_panel(app) -> None:
     panel.cancel()
     check("cancel actually stops the worker",
           pump(app, lambda: results) and results[0] is False and not stopped)
+    panel.shutdown()
+
+
+def test_no_page_keeps_a_paragraph_on_screen(app, project_config) -> None:
+    """Long explanation goes behind a `?`, not under the thing it explains.
+
+    A subtitle is permanent: read once and then always there, a paragraph at the
+    top of a page is height taken from the work below it on every visit. One
+    sentence stays, the rest goes in the help window - which can be opened when
+    it is wanted and closed when it is not.
+
+    Measured over the real pages rather than asserted per string, so a paragraph
+    added to a new page fails here rather than being noticed by somebody
+    scrolling past it.
+    """
+    from qtpy.QtWidgets import QLabel
+
+    from trackanno.gui.hub import PAGES, Hub
+    from trackanno.gui.theme import Heading
+
+    hub = Hub(str(project_config))
+    hub.show()
+    app.processEvents()
+    try:
+        long_ones, helped = [], 0
+        for name, page in zip(PAGES, hub.pages):
+            for heading in page.findChildren(Heading):
+                subtitle = heading.subtitle.text()
+                if len(subtitle) > 110:
+                    long_ones.append((name, len(subtitle), subtitle))
+                if heading.help is not None:
+                    helped += 1
+        check("every page heading is one line, not a paragraph",
+              not long_ones, str(long_ones))
+        check("and the long form is behind a button on most of them",
+              helped >= 4, f"{helped} heading(s) carry a ?")
+
+        # The one place a wall of text is right is inside the help itself.
+        review = hub.page(type(hub.pages[PAGES.index("Review")]))
+        check("the Review page reaches its own long form", review is not None)
+    finally:
+        for page in hub.pages:
+            page.shutdown()
+        hub.close()
+        app.processEvents()
+
+
+def test_the_help_button_opens_and_closes(app) -> None:
+    """A `?` is only an improvement if what is behind it can be read and shut."""
+    from qtpy.QtCore import QTimer
+    from qtpy.QtWidgets import QDialog, QTextBrowser
+
+    from trackanno.gui.theme import help_button
+
+    opened: list = []
+
+    def close_it():
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, QDialog) and widget.isVisible():
+                body = widget.findChild(QTextBrowser)
+                opened.append("" if body is None else body.toPlainText())
+                widget.reject()
+
+    button = help_button(None, "Help", "<h3>A heading</h3><p>and a paragraph.</p>")
+    QTimer.singleShot(0, close_it)
+    button.click()
+    app.processEvents()
+
+    check("the button opened something", opened, "nothing opened")
+    check("...with the text in it, rendered rather than escaped",
+          "A heading" in opened[0] and "and a paragraph." in opened[0]
+          and "<h3>" not in opened[0], opened[0] if opened else "")
+    check("...and it closed", not [w for w in app.topLevelWidgets()
+                                   if isinstance(w, QDialog) and w.isVisible()])
+
+
+def test_a_colour_in_the_log_belongs_to_one_line(app) -> None:
+    """A colour has to mean something, which it cannot if it spreads.
+
+    ``appendHtml`` and ``appendPlainText`` both take their character format from
+    the visible cursor, which sits at the end of the last line written. One
+    amber warning therefore left every later line amber, and a reader could not
+    tell which line the colour was about.
+    """
+    from qtpy.QtGui import QTextFormat
+
+    from trackanno.gui.tasks import TaskPanel
+    from trackanno.gui.theme import tokens
+
+    panel = TaskPanel("Go")
+    written = [
+        ("ordinary progress", "info"),
+        ("something worth knowing", "warning"),
+        ("more ordinary progress", "info"),
+        ("it broke\nwith a second line", "error"),
+        ("still ordinary", "info"),
+        ("finished", "good"),
+    ]
+    for message, level in written:
+        panel.append(message, level)
+
+    palette = tokens()
+    document = panel.log.document()
+    colours: list[tuple[str, str]] = []
+    for i in range(document.blockCount()):
+        block = document.findBlockByNumber(i)
+        fragment = block.begin()
+        fmt = None if fragment.atEnd() else fragment.fragment().charFormat()
+        colours.append((
+            block.text(),
+            fmt.foreground().color().name().upper()
+            if fmt is not None and fmt.hasProperty(QTextFormat.ForegroundBrush)
+            else "plain",
+        ))
+    by_line = dict(colours)
+
+    check("every message reached the log", len(colours) == 7, str(colours))
+    check("a warning is amber",
+          by_line["something worth knowing"] == palette["warning"].upper(),
+          str(colours))
+    check("the line after it is not",
+          by_line["more ordinary progress"] == "plain", str(colours))
+    check("an error is red",
+          by_line["it broke"] == palette["danger"].upper(), str(colours))
+    check("...all the way down a traceback",
+          by_line["with a second line"] == palette["danger"].upper(), str(colours))
+    check("and the line after that is plain again",
+          by_line["still ordinary"] == "plain", str(colours))
+    check("the finishing line is green",
+          by_line["finished"] == palette["success"].upper(), str(colours))
+    panel.shutdown()
+
+
+def test_a_cancelled_job_is_not_reported_as_a_failure(app) -> None:
+    """Stopping a job is something the user did, not something that went wrong,
+    and red is the colour that says a run failed."""
+    from qtpy.QtGui import QTextFormat
+
+    from trackanno.gui.tasks import TaskPanel
+    from trackanno.gui.theme import tokens
+
+    panel = TaskPanel("Go")
+    results: list = []
+    panel.finished.connect(lambda ok: results.append(ok))
+
+    def slow(reporter):
+        for _ in reporter.track(range(100000), "grinding", 100000):
+            time.sleep(0.001)
+        return "should not happen"
+
+    panel.start(slow, throttle=1)
+    pump(app, lambda: panel.bar.value() > 2, timeout=10)
+    panel.cancel()
+    check("the job stopped", pump(app, lambda: results) and results[0] is False)
+
+    document = panel.log.document()
+    last = document.findBlockByNumber(document.blockCount() - 1)
+    fragment = last.begin()
+    fmt = None if fragment.atEnd() else fragment.fragment().charFormat()
+    colour = (
+        fmt.foreground().color().name().upper()
+        if fmt is not None and fmt.hasProperty(QTextFormat.ForegroundBrush)
+        else "plain"
+    )
+    check("it says so on the last line", last.text() == "cancelled", last.text())
+    check("in amber, not the red that means the run failed",
+          colour == tokens()["warning"].upper()
+          and colour != tokens()["danger"].upper(), colour)
     panel.shutdown()
 
 

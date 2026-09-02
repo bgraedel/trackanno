@@ -17,8 +17,8 @@ from qtpy.QtGui import QColor, QFont, QPalette, QPen
 from qtpy.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 __all__ = ["THEMES", "apply_theme", "tokens", "role", "Heading", "current",
-           "theme_icon", "app_icon", "banner_style", "compact_button", "set_role", "set_flag",
-           "RADIUS"]
+           "theme_icon", "app_icon", "banner_style", "compact_button", "set_role",
+           "set_flag", "show_help", "help_button", "RADIUS"]
 
 # --------------------------------------------------------------------------- #
 # tokens
@@ -495,18 +495,61 @@ def apply_theme(app: QApplication, name: str = "dark") -> str:
 # --------------------------------------------------------------------------- #
 # small shared widgets
 # --------------------------------------------------------------------------- #
-class Heading(QWidget):
-    """A page title and its one-line explanation, styled from the theme."""
+def show_help(parent, title: str, html: str) -> None:
+    """Open ``html`` in a window that can be read, scrolled and closed.
 
-    def __init__(self, title: str, subtitle: str = "", parent=None):
+    Not a QMessageBox, which cannot scroll a paragraph.
+    """
+    from qtpy.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(620, 520)
+    body = QTextBrowser()
+    body.setOpenExternalLinks(False)
+    body.setHtml(html)
+    buttons = QDialogButtonBox(QDialogButtonBox.Close)
+    buttons.rejected.connect(dialog.reject)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(body, 1)
+    layout.addWidget(buttons)
+    dialog.exec_() if hasattr(dialog, "exec_") else dialog.exec()
+
+
+def help_button(parent, title: str, html, size: int = 26):
+    """A `?` that opens the long form of whatever it sits beside.
+
+    ``html`` may be a callable, for text that depends on what is on screen when
+    the button is pressed.
+    """
+    button = compact_button("?", size, "what this page is showing")
+    button.clicked.connect(
+        lambda: show_help(parent, title, html() if callable(html) else html)
+    )
+    return button
+
+
+class Heading(QWidget):
+    """A page title, its one-line explanation, and a `?` for the long form."""
+
+    def __init__(self, title: str, subtitle: str = "", parent=None, help: str = ""):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 10)
         layout.setSpacing(3)
 
+        from qtpy.QtWidgets import QHBoxLayout
+
         self.title = QLabel(title)
         self.title.setProperty("role", "heading")
-        layout.addWidget(self.title)
+        self.help = help_button(self, title, help) if help else None
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.title)
+        if self.help is not None:
+            row.addWidget(self.help)
+        row.addStretch(1)
+        layout.addLayout(row)
 
         self.subtitle = QLabel(subtitle)
         self.subtitle.setProperty("role", "subheading")

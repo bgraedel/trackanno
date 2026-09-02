@@ -1013,10 +1013,16 @@ def _markov_lines(g: dict) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def _pyplot():
-    """matplotlib, imported here because it is a dependency of the drawing only."""
+    """matplotlib, imported here because it is a dependency of the drawing only.
+
+    Agg is forced only while pyplot is not yet imported, so a headless CLI run
+    gets a writable backend and a notebook or GUI that already chose an
+    interactive one keeps it.
+    """
     try:
         import matplotlib
-        matplotlib.use("Agg")
+        if "matplotlib.pyplot" not in sys.modules:
+            matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError as exc:
         raise RuntimeError(

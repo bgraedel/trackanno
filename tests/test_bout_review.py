@@ -146,27 +146,44 @@ def test_the_reader_maps_every_column_a_bout_carries(synthetic) -> None:
 
 
 def test_the_caption_says_what_the_picture_cannot(synthetic) -> None:
-    """Each sentence is a fact about THESE rows. A caption that appeared
-    whatever the data said would be decoration."""
-    from trackanno.gui.timeline import PredictionReader, caption_lines
+    """Each sentence is a fact about THESE rows.
+
+    A caption that appeared whatever the data said would be decoration, and a
+    paragraph explaining what a bar IS is exactly that: true of every track, so
+    it takes room from the picture on all of them. That half lives behind the
+    panel's `?` instead, and what is left here is conditional.
+    """
+    from trackanno.gui.timeline import (
+        REVIEW_HELP, PredictionReader, caption_lines,
+    )
 
     reader = PredictionReader(synthetic)
     track = reader.track("m", 1)
     lines = caption_lines(track, reader.resolution, min_confidence=0.55)
     joined = " ".join(lines)
 
-    check("the caption names what a bar is",
-          "decoded bout" in joined and "mean posterior" in joined, joined)
-    check("it warns that hand-labelled frames are not evidence about the model",
-          "labelled by hand" in joined and "not" in joined, joined)
-    check("...and counts the spans that overlap them", "1 span(s) are hatched" in joined,
-          joined)
-    check("it says which spans rest on almost no windows",
-          "fewer than two windows per frame" in joined, joined)
+    check("it counts the spans that overlap hand labels",
+          "1 hatched" in joined, joined)
+    check("it counts the spans resting on almost no windows",
+          "on <2 windows/frame" in joined, joined)
     check("it names the confidence bar the project already applies",
-          "suggest.min_confidence (0.55)" in joined, joined)
+          "suggest.min_confidence 0.55" in joined, joined)
     check("...and says the per-frame posterior is not on disk for this run",
-          "save_posteriors was off" in joined, joined)
+          "no per-frame posterior" in joined, joined)
+    check("every line is a field, not a sentence about one",
+          all(len(line) <= 80 for line in lines),
+          max(lines, key=len) if lines else "")
+
+    check("what a bar IS is under the ? instead", "decoded" in REVIEW_HELP
+          and "mean posterior" in REVIEW_HELP)
+    check("...and so is what the second lane of each pair is",
+          "the record" in REVIEW_HELP.lower())
+    check("...and why hand-labelled frames are not evidence about the model",
+          "not evidence about it" in REVIEW_HELP)
+    check("...and the reason a held-out prediction is the only fair comparison",
+          "memorised" in REVIEW_HELP)
+    check("none of that is repeated under the picture",
+          "mean posterior" not in joined and "hairline" not in joined, joined)
 
     empty = reader.track("m", 99)
     check("a track with nothing in it gets no caption at all rather than a "
@@ -491,7 +508,7 @@ def test_an_old_style_windows_file_is_named_as_such(app, root) -> None:
     track_id = next(t for t, n in reader.tracks(movie) if n)
     track = reader.track(movie, track_id)
     lines = " ".join(caption_lines(track, reader.resolution))
-    check("the caption says these are windows, not bouts",
+    check("the caption says these are windows, not bouts, in as many words",
           "NOT decoded bouts" in lines, lines)
     check("...and says how to get bouts instead", "predict.decode" in lines, lines)
     check("a window's hand-labelled flag reads through as a fraction",
@@ -540,55 +557,133 @@ def test_a_project_with_no_predictions_says_so_instead_of_raising(app, root) -> 
     app.processEvents()
 
 
-# --------------------------------------------------------------------------- #
-# the hook
-# --------------------------------------------------------------------------- #
-def test_the_model_page_opens_the_review_window(app, root) -> None:
-    """The button is gated on the FILE, not on the model.
+def test_the_timeline_takes_the_width_the_window_gives_it(app, root) -> None:
+    """The frame axis is the thing being read, so it gets the space.
 
-    A run whose model has since been gated off still wrote rows somebody has to
-    be able to look at - and gating the review on the same verdict that gates
-    the run would hide exactly the predictions most worth arguing with.
+    Three separate ways this stopped happening, each of which put the lanes
+    behind a horizontal scrollbar on a normal window: the timeline's
+    minimumSizeHint returned its PREFERRED width and so overrode its own
+    minimum; the correction controls were one unwrappable row about 1670px
+    wide, which the whole panel then could not go under; and the splitter gave
+    a shrinking window's remaining pixels to the film rather than to the lanes.
     """
     from test_predict import build_case
 
-    from trackanno.gui.hub import Hub, ModelPage
+    from trackanno.gui.timeline import BoutReviewPanel
+    from trackanno.infer.predict import predict_all
+
+    cfg, _ = build_case(root, "review-resize", labels=2)
+    predict_all(cfg)
+    panel = BoutReviewPanel(cfg)
+    panel.show()
+    app.processEvents()
+    scroll = panel.timeline.parentWidget().parentWidget()
+    try:
+        floor = panel.minimumSizeHint().width()
+        check("the panel fits inside the window the hub opens at",
+              floor <= 1180, f"needs {floor}px, the hub opens 1280 wide")
+        check("the timeline may be narrower than it would like to be",
+              panel.timeline.minimumSizeHint().width()
+              <= panel.timeline.sizeHint().width(),
+              f"{panel.timeline.minimumSizeHint().width()} vs "
+              f"{panel.timeline.sizeHint().width()}")
+
+        widths = []
+        # Grown, shrunk and grown again: a splitter reapportions on every
+        # resize, and the bug only showed on the way back up.
+        for width in (1000, 1400, 2000, 1000, 2400):
+            panel.resize(width, 700)
+            app.processEvents()
+            widths.append((panel.width(), panel.timeline.width()))
+            check(f"no horizontal scrollbar at {width}px",
+                  scroll.horizontalScrollBar().maximum() == 0,
+                  str(widths))
+        check("a wider window is a wider timeline, every time",
+              all(b[1] > a[1] for a, b in zip(widths, widths[1:]) if b[0] > a[0]),
+              str(widths))
+        check("and the film does not take the growth",
+              panel.footage.width() <= panel.footage.maximumWidth(),
+              f"{panel.footage.width()} > {panel.footage.maximumWidth()}")
+    finally:
+        panel.close()
+        app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# the hook
+# --------------------------------------------------------------------------- #
+def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
+    """Review is a step of the workflow, not a window that floats over one.
+
+    The page is gated on the FILE, not on the model: a run whose model has since
+    been gated off still wrote rows somebody has to be able to look at, and
+    gating the review on the same verdict that gates the run would hide exactly
+    the predictions most worth arguing with.
+
+    The panel is built on arrival rather than at startup, because building it
+    opens three files, and it is torn down with the page.
+    """
+    from test_predict import build_case
+
+    from trackanno.gui.hub import PAGES, Hub, ModelPage, ReviewPage
     from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "review-page", labels=2)
     hub = Hub(str(cfg.path))
     hub.show()
     app.processEvents()
-    page = hub.page(ModelPage)
+    model, review = hub.page(ModelPage), hub.page(ReviewPage)
     try:
-        check("with no predictions the review button is dead",
-              not page.review_button.isEnabled())
+        check("Review is a step in its own right, after Model",
+              PAGES.index("Review") == PAGES.index("Model") + 1
+              and len(PAGES) == hub.sidebar.count()
+              and len(PAGES) == len(hub.pages), str(PAGES))
+        check("with no predictions the page says so rather than opening empty",
+              "nothing has been predicted yet" in review.blocker())
+        check("...and nothing was built to say it with", review.panel is None)
+        check("the Model page's button is dead while there is nothing to review",
+              not model.review_button.isEnabled())
 
         predict_all(cfg)
-        page.on_project()
+        hub.reload_project()
         app.processEvents()
-        check("the file alone enables it", page.review_button.isEnabled())
+        check("the file alone unblocks the page", review.blocker() == "")
+        check("the file alone enables the hand-over button",
+              model.review_button.isEnabled())
+        check("but the panel is still not built until somebody goes there",
+              review.panel is None)
 
-        page.review_button.click()
+        model.review_button.click()
         app.processEvents()
-        check("a review window opens", page._review is not None
-              and page._review.isVisible())
+        check("the button navigates rather than opening a window",
+              hub.sidebar.currentRow() == PAGES.index("Review")
+              and hub.stack.currentWidget() is review)
+        check("arriving builds the panel", review.panel is not None
+              and review.panel.isVisible())
         check("...on the predictions this project holds",
-              page._review.panel.reader is not None
-              and page._review.panel.reader.problem == "",
-              getattr(page._review.panel.reader, "problem", "no reader"))
+              review.panel.reader is not None
+              and review.panel.reader.problem == "",
+              getattr(review.panel.reader, "problem", "no reader"))
+        check("no free-floating review window was created",
+              not [w for w in app.topLevelWidgets()
+                   if "Review" in w.windowTitle() and w is not hub])
 
-        page.review_button.click()
+        panel = review.panel
+        hub.go_to(PAGES.index("Model"))
         app.processEvents()
-        check("pressing it again reuses the one window rather than stacking them",
-              len([w for w in app.topLevelWidgets()
-                   if w.__class__.__name__ == "BoutReviewDialog"]) == 1)
+        check("leaving the page lets go of the movie",
+              panel.footage._movie is None)
+        hub.go_to(PAGES.index("Review"))
+        app.processEvents()
+        check("coming back reuses the one panel rather than stacking them",
+              review.panel is panel)
     finally:
         # shutdown() before close(): ModelPage keeps three background threads
         # (keypoint reader, device probe, model probe) that close() does not
         # cancel, and a live QThread at interpreter exit kills the process after
         # the tests have already passed.
-        page.shutdown()
+        model.shutdown()
+        review.shutdown()
         hub.close()
         app.processEvents()
-    check("closing the page takes the review window with it", page._review is None)
+    check("closing the page takes the panel with it", review.panel is None)

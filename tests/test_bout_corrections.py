@@ -650,15 +650,19 @@ def test_a_windows_file_cannot_be_corrected(app, root) -> None:
     track = reader.track(movie, track_id)
     check("a windows file offers no partition to edit", track.partitions == {},
           str(track.partitions))
-    check("...and says why, in terms of what a window is",
+    check("...and says what to do instead, both ways round",
           "not decoded bouts" in track.edit_problem
-          and "annotations.csv" in track.edit_problem, track.edit_problem)
+          and "predict.decode" in track.edit_problem
+          and "annotate it" in track.edit_problem, track.edit_problem)
 
     widget = BoutReviewPanel(cfg)
+    widget.show()
     select(widget, movie, track_id)
     app.processEvents()
     check("the correction controls are dead rather than misleading",
           not widget.apply_button.isEnabled())
+    check("in fact they are not offered at all, the file having settled it",
+          not widget.edit_row.isVisible())
     check("and the panel says so where a reviewer will look",
           "not decoded bouts" in widget.status.text(), widget.status.text())
     widget.close()
@@ -947,16 +951,20 @@ def test_the_picture_keeps_the_two_claims_apart(app, project, panel) -> None:
           == len(panel.timeline.track.partitions[GROUP]),
           str(len(panel.timeline._hits)))
 
+    from trackanno.gui.timeline import REVIEW_HELP
+
     lines = " ".join(caption_lines(panel.timeline.track, panel.reader.resolution))
-    check("the caption names the lower lane and what a fill means",
-          "THE RECORD" in lines and "filled solid" in lines, lines)
-    check("...counts what is the reviewer's own", "1 span(s) on this track are yours"
-          in lines, lines)
-    check("...and says a boundary a person placed is not uncertain to the stride",
-          "exact to the frame you chose" in lines, lines)
-    check("the record lane carries no confidence at all, because what is asserted "
-          "about a stretch of frames is not a posterior over it",
-          "not a posterior" in lines, lines)
+    check("the caption counts what is the reviewer's own, and only counts it",
+          "1 span(s) corrected" in lines, lines)
+    # What the lanes MEAN is true of every track, so it is under the panel's ?
+    # rather than under the picture on all of them.
+    check("what the lower lane is, is in the long form",
+          "the record" in REVIEW_HELP.lower() and "filled solid" in REVIEW_HELP)
+    check("...and so is why a boundary a person placed carries no band",
+          "hairline" in REVIEW_HELP and "window stride" in REVIEW_HELP)
+    check("...and why the record lane carries no confidence at all, what is "
+          "asserted about a stretch of frames not being a posterior over it",
+          "not a posterior over it" in REVIEW_HELP)
 
 
 # --------------------------------------------------------------------------- #

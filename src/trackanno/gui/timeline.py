@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -35,9 +36,9 @@ from qtpy.QtCore import (
 )
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from qtpy.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
-    QToolTip, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QToolTip, QVBoxLayout,
+    QWidget,
 )
 
 from ..config import Config
@@ -47,13 +48,13 @@ from ..annotate.corrections import (
 )
 from ..view.overlay import build_clip_view
 from ..annotate.store import MULTI_SEP
-from .theme import tokens
+from .theme import help_button, tokens
 from .viewer import SimpleViewer, follow_combo
 
 __all__ = [
     "Segment", "TrackPredictions", "Resolution", "PredictionReader",
     "caption_lines", "ReviewCrop", "review_crop", "MovieFrames", "TrackFootage",
-    "BoutTimeline", "BoutReviewPanel", "BoutReviewDialog",
+    "BoutTimeline", "BoutReviewPanel",
 ]
 
 # The README's measured boundary error, as divisors of the window stride.
@@ -159,6 +160,16 @@ class Resolution:
     @property
     def worst_error(self) -> float:
         return self.stride / WORST_ERROR_DIVISOR
+
+    def brief(self) -> str:
+        """The edge tolerance as a number. The reasoning is under the panel's ?."""
+        if not self.known:
+            return "boundary tolerance unmeasured, no band drawn"
+        out = (f"boundary +-{self.worst_error:.0f} f worst, "
+               f"{self.mean_error:.1f} f mean (stride {self.stride})")
+        if len(self.scales) > 1:
+            out += f", coarsest of {len(self.scales)} window lengths"
+        return out
 
     def sentence(self) -> str:
         if not self.known:
@@ -291,6 +302,10 @@ class PredictionReader:
         self._tracks: dict[str, list[tuple[int, int]]] = {}
         self.resolution = Resolution()
         self.corrections: CorrectionStore | None = None
+        # Annotation windows whose label is not what the model suggests, most
+        # confident first. Empty until there are both labels and a model.
+        self.disagreements: list = []
+        self.agreement: dict = {}
 
         from ..infer.predict import load_predictions, row_kind, staleness
         from ..view.render import prediction_unit
@@ -329,6 +344,38 @@ class PredictionReader:
         # edge is a grid multiple the predictor chose, not a measurement.
         if self.bouts:
             self.resolution = measure_stride(cfg)
+        self._read_agreement()
+
+    def _read_agreement(self) -> None:
+        """Every labelled window the last fit's folds labelled differently.
+
+        One comparison per annotation window, against the out-of-fold
+        prediction: the saved model was fitted on these labels, so its own
+        opinion of one is not evidence about it. Sets ``agreement["problem"]``
+        instead of raising, since no CSV and no model are both normal.
+        """
+        from ..infer.agreement import find, load_cv_predictions, summarise
+
+        path = getattr(self.cfg.paths, "csv", None)
+        if not path or not Path(path).exists():
+            return
+        try:
+            labels = pd.read_csv(path, dtype=str, keep_default_na=False)
+        except (OSError, ValueError, UnicodeDecodeError):
+            return
+        if labels.empty or "clip_id" not in labels.columns:
+            return
+        groups = [g.name for g in self.cfg.categories]
+        try:
+            answers, problem = load_cv_predictions(self.cfg)
+            if problem:
+                self.agreement = {"problem": problem}
+                return
+            self.disagreements = find(labels, answers, groups)
+            self.agreement = summarise(labels, answers, self.disagreements, groups)
+        except Exception as exc:                     # noqa: BLE001 - see above
+            self.disagreements = []
+            self.agreement = {"problem": f"the fold predictions could not be read ({exc})"}
 
     # -- what can be selected ------------------------------------------------ #
     def tracks(self, movie_id: str) -> list[tuple[int, int]]:
@@ -409,10 +456,9 @@ class PredictionReader:
             return
         if not track.bouts:
             track.edit_problem = (
-                "these rows are fixed windows off a grid, not decoded bouts. A "
-                "window's edges are multiples the predictor chose, and a window "
-                "relabelled by hand is a clip label, which belongs in "
-                "annotations.csv. Set predict.decode and label again to get bouts."
+                "these rows are fixed windows off a grid, not decoded bouts. Set "
+                "predict.decode and label again to get bouts; to relabel a "
+                "window, annotate it."
             )
             return
         store = self.corrections
@@ -570,95 +616,126 @@ class PredictionReader:
 # --------------------------------------------------------------------------- #
 # what the picture cannot say for itself
 # --------------------------------------------------------------------------- #
+REVIEW_HELP = """
+<h3>What the lanes are</h3>
+<p>Each bar is one decoded <b>bout</b>: a run of frames between two inferred
+behavioural boundaries. Bar height is the bout's mean posterior for its own
+class, so a marginal bout is a <i>short</i> bar rather than a pale one.</p>
+
+<p>Every category group gets <b>two lanes</b>. The upper one is the model's
+bouts. The lower one is <b>the record</b>: the same bouts with your corrections
+laid over them, a corrected span filled solid and outlined, a span still the
+model's faded and dashed. The record lane has no bar height, because what a
+person asserts about a stretch of frames is not a posterior over it.</p>
+
+<p>A boundary <b>you</b> placed is drawn as a hairline; one the <b>decode</b>
+placed keeps its error band. Yours is exact to the frame you chose, and only
+the decode's is uncertain to the window stride.</p>
+
+<h3>Correcting one</h3>
+<p>Drag a boundary, or type a frame range and press <b>Set class</b>. Dragging,
+splitting, merging and relabelling are one operation - <i>name a class over a
+frame range</i> - with different arguments, so the run-length encoding stays
+gapless whatever you do to it.</p>
+
+<p>Every accepted edit is saved immediately to <b>bout_corrections.csv</b>,
+beside annotations.csv. There is no Save button to forget, and nothing is lost
+by navigating away. <b>predictions.parquet and your annotation CSV are never
+written to.</b></p>
+
+<p>A file of <b>fixed windows</b> cannot be corrected at all, and offers no
+controls rather than dead ones: a window's edges are stride multiples the
+predictor chose, so moving one corrects nothing about the animal, and a window
+relabelled by hand is a clip label, which the annotation CSV already holds.</p>
+
+<h3>Where the model and a label disagree</h3>
+<p>The <b>&lt; disagreement</b> and <b>disagreement &gt;</b> buttons walk every
+annotation window whose recorded label is not what a model fitted <i>without
+that window's movie</i> predicted for it, surest first. Those are the same
+predictions the report's confusion matrix is a tally of.</p>
+
+<p>It has to be a held-out prediction. The saved model was fitted on every label
+there is, so its opinion of one is an opinion of a row it memorised - it
+reproduces almost all of them however wrong they are.</p>
+
+<p>To <b>change</b> a label, use <i>review disagreements</i> on the Annotate
+page, which walks the same list where the label can be edited. This walk is for
+seeing where the boundary sits around one.</p>
+
+<h3>Hatching and thin spans</h3>
+<p>A <b>hatched</b> span overlaps frames you labelled by hand, which trained
+this model, so agreement there is not evidence about it. The fraction covers
+every predicted group at once, so it over-reports for any one of them.</p>
+
+<p>A span resting on <b>fewer than two windows per frame</b> is near a track's
+end, where only one window reaches: the posterior there is one window's
+opinion.</p>
+
+<p>A correction reaching past what these predictions cover is drawn cut short at
+the ends of the track. <b>The file keeps its real ends</b> - nothing is
+truncated by being displayed.</p>
+
+<p>With <b>predict.save_posteriors</b> off, the per-frame posterior behind each
+bar was never written, so only the bout's mean is available to draw.</p>
+
+<h3>The video</h3>
+<p>Every frame is cut from the movie, never from the clip cache, at one crop for
+the whole session. It has no scrubber of its own - the lanes are the frame axis,
+and they span the whole track.</p>
+"""
+
+
 def caption_lines(
     track: TrackPredictions, resolution: Resolution, min_confidence: float = 0.0,
     has_trace: bool = False,
 ) -> list[str]:
-    """The sentences under the timeline. Separate from the painting so the
-    claims can be tested without a screenshot."""
+    """What is true of THIS track, and nothing that is true of every one.
+
+    The general explanation lives in :data:`REVIEW_HELP`, behind the panel's
+    `?`: read once and then permanent, it is a paragraph taking room from the
+    picture it is about. What stays here is conditional - a count, a warning
+    that applies to this track and not the next.
+
+    Separate from the painting so the claims can be tested without a screenshot.
+    """
     if track.empty:
         return []
     lines: list[str] = []
     if track.bouts:
-        lines.append(
-            "Each bar is one decoded bout: a run of frames between two inferred "
-            "behavioural boundaries. Bar height is the bout's mean posterior for "
-            "its own class, so a marginal bout is a short bar, not a pale one."
-        )
-        lines.append(resolution.sentence())
+        lines.append(resolution.brief())
     else:
         lines.append(
-            f"This file holds {track.unit}: fixed-length windows off the "
-            "predictor's grid, NOT decoded bouts. Every edge below is a multiple "
-            "of the window length, not a moment the animal changed. Set "
-            "predict.decode and label again to cut bouts."
+            f"{track.unit}, NOT decoded bouts - set predict.decode and relabel"
         )
 
     hand = [s for lane in track.lanes.values() for s in lane
             if np.isfinite(s.human_frac) and s.human_frac > 0]
     if hand:
-        lines.append(
-            f"{len(hand)} span(s) are hatched: they overlap frames you labelled "
-            "by hand, which trained this model, so agreement there is not "
-            "evidence about it. The fraction covers every predicted group at "
-            "once, so it over-reports for any one of them."
-        )
+        lines.append(f"{len(hand)} hatched (overlaps hand labels)")
 
     thin = [s for lane in track.lanes.values() for s in lane
             if np.isfinite(s.n_covering) and s.n_covering < 2.0]
     if thin:
-        lines.append(
-            f"{len(thin)} span(s) rest on fewer than two windows per frame: near "
-            "a track's ends only one window reaches, so the posterior there is "
-            "one window's opinion."
-        )
+        lines.append(f"{len(thin)} span(s) on <2 windows/frame")
 
     if track.partitions:
         corrected = track.n_corrected
-        lines.append(
-            "The lower lane of each pair is THE RECORD: the model's bouts with "
-            "your corrections over them. A corrected span is filled solid and "
-            "outlined, a span still the model's is faded and dashed. The record "
-            "lane has no bar height, because what a person asserts about a "
-            "stretch of frames is not a posterior over it."
-        )
-        lines.append(
-            f"{corrected} span(s) on this track are yours." if corrected else
-            "Nothing on this track has been corrected, so the record is the "
-            "model's answer unchanged."
-        )
-        if corrected:
-            lines.append(
-                "A boundary you placed is a hairline, one the decode placed keeps "
-                "its band: yours is exact to the frame you chose, and only the "
-                "decode's is uncertain to the window stride."
-            )
+        lines.append(f"{corrected} span(s) corrected" if corrected
+                     else "no corrections on this track")
     if track.orphans:
         lines.append(
-            f"{len(track.orphans)} saved correction(s) cover frames these "
-            "predictions have no row for, because the run that wrote them decoded "
-            "a different span. They stay in bout_corrections.csv and are not drawn."
+            f"{len(track.orphans)} correction(s) off these predictions (kept, "
+            "not drawn)"
         )
     if track.partly_shown:
         listed = ", ".join(f"{c.f_start}-{c.f_end}" for c in track.partly_shown[:4])
         lines.append(
-            f"{len(track.partly_shown)} saved correction(s) reach past what these "
-            f"predictions cover ({listed}) and are drawn cut short at frame "
-            f"{track.f_lo} or {track.f_hi}. The file keeps their real ends."
+            f"{len(track.partly_shown)} correction(s) drawn cut short ({listed})"
         )
-    if track.edit_problem and not track.empty:
-        lines.append(f"Not correctable here: {track.edit_problem}")
-
     if min_confidence > 0 and track.bouts:
-        lines.append(
-            f"The dashed line is suggest.min_confidence ({min_confidence:g}), the "
-            "bar this project applies before showing a suggestion."
-        )
+        lines.append(f"dashed line = suggest.min_confidence {min_confidence:g}")
     if track.bouts and not has_trace:
-        lines.append(
-            "predict.save_posteriors was off for this run, so the per-frame "
-            "posterior behind each bar is not on disk and only the mean is drawn."
-        )
+        lines.append("no per-frame posterior (predict.save_posteriors was off)")
     return lines
 
 
@@ -737,7 +814,9 @@ class BoutTimeline(QWidget):
                      + records * self.RECORD_LANE + self.AXIS + 8)
 
     def minimumSizeHint(self) -> QSize:
-        return self.sizeHint()
+        """As narrow as ``minimumWidth`` allows, and no shorter than its lanes,
+        which are drawn at fixed pixel sizes."""
+        return QSize(self.minimumWidth(), self.sizeHint().height())
 
     # -- geometry ------------------------------------------------------------ #
     def _lane_plan(self) -> list[tuple[str, str, float]]:
@@ -1685,6 +1764,10 @@ class TrackFootage(QWidget):
         # and a 320 px floor takes the room out of the video rather than giving
         # it any.
         self.viewer.canvas.setMinimumSize(240, 240)
+        # The lanes beside this ARE the frame axis, and they span the whole
+        # track. The viewer's own slider spans one decode chunk, which is a
+        # number with no meaning outside this widget.
+        self.viewer.set_scrubber(False)
         # Hidden until there are frames: an empty canvas is a black rectangle,
         # and this widget's whole job on a project with no pixels is to not be
         # one.
@@ -1692,6 +1775,8 @@ class TrackFootage(QWidget):
         self.source = QLabel("")
         self.source.setWordWrap(True)
         self.source.setProperty("role", "muted")
+        # The full caption, of which the label may be showing an elided line.
+        self._caption_text = ""
 
         # The annotation window's own two controls over the same rendering. Both
         # are display-time transforms of one decoded array, so either can change
@@ -1822,6 +1907,42 @@ class TrackFootage(QWidget):
             return None
         return np.asarray(array[min(self.viewer._frame, array.shape[0] - 1)])
 
+    @property
+    def caption(self) -> str:
+        """The whole line under the picture, elided or not.
+
+        The label may be showing only as much of it as fits; this is what it
+        says, and it is what the tooltip carries.
+        """
+        return self._caption_text
+
+    def _set_caption(self, text: str) -> None:
+        """The line under the picture, at a height that does not move.
+
+        Elided to one line while there is video, so the caption cannot take a
+        line out of it; wrapped in full when there is none. All of it is on the
+        tooltip either way.
+        """
+        self._caption_text = text
+        showing = self.viewer.isVisible()
+        self.source.setWordWrap(not showing)
+        shown = (
+            self.source.fontMetrics().elidedText(
+                text, Qt.ElideRight, max(60, self.source.width()))
+            if showing else text
+        )
+        if shown != self.source.text():
+            self.source.setText(shown)
+        # Set here, since this is what decides how much is on screen.
+        self.source.setToolTip(
+            (text + "\n\n" + self._difference()) if showing else text
+        )
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        if self._caption_text:
+            self._set_caption(self._caption_text)
+
     # -- moving ------------------------------------------------------------- #
     def show_frame(self, frame: int) -> None:
         """Put ``frame`` of this track on screen, from the movie."""
@@ -1845,7 +1966,7 @@ class TrackFootage(QWidget):
         self._frames().want(self._request, first)
         self._read_ahead(first)
         if not self._length:
-            self.source.setText(
+            self._set_caption(
                 f"reading frames {first}-{first + REVIEW_CHUNK} of "
                 f"{self._movie_id}..."
             )
@@ -1885,7 +2006,10 @@ class TrackFootage(QWidget):
     def _show_chunk(self, first: int, payload, frame: int) -> None:
         array, marks = payload
         if self._loaded != int(first):
-            self.viewer.set_clip(array, self._view(marks, array))
+            # The frame goes in with the pixels: seeking afterwards paints
+            # frame 0 of the new chunk first.
+            offset = int(min(max(frame - int(first), 0), max(0, len(array) - 1)))
+            self.viewer.set_clip(array, self._view(marks, array), frame=offset)
             self._mark()
             self.viewer.setVisible(True)
             self.controls.setVisible(True)
@@ -1893,8 +2017,7 @@ class TrackFootage(QWidget):
             self._first = int(first)
             self._length = int(len(array))
         self._seek(frame - self._first, frame)
-        self.source.setText(self._note())
-        self.source.setToolTip(self._difference())
+        self._set_caption(self._note())
 
     def _view(self, boxes, clip: np.ndarray):
         """The geometry for a newly decoded array, remembered so the controls can
@@ -1995,13 +2118,26 @@ class TrackFootage(QWidget):
             return                       # paused between the schedule and here
         nxt = self._first + self._length
         if nxt >= self._span[1]:
-            return                       # the end of the track; the chunk loops
+            # The end of the track. The viewer would loop the chunk it holds,
+            # which restarts part-way through.
+            self._restart_at(self._span[0])
+            return
         was = self._loaded
         self.viewer.pause()
         self.show_frame(nxt)
         if self._awaiting == nxt:
             self._resume_at = nxt        # the movie is being read for it
         elif self._loaded != was and self._position == nxt and self._length:
+            self.viewer.play()
+
+    def _restart_at(self, frame: int) -> None:
+        """Move playback to ``frame`` and carry on, waiting for a decode if one
+        is needed."""
+        self.viewer.pause()
+        self.show_frame(int(frame))
+        if self._awaiting == int(frame):
+            self._resume_at = int(frame)
+        elif self._length:
             self.viewer.play()
 
     # -- what the decoder sends back ----------------------------------------- #
@@ -2099,7 +2235,7 @@ class TrackFootage(QWidget):
                 " The timeline still shows what was predicted; only the frames "
                 "behind it are missing."
             )
-        self.source.setText(text)
+        self._set_caption(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -2129,23 +2265,57 @@ class BoutReviewPanel(QWidget):
         self._track: TrackPredictions | None = None
         self._undo: list[tuple[str, Partition]] = []
 
+        # Elided rather than laid out at full width: a movie id is long, and
+        # unelided the two of them set a floor under the whole page.
         self.movie = QComboBox()
-        self.movie.setMinimumWidth(160)
+        self.movie.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.movie.setMinimumContentsLength(10)
+        self.movie.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.movie.currentIndexChanged.connect(self._on_movie)
         self.track = QComboBox()
-        self.track.setMinimumWidth(160)
+        self.track.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.track.setMinimumContentsLength(8)
+        self.track.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.track.currentIndexChanged.connect(self._on_track)
         self.headline = QLabel("")
         self.headline.setWordWrap(True)
         self.headline.setTextFormat(Qt.RichText)
 
+        # Where in the disagreement walk this panel is. -1 is "not started", so
+        # the first press lands on the worst one rather than on the second.
+        self._disagree_at = -1
+        self.prev_disagreement = QPushButton("< disagreement")
+        self.next_disagreement = QPushButton("disagreement >")
+        for button, step in ((self.prev_disagreement, -1),
+                             (self.next_disagreement, 1)):
+            button.setToolTip(
+                "Go to a window somebody labelled by hand that the model would "
+                "have labelled differently, worst agreement first and across "
+                "every movie. A confusion matrix says which classes a model "
+                "confuses; this says which frames."
+            )
+            button.clicked.connect(lambda _=False, s=step: self._step_disagreement(s))
+        # A sentence, so it gets a line of its own rather than a slot between
+        # two combo boxes: unwrapped in the top row it set a 750px floor under
+        # the whole panel.
+        self.agreement_note = QLabel("")
+        self.agreement_note.setWordWrap(True)
+        self.agreement_note.setProperty("role", "muted")
+        self.help_button = help_button(self, "Reviewing predictions", REVIEW_HELP)
+
         top = QHBoxLayout()
         top.addWidget(QLabel("movie"))
-        top.addWidget(self.movie)
+        top.addWidget(self.movie, 1)
         top.addSpacing(12)
         top.addWidget(QLabel("track"))
-        top.addWidget(self.track)
+        top.addWidget(self.track, 1)
+        top.addSpacing(16)
+        top.addWidget(self.prev_disagreement)
+        top.addWidget(self.next_disagreement)
         top.addStretch(1)
+        top.addWidget(self.help_button)
 
         self.timeline = BoutTimeline(cfg)
         self.timeline.spanClicked.connect(self._on_span_clicked)
@@ -2159,6 +2329,13 @@ class BoutReviewPanel(QWidget):
         # moves the marker. Whether a boundary is in the right place is not a
         # question a drawing can answer on its own.
         self.footage = TrackFootage(cfg)
+        # Bounded on both sides. The film is a square of reference and the frame
+        # axis is the thing being read, so every pixel the window gains belongs
+        # to the timeline - and without the cap the splitter took the lot on a
+        # shrink and left the lanes behind a horizontal scrollbar.
+        self.footage.setMinimumWidth(240)
+        self.footage.setMaximumWidth(520)
+        scroll.setMinimumWidth(320)
         self.timeline.positionPicked.connect(self.footage.show_frame)
         self.footage.positionChanged.connect(self.timeline.set_position)
         self.split = QSplitter(Qt.Horizontal)
@@ -2175,19 +2352,25 @@ class BoutReviewPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(top)
+        layout.addWidget(self.agreement_note)
         layout.addWidget(self.headline)
         layout.addWidget(self.split, 1)
-        layout.addLayout(self._build_edit_row())
+        self.edit_row = self._build_edit_row()
+        layout.addWidget(self.edit_row)
         layout.addWidget(self.status)
         layout.addWidget(self.caption)
 
         if cfg is not None:
             self.reload()
 
-    def _build_edit_row(self) -> QHBoxLayout:
-        """The correction controls. Always present and never gated on a config
-        key: whether a project can be corrected is a property of the file on
-        disk."""
+    def _build_edit_row(self) -> QWidget:
+        """The correction controls, as one widget that can be taken away whole.
+
+        Two lines so the row fits a normal window: an assertion, then the
+        actions on it. Never gated on a config key, since whether a project can
+        be corrected is a property of the file on disk; where the file settles
+        it the row is hidden rather than greyed out.
+        """
         self.group = QComboBox()
         self.group.setMinimumWidth(120)
         self.group.currentIndexChanged.connect(self._on_group)
@@ -2205,9 +2388,17 @@ class BoutReviewPanel(QWidget):
             "a bout and merging two are the same thing over a different range."
         )
         self.apply_button.clicked.connect(self._on_apply)
-        self.merge_left = QPushButton("Merge into previous")
+        # Short labels with the sentence in the tooltip: the row has to fit a
+        # window, and "Merge into previous" is three words of button.
+        self.merge_left = QPushButton("Merge <")
+        self.merge_left.setToolTip(
+            "Take the PREVIOUS span's class over the selected frames."
+        )
         self.merge_left.clicked.connect(lambda: self._on_merge(-1))
-        self.merge_right = QPushButton("Merge into next")
+        self.merge_right = QPushButton("Merge >")
+        self.merge_right.setToolTip(
+            "Take the NEXT span's class over the selected frames."
+        )
         self.merge_right.clicked.connect(lambda: self._on_merge(1))
         self.undo_button = QPushButton("Undo")
         self.undo_button.clicked.connect(self._on_undo)
@@ -2217,7 +2408,7 @@ class BoutReviewPanel(QWidget):
             "model's own bouts."
         )
         self.revert_button.clicked.connect(self._on_revert)
-        self.derive_button = QPushButton("Derived labels...")
+        self.derive_button = QPushButton("Derived labels")
         self.derive_button.setToolTip(
             "Show which annotation windows these corrections would label, and "
             "which straddle a boundary and cannot be labelled. Writes nothing."
@@ -2227,23 +2418,32 @@ class BoutReviewPanel(QWidget):
         self.status = QLabel("")
         self.status.setWordWrap(True)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("frames"))
-        row.addWidget(self.from_frame)
-        row.addWidget(QLabel("to"))
-        row.addWidget(self.to_frame)
-        row.addWidget(QLabel("are"))
-        row.addWidget(self.klass)
-        row.addWidget(QLabel("in"))
-        row.addWidget(self.group)
-        row.addWidget(self.apply_button)
-        row.addWidget(self.merge_left)
-        row.addWidget(self.merge_right)
-        row.addWidget(self.undo_button)
-        row.addWidget(self.revert_button)
-        row.addWidget(self.derive_button)
-        row.addStretch(1)
-        return row
+        claim = QHBoxLayout()
+        claim.addWidget(QLabel("frames"))
+        claim.addWidget(self.from_frame)
+        claim.addWidget(QLabel("to"))
+        claim.addWidget(self.to_frame)
+        claim.addWidget(QLabel("are"))
+        claim.addWidget(self.klass, 1)
+        claim.addWidget(QLabel("in"))
+        claim.addWidget(self.group, 1)
+        claim.addWidget(self.apply_button)
+        claim.addStretch(1)
+
+        actions = QHBoxLayout()
+        for button in (self.merge_left, self.merge_right, self.undo_button,
+                       self.revert_button, self.derive_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
+
+        rows = QVBoxLayout()
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(4)
+        rows.addLayout(claim)
+        rows.addLayout(actions)
+        holder = QWidget()
+        holder.setLayout(rows)
+        return holder
 
     # -- loading -------------------------------------------------------------- #
     def set_config(self, cfg: Config | None) -> None:
@@ -2291,15 +2491,131 @@ class BoutReviewPanel(QWidget):
             if self.cfg is None:
                 self.reader = None
                 self._say("", "no project open")
+                self._refresh_agreement_note()
                 return
             self.reader = PredictionReader(self.cfg)
             if self.reader.problem:
                 self._say("", self.reader.problem)
+                self._refresh_agreement_note()
                 return
             self.movie.addItems(self.reader.movies)
         finally:
             self._loading = False
+        self._disagree_at = -1
+        self._refresh_agreement_note()
         self._fill_tracks()
+
+    # -- where the model and a hand label disagree ---------------------------- #
+    def _refresh_agreement_note(self) -> None:
+        """How many labelled windows the suggestion contradicts, out of how many.
+
+        The denominator and the refusals both, because a count on its own reads
+        as a model that agrees with everything it was not asked about.
+        """
+        found = self.reader.disagreements if self.reader is not None else []
+        summary = self.reader.agreement if self.reader is not None else {}
+        for button in (self.prev_disagreement, self.next_disagreement):
+            button.setEnabled(bool(found))
+        problem = summary.get("problem") if summary else None
+        if problem:
+            self.agreement_note.setText(f"nothing to compare against: {problem}")
+            return
+        if not summary:
+            self.agreement_note.setText("nothing has been labelled by hand yet")
+            return
+        held = (
+            f"; {summary['n_unanswered']} more no fold scored, being in the audit "
+            "holdout, without a feature row, or labelled since the last fit"
+            if summary["n_unanswered"] else ""
+        )
+        if not summary["n_compared"]:
+            self.agreement_note.setText(
+                "no labelled window was scored by a fold, so nothing here has "
+                "been compared" + held
+            )
+            return
+        if not found:
+            self.agreement_note.setText(
+                f"held out, the model predicted the recorded label on all "
+                f"{summary['n_compared']} window(s) it scored{held}"
+            )
+            return
+        note = (
+            f"{summary['n_disagree']} of {summary['n_compared']} labelled "
+            f"window(s) got a different class from the folds{held}"
+        )
+        worst = summary.get("most_common")
+        if worst:
+            note += (
+                f". Most often you said {worst['label']} where a fold said "
+                f"{worst['suggestion']} ({worst['n']})"
+            )
+        self.agreement_note.setText(note)
+
+    def _step_disagreement(self, step: int) -> None:
+        """Move through the disagreements, worst agreement first and wrapping.
+
+        Across tracks and across movies: the interesting ones are wherever they
+        are, and hunting for them by hand is the work this replaces.
+        """
+        found = self.reader.disagreements if self.reader is not None else []
+        if not found:
+            self.status.setText(
+                "nothing to walk: no clips labelled by hand, no model to ask, or "
+                "the model suggests exactly what was recorded on every one of them"
+            )
+            return
+        if self._disagree_at < 0:
+            self._disagree_at = 0 if step > 0 else len(found) - 1
+        else:
+            self._disagree_at = (self._disagree_at + step) % len(found)
+        self._show_disagreement(found[self._disagree_at], len(found))
+
+    def _show_disagreement(self, d, total: int) -> None:
+        """Select the track it is on, aim the edit row at it, and say what it is."""
+        if self.reader is None:
+            return
+        if self.movie.currentText() != d.movie_id:
+            index = self.movie.findText(d.movie_id)
+            if index < 0:
+                self.status.setText(
+                    f"{d.movie_id} is labelled but is not in these predictions"
+                )
+                return
+            self._loading = True
+            try:
+                self.movie.setCurrentIndex(index)
+            finally:
+                self._loading = False
+            self._fill_tracks()
+        row = self.track.findData(int(d.track_id))
+        if row < 0:
+            self.status.setText(
+                f"track {d.track_id} of {d.movie_id} is labelled but is not in "
+                "these predictions"
+            )
+            return
+        if row != self.track.currentIndex():
+            self.track.setCurrentIndex(row)
+        else:
+            self._paint()
+        # After the paint: it refills the group combo and clears the position.
+        group_row = self.group.findText(d.group)
+        if group_row >= 0:
+            self.group.setCurrentIndex(group_row)
+        self.from_frame.setValue(int(d.f_start))
+        self.to_frame.setValue(int(d.f_end))
+        self.timeline.set_position(d.frame)
+        self.footage.show_frame(d.frame)
+        self.status.setText(
+            f"{self._disagree_at + 1} of {total}: frames {d.f_start}-{d.f_end} "
+            f"of track {d.track_id} were labelled {d.label} in {d.group}, and "
+            f"a model fitted without this movie said {d.suggestion} "
+            + ("at confidence unknown" if d.confidence is None
+               else f"at confidence {d.confidence:.2f}")
+            + ". One of the two is wrong, and the clip is the only thing that "
+              "says which"
+        )
 
     def _on_movie(self, _index: int) -> None:
         if not getattr(self, "_loading", False):
@@ -2378,7 +2694,11 @@ class BoutReviewPanel(QWidget):
         lines = caption_lines(
             track, self.reader.resolution, floor, has_trace=bool(track.trace)
         )
-        self.caption.setText("<br>".join(lines))
+        # Separated rather than stacked: these are fields about one track, and a
+        # line each turns four facts into a paragraph-shaped block of text that
+        # takes its height out of the picture above it.
+        self.caption.setText("&nbsp;&nbsp;.&nbsp;&nbsp;".join(lines))
+        self.caption.setToolTip("\n".join(lines))
 
     def _say(self, head: str, problem: str) -> None:
         self.headline.setText(head)
@@ -2460,6 +2780,11 @@ class BoutReviewPanel(QWidget):
 
     def _refresh_edit_gate(self) -> None:
         problem = self._group_problem()
+        # A refusal that belongs to the FILE rather than to one lane: no other
+        # group would make these controls work, so they go away instead of
+        # sitting there greyed out, inviting the gesture they would refuse.
+        settled = bool(self._track is not None and self._track.edit_problem)
+        self.edit_row.setVisible(not settled)
         for button in (self.apply_button, self.merge_left, self.merge_right,
                        self.revert_button, self.derive_button):
             button.setEnabled(not problem)
@@ -2707,27 +3032,3 @@ class BoutReviewPanel(QWidget):
         )
         return derivation_report(derivation)
 
-
-class BoutReviewDialog(QDialog):
-    """The panel in a window of its own.
-
-    Close and no Save: every accepted edit is already on disk by the time the
-    button could be pressed. Closing also lets go of the movie, through the
-    panel's own hide handler, so leaving this window open holds no file open.
-    """
-
-    def __init__(self, cfg: Config, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Review and correct predictions")
-        # Room for a square of film beside the lanes: the two are read against
-        # each other, and a video that has to be scrolled to is not.
-        self.resize(1280, 780)
-        self.panel = BoutReviewPanel(cfg, self)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.panel, 1)
-        layout.addWidget(buttons)
-
-    def reload(self) -> None:
-        self.panel.reload()

@@ -313,17 +313,33 @@ class SimpleViewer(ClipViewer):
         self.set_fps(fps)
 
     # -- interface ---------------------------------------------------------- #
-    def set_clip(self, array: np.ndarray, view: ClipView | None = None) -> None:
+    def set_clip(self, array: np.ndarray, view: ClipView | None = None,
+                 frame: int = 0) -> None:
+        """Show ``array``, starting on ``frame``.
+
+        Set here rather than by a seek afterwards, which would paint frame 0
+        first.
+        """
         self._array = array
         self.canvas.set_clip(array, view)
         n = int(array.shape[0])
+        frame = int(min(max(int(frame), 0), max(0, n - 1)))
         self._slider.blockSignals(True)
         self._slider.setRange(0, max(0, n - 1))
-        self._slider.setValue(0)
+        self._slider.setValue(frame)
         self._slider.blockSignals(False)
-        self._frame = 0
-        self.canvas.set_frame(0)
-        self._counter.setText(f"1 / {n}")
+        self._frame = frame
+        self.canvas.set_frame(frame)
+        self._counter.setText(f"{frame + 1} / {n}")
+
+    def set_scrubber(self, visible: bool) -> None:
+        """Show or hide the slider and counter under the picture.
+
+        The review window hides them: it has a frame axis of its own, and this
+        slider spans only the frames decoded so far.
+        """
+        self._slider.setVisible(bool(visible))
+        self._counter.setVisible(bool(visible))
 
     def clear(self) -> None:
         """Drop the clip so nothing keeps the cache's memory map alive."""

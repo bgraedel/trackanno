@@ -32,7 +32,8 @@ from qtpy.QtWidgets import (
 from ..annotate.clips import MANIFEST_FILE, TRACKS_FILE, ClipStore
 from ..config import ConfigError, load_config
 from ..project import (
-    CONFIG_NAME, _exists, config_path_for, create_project, project_status, recent_projects,
+    CONFIG_NAME, _exists, config_path_for, create_project, forget_path_probes,
+    project_status, recent_projects,
     remember_project, write_config,
 )
 from ..annotate.store import AnnotationStore
@@ -43,11 +44,11 @@ from .theme import (
     Heading, app_icon, apply_theme, banner_style, compact_button, current,
     set_role, theme_icon, tokens,
 )
-from .timeline import BoutReviewDialog
+from .timeline import REVIEW_HELP, BoutReviewPanel
 from .tasks import TaskPanel, TaskRunner
 
 PAGES = ["Project", "Configure", "Detect & crop", "Annotate", "Model",
-         "Distribution", "Export"]
+         "Review", "Distribution", "Export"]
 
 PAGE_HINTS = [
     "Pick the folder to work in",
@@ -55,13 +56,17 @@ PAGE_HINTS = [
     "Find the animals and cut them into clips",
     "Watch each clip and press one key",
     "Learn from your labels and suggest the next one",
+    "Check where the model put each boundary, and move it",
     "See how your labels are spread before you commit to them",
     "Put the labels back onto the original movies",
 ]
 
 
-def _heading(text: str, subtitle: str = "") -> QWidget:
-    return Heading(text, subtitle)
+def _heading(text: str, subtitle: str = "", help: str = "") -> QWidget:
+    """A page title, one line saying what the page is for, and a `?` for the
+    rest. The subtitle is permanent, so anything longer goes behind the
+    button."""
+    return Heading(text, subtitle, help=help)
 
 
 def _muted(label: QLabel) -> QLabel:
@@ -170,8 +175,26 @@ class ProjectPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Project",
-            "A project is a folder holding config.yaml, the clip cache and the "
-            "annotation CSV. Everything else on this window operates on the open one.",
+            "Pick the folder to work in.",
+            help="""
+<p>A <b>project</b> is a folder holding three things: <b>config.yaml</b>,
+<b>work/</b> (the clip cache) and <b>annotations.csv</b>. Everything else on
+this window operates on the open one.</p>
+
+<p><i>New project</i> writes a fully commented config.yaml with the paths filled
+in, so the file explains itself when you open it in an editor.</p>
+
+<p><b>Templates.</b> Tuning the detector, the crop geometry and the category
+buttons is most of the setup for a dataset, and the next dataset usually wants
+the same answers. <i>Save as template</i> stores the open project's settings
+under a name, and <i>New project</i> then offers them under <b>start from</b>.</p>
+
+<p>A template is a whole config.yaml, comments included, kept outside any
+project so it outlives the one it came from. It carries everything except the
+three paths that describe one project on one disk - video_dir, work_dir and csv
+are reset, since a template pointing at last month's movie folder is worse than
+one pointing nowhere.</p>
+""",
         ))
         layout.addLayout(buttons)
         layout.addWidget(status_box)
@@ -321,13 +344,19 @@ class NewProjectDialog(QDialog):
         form.addRow("detection model", self.model)
 
         note = QLabel(
-            "The clip cache and annotations.csv are created inside the project "
-            "folder. A template supplies every other setting, and 'Save as "
-            "template' on the Project page makes one from a project you have "
-            "already tuned. You can change any of this on the Configure page."
+            "Everything else comes from the template, and can be changed later "
+            "on the Configure page."
         )
         note.setWordWrap(True)
         note.setProperty("role", "muted")
+        note.setToolTip(
+            "The clip cache and annotations.csv are created inside the project "
+            "folder.\n\n"
+            "A template supplies every other setting. 'Save as template' on the "
+            "Project page makes one from a project you have already tuned, so "
+            "the next dataset starts from the same answers.\n\n"
+            "None of it is final: every setting is on the Configure page."
+        )
 
         ok = QPushButton("Create")
         ok.setDefault(True)
@@ -540,9 +569,23 @@ class ConfigPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Configure",
-            "Saved automatically, straight back into config.yaml - comments and all, "
-            "so the file stays readable and hand-editable. Settings not shown here "
-            "are left untouched.",
+            "Every setting for this project, saved as you type.",
+            help="""
+<p>Edits are written <b>straight back into config.yaml</b>, comments and all,
+about 0.7 seconds after typing stops - so the file stays readable and
+hand-editable, and the two thirds of it that document each knob survive.</p>
+
+<p>Settings <b>not shown here are left untouched</b>. A key the file does not
+mention keeps the loader's default rather than picking up whatever this form's
+spin box happens to start at.</p>
+
+<p>Every autosave is parsed by the real loader before it replaces anything. An
+edit that would not load is refused with the loader's own message and the file
+is not touched.</p>
+
+<p>Settings marked <b>*</b> describe how the clips were cut, so changing one
+takes effect only after detection is run again.</p>
+""",
         ))
         layout.addWidget(self.banner)
         layout.addWidget(self.pose_row)
@@ -1128,15 +1171,28 @@ class ModelRegistryDialog(QDialog):
         return bool(runner())
 
 
+# Same width, so the ids line up down the list.
+_PREPARE_STATES = {
+    "prepared": "[prepared]",
+    "detected": "[detected]",
+    "new": "[  new   ]",
+}
+
+
 class PreparePage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
         self._scan: TaskRunner | None = None
         self._scanned_for: Path | None = None
+        # Last known per-movie state, and a guard so refilling the list does not
+        # re-enter the handler through its own setText/setCheckState calls.
+        self._states: dict[str, str] = {}
+        self._filling = False
 
         self.movies = QListWidget()
         self.movies.setSelectionMode(QListWidget.NoSelection)
         self.movies.setAlternatingRowColors(True)
+        self.movies.itemChanged.connect(self._on_item_toggled)
 
         scan_btn = QPushButton("Scan video folder")
         scan_btn.clicked.connect(self.scan)
@@ -1206,9 +1262,25 @@ class PreparePage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Detect & crop",
-            "Runs the detector over every frame, tracks the detections, and cuts "
-            "the per-track clips the annotator will see. This is the slow, "
-            "GPU-bound step; it is resumable, and finished movies are skipped.",
+            "Find the animals and cut them into clips.",
+            help="""
+<p>Runs the detector over every frame, tracks the detections across frames, and
+cuts the per-track clips the annotator will see.</p>
+
+<p>This is the <b>slow, GPU-bound step</b> - minutes to hours. It is
+<b>resumable</b>: each movie is committed on its own and a finished one is
+skipped on the next run, so a cancelled or killed run costs at most the movie in
+progress and never the cache already built.</p>
+
+<p>It runs in two halves, and only the first needs a GPU. A movie marked
+<b>[detected]</b> already has its tracks - from this machine, or from a GPU box
+whose <code>work/</code> folder was copied here - and only its clips still have
+to be cut. That half needs no model and no GPU, so this page opens and runs
+without one.</p>
+
+<p>Cancel takes effect at the next frame rather than immediately, because the
+frame in flight is the one that would leave a half-written cache behind.</p>
+""",
         ))
         layout.addWidget(splitter, 1)
 
@@ -1221,7 +1293,11 @@ class PreparePage(Page):
                 "The movie folder does not exist yet. Set it on the Configure page "
                 f"(step 2, \"video folder\").\nCurrently: {self.cfg.paths.video_dir}"
             )
-        if not status.model_ok:
+        # Cutting clips needs no model, so a project whose detections arrived from
+        # a GPU box opens here without one. Ticking a movie that DOES need
+        # detecting then stops the run with the missing-model error before any
+        # work starts, which is the honest place to find out.
+        if not status.model_ok and not status.n_detected:
             return (
                 "The detection model file was not found. Set it on the Configure "
                 f"page (step 2, \"detection model\").\nCurrently: {self.cfg.paths.model}"
@@ -1259,6 +1335,10 @@ class PreparePage(Page):
     # -- scanning ----------------------------------------------------------- #
     def _on_run_finished(self, ok: bool) -> None:
         self.hub.set_cache_job(False)
+        # A run just created the markers this page reads, and a "not there" verdict
+        # is cached for half a minute. Without this the movie that finished keeps
+        # reading as unprepared until the cache ages out.
+        forget_path_probes()
         self.hub.reload_project()
 
     def restyle(self) -> None:
@@ -1308,44 +1388,79 @@ class PreparePage(Page):
         self._mark_prepared(select_new=True)
 
     def _mark_prepared(self, select_new: bool = False) -> None:
-        prepared = self._prepared_ids()
-        for i in range(self.movies.count()):
-            item = self.movies.item(i)
-            movie = item.data(Qt.UserRole + 1)
-            if not movie:
-                continue
-            done = movie["movie_id"] in prepared
-            item.setText(
-                f"{'[prepared]' if done else '[  new   ]'}  {movie['movie_id']}"
-                f"      {movie['n_frames']} frames  {movie['width']}x{movie['height']}"
-                f"  @ {movie['fps']:g} fps"
-            )
-            if select_new:
-                item.setCheckState(Qt.Unchecked if done else Qt.Checked)
-        n_new = self.movies.count() - sum(
-            1 for i in range(self.movies.count())
-            if (self.movies.item(i).data(Qt.UserRole) or "") in prepared
-        )
+        states = self._states = self._movie_states()
+        n_todo = 0
+        self._filling = True
+        try:
+            for i in range(self.movies.count()):
+                item = self.movies.item(i)
+                movie = item.data(Qt.UserRole + 1)
+                if not movie:
+                    continue
+                state = states.get(movie["movie_id"], "new")
+                item.setText(
+                    f"{_PREPARE_STATES[state]}  {movie['movie_id']}"
+                    f"      {movie['n_frames']} frames  {movie['width']}x{movie['height']}"
+                    f"  @ {movie['fps']:g} fps"
+                )
+                # A detected movie is ticked like a new one: it still has work
+                # left, just less of it.
+                if select_new:
+                    item.setCheckState(Qt.Unchecked if state == "prepared" else Qt.Checked)
+                if state != "prepared":
+                    n_todo += 1
+        finally:
+            self._filling = False
+        self._update_run_label(states)
         if self.movies.count():
+            n_detected = sum(1 for s in states.values() if s == "detected")
+            detail = f", {n_detected} detected elsewhere" if n_detected else ""
             self.scan_state.setText(
-                f"{self.movies.count()} movie(s), {n_new} not yet prepared"
+                f"{self.movies.count()} movie(s), {n_todo} not yet prepared{detail}"
             )
 
-    def _prepared_ids(self) -> set[str]:
+    def _on_item_toggled(self, _item) -> None:
+        """Ticking a movie changes what the run will do, so it changes the button."""
+        if self._filling:
+            return
+        self._update_run_label(self._states)
+
+    def _update_run_label(self, states: dict) -> None:
+        """Say what the button will actually do, which is not always detection."""
+        pending = [
+            states.get(self.movies.item(i).data(Qt.UserRole), "new")
+            for i in range(self.movies.count())
+            if self.movies.item(i).checkState() == Qt.Checked
+        ]
+        only_cutting = bool(pending) and all(s == "detected" for s in pending)
+        self.tasks.set_run_label("Cut clips" if only_cutting else "Run detection")
+
+    def _movie_states(self) -> dict[str, str]:
+        """movie_id -> "prepared" | "detected" | "new", from the cache directory.
+
+        "detected" is tracks but no clips: detection ran, here or elsewhere.
+        """
+        from ..annotate.clips import DETECT_FILE, DONE_FILE
+
         if self.cfg is None:
-            return set()
+            return {}
         work = self.cfg.paths.work_dir
         # Guarded: a work_dir on a share blocks here once per movie directory.
         if not _exists(work, "dir"):
-            return set()
+            return {}
         try:
             entries = sorted(work.iterdir())
         except OSError:
-            return set()
-        return {
-            d.name for d in entries
-            if _exists(d, "dir") and _exists(d / "prepare_done.json")
-        }
+            return {}
+        states: dict[str, str] = {}
+        for d in entries:
+            if not _exists(d, "dir"):
+                continue
+            if _exists(d / DONE_FILE):
+                states[d.name] = "prepared"
+            elif _exists(d / DETECT_FILE):
+                states[d.name] = "detected"
+        return states
 
     def _set_all(self, checked: bool) -> None:
         for i in range(self.movies.count()):
@@ -1731,14 +1846,12 @@ class ModelPage(Page):
         # The only gate reviewing needs is the file: a run whose model has since
         # been gated off still wrote rows somebody has to be able to look at.
         self._has_predictions = False
-        self._review: BoutReviewDialog | None = None
-        self.review_button = QPushButton("Review predictions...")
+        self.review_button = QPushButton("Review predictions")
         self.review_button.setEnabled(False)
         self.review_button.setToolTip(
-            "Draw one track's predicted spans along the frame axis - where each "
-            "begins and ends, which class, and how confident - and correct them. "
-            "Corrections go to bout_corrections.csv; predictions.parquet and your "
-            "annotation CSV are never written to."
+            "Go to the Review page: one track's predicted spans along the frame "
+            "axis - where each begins and ends, which class, and how confident - "
+            "and the controls that correct them."
         )
         self.review_button.clicked.connect(self._review_predictions)
 
@@ -1758,10 +1871,27 @@ class ModelPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Model",
-            "Fits a classifier on the labels so far and cross-validates it leaving "
-            "whole movies out. The suggestion it produces is only ever displayed, "
-            "never pre-selected, and it stays silent unless agreement beats chance "
-            "by a bootstrapped margin.",
+            "Learn from your labels, and label everything with what it learnt.",
+            help="""
+<p>Fits a classifier on the labels so far and cross-validates it <b>leaving
+whole movies out</b>, so the score is performance on a movie the model has never
+seen rather than on frames next to ones it has.</p>
+
+<p>The suggestion it produces is <b>only ever displayed, never pre-selected</b>,
+and it stays silent unless agreement beats chance by a bootstrapped margin.
+Gating on Cohen's kappa and not on accuracy-vs-majority: accuracy rejects an
+informative model whose accuracy sits below the majority rate, and accepts a
+near-degenerate one that clears it by luck.</p>
+
+<p>About a tenth of clips are held out of the suggestion loop entirely - never
+trained on, never carrying a suggestion. How often you and the model agree on
+<i>those</i> is an honest measure rather than a measure of how much the
+suggestion nudged you.</p>
+
+<p><b>Label every clip</b> writes predictions.parquet, which the Review,
+Distribution and Export pages read. It never writes to your annotation CSV: a
+model trained on its own output has lost the ground truth.</p>
+""",
         ))
         layout.addLayout(repair_row)
         layout.addLayout(predict_row)
@@ -1792,10 +1922,6 @@ class ModelPage(Page):
         self._refresh_predict_gate()
         self.refresh_gate()
         self._load_report()
-        # Only while it is on screen, so an open review window stops describing
-        # the rows the previous run wrote. Closed, it re-reads on the next open.
-        if self._review is not None and self._review.isVisible():
-            self._review.panel.set_config(self.cfg)
 
     def _refresh_predict_gate(self) -> None:
         """Re-read whether any group cleared the reliability bar, and re-plan.
@@ -2098,21 +2224,9 @@ class ModelPage(Page):
 
     # -- looking at what came out -------------------------------------------- #
     def _review_predictions(self) -> None:
-        """Open the timeline over predictions.parquet.
-
-        One dialog, reused: two views of a file both can write would each hold
-        their own idea of a track's corrections, and each save would erase the
-        other's.
-        """
-        if self.cfg is None:
-            return
-        if self._review is None:
-            self._review = BoutReviewDialog(self.cfg, self)
-        else:
-            self._review.panel.set_config(self.cfg)
-        self._review.show()
-        self._review.raise_()
-        self._review.activateWindow()
+        """Hand over to the Review page, which is where the timeline lives."""
+        if self.cfg is not None:
+            self.hub.go_to(PAGES.index("Review"))
 
     def _build_work(self):
         blocker = self.blocker()
@@ -2158,13 +2272,6 @@ class ModelPage(Page):
     def shutdown(self) -> None:
         self._closing = True
         self.tasks.shutdown()
-        # A dialog parented to this page outlives it otherwise, and it holds a
-        # Config and two loaded parquet tables belonging to a project that is
-        # being closed.
-        if self._review is not None:
-            self._review.close()
-            self._review.deleteLater()
-            self._review = None
         # Wait for them: a QThread still running at teardown aborts the process.
         for runner in (self._repair_runner, self._plan_runner):
             if runner is not None:
@@ -2250,7 +2357,104 @@ def _format_report(reports: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 6. export
+# 6. review
+# --------------------------------------------------------------------------- #
+class ReviewPage(Page):
+    """Where a predicted boundary is checked, and moved.
+
+    The panel opens three files, so it is built on the first visit rather than
+    at startup, and there is one of it per window. Leaving the page hides it,
+    which is what makes it let go of the movie and its decode thread.
+    """
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        self.panel: BoutReviewPanel | None = None
+        self._has_predictions = False
+        self._project: str | None = None
+        # Set when the file under the panel has changed and the panel has not
+        # been told yet, because it is not on screen to be told.
+        self._stale = False
+
+        self.note = _muted(QLabel(""))
+        self.note.setWordWrap(True)
+
+        self.host = QVBoxLayout()
+        self.host.setContentsMargins(0, 0, 0, 0)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(_heading(
+            "Review",
+            "Check where the model put each boundary, against the footage.",
+            # The panel carries the same `?`, but the panel is not built until
+            # there are predictions - and the page is worth explaining before
+            # then, to somebody wondering what it would show.
+            help=REVIEW_HELP,
+        ))
+        layout.addWidget(self.note)
+        layout.addLayout(self.host, 1)
+
+    def blocker(self) -> str:
+        if self.cfg is None:
+            return "no project open"
+        if not self._has_predictions:
+            return ("nothing has been predicted yet - run Label every clip on "
+                    "the Model page, and set predict.decode so it emits bouts")
+        return ""
+
+    def on_project(self) -> None:
+        from ..infer.predict import predictions_path
+
+        self._has_predictions = (
+            self.cfg is not None and predictions_path(self.cfg).exists()
+        )
+        project = str(self.cfg.path) if self.cfg is not None else None
+        if project != self._project:
+            # A different project: the panel holds the old one's tables.
+            self._project = project
+            self._discard()
+        else:
+            self._stale = True
+        if self.isVisible():
+            self.ensure_loaded()
+        self._paint()
+
+    def ensure_loaded(self) -> None:
+        """Build or refresh the panel. Called on arrival, never at startup."""
+        self._paint()
+        if self.blocker():
+            self._discard()
+            return
+        if self.panel is None:
+            self.panel = BoutReviewPanel(self.cfg, self)
+            self.host.addWidget(self.panel, 1)
+            self._stale = False
+        elif self._stale:
+            # Re-reads all three files, and lets go of the previous movie first.
+            self.panel.set_config(self.cfg)
+            self._stale = False
+
+    def _paint(self) -> None:
+        blocker = self.blocker()
+        self.note.setText(blocker)
+        self.note.setVisible(bool(blocker))
+
+    def _discard(self) -> None:
+        if self.panel is None:
+            return
+        self.panel.release()
+        self.host.removeWidget(self.panel)
+        self.panel.setParent(None)
+        self.panel.deleteLater()
+        self.panel = None
+        self._stale = False
+
+    def shutdown(self) -> None:
+        self._discard()
+
+
+# --------------------------------------------------------------------------- #
+# 7. distribution & export
 # --------------------------------------------------------------------------- #
 class DistributionPage(Page):
     """What the labels look like, before anything is trained or exported."""
@@ -2291,9 +2495,19 @@ class DistributionPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Distribution",
-            "How your labels are spread, right now. Worth a look before training "
-            "or exporting: a class with almost nothing in it, or one that "
-            "swallows everything, decides what the next step is actually worth.",
+            "How your labels are spread, right now.",
+            help="""
+<p>Worth a look before training or exporting. A class with almost nothing in it,
+or one that swallows everything, decides what the next step is actually
+worth.</p>
+
+<p>The summary flags: values with nothing labelled yet; values below
+<b>suggest.min_per_class</b>, which are dropped at training time; values
+appearing in only one movie, which grouped cross-validation cannot score because
+they cannot be held out; values present in the CSV but no longer in the config;
+and any value over 90% of the labels, where a constant predictor scores well and
+a good-looking accuracy means nothing.</p>
+""",
         ))
         layout.addLayout(head)
         layout.addWidget(self.notes)
@@ -2503,11 +2717,20 @@ class ExportPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading(
             "Export",
-            "Burns the labels back onto the original movie, colouring each track "
-            "by its category. Works at any time, including on a half-finished CSV. "
-            "Colour by your own labels, by the model's predictions, or by both - a "
-            "predicted box is drawn dashed with its confidence, so it can never be "
-            "mistaken for something you decided.",
+            "Put the labels back onto the original movies.",
+            help="""
+<p>Burns the labels onto a copy of the original movie, colouring each track by
+its category. Works at any time, including on a half-finished CSV.</p>
+
+<p>Colour by <b>your own labels</b>, by the <b>model's predictions</b>, or by
+both. A predicted box is drawn <b>dashed and carries its confidence</b>, so it
+can never be mistaken for something you decided - which is the whole reason the
+two can be shown together at all.</p>
+
+<p>Frames no label or prediction covers are left as they were rather than
+painted a default colour, since a coloured box is a claim and there is none to
+make there.</p>
+""",
         ))
         layout.addWidget(splitter, 1)
 
@@ -2711,8 +2934,8 @@ class Hub(QMainWindow):
 
         self.pages: list[Page] = [
             ProjectPage(self), ConfigPage(self), PreparePage(self),
-            AnnotatePage(self), ModelPage(self), DistributionPage(self),
-            ExportPage(self),
+            AnnotatePage(self), ModelPage(self), ReviewPage(self),
+            DistributionPage(self), ExportPage(self),
         ]
         self.stack = QStackedWidget()
         for page in self.pages:
@@ -2956,7 +3179,7 @@ class Hub(QMainWindow):
             )
             return (
                 f"{status.n_annotated} of {status.n_clips} clips labelled. "
-                "Keep going - one keypress per clip." + note,
+                + note,
                 3, "Go to Annotate",
             )
         return (
@@ -2987,6 +3210,8 @@ class Hub(QMainWindow):
                 page.panel.setFocus()
         elif isinstance(page, ExportPage) and page._list_stale:
             page.reload_movies()
+        elif isinstance(page, ReviewPage):
+            page.ensure_loaded()
         elif isinstance(page, DistributionPage) and page._stale:
             page.reload()
         elif isinstance(page, ModelPage):
@@ -3002,6 +3227,8 @@ class Hub(QMainWindow):
             return [(">", "start here")] + [("", "needs a project")] * (len(PAGES) - 1)
         s = self.status
         paths_ok = s.video_dir_ok and s.model_ok
+        review = self.page(ReviewPage)
+        predicted = review is not None and review._has_predictions
         return [
             ("*", ""),
             ("*" if paths_ok else "!", "" if paths_ok else "something is missing"),
@@ -3010,6 +3237,7 @@ class Hub(QMainWindow):
              (">" if s.n_clips else ""),
              f"{s.n_annotated} / {s.n_clips}" if s.n_clips else ""),
             ("*" if s.suggester else "", s.suggester.split(":")[0] if s.suggester else ""),
+            ("*" if predicted else "", "" if predicted else "nothing predicted yet"),
             ("*" if s.n_annotated else "", f"{s.n_annotated} labelled" if s.n_annotated else ""),
             ("*" if s.n_annotated else "", ""),
         ]

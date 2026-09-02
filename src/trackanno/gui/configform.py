@@ -149,6 +149,16 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
          ("tracking", "min_track_length", "int", "min track length",
           "Drop tracks seen in fewer frames than this. Must not be more than the "
           "frames processed.", {"min": 1, "max": 100000}),
+         ("tracking", "border_margin_px", "int", "border margin (px)",
+          "Discard tracks that come this close to the frame edge, where the "
+          "animal is partly outside the picture and a pose model places its "
+          "keypoints against a shape that is not all there. 0 keeps every "
+          "track.", {"min": 0, "max": 2000, "step": 5}),
+         ("tracking", "border_max_frac", "float", "border tolerance",
+          "The share of a track's frames allowed at the border before the whole "
+          "track goes. 0 discards a track that ever reaches the edge; 0.1 lets "
+          "one pass through it.",
+          {"min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2}),
          ("tracking", "greedy_max_dist_px", "float", "greedy max distance",
           "Only used by the greedy fallback tracker.", {"min": 1.0, "max": 500.0, "step": 5.0}),
      ]),
@@ -307,14 +317,20 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
      "Hyperparameters for the classifier, the same ones for either model.",
      [
          ("suggest", "iterations", "int", "boosting iterations",
-          "More iterations fit harder. 400 suits a few hundred labelled clips.",
+          "More iterations fit harder, and cost proportionally more time on every "
+          "background refit. 1000 is CatBoost's own default.",
           {"min": 10, "max": 5000, "step": 50}),
          ("suggest", "depth", "int", "tree depth",
           "CatBoost trees are symmetric, so depth sets the width too: 2**depth "
-          "leaves. Past 6 it overfits a hand-labelled set.", {"min": 1, "max": 10}),
-         ("suggest", "learning_rate", "float", "learning rate",
+          "leaves, 64 at the default 6. Past that a few hundred hand-labelled "
+          "clips get memorised.", {"min": 1, "max": 10}),
+         ("suggest", "learning_rate", "autonum", "learning rate",
           "Smaller learns more slowly and generalises better, given enough "
-          "iterations.", {"min": 0.005, "max": 1.0, "step": 0.01, "decimals": 3}),
+          "iterations. 'auto' leaves it to the estimator, which is CatBoost's "
+          "own default: it derives the rate from the number of rows and "
+          "iterations rather than fixing one in advance.",
+          {"numeric": "float", "min": 0.001, "max": 1.0, "step": 0.01,
+           "decimals": 3}),
          ("suggest", "l2_leaf_reg", "float", "L2 regularisation",
           "Higher values penalise large leaf values, which helps on small label "
           "sets.", {"min": 0.0, "max": 30.0, "step": 0.5}),
@@ -358,7 +374,8 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Share of each batch drawn at random from the audit holdout instead of "
           "being ranked. 'auto' is the audit holdout above, which keeps the audit "
           "set growing at the same rate.",
-          {"numeric": "float", "min": 0.0, "max": 1.0, "step": 0.05}),
+          {"numeric": "float", "min": 0.0, "max": 1.0, "step": 0.05,
+           "decimals": 3}),
          ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
           "Two clips of one track must start this many frames apart to be in the "
           "same batch. 'auto' is the clip length, so no footage is judged twice. "
@@ -470,6 +487,7 @@ NEEDS_REPREPARE = {
     "detection.max_det", "detection.half",
     "tiling.enabled", "tiling.tile", "tiling.overlap", "tiling.merge_iou",
     "tracking.backend", "tracking.min_track_length", "tracking.greedy_max_dist_px",
+    "tracking.border_margin_px", "tracking.border_max_frac",
     "normalize.mode", "normalize.percentiles", "normalize.smooth_window",
     "clips.frames", "clips.stride", "clips.window_mode", "clips.follow", "clips.pad",
     "clips.crop_size", "clips.max_size", "clips.min_clip_frames",
@@ -536,10 +554,11 @@ class ConfigForm(QScrollArea):
                 self._kinds[dotted] = kind
             layout.addWidget(box)
 
-        note = QLabel(
-            "Settings marked <b>*</b> describe how the clips were cut. Changing one "
-            "takes effect after Detect &amp; crop is re-run with 'redo' ticked; "
-            "everything else applies at once."
+        note = QLabel("Settings marked <b>*</b> need Detect &amp; crop re-run.")
+        note.setToolTip(
+            "They describe how the clips were cut, so a change to one takes "
+            "effect only after Detect & crop is run again with 'redo' ticked. "
+            "Everything else applies at once."
         )
         note.setWordWrap(True)
         note.setProperty("role", "muted")
@@ -824,7 +843,8 @@ class ConfigForm(QScrollArea):
         generated config.yaml does not mention ``suggest.iterations``, so
         writing every widget back turned it into the spin box's minimum of 10 -
         and ``depth`` into 1, and ``balance_classes`` off - on the first
-        autosave of every project.
+        autosave of every project, replacing the estimator's own defaults with
+        the corner of the form.
         """
         raw = self._raw_values()
         return {key: value for key, value in raw.items()
@@ -1241,14 +1261,19 @@ class CategoryEditor(QWidget):
         add = QPushButton("+ add group")
         add.clicked.connect(lambda: self.add_group())
 
-        hint = QLabel(
-            "A <b>single</b> group is a set of mutually exclusive choices and can "
-            "auto-advance; a <b>multi</b> group is checkboxes and never advances on "
-            "its own. Shortcut keys must be unique and must not collide with the "
-            "navigation keys (arrows, Tab, Space, o, s, c, u, n, m, 0, + and -)."
-        )
+        hint = QLabel("<b>single</b> = one choice, auto-advances. "
+                      "<b>multi</b> = checkboxes, never advances.")
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
+        hint.setToolTip(
+            "A single group is a set of mutually exclusive choices, and picking "
+            "one commits the clip and moves on once every required group is "
+            "filled. A multi group is checkboxes, and ticking one never yanks "
+            "the clip away.\n\n"
+            "Shortcut keys must be unique, and must not collide with the "
+            "navigation keys: arrows, Tab, Space, o, s, c, u, n, m, 0, + and -. "
+            "The config refuses to start if one does."
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -1527,14 +1552,19 @@ class KeypointEditor(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(_row_height())
 
         order_note = QLabel(
-            "<b>Order matters, names do not.</b> The pose features read keypoints by "
-            "position: <b>0</b> is the head, <b>1</b> the base (the body-frame origin), "
-            "and <b>1</b> onwards the flagellum chain. A model that predicts them in "
-            "another order still gives body-length and beat numbers, but they mean "
-            "nothing."
+            "<b>Order matters, names do not:</b> 0 = head, 1 = base, "
+            "1 onwards = the flagellum chain."
         )
         order_note.setWordWrap(True)
         order_note.setProperty("role", "muted")
+        order_note.setToolTip(
+            "The pose features read keypoints by POSITION, not by name. 0 is "
+            "the head, 1 is the base and the body-frame origin, and 1 onwards "
+            "is the flagellum chain.\n\n"
+            "A model that predicts the same points in another order still "
+            "produces body-length and beat numbers. They mean nothing, and "
+            "nothing downstream can tell."
+        )
 
         # -- skeleton --
         self.edges = QTableWidget(0, 3)
