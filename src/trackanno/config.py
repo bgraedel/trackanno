@@ -7,15 +7,17 @@ errors here should read like advice, not like a stack trace.
 from __future__ import annotations
 
 import hashlib
+import re
 import warnings
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclasses_fields
 from pathlib import Path
 from typing import Any, Sequence
 
 import yaml
 
 __all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption",
-           "ModelSource", "RESERVED_GROUP_NAMES"]
+           "ModelSource", "RESERVED_GROUP_NAMES", "section_defaults"]
 
 # A category group becomes a CSV column, so a group named like a built-in column
 # silently overwrites it. Hand-maintained mirror of ``store.IDENTITY_COLUMNS``
@@ -40,6 +42,7 @@ class ConfigError(ValueError):
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
 def _section(data: dict, name: str) -> dict:
     value = data.get(name, {})
     if value is None:
@@ -58,15 +61,6 @@ def _known(section: str, given: dict, allowed: Sequence[str]) -> None:
         )
 
 
-def _spelled_out(written: int | str, value: int) -> str:
-    """``50``, or ``50 (from 'auto')`` when the user never typed that number.
-
-    A complaint about two settings that disagree is unreadable if one of them
-    was written as ``auto`` and the message quotes only what it resolved to.
-    """
-    return f"{value}, from 'auto'" if isinstance(written, str) else str(value)
-
-
 def _optional_auto(value, where: str, expected: str):
     """A setting that may say ``auto``: ``None`` for auto, the value otherwise.
 
@@ -82,89 +76,109 @@ def _optional_auto(value, where: str, expected: str):
     return value
 
 
-def _window_scales(value) -> list[int]:
-    """``predict.window_scales`` as frame counts, or a refusal naming the choices.
-
-    Only the checks a single section can make: that the entries are frame counts
-    at all, and that none is repeated. Whether the list CONTAINS
-    ``predict.window_frames`` needs two sections and so belongs to
-    :func:`load_config`. A repeat is refused rather than deduplicated: the scales
-    are averaged into the per-frame posterior with equal weight each, so listing
-    one twice would silently give it double weight.
-    """
-    if value is None:
-        return []
-    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        raise ConfigError(
-            "predict.window_scales must be a list of window lengths in frames, "
-            f"like [25, 50, 100] (got {value!r}). Leave it empty to score at "
-            "predict.window_frames alone, which is what every earlier version did"
-        )
-    out: list[int] = []
-    for entry in value:
-        try:
-            frames = int(entry)
-        except (TypeError, ValueError):
-            raise ConfigError(
-                f"predict.window_scales entry {entry!r} is not a frame count; "
-                "each entry is how many frames one window of that scale spans"
-            ) from None
-        if frames < 1:
-            raise ConfigError(
-                f"predict.window_scales entry {frames} must be at least 1; it is "
-                "how many frames one window spans, and a window spanning none of "
-                "them has nothing to measure"
-            )
-        if frames in out:
-            raise ConfigError(
-                f"predict.window_scales lists {frames} twice. Every scale is "
-                "averaged into the per-frame posterior with the same weight, so a "
-                "repeated scale would count twice and quietly outvote the others - "
-                "which is the arbitrary weighting multi-scale scoring is meant to "
-                "remove, not to introduce. List each length once"
-            )
-        out.append(frames)
-    return out
-
-
-def _selection_rules(d: dict) -> tuple[str, str]:
-    """``(select_rule, select_target_rule)``, or a refusal naming the choices.
-
-    Both names are validated against :mod:`trackanno.learn.select` itself rather than
-    against a list copied into this file, which would rot silently in either
-    direction.
-    """
-    from .learn.select import TARGET_RULES, UNCERTAINTY_RULES
-
+def _selection_rule(d: dict) -> str:
+    """``select_rule`` as ``off`` or ``margin``, or a refusal."""
     raw = d.get("select_rule", "off")
     if isinstance(raw, bool):
-        # YAML reads a bare `off` (and `no`, and `false`) as a boolean, so the
-        # value this key is most likely to be given arrives as the wrong type.
+        # YAML reads a bare `off` as a boolean.
         raise ConfigError(
             "suggest.select_rule came through as a YAML boolean, which is what an "
-            "unquoted `off`/`on` becomes. Quote it - select_rule: \"off\" - so it "
-            "stays the word it looks like on the page."
+            "unquoted `off`/`on` becomes. Quote it: select_rule: \"off\"."
         )
     rule = str(raw)
-    if rule != "off" and rule not in UNCERTAINTY_RULES:
-        raise ConfigError(
-            f"suggest.select_rule must be \"off\" (clips reach the annotator in the "
-            f"GUI's own shuffled order, as they always have) or one of "
-            f"{sorted(UNCERTAINTY_RULES)}, got {rule!r}. They rank differently and "
-            "the difference is not cosmetic: least_confidence reads only the top "
-            "probability, margin the gap between the top two, entropy the whole "
-            "vector and so mostly its tail."
+    if rule in ("least_confidence", "entropy"):
+        warnings.warn(
+            f"suggest.select_rule {rule!r} is no longer available; using 'margin'",
+            stacklevel=3,
         )
-    target_rule = str(d.get("select_target_rule", "target_runner_up"))
-    if target_rule not in TARGET_RULES:
+        return "margin"
+    if rule not in ("off", "margin"):
         raise ConfigError(
-            f"suggest.select_target_rule must be one of {sorted(TARGET_RULES)}, got "
-            f"{target_rule!r}. 'target_confident' fills a starved class fastest and "
-            "cannot move its boundary; 'target_runner_up' picks the clips sitting on "
-            "that boundary, which fills the count more slowly and is the only one of "
-            "the two whose labels move the decision surface."
+            f"suggest.select_rule must be \"off\" or \"margin\", got {rule!r}"
         )
-    return rule, target_rule
+    return rule
+
+
+def _feature_columns(value, groups: list[str]) -> list[str] | None:
+    """``suggest.feature_columns``, checked against the vocabulary and the groups.
+
+    ``None`` (and an absent key) means "do not cut here"; a list narrows what
+    ``feature_groups`` selected. The names are checked against
+    :func:`trackanno.measure.clipfeatures.known_columns`, which is the full set a
+    built table can hold, so a typo is refused here rather than silently changing
+    the feature space the model was fitted in. Only when the key is given: the
+    schema pulls the measurement modules in, and the default path must not pay
+    for that.
+
+    A name whose family is not in ``feature_groups`` is refused rather than
+    turning that family back on, because the two keys would then disagree about
+    what the model may see and only one of them would be on screen.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raise ConfigError(
+            f"suggest.feature_columns must be a list of column names, got the "
+            f"string {value!r}. One name is still a list: [{value}]."
+        )
+    names = [str(c).strip() for c in value]
+    if not names:
+        raise ConfigError(
+            "suggest.feature_columns is an empty list, so the model would have no "
+            "inputs at all. 'every column the feature groups selected' is written "
+            "as null, not as []."
+        )
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise ConfigError(
+            f"suggest.feature_columns names {repeated} more than once. A column "
+            "listed twice is not weighted twice, so the repeat says something the "
+            "model cannot do; drop it."
+        )
+
+    import difflib
+
+    from .measure.clipfeatures import group_of, known_columns
+    from .measure.embeddings import EMBEDDING_COLUMN
+
+    # Embedding names are matched by shape: their width follows the PCA, and
+    # training refuses the ones the table actually lacks.
+    vocabulary = known_columns()
+    unknown = [n for n in names
+               if n not in set(vocabulary) and not EMBEDDING_COLUMN.match(n)]
+    if unknown:
+        near = difflib.get_close_matches(unknown[0], vocabulary, n=4, cutoff=0.6)
+        raise ConfigError(
+            f"suggest.feature_columns names {len(unknown)} column(s) no feature "
+            f"table has: {unknown[:6]}"
+            + (f". Did you mean {', '.join(near)}?" if near else ".")
+            + " Pick them on the Configure page, which lists what this project can "
+            "actually compute, or set the key to null to use every column the "
+            "feature groups selected."
+        )
+    outside = sorted({n for n in names if group_of(n) not in groups})
+    if outside:
+        families = sorted({str(group_of(n)) for n in outside})
+        raise ConfigError(
+            f"suggest.feature_columns names {outside[:6]} from the feature "
+            f"group(s) {families}, which suggest.feature_groups does not include "
+            f"({groups}). The two keys would then disagree about what the model may "
+            "see. Either add the group to suggest.feature_groups, or drop those "
+            "columns from suggest.feature_columns."
+        )
+    return names
+
+
+_CLIP_ID = re.compile(r"^(?P<movie>.+)__t(?P<track>\d+)__f\d+$")
+
+
+def audit_track_key(clip_id: str) -> str:
+    """``movie_id::track_id`` for a clip_id, the unit the audit holdout is drawn
+    over. An id not in ``clip_id_for`` form is its own key."""
+    m = _CLIP_ID.match(str(clip_id))
+    if m is None:
+        return str(clip_id)
+    return f"{m['movie']}::{int(m['track'])}"
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -226,31 +240,32 @@ class ND2Options:
         )
 
 
+# Removed normalize.mode values and the mode an old config now gets instead.
+REMOVED_NORMALIZE_MODES = {"smooth": "per_frame", "none": "fixed"}
+
+
 @dataclass
 class Normalize:
-    """How raw frames become uint8.
-
-    ``smooth`` tracks slow illumination/focus drift without the frame-to-frame
-    breathing of per-frame scaling: percentiles sampled on a subset of frames,
-    median-filtered over time, then interpolated to every frame.
-    """
+    """How raw frames become uint8: ``per_frame`` or ``fixed`` percentiles."""
 
     mode: str = "per_frame"
     percentiles: tuple[float, float] = (0.5, 99.5)
-    sample_every: int | str = "auto"
-    smooth_window: int = 9
     subsample: int = 4
 
     @classmethod
     def parse(cls, d: dict) -> "Normalize":
-        _known("normalize", d,
-               ["mode", "percentiles", "sample_every", "smooth_window", "subsample"])
+        _known("normalize", d, ["mode", "percentiles", "subsample"])
         mode = str(d.get("mode", "per_frame"))
-        if mode not in ("smooth", "fixed", "per_frame", "none"):
+        if mode in REMOVED_NORMALIZE_MODES:
+            fallback = REMOVED_NORMALIZE_MODES[mode]
+            warnings.warn(f"normalize.mode: {mode!r} was removed; using {fallback!r}",
+                          stacklevel=3)
+            mode = fallback
+        if mode not in ("fixed", "per_frame"):
             raise ConfigError(
-                "normalize.mode must be 'per_frame' (default), 'smooth' (slow-drift only), "
-                "'fixed' (one mapping for the whole movie - faithful to real intensity "
-                "changes, including flicker) or 'none'"
+                "normalize.mode must be 'per_frame' (default) or 'fixed' (one mapping "
+                "for the whole movie - faithful to real intensity changes, including "
+                "flicker)"
             )
         pcts = d.get("percentiles", [0.5, 99.5])
         if len(pcts) != 2 or not 0 <= float(pcts[0]) < float(pcts[1]) <= 100:
@@ -258,8 +273,6 @@ class Normalize:
         return cls(
             mode=mode,
             percentiles=(float(pcts[0]), float(pcts[1])),
-            sample_every=d.get("sample_every", "auto"),
-            smooth_window=max(1, int(d.get("smooth_window", 9))),
             subsample=max(1, int(d.get("subsample", 4))),
         )
 
@@ -338,8 +351,8 @@ class Tracking:
     tracker_cfg: str = ""            # "" -> the backend's bundled yaml
     min_track_length: int = 50
     greedy_max_dist_px: float = 25.0
-    # How close to the frame edge counts as being at it, and how much of a
-    # track may be there before the whole track is discarded. 0 px is off.
+    # How close to the frame edge counts as being at it, and how much of one
+    # clip may be spent there before that clip goes. 0 px is off.
     border_margin_px: int = 0
     border_max_frac: float = 0.0
     overrides: dict = field(default_factory=dict)
@@ -363,15 +376,16 @@ class Tracking:
             raise ConfigError(
                 f"tracking.border_margin_px must be 0 or more (got {margin}); it is "
                 "how far from the frame edge still counts as being at it, and "
-                "'do not discard border tracks at all' is written as 0"
+                "'do not exclude border detections at all' is written as 0"
             )
         border_frac = float(d.get("border_max_frac", 0.0))
         if not 0.0 <= border_frac <= 1.0:
             raise ConfigError(
                 f"tracking.border_max_frac must be in [0, 1] (got {border_frac}); it "
-                "is the share of a track's detections allowed within "
-                "tracking.border_margin_px of the edge, so 0 discards a track that "
-                "reaches the edge at all and 1 discards none"
+                "is the share of ONE CLIP's detections allowed within "
+                "tracking.border_margin_px of the edge, so 0 discards a clip that "
+                "reaches the edge at all and 1 discards none. The track carries on "
+                "either way: it is clips that go, not tracks"
             )
         return cls(
             backend=backend,
@@ -386,7 +400,7 @@ class Tracking:
 
 @dataclass
 class Features:
-    """Per-detection CNN features, pooled from the same forward pass."""
+    """Per-detection detector embeddings, pooled from the same forward pass."""
 
     enabled: bool = True
     levels: list[str] = field(default_factory=lambda: ["P3", "P4", "P5"])
@@ -409,6 +423,76 @@ class Features:
             pool=max(1, int(d.get("pool", 1))),
             dtype=dtype,
         )
+
+
+@dataclass
+class EmbeddingSpec:
+    """One per-detection embedding input: ``detector`` or a ``file`` per movie."""
+
+    name: str
+    source: str = "detector"
+    # File source only: a path with ``{movie_id}``, relative to the config.
+    path: str | None = None
+
+    @property
+    def group(self) -> str:
+        return f"emb_{self.name}"
+
+
+def _embeddings(value) -> list[EmbeddingSpec]:
+    """``suggest.embeddings``: a list of ``{name, source, path}`` mappings."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError("suggest.embeddings must be a list of {name, source, path}")
+    out: list[EmbeddingSpec] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ConfigError(f"suggest.embeddings entry {entry!r} is not a mapping")
+        _known("suggest.embeddings", entry, ["name", "source", "path"])
+        name = str(entry.get("name", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9]+", name):
+            raise ConfigError(
+                f"suggest.embeddings name {name!r} must be letters and digits only"
+            )
+        source = str(entry.get("source", "detector"))
+        if source not in ("detector", "file"):
+            raise ConfigError(
+                f"suggest.embeddings {name}: source must be 'detector' or 'file', "
+                f"got {source!r}"
+            )
+        path = entry.get("path")
+        if source == "file" and (not path or "{movie_id}" not in str(path)):
+            raise ConfigError(
+                f"suggest.embeddings {name}: a file source needs a path containing "
+                "{movie_id}, e.g. embeddings/{movie_id}.parquet"
+            )
+        if any(e.name == name for e in out):
+            raise ConfigError(f"suggest.embeddings names {name!r} twice")
+        out.append(EmbeddingSpec(name, source, str(path) if path else None))
+    return out
+
+
+_OLD_CNN = re.compile(r"^cnn(\d+)_(mean|std|delta)$")
+
+
+def _migrate_cnn(groups: list[str], embeddings: list[EmbeddingSpec],
+                 columns) -> tuple[list[str], object]:
+    """Map the retired ``cnn`` group onto a ``detector`` embedding named ``det``."""
+    if "cnn" not in groups:
+        return groups, columns
+    warnings.warn(
+        "suggest.feature_groups 'cnn' is now the detector embedding 'det'; "
+        "reading it as suggest.embeddings [{name: det, source: detector}] and "
+        "group emb_det. Retrain models fitted on cnn columns.",
+        stacklevel=4,
+    )
+    if not any(e.name == "det" for e in embeddings):
+        embeddings.append(EmbeddingSpec("det", "detector"))
+    groups = list(dict.fromkeys("emb_det" if g == "cnn" else g for g in groups))
+    if columns is not None and not isinstance(columns, str):
+        columns = [_OLD_CNN.sub(r"emb_det_\1_\2", str(c)) for c in columns]
+    return groups, columns
 
 
 @dataclass
@@ -438,106 +522,50 @@ class Suggest:
     # rather than the estimator. One behaviour dominates a behaviour log, and
     # an unweighted model scores well by answering with it.
     balance_classes: bool = True
-    # Which feature families the model may use: the CNN columns re-identify
-    # individuals almost perfectly, so a project that wants behaviour rather
-    # than re-identification may drop them.
+    # Which processor fits the trees: cpu, gpu or auto. CatBoost only.
+    # CatBoost's GPU uses 128 feature borders against the CPU's 254, so the two
+    # fit different models. It is also slower below roughly 50 000 rows.
+    device: str = "cpu"
+    # Which feature families the model may use. Absent, every static family
+    # plus every declared embedding.
     feature_groups: list[str] = field(
-        default_factory=lambda: ["kinematic", "pose", "waveform", "cnn"])
-    # A second, ORTHOGONAL cut through the same columns. `feature_groups` asks
-    # which instrument a column came from; this asks how its value behaves when
-    # the window length changes, which differs inside every group - `beat_*` is
-    # length-invariant and its groupmate `body_path_length` is not. 'all' is
-    # every column the groups selected; 'length_invariant' keeps only the ones
-    # that do not scale with the window, which is what makes ONE model applicable
-    # at several window lengths (`predict.window_scales`). That costs real
-    # signal, so it is opted into, never a default.
-    feature_scope: str = "all"
-
+        default_factory=lambda: ["kinematic", "pose", "waveform"])
+    # Per-detection embedding inputs, each a feature group ``emb_<name>``.
+    embeddings: list[EmbeddingSpec] = field(default_factory=list)
+    # Frames of kinematic context centred on each window; 0 is off.
+    context_frames: int = 0
+    # The finest of the three cuts: the columns themselves, by name. None is not
+    # "no columns" but "do not cut here", which is what keeps the default the
+    # behaviour every project on disk was fitted under. It NARROWS what the
+    # groups selected rather than replacing it, so a name whose family is not in
+    # `feature_groups` is a contradiction and is refused rather than quietly
+    # turning that family back on.
+    feature_columns: list[str] | None = None
     # -- which clips the annotator is handed next (:mod:`trackanno.learn.select`) --- #
-    # Every key below is prefixed `select_` rather than living in a section of
-    # its own, because none of them mean anything without the model this section
-    # fits. 'off' is the default: no ranking runs and the GUI keeps its seeded
-    # shuffle. Selection stops the labelled set being a random sample of the
-    # clips, which changes what every statistic computed over it means, so it is
-    # something a project opts into.
+    # 'off' keeps the GUI's seeded shuffle; 'margin' puts the clips the model is
+    # least sure about first, in batches re-ranked after each refit.
     select_rule: str = "off"
-    # Clips per batch. Twice `retrain_every` so a batch outlives the refit that
-    # produced it, and large enough that the reserved audit share is a whole
-    # slot: `int(share * n + 0.5)` rounds a batch of 4 at the 0.10 default down
-    # to no draw at all.
     select_batch_size: int = 20
-    # Share of each batch drawn uniformly at random from the audit holdout.
-    # 'auto' is `audit_fraction`: draw audit clips at any other rate and the
-    # labelled audit subset stops being proportional to the audit set, so the one
-    # unbiased accuracy in the tool describes a differently-composed sample.
-    select_audit_share: float | str = "auto"
-    # Frames two ranked clips of one track must be apart. 'auto' is
-    # `clips.frames`: closer than one clip length and two windows of a track
-    # share footage, so the second charges the annotator again for what the first
-    # already showed. Pairs exactly that far apart are kept.
-    select_frame_gap: int | str = "auto"
-    # Labels a class needs before slots are spent hunting for it. 0 (off) even
-    # when selection is on: targeting skews the label marginals, and both
-    # `train_group`'s gates - Cohen's kappa and the majority baseline - are
-    # computed against those marginals, so it can turn the suggester silent on a
-    # model that has not changed.
-    select_target_quota: int = 0
-    select_target_rule: str = "target_runner_up"
 
-    # -- what the selector actually runs with, 'auto' spelled out ----------- #
     @property
     def selection_on(self) -> bool:
         return self.select_rule != "off"
 
-    def resolved_audit_share(self) -> float:
-        """``select_audit_share`` with ``auto`` filled in: ``audit_fraction``.
-
-        One number, two places it has to hold: `audit_fraction` decides which
-        clips are in the holdout, and this decides how often the batch draws from
-        it. Let them differ and the labelled audit subset fills at the wrong
-        rate, either stalling `audit_accuracy` or eating slots the ranking was
-        supposed to spend.
-        """
-        if isinstance(self.select_audit_share, str):
-            return float(self.audit_fraction)
-        return float(self.select_audit_share)
-
     def audit_by_hash(self, clip_id: str) -> bool:
-        """Whether ``clip_id`` hashes into the audit holdout - the FALLBACK answer.
+        """Whether ``clip_id``'s track hashes into the audit holdout (fallback).
 
-        Fallback, because this answer is not stable: ``clip_id`` embeds the track
-        id and re-running detection renumbers every track, so every id changes
-        and this redraws the holdout from scratch. A LABELLED clip's membership
-        is therefore written down the first time it is asked
-        (``store.AUDIT_COLUMN``) and this is consulted only where no record
-        exists, on an unlabelled clip whose membership is still free to move.
-
-        It lives on the config because two modules need it and neither can own
-        it: the store stamps membership into the CSV at label time and
-        :mod:`trackanno.learn.suggest` reads the stamp back.
-
-        Its own seed, not ``seed``: ``seed`` exists to be varied to check CV
-        stability, and doing that must not redraw the holdout.
+        Hashed on ``movie_id::track_id`` so every clip of a track lands on the
+        same side. Track ids change on re-detection, so a labelled clip's
+        recorded membership (``store.AUDIT_COLUMN``) wins over this. Uses its
+        own seed so varying ``seed`` does not redraw the holdout.
         """
         frac = float(self.audit_fraction)
         if frac <= 0:
             return False
         digest = hashlib.blake2b(
-            f"{self.audit_seed}:{clip_id}".encode(), digest_size=8
+            f"{self.audit_seed}:{audit_track_key(clip_id)}".encode(), digest_size=8
         ).digest()
         return (int.from_bytes(digest, "big") % 10_000) < frac * 10_000
-
-    def resolved_frame_gap(self, clips: "Clips") -> int:
-        """``select_frame_gap`` with ``auto`` filled in: ``clips.frames``.
-
-        Two windows of one track less than a clip length apart overlap, so a
-        human judging both judges some frames twice. Anything wider is a claim
-        about how fast behaviour changes, which is per-project and left to be
-        typed.
-        """
-        if isinstance(self.select_frame_gap, str):
-            return max(0, int(clips.frames))
-        return max(0, int(self.select_frame_gap))
 
     @classmethod
     def parse(cls, d: dict) -> "Suggest":
@@ -547,9 +575,9 @@ class Suggest:
              "min_macro_f1", "audit_fraction", "audit_visible", "seed", "audit_seed",
              "min_confidence",
              "iterations", "depth", "learning_rate", "l2_leaf_reg", "balance_classes",
-             "feature_groups", "feature_scope",
-             "select_rule", "select_batch_size", "select_audit_share",
-             "select_frame_gap", "select_target_quota", "select_target_rule"],
+             "device",
+             "feature_groups", "feature_columns", "embeddings", "context_frames",
+             "select_rule", "select_batch_size"],
         )
         model = str(d.get("model", "catboost"))
         if model not in ("hist", "catboost"):
@@ -564,62 +592,65 @@ class Suggest:
             )
         from .measure.clipfeatures import FEATURE_GROUPS
 
+        embeddings = _embeddings(d.get("embeddings"))
+        context_frames = int(d.get("context_frames", 0) or 0)
+        if context_frames < 0:
+            raise ConfigError("suggest.context_frames must be 0 (off) or a frame count")
         groups = d.get("feature_groups")
-        groups = list(FEATURE_GROUPS) if groups is None else [str(g) for g in groups]
-        unknown = [g for g in groups if g not in FEATURE_GROUPS]
+        explicit = groups is not None
+        if groups is None:
+            groups = [g for g in FEATURE_GROUPS if g != "context" or context_frames > 0]
+            groups += [e.group for e in embeddings]
+        else:
+            groups = [str(g) for g in groups]
+        groups, columns = _migrate_cnn(groups, embeddings, d.get("feature_columns"))
+        allowed = list(FEATURE_GROUPS) + [e.group for e in embeddings]
+        unknown = [g for g in groups if g not in allowed]
         if unknown:
             raise ConfigError(
                 f"suggest.feature_groups has unknown entries {unknown}; "
-                f"choose from {sorted(FEATURE_GROUPS)}"
+                f"choose from {allowed} (emb_<name> needs a suggest.embeddings entry)"
             )
         if not groups:
             raise ConfigError(
                 "suggest.feature_groups is empty, so the model would have no "
-                f"inputs at all; choose at least one of {sorted(FEATURE_GROUPS)}"
+                f"inputs at all; choose at least one of {allowed}"
             )
-        scope = str(d.get("feature_scope", "all"))
-        if scope not in ("all", "length_invariant"):
+        unused = [e.group for e in embeddings if e.group not in groups]
+        if context_frames > 0 and "context" not in groups:
+            unused.append("context")
+        if explicit and unused:
+            warnings.warn(
+                f"{unused} are configured (suggest.embeddings, suggest.context_frames) "
+                "but suggest.feature_groups does not list them, so the model will "
+                "not use them",
+                stacklevel=3,
+            )
+        chosen = _feature_columns(columns, groups)
+        device = str(d.get("device", "cpu")).lower()
+        if device not in ("cpu", "gpu", "auto"):
             raise ConfigError(
-                "suggest.feature_scope must be 'all' (every column the feature "
-                "groups selected) or 'length_invariant' (only the columns whose "
-                "value does not scale with the window length, which is what lets "
-                "one model be applied at several predict.window_scales)"
+                f"suggest.device must be 'cpu', 'gpu' or 'auto', got {device!r}. "
+                "'auto' uses a GPU where CatBoost sees one, so the same project "
+                "can be fitted two ways on two machines; 'gpu' raises instead."
+            )
+        if device == "gpu" and model != "catboost":
+            raise ConfigError(
+                f"suggest.device is 'gpu' but suggest.model is {model!r}. "
+                "scikit-learn's HistGradientBoosting is CPU-only, so the setting "
+                "would do nothing. Use suggest.model 'catboost', or device 'cpu'."
             )
         audit = float(d.get("audit_fraction", 0.10))
         if not 0.0 <= audit < 1.0:
             raise ConfigError("suggest.audit_fraction must be in [0, 1)")
         enabled = bool(d.get("enabled", True))
-        rule, target_rule = _selection_rules(d)
+        rule = _selection_rule(d)
         batch = int(d.get("select_batch_size", 20))
         if batch < 1:
             raise ConfigError(
                 f"suggest.select_batch_size must be at least 1 (got {batch}); it is "
                 "how many clips one batch hands the annotator, and a batch of none "
                 "is spelled by setting suggest.select_rule to 'off'"
-            )
-        share = _optional_auto(
-            d.get("select_audit_share", "auto"), "suggest.select_audit_share",
-            "a share of the batch or 'auto' (suggest.audit_fraction, so the batch "
-            "draws audit clips at the rate the project contains them)",
-        )
-        if share is not None and not 0.0 <= float(share) <= 1.0:
-            raise ConfigError(
-                f"suggest.select_audit_share must be in [0, 1], got {float(share)}; "
-                "it is the share of each batch drawn at random from the audit "
-                "holdout, and 1.0 - every slot a random draw - is already the "
-                "degenerate end of it"
-            )
-        gap = _optional_auto(
-            d.get("select_frame_gap", "auto"), "suggest.select_frame_gap",
-            "a number of frames or 'auto' (clips.frames, one clip length, which "
-            "is exactly the separation below which two windows of one track "
-            "share footage)",
-        )
-        if gap is not None and int(gap) < 0:
-            raise ConfigError(
-                f"suggest.select_frame_gap must be 0 or more (got {int(gap)}); 0 "
-                "turns the diversity rule off, and a negative separation is not a "
-                "thing to require"
             )
         rate = _optional_auto(
             d.get("learning_rate", "auto"), "suggest.learning_rate",
@@ -631,13 +662,6 @@ class Suggest:
                 f"suggest.learning_rate must be in (0, 1], got {float(rate)}; it is "
                 "the share of each tree's correction that is kept, and 'let the "
                 "estimator choose' is written as 'auto'"
-            )
-        quota = int(d.get("select_target_quota", 0))
-        if quota < 0:
-            raise ConfigError(
-                f"suggest.select_target_quota must be 0 or more (got {quota}); it is "
-                "the label count a class stops being starved at, and 'do not target "
-                "at all' is written as 0"
             )
         if rule != "off" and audit <= 0.0:
             raise ConfigError(
@@ -679,14 +703,13 @@ class Suggest:
             learning_rate="auto" if rate is None else float(rate),
             l2_leaf_reg=float(d.get("l2_leaf_reg", 3.0)),
             balance_classes=bool(d.get("balance_classes", True)),
+            device=device,
             feature_groups=groups,
-            feature_scope=scope,
+            embeddings=embeddings,
+            context_frames=context_frames,
+            feature_columns=chosen,
             select_rule=rule,
             select_batch_size=batch,
-            select_audit_share="auto" if share is None else float(share),
-            select_frame_gap="auto" if gap is None else int(gap),
-            select_target_quota=quota,
-            select_target_rule=target_rule,
         )
 
 
@@ -708,12 +731,18 @@ class Spectral:
     # per track, so a small hop is cheap and localises a reversal to within one
     # hop.
     hop: int = 5
+    # Support of the wave_flow columns, which read the direction from the phase
+    # GRADIENT and so need no cycles - the window above is what the FREQUENCY
+    # needs. Keep it well under a beat period: it is the shortest stretch over
+    # which a direction is claimed, so it sets how sharply a reversal lands.
+    flow_frames: int = 5
 
     @classmethod
     def parse(cls, d: dict) -> "Spectral":
-        _known("spectral", d, ["window", "hop"])
+        _known("spectral", d, ["window", "hop", "flow_frames"])
         window = int(d.get("window", 75))
         hop = int(d.get("hop", 5))
+        flow_frames = int(d.get("flow_frames", 5))
         if window < 8:
             raise ConfigError(
                 "spectral.window must be at least 8 frames; below that there is no "
@@ -721,256 +750,79 @@ class Spectral:
             )
         if not 1 <= hop <= window:
             raise ConfigError("spectral.hop must be between 1 and spectral.window")
-        return cls(window=window, hop=hop)
+        if flow_frames < 3:
+            raise ConfigError(
+                f"spectral.flow_frames must be at least 3 (got {flow_frames}); it is "
+                "the stretch a direction is read over, and a centred difference in "
+                "time needs three frames to exist"
+            )
+        return cls(window=window, hop=hop, flow_frames=flow_frames)
 
 
 @dataclass
 class Predict:
-    """How much of each movie the bulk labelling pass covers, and how finely.
+    """How the labelling pass scores every frame and cuts it into bouts.
 
-    ``manifest`` scores exactly the clips cut for annotation, a sampling chosen
-    for a human's attention, so everything between two annotation windows comes
-    out unlabelled and unpainted in the rendered movie. ``dense`` lays its own
-    grid over every frame of every track - see :mod:`trackanno.infer.densepredict`.
-
-    By default that grid TILES, so a change of behaviour can only be reported at
-    a window boundary and the error is up to a window long. ``window_stride``
-    below the window length overlaps the windows and pins a transition to within
-    one stride; ``window_scales`` scores at several window LENGTHS instead, so a
-    behaviour shorter than one window is still visible and a long one is not cut
-    into verdicts that can disagree. Both make several windows speak for one
-    frame, which is what ``decode`` resolves, so both are only valid together
-    with it. Several scales need one condition more: windows of different lengths
-    carry different feature values under identical column names, so the model
-    must have been fitted on columns that do not scale with the window
-    (``suggest.feature_scope``).
+    Windows of ``clips.frames`` start every ``window_stride`` frames over every
+    track; their class probabilities are averaged per frame and cut into bouts.
+    See :mod:`trackanno.infer.densepredict`.
     """
 
-    coverage: str = "dense"
-    window_frames: int | str = "auto"
-    # Frames between one window's start and the next. 'auto' is window_frames,
-    # an exact tiling: the only stride whose rows can be painted straight out of
-    # predictions.parquet without a decode.
+    # Frames between one window's start and the next. 'auto' is clips.frames,
+    # an exact tiling; smaller overlaps the windows and pins a transition to
+    # within one stride.
     window_stride: int | str = "auto"
-    # Every window LENGTH the dense pass scores at, `window_frames` included.
-    # Empty (the default) is the single length `window_frames`. One window length
-    # is one guess about the timescale of behaviour: a transition shorter than it
-    # is invisible, and a longer bout is chopped into independent verdicts that
-    # can disagree. The cost is a feature build per scale, and the constraint is
-    # severe - a model fitted at one length reads another length's features on
-    # the wrong scale, so several scales are only coherent for a model fitted on
-    # length-invariant columns (`suggest.feature_scope`), which `load_config`
-    # enforces.
-    window_scales: list[int] = field(default_factory=list)
     # Detections a dense window needs before its features mean anything. Two is
     # the floor at which ANY motion feature can exist. Deliberately NOT
-    # clips.min_clip_frames, which exists so an annotator gets a watchable video
-    # and would punch the holes dense coverage removes back into the export.
-    # Every row carries n_present and present_frac for a stricter downstream bar.
+    # clips.min_clip_frames, which exists so an annotator gets a watchable video.
     min_frames: int = 2
-    # How the per-frame posterior becomes labels. 'none' keeps the one label a
-    # window already carries, which is all a tiling grid needs. 'min_bout' cuts
-    # the posterior into bouts and absorbs any bout shorter than min_bout_frames
-    # into its neighbours. 'viterbi' asks for the most likely label SEQUENCE
-    # under a sticky transition prior, so a short bout survives when its evidence
-    # outweighs the cost of the two transitions it needs.
-    decode: str = "none"
-    # The shortest bout worth believing, in frames. A statement about the ANIMAL,
-    # not about the model: the shortest episode of a behaviour you would accept
-    # as real. 0 means no floor, and so does 1 - a decode's shortest possible run
-    # is already one frame - which is why `decode: min_bout` refuses both.
+    # The shortest bout worth believing, in frames: shorter runs are absorbed
+    # into their neighbours. 0 keeps the plain per-frame argmax runs.
     min_bout_frames: int = 0
-    # viterbi only: the probability that a frame keeps the previous frame's
-    # label. 'auto' is 1 - 1/min_bout_frames, the stickiness whose average run
-    # is min_bout_frames long.
-    self_transition: float | str = "auto"
-    # Write the per-frame posterior beside the predictions. Off by default: it
-    # is one row per frame per track rather than one per window, so it dwarfs
-    # predictions.parquet, and it is mostly worth keeping while tuning a decode.
-    save_posteriors: bool = False
-
-    # -- 'auto' spelled out ------------------------------------------------- #
-    def resolved_window(self, clips: "Clips") -> int:
-        """``window_frames`` with ``auto`` filled in: min(frames, stride) of the clips.
-
-        The same number :func:`trackanno.infer.densepredict.window_length` computes,
-        repeated here because the stride check in :func:`load_config` compares
-        two numbers the user may never have typed, and loading a config must not
-        drag in the dense pipeline (and pandas behind it) to learn one integer.
-
-        The ``min`` is only meaningful while the annotation clips do NOT overlap:
-        ``auto`` is trying to be both the length the model was fitted at
-        (``clips.frames``) and a start that lands on the annotation grid (a
-        multiple of ``clips.stride``), and ``clips.stride < clips.frames`` pulls
-        those apart. :func:`load_config` refuses ``auto`` there for a dense
-        project rather than resolving it; a ``coverage: manifest`` project still
-        resolves, and ``predict.py --coverage dense`` on one of those is caught
-        by :meth:`trackanno.learn.suggest.Suggester.refuse_window_mismatch`.
-        """
-        if isinstance(self.window_frames, str):
-            return max(1, min(int(clips.frames), int(clips.stride)))
-        return max(1, int(self.window_frames))
 
     def resolved_stride(self, clips: "Clips") -> int:
-        """``window_stride`` with ``auto`` filled in: the window length itself."""
+        """``window_stride`` with ``auto`` filled in: ``clips.frames``."""
         if isinstance(self.window_stride, str):
-            return self.resolved_window(clips)
+            return max(1, int(clips.frames))
         return max(1, int(self.window_stride))
-
-    def resolved_scales(self, clips: "Clips") -> list[int]:
-        """Every window length to score at, the base one first.
-
-        Empty ``window_scales`` is ONE scale, ``resolved_window``, so no caller
-        downstream has to branch on "is multi-scale on".
-
-        The base length leads because it is what the rest of the pipeline is
-        planned at; the rest follow in ASCENDING order rather than as typed, so
-        two configs listing the same scales differently lay the dense table out
-        in the same row order. ``load_config`` has already refused a non-empty
-        list that does not contain the base length, so the deduplication below
-        cannot silently drop a scale the user asked for.
-        """
-        base = self.resolved_window(clips)
-        if not self.window_scales:
-            return [base]
-        return [base] + sorted({int(s) for s in self.window_scales} - {base})
-
-    def resolved_self_transition(self) -> float:
-        """``self_transition`` with ``auto`` filled in.
-
-        The identity itself lives in :func:`trackanno.infer.bouts.self_transition_for`,
-        beside the decoder that consumes it, so the number and its guard cannot
-        drift apart. ``auto`` is only reachable under ``decode: viterbi``, which
-        is where ``parse`` guarantees ``min_bout_frames >= 2``.
-        """
-        if isinstance(self.self_transition, str):
-            from .infer.bouts import self_transition_for
-
-            return self_transition_for(self.min_bout_frames)
-        return float(self.self_transition)
 
     @classmethod
     def parse(cls, d: dict) -> "Predict":
-        _known(
-            "predict", d,
-            ["coverage", "window_frames", "window_stride", "window_scales",
-             "min_frames", "decode", "min_bout_frames", "self_transition",
-             "save_posteriors"],
-        )
-        coverage = str(d.get("coverage", "dense"))
-        if coverage not in ("dense", "manifest"):
-            raise ConfigError(
-                "predict.coverage must be 'dense' (every frame of every track) or "
-                "'manifest' (only the clips that were cut for annotation)"
+        removed = sorted(k for k in ("decode", "self_transition") if k in d)
+        if removed:
+            warnings.warn(
+                f"ignoring predict.{', predict.'.join(removed)}: Viterbi decoding was "
+                "removed, and predict.min_bout_frames is now a hard floor on bout length",
+                stacklevel=3,
             )
-        window = d.get("window_frames", "auto")
-        if isinstance(window, str):
-            if window != "auto":
-                raise ConfigError(
-                    "predict.window_frames must be a frame count or 'auto' "
-                    "(min of clips.frames and clips.stride)"
-                )
-        elif int(window) < 1:
-            raise ConfigError(
-                f"predict.window_frames must be at least 1 (got {int(window)}); it is "
-                "how many frames one window spans, and a window spanning none of "
-                "them has nothing to measure"
-            )
+            d = {k: v for k, v in d.items() if k not in removed}
+        _known("predict", d, ["window_stride", "min_frames", "min_bout_frames"])
         stride = d.get("window_stride", "auto")
         if isinstance(stride, str):
             if stride != "auto":
                 raise ConfigError(
-                    "predict.window_stride must be a frame count or 'auto' (the same "
-                    "number as predict.window_frames, so the windows tile exactly)"
+                    "predict.window_stride must be a frame count or 'auto' "
+                    "(clips.frames, so the windows tile exactly)"
                 )
         elif int(stride) < 1:
             raise ConfigError(
-                f"predict.window_stride must be at least 1 (got {int(stride)}); it is "
-                "the step the window grid advances by, so 0 or less never terminates"
+                f"predict.window_stride must be at least 1 (got {int(stride)})"
             )
-        scales = _window_scales(d.get("window_scales"))
         min_frames = int(d.get("min_frames", 2))
         if min_frames < 1:
             raise ConfigError(
                 f"predict.min_frames must be at least 1 (got {min_frames}); a window "
                 "with no detections in it has nothing to measure"
             )
-        decode = str(d.get("decode", "none"))
-        if decode not in ("none", "min_bout", "viterbi"):
-            raise ConfigError(
-                "predict.decode must be 'none' (one label per window, exactly as it "
-                "was predicted), 'min_bout' (cut the per-frame posterior into bouts, "
-                "then absorb any bout shorter than predict.min_bout_frames into its "
-                "neighbours) or 'viterbi' (the most likely label sequence under a "
-                "sticky transition prior, which keeps a short bout the evidence "
-                "really supports)"
-            )
         min_bout = int(d.get("min_bout_frames", 0))
         if min_bout < 0:
             raise ConfigError(
-                f"predict.min_bout_frames must be 0 or more (got {min_bout}); it is a "
-                "length in frames, and 'no shortest bout at all' is written as 0, not "
-                "as a negative length"
-            )
-        # 1 is refused for the same reason 0 is: `bouts.decode_min_bout` returns
-        # the plain argmax whenever the floor is `<= 1`, since the shortest run a
-        # decode can produce is already one frame long.
-        if decode == "min_bout" and min_bout <= 1:
-            raise ConfigError(
-                f"predict.decode is 'min_bout' but predict.min_bout_frames is "
-                f"{min_bout}, so the decode has no shortest bout to enforce and "
-                "would hand back the labels it was given, unchanged. 0 says there "
-                "is no floor at all; 1 sets the floor at the shortest bout that "
-                "can exist, which excludes nothing - both come back out of the "
-                "decode as the plain per-frame argmax. Set predict.min_bout_frames "
-                "to the shortest episode you would accept as real (in frames, so 2 "
-                "or more), or set predict.decode to 'none' and mean it"
-            )
-        stay = d.get("self_transition", "auto")
-        if isinstance(stay, str):
-            if stay != "auto":
-                raise ConfigError(
-                    "predict.self_transition must be a probability or 'auto' "
-                    "(1 - 1/predict.min_bout_frames)"
-                )
-        elif not 0.0 < float(stay) < 1.0:
-            raise ConfigError(
-                f"predict.self_transition must be strictly between 0 and 1 (got "
-                f"{float(stay)}); it is the probability that a frame keeps the "
-                "previous frame's label, so 1.0 never leaves the state it starts in "
-                "and labels the whole track with it, and 0.0 forbids staying, which "
-                "makes every bout one frame long"
-            )
-        if decode == "viterbi" and isinstance(stay, str) and min_bout < 2:
-            raise ConfigError(
-                "predict.decode is 'viterbi' with predict.self_transition: auto, "
-                "which stands for 1 - 1/predict.min_bout_frames and so needs "
-                f"predict.min_bout_frames to be at least 2 (got {min_bout}): at 0 the "
-                "identity divides by zero, and at 1 it gives 0.0, a prior that forbids "
-                "two consecutive frames ever sharing a label. Set "
-                "predict.min_bout_frames to the shortest bout you would believe, or "
-                "give predict.self_transition a probability of its own"
-            )
-        if decode != "none" and coverage != "dense":
-            raise ConfigError(
-                f"predict.decode is {decode!r}, which needs predict.coverage: dense "
-                f"(this config asks for {coverage!r}). A decode reads a posterior for "
-                "every frame and re-cuts it into bouts; 'manifest' coverage scores "
-                "only the clips that were cut for annotation, so most frames have no "
-                "posterior at all and the bouts would be drawn across the gaps "
-                "between clips. Set predict.coverage to 'dense', or predict.decode "
-                "to 'none'"
+                f"predict.min_bout_frames must be 0 or more (got {min_bout})"
             )
         return cls(
-            coverage=coverage,
-            window_frames=window if isinstance(window, str) else int(window),
             window_stride=stride if isinstance(stride, str) else int(stride),
-            window_scales=scales,
             min_frames=min_frames,
-            decode=decode,
             min_bout_frames=min_bout,
-            self_transition=stay if isinstance(stay, str) else float(stay),
-            save_posteriors=bool(d.get("save_posteriors", False)),
         )
 
 
@@ -1067,16 +919,13 @@ class Clips:
     min_clip_frames: int = 40
     max_clips_per_track: int = 0
     context_tracks: bool = True
-    thumbnails: bool = False
-    thumbnail_size: int = 256
 
     @classmethod
     def parse(cls, d: dict) -> "Clips":
         _known(
             "clips", d,
             ["frames", "stride", "window_mode", "follow", "crop_from", "smooth_window", "pad",
-             "crop_size", "max_size", "min_clip_frames", "max_clips_per_track", "context_tracks",
-             "thumbnails", "thumbnail_size"],
+             "crop_size", "max_size", "min_clip_frames", "max_clips_per_track", "context_tracks"],
         )
         follow = str(d.get("follow", "smooth"))
         if follow not in ("smooth", "fixed", "track"):
@@ -1121,8 +970,6 @@ class Clips:
             min_clip_frames=min_present,
             max_clips_per_track=int(d.get("max_clips_per_track", 0)),
             context_tracks=bool(d.get("context_tracks", True)),
-            thumbnails=bool(d.get("thumbnails", False)),
-            thumbnail_size=int(d.get("thumbnail_size", 256)),
         )
 
 
@@ -1228,15 +1075,11 @@ class UI:
     show_overlay: bool = True
     show_skeleton: bool = False
     show_context_tracks: bool = False
-    show_minimap: bool = False
     show_kymograph: bool = True
-    kymo_interpolate: bool = True
     kymo_smooth_px: float = 0.6
-    kymo_field: str = "curvature"
     kymo_sign: str = "canonical"
     follow: str = "centred"
     view_zoom: float = 1.0
-    smooth_window: int = 15
     prefetch: int = 8
     resume: str = "first_unannotated"
     annotator: str = ""
@@ -1249,10 +1092,10 @@ class UI:
             "ui", d,
             ["theme", "fps", "autoplay", "loop", "auto_advance", "show_overlay",
              "show_skeleton",
-             "show_context_tracks", "show_minimap", "show_kymograph",
-             "kymo_interpolate", "kymo_smooth_px", "kymo_field", "kymo_sign",
+             "show_context_tracks", "show_kymograph",
+             "kymo_smooth_px", "kymo_sign",
              "follow",
-             "view_zoom", "smooth_window",
+             "view_zoom",
              "prefetch", "resume", "annotator", "shuffle", "shuffle_seed"],
         )
         resume = str(d.get("resume", "first_unannotated"))
@@ -1262,12 +1105,19 @@ class UI:
         if theme not in ("dark", "light", "system"):
             raise ConfigError("ui.theme must be 'dark', 'light' or 'system'")
 
+        kymo_sign = str(d.get("kymo_sign", "canonical"))
+        if kymo_sign == "absolute":
+            warnings.warn("ui.kymo_sign: 'absolute' was removed; using 'canonical'",
+                          stacklevel=3)
+            kymo_sign = "canonical"
         follow = str(d.get("follow", "centred"))
-        if follow not in ("centred", "smooth", "locked"):
+        if follow == "smooth":
+            warnings.warn("ui.follow: 'smooth' was removed; using 'centred'", stacklevel=3)
+            follow = "centred"
+        if follow not in ("centred", "locked"):
             raise ConfigError(
                 "ui.follow must be 'centred' (one view on the track's median position - all "
-                "motion visible), 'smooth' (view follows a moving average - drift removed, "
-                "beat kept) or 'locked' (re-centred every frame - translation invisible)"
+                "motion visible) or 'locked' (re-centred every frame - translation invisible)"
             )
         return cls(
             theme=theme,
@@ -1278,17 +1128,11 @@ class UI:
             show_overlay=bool(d.get("show_overlay", True)),
             show_skeleton=bool(d.get("show_skeleton", False)),
             show_context_tracks=bool(d.get("show_context_tracks", False)),
-            show_minimap=bool(d.get("show_minimap", False)),
             show_kymograph=bool(d.get("show_kymograph", True)),
-            kymo_interpolate=bool(d.get("kymo_interpolate", True)),
             kymo_smooth_px=max(0.0, float(d.get("kymo_smooth_px", 0.6))),
-            kymo_field=_one_of(d.get("kymo_field", "curvature"),
-                               ("curvature", "tangent"), "ui.kymo_field"),
-            kymo_sign=_one_of(d.get("kymo_sign", "canonical"),
-                              ("raw", "canonical", "absolute"), "ui.kymo_sign"),
+            kymo_sign=_one_of(kymo_sign, ("raw", "canonical"), "ui.kymo_sign"),
             follow=follow,
             view_zoom=max(1.0, float(d.get("view_zoom", 1.0))),
-            smooth_window=max(1, int(d.get("smooth_window", 15))),
             prefetch=max(0, int(d.get("prefetch", 8))),
             resume=resume,
             annotator=str(d.get("annotator", "")),
@@ -1308,12 +1152,9 @@ _DEFAULT_KEYS = {
     "zoom_in": ["+", "="],
     "zoom_out": ["-"],
     "zoom_reset": ["0"],
-    "minimap": ["m"],
     "uncertain": ["u"],
     "clear": ["Backspace"],
     "undo": ["Ctrl+Z"],
-    "save": ["Ctrl+S"],
-    "first_unannotated": ["Ctrl+U"],
     "notes": ["n"],
 }
 
@@ -1411,73 +1252,6 @@ class Config:
         return opt.color if opt else None
 
 
-def _refuse_unresolvable_window(cfg: Config) -> None:
-    """Refuse ``predict.window_frames: auto`` over an OVERLAPPING annotation grid.
-
-    ``auto`` promises two things at once and they are the same number only while
-    the annotation clips tile:
-
-    * the length the model was fitted at, which is ``clips.frames`` - that is
-      what ``clip_features.parquet`` is measured over and what ``train`` stamps
-      into the payload as ``trained_window``;
-    * a start that lands on the annotation grid, i.e. a multiple of
-      ``clips.stride``, so a dense window coinciding with an annotated one is
-      handed the same ``clip_id`` and hand labels join to it.
-
-    ``clips.stride < clips.frames`` pulls them apart, and ``min(frames, stride)``
-    would then pick landing and drop the trained length, scoring every row at a
-    scale the model was not fitted at and at normal confidence. So ``auto`` is
-    refused and the number is asked for; the message names the two coherent
-    answers, both of which leave every existing label alone. A project whose
-    clips tile is untouched.
-
-    Only under ``coverage: dense``, the one coverage this key governs.
-    ``predict.py --coverage dense`` can still push a manifest config down the
-    dense path, where :meth:`trackanno.learn.suggest.Suggester.refuse_window_mismatch`
-    refuses the mismatch against the model's own recorded length.
-    """
-    if not isinstance(cfg.predict.window_frames, str):
-        return
-    if cfg.predict.coverage != "dense":
-        return
-    frames, stride = int(cfg.clips.frames), int(cfg.clips.stride)
-    if stride >= frames:
-        return
-    raise ConfigError(
-        f"predict.window_frames is 'auto', but this project's annotation clips "
-        f"overlap - clips.stride is {stride} and clips.frames is {frames} - so "
-        "'auto' has nothing to resolve to. It stands for "
-        f"min(clips.frames, clips.stride), which is the longest dense window "
-        "that is BOTH the length the model is fitted at (clips.frames, "
-        f"{frames} - clip_features.parquet is measured over the annotation clip "
-        "manifest) AND aligned with that manifest's own starts (every "
-        f"clips.stride, {stride} frames). Those are the same number only while "
-        f"the clips tile. Here 'auto' would give {min(frames, stride)}, and a "
-        f"model fitted at {frames} frames would read every dense row on the "
-        "wrong scale - path_length, straightness, every *_std and present_frac "
-        "all scale with the window - at unchanged confidence. Write the length "
-        "you want; neither answer touches a single existing label, because this "
-        "decides what the PREDICTOR measures and not what anyone annotated:\n"
-        f"  predict.window_frames: {frames}\n"
-        "      Windows of the trained length, still tiling. Their starts stop "
-        f"coinciding with the annotation clips' (every {frames} frames rather "
-        f"than every {stride}), so dense rows no longer join to hand labels by "
-        "clip_id: 'human_labelled' comes back false on all of them and "
-        "--include-labelled has nothing to withhold.\n"
-        f"  predict.window_frames: {frames} with predict.window_stride: {stride} "
-        "and a predict.decode\n"
-        "      The trained length AND the annotation grid's starts. The windows "
-        "then overlap, which is what the decode is for - it collapses them into "
-        "disjoint bouts, whose provenance is the frame-based "
-        "human_overlap_frac rather than a clip_id join, so nothing is lost there "
-        "either.\n"
-        "Raising clips.stride back to clips.frames would also silence this, and "
-        "is the one answer that does cost you something: it re-cuts the "
-        "annotation grid, so every clip_id moves and the labels already made "
-        "against the old ones stop matching anything."
-    )
-
-
 def load_config(path: str | Path | None = None) -> Config:
     """Load and validate config.yaml. Relative paths resolve against its folder."""
     if path is None:
@@ -1521,99 +1295,28 @@ def load_config(path: str | Path | None = None) -> Config:
         render=Render.parse(_section(data, "render"), root),
     )
 
+    # Before embeddings, an unset feature_groups meant the detector's cnn group.
+    old = data.get("suggest")
+    if (isinstance(old, dict) and "feature_groups" not in old
+            and "embeddings" not in old and cfg.features.enabled):
+        warnings.warn(
+            "detector embeddings are now opt-in; add suggest.embeddings "
+            "[{name: det, source: detector}] and emb_det to feature_groups to use them",
+            stacklevel=2,
+        )
+
     # `task: pose` with no keypoints listed is INCOMPLETE, not invalid, and must
     # not raise here: the count is readable from the checkpoint.
     # `Config.needs_keypoints` carries the state and TiledDetector fills it in.
 
-    # The dense window grid spans two sections: `auto` for the window length
-    # means min(clips.frames, clips.stride), so the two numbers can only be
-    # compared once `clips` has been parsed as well.
-    _refuse_unresolvable_window(cfg)
-    length = cfg.predict.resolved_window(cfg.clips)
+    # The dense window is clips.frames, so the stride check spans two sections.
     stride = cfg.predict.resolved_stride(cfg.clips)
-    length_txt = _spelled_out(cfg.predict.window_frames, length)
-    stride_txt = _spelled_out(cfg.predict.window_stride, stride)
-    if stride > length:
+    if stride > int(cfg.clips.frames):
         raise ConfigError(
-            f"predict.window_stride ({stride_txt}) is longer than "
-            f"predict.window_frames ({length_txt}), so the grid would step over "
-            f"{stride - length} frame(s) between the end of one window and the "
-            "start of the next. Those frames get no prediction and no colour in "
-            "the render - the very hole predict.coverage: dense exists to close. "
-            "Leave predict.window_stride at 'auto' to tile exactly, or take it "
-            "below predict.window_frames to overlap the windows, which needs a "
-            "predict.decode as well"
+            f"predict.window_stride ({stride}) is longer than the window "
+            f"(clips.frames, {cfg.clips.frames}), which would leave frames no "
+            "window scores. Leave it at 'auto' to tile, or go below to overlap"
         )
-    if stride < length and cfg.predict.decode == "none":
-        raise ConfigError(
-            f"predict.window_stride ({stride_txt}) is shorter than "
-            f"predict.window_frames ({length_txt}), so dense windows overlap, but "
-            "predict.decode is 'none' - these two keys conflict. Overlapping "
-            "windows written straight into predictions.parquet give one track "
-            "several rows painting the same range(f_start, f_end), and render.py "
-            "resolves that by letting whichever row came last win: the exported "
-            "colour of an overlapped frame would be decided by parquet row order "
-            "rather than by the model. A decode is what makes overlap safe - it "
-            "collapses the overlapping windows into one disjoint bout per stretch "
-            "of frames. Set predict.decode to 'min_bout' or 'viterbi', or put "
-            "predict.window_stride back to 'auto'"
-        )
-
-    # Multi-scale scoring spans three sections, and each refusal below is silent
-    # skew if it is not made here: nothing downstream can tell a posterior
-    # averaged over incommensurable scales from a good one.
-    written_scales = list(cfg.predict.window_scales)
-    if written_scales and length not in written_scales:
-        raise ConfigError(
-            f"predict.window_scales is {written_scales} but does not include "
-            f"predict.window_frames ({length_txt}), which is the length the rest "
-            "of the pipeline is planned at - densepredict.window_length, the "
-            "trained-window check and the dense clip ids all use it. Two keys "
-            "would then name the window length and disagree. Add "
-            f"{length} to predict.window_scales, or set predict.window_frames to "
-            "one of the scales you listed"
-        )
-    scales = cfg.predict.resolved_scales(cfg.clips)
-    if len(scales) > 1:
-        listed = ", ".join(str(s) for s in scales)
-        if cfg.predict.coverage != "dense":
-            raise ConfigError(
-                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
-                f"but predict.coverage is {cfg.predict.coverage!r}. Several scales "
-                "exist to be averaged onto the frames they cover, and only dense "
-                "coverage lays a grid over every frame; 'manifest' scores the clips "
-                "cut for annotation, whose length is clips.frames and nothing else. "
-                "Set predict.coverage to 'dense', or empty predict.window_scales"
-            )
-        if cfg.predict.decode == "none":
-            raise ConfigError(
-                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
-                "but predict.decode is 'none'. Windows of several lengths cover "
-                "the same frames, so this is the overlap problem again and worse: "
-                "the renderer paints range(f_start, f_end) per track and lets "
-                "whichever row came last win, so a frame's exported colour would be "
-                "decided by parquet row order - and here the competing rows are not "
-                "even the same length. The decode is what averages the scales into "
-                "one per-frame posterior and cuts it into disjoint bouts. Set "
-                "predict.decode to 'min_bout' or 'viterbi', or empty "
-                "predict.window_scales"
-            )
-        if cfg.suggest.feature_scope != "length_invariant":
-            raise ConfigError(
-                f"predict.window_scales asks for {len(scales)} scales ({listed}) "
-                "but suggest.feature_scope is "
-                f"{cfg.suggest.feature_scope!r}, so the model is fitted on columns "
-                "whose VALUES scale with the window length - path_length over 100 "
-                "frames is simply twice the path_length over 50, under the same "
-                "column name. Scoring one such model at several lengths feeds it "
-                "rows on scales it was never fitted at and averages the results "
-                "together, at unchanged confidence and with nothing in the output "
-                "to show for it. Set suggest.feature_scope to 'length_invariant' "
-                "and retrain, or empty predict.window_scales. (This is the config "
-                "saying what the NEXT model will be fitted on; the model already on "
-                "disk is checked against its own recorded columns when a labelling "
-                "run starts.)"
-            )
 
     # Category keys must not collide with the navigation shortcuts.
     nav = {k.lower() for binds in keys.values() for k in binds}
@@ -1625,3 +1328,47 @@ def load_config(path: str | Path | None = None) -> Config:
                     f"navigation shortcut in the 'keys' section"
                 )
     return cfg
+
+
+# --------------------------------------------------------------------------- #
+# defaults, for a form that has to show a key the file does not mention
+# --------------------------------------------------------------------------- #
+_SECTION_TYPES = {
+    "nd2": "ND2Options", "tiff": "TiffOptions", "normalize": "Normalize",
+    "detection": "Detection", "model": "ModelSource", "tiling": "Tiling",
+    "tracking": "Tracking", "keypoints": "Keypoints", "features": "Features",
+    "spectral": "Spectral", "suggest": "Suggest", "predict": "Predict",
+    "clips": "Clips", "ui": "UI", "render": "Render", "paths": "Paths",
+}
+
+_DEFAULTS_CACHE: dict[str, dict] = {}
+
+
+def section_defaults(name: str) -> dict:
+    """What the loader uses for the keys ``config.yaml`` does not mention.
+
+    Read by running the section's own ``parse`` over an empty mapping, so it
+    cannot drift from what a project actually loads with. That matters because
+    the generated file documents most settings and leaves the rest out entirely:
+    ``suggest.iterations`` is not in it, and 1000 is still what gets fitted.
+
+    Path-valued defaults are dropped. A path only means something relative to a
+    project folder, and this has no project.
+    """
+    if name in _DEFAULTS_CACHE:
+        return _DEFAULTS_CACHE[name]
+    cls = globals().get(_SECTION_TYPES.get(name, ""))
+    values: dict[str, Any] = {}
+    if cls is not None:
+        try:
+            parsed = cls.parse({}, Path(".")) if name in ("paths", "render") else cls.parse({})
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            values = {
+                f.name: getattr(parsed, f.name)
+                for f in dataclasses_fields(parsed)
+                if not isinstance(getattr(parsed, f.name), Path)
+            }
+    _DEFAULTS_CACHE[name] = values
+    return values

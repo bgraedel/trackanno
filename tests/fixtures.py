@@ -9,7 +9,7 @@ that had nothing to do with the code.
 
 Everything here is generated: a synthetic movie, its tracks, a real clip cache
 written by the real ``write_clip_cache``, and a real config. It costs a second
-or so to build and is cached per (pose, thumbnails) combination for the run.
+or so to build and is cached per pose flag for the run.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _node_names() -> list:
             + [f"Flag{i}" for i in range(1, N_KEYPOINTS - 2)] + ["Tip"])
 
 
-def _settings(thumbnails: bool, pose: bool) -> dict:
+def _settings(pose: bool) -> dict:
     """Whatever has to differ from a freshly created project.
 
     Deliberately applied with the real ``write_config`` to a real
@@ -57,8 +57,6 @@ def _settings(thumbnails: bool, pose: bool) -> dict:
         "clips.crop_size": 96,
         "clips.max_size": 256,
         "clips.min_clip_frames": 40,
-        "clips.thumbnails": bool(thumbnails),
-        "clips.thumbnail_size": 64,
         "ui.annotator": "tester",
     }
 
@@ -80,13 +78,13 @@ def _add_keypoints(tracks):
     return tracks
 
 
-def make_project(root: Path, pose: bool = False, thumbnails: bool = False) -> Path:
+def make_project(root: Path, pose: bool = False) -> Path:
     """Build a project with a real clip cache under ``root``; return its config.
 
     Cached across calls, so a suite that wants the same flavour twice pays for
     it once. The returned path is stable for the life of the process.
     """
-    key = (bool(pose), bool(thumbnails))
+    key = bool(pose)
     cached = _CACHE.get(key)
     if cached is not None and cached.exists():
         return cached
@@ -101,11 +99,11 @@ def make_project(root: Path, pose: bool = False, thumbnails: bool = False) -> Pa
     from trackanno.video.movies import Normalizer
     from trackanno.project import create_project, write_config
 
-    project = Path(root) / f"fixture{'_pose' if pose else ''}{'_thumbs' if thumbnails else ''}"
+    project = Path(root) / f"fixture{'_pose' if pose else ''}"
     config_path = create_project(project)
     names = _node_names()
     write_config(
-        config_path, _settings(thumbnails, pose),
+        config_path, _settings(pose),
         keypoints={"nodes": names,
                    "edges": [[names[i], names[i + 1]] for i in range(1, len(names) - 1)]}
         if pose else None,

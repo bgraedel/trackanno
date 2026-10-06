@@ -69,19 +69,12 @@ cpu = [
     "torch>=2.2",
     "torchvision>=0.17",
 ]
-# `uv sync --extra sleap` adds the optional SLEAP .h5 export (keypoint-MoSeq compatibility).
-sleap = ["sleap-io>=0.1"]
 
 [project.scripts]
 # `uv tool install .` puts `trackanno` on PATH; that one command IS the app.
 # Kept a console script rather than a gui-script on purpose: a silent failure is
 # worse than a terminal window, and the long jobs print useful progress.
-trackanno = "trackanno.gui.hub:main"
-trackanno-prepare = "trackanno.prepare:main"
-trackanno-annotate = "trackanno.gui.app:main"
-trackanno-render = "trackanno.render:main"
-trackanno-suggest = "trackanno.suggest:main"
-trackanno-predict = "trackanno.predict:main"
+trackanno = "trackanno.cli:main"
 
 [build-system]
 requires = ["hatchling"]

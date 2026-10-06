@@ -2,8 +2,7 @@
 
 ``trackanno.gui.hub`` is the whole workflow in one window. The steps are also
 separate entry points: ``detect.prepare`` (tiled YOLO detection, tracking, clip
-cache), ``gui.app`` (the annotation screen), ``learn.suggest`` (train the label
-suggester), ``infer.predict`` (score every clip) and ``view.render`` (labelled
+cache), ``learn.suggest`` (train the label suggester), ``infer.predict`` (score every clip) and ``view.render`` (labelled
 overlay movies).
 
 Modules are grouped by what they are for: ``video`` reads recordings and model

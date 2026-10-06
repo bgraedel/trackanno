@@ -8,8 +8,7 @@ open. Three rules:
 * The model's half is the OUT-OF-FOLD prediction, from a model fitted without
   that clip's movie. The saved model was fitted on these labels and reproduces
   them, so its own opinion of one is not evidence about it.
-* A window no fold scored is not a disagreement, and :func:`summarise` counts
-  those separately. Most confident first.
+* A window no fold scored is not a disagreement. Most confident first.
 
 Clips in the audit holdout have no fold prediction and so never appear, which
 keeps the model's opinion of the last unbiased sample away from a reviewer.
@@ -22,7 +21,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-__all__ = ["Disagreement", "differs", "find", "load_cv_predictions", "summarise"]
+__all__ = ["Disagreement", "differs", "find", "load_cv_predictions"]
 
 _NOT_A_LABEL = {"", "nan", "none", "<na>"}
 
@@ -173,44 +172,3 @@ def find(annotations: pd.DataFrame, suggestions: Mapping, groups=None
                             d.movie_id, d.track_id, d.f_start))
     return out
 
-
-def summarise(annotations: pd.DataFrame, suggestions: Mapping,
-              found: list[Disagreement], groups=None) -> dict:
-    """How many labelled windows were compared, and how many were not.
-
-    A count of disagreements with no denominator beside it reads as a model
-    that agrees.
-    """
-    named = _groups(annotations, suggestions, groups)
-    labelled = compared = 0
-    if not annotations.empty and "clip_id" in annotations.columns:
-        clip_ids = annotations["clip_id"].astype(str)
-        for group in named:
-            has_label = ~(
-                annotations[group].astype(str).str.strip().str.lower()
-                .isin(_NOT_A_LABEL)
-            )
-            answered = clip_ids.isin({
-                clip_id for clip_id, groups in suggestions.items()
-                if group in (groups or {})
-            })
-            labelled += int(has_label.sum())
-            compared += int((has_label & answered).sum())
-
-    per_group: dict[str, int] = {}
-    pairs: dict[tuple[str, str], int] = {}
-    for d in found:
-        per_group[d.group] = per_group.get(d.group, 0) + 1
-        pairs[(d.label, d.suggestion)] = pairs.get((d.label, d.suggestion), 0) + 1
-    worst = max(pairs.items(), key=lambda kv: kv[1], default=None)
-    return {
-        "n_labelled": labelled,
-        "n_compared": compared,
-        "n_unanswered": labelled - compared,
-        "n_disagree": len(found),
-        "per_group": per_group,
-        "most_common": (
-            {"label": worst[0][0], "suggestion": worst[0][1], "n": worst[1]}
-            if worst else None
-        ),
-    }

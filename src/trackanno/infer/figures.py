@@ -7,10 +7,10 @@ Style (fonts, grid, spines) is inherited from the caller's rcParams.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pandas as pd
-
-from .transitions import _pyplot
 
 __all__ = [
     "GREY", "transition_graph", "jump_matrix", "survival",
@@ -20,6 +20,22 @@ __all__ = [
 
 # Stretches the decode could not label.
 GREY = "#c8c8c8"
+
+
+def _pyplot():
+    """matplotlib, imported here because it is a dependency of the drawing only.
+
+    Agg is forced only while pyplot is not yet imported, so a headless run gets
+    a writable backend and a notebook that already chose one keeps it.
+    """
+    try:
+        import matplotlib
+        if "matplotlib.pyplot" not in sys.modules:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("drawing needs matplotlib; install it") from exc
+    return plt
 
 
 def _steady(markov: dict, name: str, n_classes: int) -> float:
@@ -250,7 +266,7 @@ def trajectories(tracks: pd.DataFrame, rows: pd.DataFrame, classes: list,
     """Centroid paths of one movie's tracks, coloured by decoded behaviour.
 
     ``tracks`` must carry frame, track_id, cx, cy (see
-    :func:`trackanno.infer.motifs.track_paths`); ``rows`` the movie's bouts.
+    ``notebooks/motifs.py``); ``rows`` the movie's bouts.
     """
     plt = _pyplot()
     fig, ax = plt.subplots(figsize=(6.8, 6.2))
@@ -383,7 +399,7 @@ def phase_cycles(results: dict, classes: list, flag_chain: list, *,
     """The phase-averaged beat cycle, one panel per class, shared limits.
 
     ``results`` maps each class to its
-    :func:`trackanno.infer.motifs.phase_cycle` result.
+    ``phase_cycle`` result in ``notebooks/motifs.py``.
     """
     plt = _pyplot()
     pts = np.concatenate(

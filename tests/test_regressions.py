@@ -125,7 +125,7 @@ def test_forced_rebuild_clears_the_done_marker(root: Path) -> None:
           "(out_dir / DONE_FILE).unlink(missing_ok=True)" in body)
 
     cut = inspect.getsource(prepare.cut_movie)
-    cut_body = cut.split("if done_path.exists() and not force:")[1].split("staged = StagedWrite")[0]
+    cut_body = cut.split("if not force:")[1].split("staged = StagedWrite")[0]
     check("stage 2 unlinks its marker before any artefact is written",
           "done_path.unlink(missing_ok=True)" in cut_body,
           "unlink is missing or happens too late")
@@ -449,7 +449,7 @@ class _AlwaysAudit:
 
 
 def test_the_distribution_counts_what_the_csv_says(root: Path) -> None:
-    """The Distribution page is only worth having if its numbers are right, and
+    """The label distribution is only worth having if its numbers are right, and
     the cases that matter are the awkward ones: multi-select values packed into
     one cell, options with nothing against them, values left over from a rename,
     and blank cells in a required group."""
@@ -519,20 +519,17 @@ def test_the_distribution_counts_what_the_csv_says(root: Path) -> None:
               for ln in empty_lines), repr(empty_lines))
 
 
-def test_the_distribution_page_survives_a_broken_csv(app, root: Path) -> None:
-    """Reading the CSV happens on the UI thread when the page is shown, so a
-    file someone has half-written or opened in Excel must report itself rather
+def test_the_distribution_survives_a_broken_csv(app, root: Path) -> None:
+    """Reading the CSV happens on the UI thread when the Model page is shown, so
+    a file someone has half-written or opened in Excel must report itself rather
     than raise into Qt and take the window down."""
-    from trackanno.gui.hub import DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import Hub, ModelPage
     from trackanno.project import create_project
 
     path = create_project(root / "broken-dist")
     hub = Hub(str(path))
     hub.show()
-    page = hub.page(DistributionPage)
-    check("the page is found by class, not by index", page is not None)
-    check("it sits before Export",
-          hub.pages.index(page) < hub.pages.index(hub.page(ExportPage)))
+    page = hub.page(ModelPage).distribution
 
     page.reload()
     check("with no CSV it says so, and does not raise",
@@ -646,7 +643,7 @@ def test_the_group_picker_never_empties_itself(app, root: Path) -> None:
     # Ticking the wanted group first is the documented way round, and works.
     picker._boxes["kinematic"].setChecked(True)
     app.processEvents()
-    for name in ("cnn", "waveform"):
+    for name in ("context", "waveform"):
         picker._boxes[name].setChecked(False)
     app.processEvents()
     check("swapping groups the other way round works",
@@ -812,7 +809,6 @@ def test_the_window_has_an_icon(app) -> None:
 # gui
 # --------------------------------------------------------------------------- #
 def test_gui_regressions(app, root: Path) -> None:
-    from trackanno.config import load_config
     from trackanno.gui.hub import ExportPage, Hub, ModelPage
     from trackanno.project import create_project, write_config
 
@@ -843,27 +839,6 @@ def test_gui_regressions(app, root: Path) -> None:
     check("the status is cleared too", hub.status is None)
     check("the title no longer names the old project", "good" not in hub.windowTitle())
     check("no annotation panel survives", hub.pages[3].panel is None)
-    hub.close()
-
-    # -- C7: the theme toggle must survive the next autosave ----------------
-    hub = Hub(str(good))
-    hub.show()
-    hub.go_to(1)
-    app.processEvents()
-    started = hub.cfg.ui.theme
-    hub.toggle_theme()
-    app.processEvents()
-    switched = hub.cfg.ui.theme
-    check("toggling changed the theme", switched != started)
-    config_page = hub.pages[1]
-    check("the form was told about it",
-          config_page.form.values()["ui.theme"] == switched,
-          config_page.form.values()["ui.theme"])
-    config_page.form._widgets["clips.pad"].setValue(2.25)
-    app.processEvents()
-    check("the autosave fires", pump(app, lambda: not config_page._dirty))
-    check("and does not undo the theme",
-          load_config(good).ui.theme == switched, load_config(good).ui.theme)
     hub.close()
 
     # -- U3: a routine refresh must not disable a running Cancel ------------
@@ -971,50 +946,6 @@ def test_annotator_rename_reaches_the_csv(app) -> None:
         app.processEvents()
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-
-
-def test_minimap_keeps_uncommitted_input(app) -> None:
-    """U2. Pressing m called _load(), which rewrites every widget from the CSV,
-    silently discarding ticks and notes."""
-    from trackanno.annotate.clips import ClipStore
-    from trackanno.config import load_config
-    from trackanno.gui.app import AnnotationWidget
-    from trackanno.annotate.store import AnnotationStore
-
-    config_path = make_project(FIXTURES)
-    repo = config_path.parent
-    cfg = load_config(config_path)
-    store = ClipStore(cfg.paths.work_dir)
-
-    csv = cfg.paths.work_dir / "_regress_minimap.csv"
-    csv.unlink(missing_ok=True)
-    cfg.paths.csv = csv
-    panel = AnnotationWidget(cfg, store, AnnotationStore(csv, cfg))
-    panel.viewer.pause()
-    app.processEvents()
-
-    multi = next((g for g in cfg.categories if g.is_multi), None)
-    if multi is not None:
-        panel.categories.toggle(multi.name, multi.options[0].name)
-    panel.notes.setText("a note I typed")
-    panel.uncertain_box.setChecked(True)
-    app.processEvents()
-
-    panel._toggle_minimap()
-    app.processEvents()
-    check("the note survives the minimap toggle",
-          panel.notes.text() == "a note I typed", repr(panel.notes.text()))
-    check("uncertain survives it", panel.uncertain_box.isChecked())
-    if multi is not None:
-        check("the ticked option survives it",
-              multi.options[0].name in panel.categories.values()[multi.name])
-    panel._toggle_minimap()
-    app.processEvents()
-    check("and toggling back is harmless too", panel.notes.text() == "a note I typed")
-
-    panel.shutdown()
-    store.close()
-    csv.unlink(missing_ok=True)
 
 
 def test_write_failures_are_reported_not_fatal(app) -> None:
@@ -1255,15 +1186,20 @@ def test_feature_groups_match_what_can_be_computed(root: Path) -> None:
     check("switching to pose enables them",
           not availability["pose"] and not availability["waveform"])
 
-    write_config(path, {"features.enabled": False})
-    check("cnn follows features.enabled",
-          bool(available_groups(load_config(path))["cnn"]))
+    write_config(path, {"features.enabled": False,
+                        "suggest.embeddings": [{"name": "det", "source": "detector"}]})
+    check("a detector embedding follows features.enabled",
+          bool(available_groups(load_config(path))["emb_det"]))
+    check("context follows suggest.context_frames",
+          bool(available_groups(load_config(path))["context"]))
 
     # Every emitted feature must belong to exactly one known group, or a
     # selection would silently drop columns nobody accounted for.
     for column in ("speed_mean", "area_mean", "body_len_mean", "beat_freq_hz",
-                   "wave_amp_asym", "cnn3_mean", "conf_std"):
+                   "wave_amp_asym", "ctx_speed_mean", "conf_std"):
         check(f"{column} maps to a group", group_of(column) in FEATURE_GROUPS)
+    check("an embedding column maps to its embedding's group",
+          group_of("emb_det_3_mean") == "emb_det")
     check("metadata maps to no group", group_of("clip_id") is None)
 
     try:

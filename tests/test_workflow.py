@@ -280,7 +280,7 @@ def test_cache_is_released_before_detection(app) -> None:
     the movies that had actually been on screen, which made it look random.
     """
     from trackanno.config import load_config
-    from trackanno.gui.hub import DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import ExportPage, Hub
 
     config_path = make_project(FIXTURES)
     repo = config_path.parent
@@ -334,40 +334,6 @@ def test_theme(app) -> None:
               str([(p.name, p.exists()) for p in assets]))
         check(f"{name} sheet points at the arrows it generated",
               all(str(p).replace("\\", "/") in sheet for p in assets))
-
-    # And the live toggle must actually repaint, not just rewrite the config.
-    from trackanno.gui.hub import Hub
-    from trackanno.project import create_project
-
-    scratch = Path(tempfile.mkdtemp(prefix="trackanno-theme-"))
-    try:
-        path = create_project(scratch / "p")
-        hub = Hub(str(path))
-        hub.show()
-        app.processEvents()
-        started = current()
-        check("the toggle is a compact icon button, not a wide label",
-              not hub.theme_button.text() and not hub.theme_button.icon().isNull()
-              and hub.theme_button.width() <= 34)
-        check("the toggle says what it does",
-              ("light" if started == "dark" else "dark") in hub.theme_button.toolTip().lower(),
-              hub.theme_button.toolTip())
-        hub.toggle_theme()
-        app.processEvents()
-        check("toggling swaps the theme", current() != started)
-        check("the tooltip now offers the way back",
-              ("dark" if current() == "light" else "light") in hub.theme_button.toolTip().lower(),
-              hub.theme_button.toolTip())
-        from trackanno.config import load_config
-        check("the choice is remembered in the project",
-              load_config(path).ui.theme == current(), load_config(path).ui.theme)
-        hub.toggle_theme()
-        app.processEvents()
-        check("and back again", current() == started)
-        hub.close()
-        app.processEvents()
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
 
     applied = apply_theme(app, "system")
     check("system resolves to a real theme", applied in ("dark", "light"))
@@ -672,16 +638,15 @@ def test_detections_from_a_different_config_are_refused(root: Path) -> None:
     else:
         check("and the refusal names the section that changed", False)
 
-    try:
-        cut_movie(movie, cfg)
-    except ValueError:
-        check("cutting clips from stale detections is refused", True)
-    else:
-        check("cutting clips from stale detections is refused", False)
+    for force in (False, True):
+        info = cut_movie(movie, cfg, force=force)
+        check(f"cutting clips from stale detections is skipped (force={force})",
+              info.get("skipped") is True
+              and not (cfg.movie_dir(movie.id) / "prepare_done.json").exists(), str(info))
 
 
-def test_border_discards_are_reported_by_the_planner(root: Path) -> None:
-    """The warning names the tracks plan_clips actually dropped.
+def test_border_exclusions_are_reported_by_the_planner(root: Path) -> None:
+    """The warning names the tracks plan_clips actually excluded frames from.
 
     It used to be produced by re-running the border test over a hand-copy of
     plan_clips' own min_track_length filter, so the two could count different
@@ -704,11 +669,163 @@ def test_border_discards_are_reported_by_the_planner(root: Path) -> None:
         movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60,
         reporter=CallbackReporter(on_log=lambda m, level: logs.append(m)),
     )
-    warned = [m for m in logs if "discarded for reaching within" in m]
-    check("the discard is reported once", len(warned) == 1, str(logs))
-    check("...naming how many tracks went", warned and warned[0].startswith("1 track(s)"),
-          warned[0] if warned else "")
+    warned = [m for m in logs if "reach within" in m]
+    check("the exclusion is reported once", len(warned) == 1, str(logs))
+    check("...naming how many tracks reached the edge",
+          warned and warned[0].startswith("1 track(s)"), warned[0] if warned else "")
     check("the track that stayed clear still became clips", info["n_clips"] > 0)
+
+
+def test_the_model_report_shows_what_the_model_leans_on(app) -> None:
+    """Which measurement carries a decision is the first thing to look at when
+    two classes keep being confused, and the window never showed it."""
+    from trackanno.gui.hub import _format_report
+
+    features = [{"feature": f"feat_{i}", "importance": round(20.0 - i, 2)}
+                for i in range(15)]
+    html = _format_report({"behaviour": {
+        "reliable": True, "n_labels": 240, "n_classes": 3, "macro_f1": 0.52,
+        "kappa": 0.33, "kappa_lower": 0.29, "accuracy": 0.57,
+        "baseline_accuracy": 0.45, "scope": "leave-movie-out over 2 movies",
+        "top_features": features,
+    }})
+    check("the report names the strongest feature", "feat_0" in html)
+    check("...and stops at ten", "feat_9" in html and "feat_10" not in html)
+    check("...with the importance beside it", "20.00" in html, html[-400:])
+    check("a report with no importances says nothing about them",
+          "top" not in _format_report({"behaviour": {"top_features": []}}).lower())
+
+
+def test_asking_for_one_movie_does_not_open_the_others(root: Path) -> None:
+    """Discovery is the first thing a run does and it is minutes on a share.
+
+    Every id is its file's stem (plus an ND2 position), so a named movie can be
+    found without opening the rest of the folder - which the GUI does once per
+    run and once per minimap.
+    """
+    import warnings as W
+
+    import tifffile
+
+    from trackanno.video.movies import discover_movies
+
+    cfg, movie, _ = _prep_project(root, "one-of-many")
+    cfg.paths.video_dir.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(cfg.paths.video_dir / "wanted.tif"),
+                     np.stack([movie.frame(i) for i in range(4)]),
+                     photometric="minisblack")
+    # Not a TIFF at all, so anything that opens it warns and says so.
+    (cfg.paths.video_dir / "unreadable.tif").write_text("not a tiff", encoding="utf-8")
+
+    with W.catch_warnings(record=True) as caught:
+        W.simplefilter("always")
+        picked = discover_movies(cfg, only=["wanted"])
+    for source in picked:
+        source.close()
+    check("the named movie comes back", [s.id for s in picked] == ["wanted"],
+          str([s.id for s in picked]))
+    check("...without the rest of the folder being opened",
+          not [w for w in caught if "unreadable" in str(w.message)],
+          str([str(w.message) for w in caught]))
+
+    # The shortcut is only a shortcut: an id no file name could hold still gets
+    # the whole folder looked at, so the refusal names what is really there.
+    with W.catch_warnings(record=True):
+        W.simplefilter("always")
+        try:
+            discover_movies(cfg, only=["typo"])
+            raised = ""
+        except ValueError as exc:
+            raised = str(exc)
+    check("an unknown id is refused, and the message lists what there is",
+          "typo" in raised and "wanted" in raised, raised or "nothing raised")
+
+
+def test_a_cut_only_run_is_given_the_clip_stage(app, root: Path, monkeypatch) -> None:
+    """The button says "Cut clips", so the run must be one that cuts clips.
+
+    It used to be given stage "all" whatever the button said, and "all" asks
+    every ticked movie whether it needs detecting. A handoff that no longer
+    matches this config answers yes, so the annotating machine loaded the model
+    and started detecting again - hours of work behind a button that promised
+    minutes - or, with no weights on it at all, died on a missing model file it
+    never needed. Both arrive as "cutting the clips does nothing in the GUI".
+    """
+    import tifffile
+    from qtpy.QtWidgets import QListWidgetItem
+
+    from trackanno.detect import prepare as prepare_module
+    from trackanno.detect.prepare import detect_movie
+    from trackanno.gui.hub import PreparePage
+    from trackanno.progress import NullReporter
+    from trackanno.project import project_status
+
+    cfg, movie, frames = _prep_project(root, "cut-only")
+    # A real file to be discovered, and deliberately no model.pt beside it: the
+    # weights live on the GPU box, and only the clip stage can run without them.
+    cfg.paths.video_dir.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(
+        str(cfg.paths.video_dir / f"{movie.id}.tif"),
+        np.stack([movie.frame(i) for i in range(60)]),
+    )
+    detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+    check("the model this project names is not here", not cfg.paths.model.exists())
+
+    class StubHub:
+        def __init__(self):
+            self.cfg, self.status = cfg, project_status(cfg)
+
+        def release_caches(self):
+            pass
+
+    page = PreparePage(StubHub())
+    check("a project with detections and no model can still open the page",
+          page.blocker() == "", page.blocker())
+
+    def listed(movie_id: str, state: str) -> None:
+        item = QListWidgetItem()
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setData(Qt.UserRole, movie_id)
+        item.setData(Qt.UserRole + 1, {
+            "movie_id": movie_id, "n_frames": 60, "width": movie.width,
+            "height": movie.height, "fps": movie.fps,
+        })
+        page.movies.addItem(item)
+        item.setCheckState(Qt.Checked)
+        page._states[movie_id] = state
+
+    listed(movie.id, "detected")
+    page._update_run_label(page._states)
+    check("the button offers to cut", page.tasks.run_button.text() == "Cut clips")
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        prepare_module, "prepare_all",
+        lambda cfg, ids=None, force=False, limit=None,
+        reporter=None, stage="all": seen.update(stage=stage, ids=ids) or [],
+    )
+    page._build_work()(NullReporter())
+    check("a cut-only run is given the clip stage", seen.get("stage") == "clips",
+          str(seen))
+
+    # One movie that still needs detecting puts the whole run back to 'all',
+    # because that one does need a detector.
+    listed("undetected", "new")
+    page._update_run_label(page._states)
+    check("a run with anything undetected offers detection",
+          page.tasks.run_button.text() == "Run detection")
+    page._build_work()(NullReporter())
+    check("...and is given the stage that can detect", seen.get("stage") == "all",
+          str(seen))
+
+    # And the promise itself: with no weights anywhere, the clip stage cuts.
+    monkeypatch.undo()
+    page.movies.takeItem(1)
+    from trackanno.annotate.clips import DONE_FILE
+
+    page._build_work()(NullReporter())
+    check("the cut-only run wrote the clips it promised",
+          (cfg.movie_dir(movie.id) / DONE_FILE).exists())
 
 
 def test_a_handoff_that_cannot_account_for_itself_is_refused(root: Path) -> None:
@@ -974,7 +1091,7 @@ def test_a_cancelled_job_is_not_reported_as_a_failure(app) -> None:
 
 
 def test_hub(app, project_config: Path) -> None:
-    from trackanno.gui.hub import PAGES, ConfigPage, DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import PAGES, ConfigPage, ExportPage, Hub, ModelPage
 
     hub = Hub(str(project_config))
     hub.show()
@@ -998,8 +1115,8 @@ def test_hub(app, project_config: Path) -> None:
     check("export is blocked without annotations",
           "no annotations" in export.blocker(), export.blocker())
     check("distribution is blocked without annotations",
-          "no annotations" in hub.page(DistributionPage).blocker(),
-          hub.page(DistributionPage).blocker())
+          "no annotations" in hub.page(ModelPage).distribution.blocker(),
+          hub.page(ModelPage).distribution.blocker())
 
     # The config page is a real editor: change a value, save, and the file
     # must both change and still load.
@@ -1118,7 +1235,7 @@ def test_hub(app, project_config: Path) -> None:
 def test_hub_with_cache(app) -> None:
     """The annotate page inside the hub, against a generated clip cache."""
     from trackanno.config import load_config
-    from trackanno.gui.hub import DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import ExportPage, Hub
 
     repo_config = make_project(FIXTURES)
     cfg = load_config(repo_config)
@@ -1167,7 +1284,7 @@ def test_later_steps_unlock(app) -> None:
     import shutil as _shutil
 
     from trackanno.config import load_config
-    from trackanno.gui.hub import DistributionPage, ExportPage, Hub
+    from trackanno.gui.hub import ExportPage, Hub, ModelPage
     from trackanno.project import write_config
 
     config_path = make_project(FIXTURES)
@@ -1213,10 +1330,10 @@ def test_later_steps_unlock(app) -> None:
         check("Export lists the movies it can render",
               hub.page(ExportPage).movies.count() > 0)
 
-        # The new step between Model and Export reads the same CSV.
-        hub.go_to(hub.pages.index(hub.page(DistributionPage)))
+        # The Model page's distribution tab reads the same CSV.
+        hub.go_to(hub.pages.index(hub.page(ModelPage)))
         app.processEvents()
-        dist = hub.page(DistributionPage)
+        dist = hub.page(ModelPage).distribution
         check("Distribution charts every category group",
               len(dist._charts) == len(hub.cfg.categories), repr(list(dist._charts)))
         counted = sum(b.count for b in dist._charts[group.name].tally.bars
@@ -1264,8 +1381,9 @@ def test_a_template_carries_settings_but_not_paths(root) -> None:
           template.name == "Trypanosome 100 fps", template.name)
     check("the file name is a slug of it",
           template.path.name == "trypanosome-100-fps.yaml", template.path.name)
-    check("it appears in the picker after the built-in",
-          [t.name for t in list_templates()] == ["default", "Trypanosome 100 fps"])
+    names = [t.name for t in list_templates()]
+    check("it appears in the picker after the built-in and the shipped presets",
+          names[0] == "default" and names[-1] == "Trypanosome 100 fps", str(names))
 
     other = root / "tpl-videos-2"
     other.mkdir()
@@ -1368,6 +1486,9 @@ def test_the_new_project_dialog_offers_the_templates(app, root) -> None:
     check("the built-in is offered first and marked as such",
           items[0] == "default (built in)", str(items))
     check("the saved one is offered too", "from the dialog" in items, str(items))
+    check("the shipped presets are offered between them",
+          "annotator (preset)" in items and items.index("annotator (preset)")
+          < items.index("from the dialog"), str(items))
     check("the default selection is the built-in",
           dialog.values()["template"] == BUILTIN_NAME)
     check("the built-in cannot be forgotten", not dialog.forget_btn.isEnabled())
@@ -1447,35 +1568,124 @@ def test_browsing_to_a_file_stops_using_the_shared_model(app, root) -> None:
         app.processEvents()
 
 
-def test_the_device_list_says_when_it_is_still_looking(app, root) -> None:
-    """Importing torch takes seconds, and the list is auto/cpu until it lands.
 
-    A settings page showing only 'cpu' reads as "no GPU on this machine", which
-    is the wrong answer while the probe has simply not finished.
+def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> None:
+    """The registry is where a first model usually comes from.
+
+    Offering it only on the Configure page sends a new user straight back out of
+    the dialog they came to for exactly this. Nothing is downloaded while the
+    dialog is open, though: it can still be cancelled, and a cancelled dialog
+    that had already written 200 MB into the cache is a surprise.
     """
-    from trackanno.gui.hub import ConfigPage, Hub
+    from trackanno.gui import hub as H
 
-    project = make_project(root / "devices")
-    window = Hub(str(project))
+    class Entry:
+        id, version, sha256 = "shared-pose", "v2", "cd" * 32
+        label = "shared-pose v2"
+
+    entry = Entry()
+
+    class StubRegistry:
+        def __init__(self, parent=None):
+            pass
+
+        def run(self):
+            return True
+
+        def chosen(self):
+            return entry
+
+    monkeypatch.setattr(H, "ModelRegistryDialog", StubRegistry)
+    dialog = H.NewProjectDialog()
     try:
-        page = next(p for p in window.pages if isinstance(p, ConfigPage))
-        app.processEvents()
-        status = page.form._status["detection.device"]
-        check("the device row starts by saying the probe is running",
-              "checking" in status.text().lower(), status.text())
-        check("and it is visible, not a tooltip nobody hovers", not status.isHidden())
+        dialog.name.setText("from-registry")
+        dialog.location.edit.setText(str(root))
+        dialog._pick_shared_model()
 
-        check("the probe answers", pump(app, lambda: "checking" not in status.text().lower(),
-                                        timeout=120))
-        check("and it says what auto resolves to here",
-              status.text().startswith("auto uses"), status.text())
-        items = [page.form._widgets["detection.device"].itemText(i)
-                 for i in range(page.form._widgets["detection.device"].count())]
-        check("with auto and cpu always offered", {"auto", "cpu"} <= set(items), str(items))
+        check("the chosen model is what create_project must NOT be handed",
+              dialog.values()["model"] is None, str(dialog.values()["model"]))
+        check("...since it is not a file on this disk yet",
+              dialog.chosen_model() is entry)
+        check("the path field stops looking editable, as on the Configure page",
+              not dialog.model.edit.isEnabled())
+        check("and the row says which model, and that the path is dead",
+              "shared-pose v2" in dialog.model_note.text()
+              and "not used" in dialog.model_note.text(), dialog.model_note.text())
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            H.QMessageBox, "question",
+            lambda *a, **k: (asked.append(str(a[2])), H.QMessageBox.No)[1],
+        )
+        dialog._accept()
+        check("creating is not held up over a model that HAS been chosen",
+              not any("no detection model" in text for text in asked), str(asked))
+
+        picked = str(root / "small.pt")
+        dialog.model.edit.setText(picked)
+        dialog.model.picked.emit(picked)
+        check("browsing to a file drops the shared model, as Browse does elsewhere",
+              dialog.chosen_model() is None)
+        check("the path is editable again", dialog.model.edit.isEnabled())
+        check("and the file is what create_project is handed",
+              dialog.values()["model"] == picked, str(dialog.values()["model"]))
+    finally:
+        dialog.close()
+
+
+def test_the_shared_model_is_fetched_after_the_project_is_written(app, root, monkeypatch) -> None:
+    """Create first, download second, against the config just created.
+
+    The order is the point. The download is the slow half, and a project that
+    exists on disk can be configured, cancelled or reopened while it runs; a
+    fetch that had to finish first would make the New Project button a progress
+    bar. `_install_shared_model` is the same routine the Configure page uses, so
+    what a manifest may decide cannot differ between the two screens.
+    """
+    from trackanno.gui import hub as H
+
+    class Entry:
+        id, version, sha256 = "shared-pose", "v2", "cd" * 32
+        label = "shared-pose v2"
+
+    entry = Entry()
+    target = root / "fetched"
+
+    class StubDialog:
+        def __init__(self, parent=None):
+            pass
+
+        def run(self):
+            return True
+
+        def values(self):
+            return {"directory": target, "video_dir": None, "model": None,
+                    "template": "annotator"}
+
+        def chosen_model(self):
+            return entry
+
+    installed: list = []
+    monkeypatch.setattr(H, "NewProjectDialog", StubDialog)
+    monkeypatch.setattr(H, "_install_shared_model",
+                        lambda page, e, path: installed.append((e, Path(path))))
+
+    window = H.Hub(str(make_project(root / "host")))
+    try:
+        page = next(p for p in window.pages if isinstance(p, H.ProjectPage))
+        page._new_project()
+
+        check("the project is on disk before anything is downloaded",
+              (target / "config.yaml").exists())
+        check("the fetch is aimed at the config just written",
+              installed == [(entry, target / "config.yaml")], str(installed))
+        check("and the new project is the one open",
+              window.cfg is not None
+              and window.cfg.path == (target / "config.yaml").resolve(),
+              str(window.cfg.path if window.cfg else None))
     finally:
         window.close()
         app.processEvents()
-
 
 def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
     """One probe answers both, or the page shows one thing and the run does another.
@@ -1488,16 +1698,10 @@ def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
     """
     from trackanno.detect import tiling
 
-    offered = {value for value, _label in tiling.describe_devices()}
-    check("the list always offers auto and cpu", {"auto", "cpu"} <= offered, str(offered))
-
     indices = tiling.cuda_devices()
-    check("the listed GPUs are exactly the usable ones",
-          {str(i) for i in indices} <= offered, f"{indices} vs {offered}")
-
     resolved = tiling.resolve_device("auto")
-    check("and auto only ever resolves to something on that list",
-          resolved in offered or resolved == "cpu", f"auto -> {resolved}, offered {offered}")
+    check("auto only ever resolves to a usable device",
+          resolved in {str(i) for i in indices} | {"cpu", "mps"}, f"auto -> {resolved}")
     if indices:
         check("auto takes the first usable GPU", resolved == str(indices[0]), resolved)
     else:
@@ -1507,20 +1711,9 @@ def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
     check("an index nobody offered is refused, not handed to ultralytics",
           tiling.resolve_device("99") == "cpu", tiling.resolve_device("99"))
 
-
-def test_describe_auto_says_why_it_landed_on_the_cpu() -> None:
-    """"cpu" alone cannot be acted on; the reason is what tells you the fix."""
-    from trackanno.detect import tiling
-
-    sentence = tiling.describe_auto()
-    check("it is one sentence about auto", sentence.startswith("auto uses"), sentence)
-    if tiling.resolve_device("auto") == "cpu":
-        check("and a CPU answer explains itself", ":" in sentence, sentence)
-
     usable, why = tiling.cuda_status()
     check("a refusal always carries a reason", usable or bool(why), repr((usable, why)))
     check("and a working GPU carries none", not usable or not why, repr(why))
-
-    check("a CUDA index is named with its card",
+    check("a device is named the way a log line reads it",
           tiling.device_label("cpu") == "the CPU" and "mps" in tiling.device_label("mps"),
           tiling.device_label("mps"))

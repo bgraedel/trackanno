@@ -22,10 +22,10 @@ from typing import Any
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
-    QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QColorDialog, QComboBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..project import _exists
@@ -42,18 +42,6 @@ __all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "GROUPS", "FIELDS",
 # rots silently in either direction - a rule added there never appears in the
 # form, and one removed there stays offered until somebody picks it and the
 # loader refuses the save.
-def _uncertainty_rules() -> list[str]:
-    from ..learn.select import UNCERTAINTY_RULES
-
-    return ["off"] + sorted(UNCERTAINTY_RULES)
-
-
-def _target_rules() -> list[str]:
-    from ..learn.select import TARGET_RULES
-
-    return sorted(TARGET_RULES)
-
-
 def _trackers() -> list[str]:
     from ..detect.tracking import TRACKERS
 
@@ -102,8 +90,8 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           {"options": ["detect", "pose"]}),
          ("detection", "device", "choice", "compute device",
           "'auto' uses a GPU where there is one and the CPU otherwise, so the "
-          "project moves between machines. The list comes from this computer.",
-          {"options": ["auto", "cpu"]}),
+          "project moves between machines. A number picks one CUDA device.",
+          {"options": ["auto", "cpu", "0", "mps"]}),
          ("detection", "imgsz", "int", "inference size",
           "The resolution each tile is seen at. Match what the model was trained "
           "at; another value changes what it detects.",
@@ -150,14 +138,15 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Drop tracks seen in fewer frames than this. Must not be more than the "
           "frames processed.", {"min": 1, "max": 100000}),
          ("tracking", "border_margin_px", "int", "border margin (px)",
-          "Discard tracks that come this close to the frame edge, where the "
-          "animal is partly outside the picture and a pose model places its "
-          "keypoints against a shape that is not all there. 0 keeps every "
-          "track.", {"min": 0, "max": 2000, "step": 5}),
+          "Exclude the frames where a track comes this close to the frame edge, "
+          "where the animal is partly outside the picture and a pose model "
+          "places its keypoints against a shape that is not all there. The track "
+          "carries on where it comes back. 0 keeps every frame.",
+          {"min": 0, "max": 2000, "step": 5}),
          ("tracking", "border_max_frac", "float", "border tolerance",
-          "The share of a track's frames allowed at the border before the whole "
-          "track goes. 0 discards a track that ever reaches the edge; 0.1 lets "
-          "one pass through it.",
+          "The share of one clip's frames allowed at the border before that clip "
+          "goes. 0 discards a clip that reaches the edge at all; 0.1 keeps one "
+          "the animal only passes through.",
           {"min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2}),
          ("tracking", "greedy_max_dist_px", "float", "greedy max distance",
           "Only used by the greedy fallback tracker.", {"min": 1.0, "max": 500.0, "step": 5.0}),
@@ -205,16 +194,12 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
          ("clips", "context_tracks", "bool", "record neighbours",
           "Record neighbouring tracks that fall inside the crop, so they can be "
           "outlined on demand.", {}),
-         ("clips", "thumbnails", "bool", "full-frame thumbnails",
-          "Needed for the context minimap. Costs about 65 kB per clip.", {}),
          ("normalize", "mode", "choice", "intensity mapping",
-          "per_frame: own mapping per frame (flattest). smooth: corrects slow drift "
-          "only. fixed: one mapping for the movie, faithful including flicker.",
-          {"options": ["per_frame", "smooth", "fixed", "none"]}),
+          "per_frame: own mapping per frame (flattest). fixed: one mapping for the "
+          "movie, faithful including flicker.",
+          {"options": ["per_frame", "fixed"]}),
          ("normalize", "percentiles", "floatpair", "percentiles",
           "Low and high percentile mapped to 0 and 255.", {}),
-         ("normalize", "smooth_window", "int", "smooth window",
-          "Samples in the rolling median (smooth mode only).", {"min": 1, "max": 999}),
      ]),
 
     # -- annotating ---------------------------------------------------------- #
@@ -236,7 +221,7 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
           "Where the session resumes.",
           {"options": ["first_unannotated", "last_position"]}),
          ("ui", "theme", "choice", "appearance",
-          "dark, light, or follow the desktop.",
+          "dark, light, or follow the desktop. Applies on next start.",
           {"options": ["dark", "light", "system"]}),
      ]),
 
@@ -245,8 +230,8 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
      [
          ("ui", "follow", "choice", "view follows",
           "centred: one view on the track's median position, all motion visible. "
-          "smooth: drift removed, beat kept. locked: re-centred every frame.",
-          {"options": ["centred", "smooth", "locked"]}),
+          "locked: re-centred every frame.",
+          {"options": ["centred", "locked"]}),
          ("ui", "view_zoom", "float", "view zoom",
           "Magnification into the crop. 1.0 shows the whole crop.",
           {"min": 1.0, "max": 4.0, "step": 0.25}),
@@ -265,19 +250,11 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
          ("ui", "show_kymograph", "bool", "show curvature kymograph",
           "Draw the kymograph under the clip. Needs keypoints, so it only appears "
           "on a pose project.", {}),
-         ("ui", "kymo_field", "choice", "kymograph shows",
-          "curvature (dpsi/ds, sharper but noisier) or the tangent angle psi itself, "
-          "unwrapped along the flagellum and over time. The same beat, two standard "
-          "views.",
-          {"options": ["curvature", "tangent"]}),
          ("ui", "kymo_sign", "choice", "kymograph sign",
           "canonical flips each clip so its static curvature is positive, raw leaves "
-          "it as measured, absolute drops the sign. A 2D view cannot tell a cell "
-          "from its mirror image, so raw sign flips between clips.",
-          {"options": ["canonical", "raw", "absolute"]}),
-         ("ui", "kymo_interpolate", "bool", "smooth the kymograph",
-          "Filter the kymograph when it is drawn. Off shows one hard-edged block per "
-          "frame, which is what you want when judging whether a track is noisy.", {}),
+          "it as measured. A 2D view cannot tell a cell from its mirror image, so "
+          "raw sign flips between clips.",
+          {"options": ["canonical", "raw"]}),
          ("ui", "kymo_smooth_px", "float", "kymograph fit tolerance",
           "How far the fitted centreline may sit from each keypoint, in pixels. Too "
           "little turns tracking jitter into stripes, too much flattens a real beat.",
@@ -316,6 +293,11 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
     ("Model fitting",
      "Hyperparameters for the classifier, the same ones for either model.",
      [
+         ("suggest", "device", "choice", "fit on",
+          "CatBoost only. Its GPU uses 128 feature borders against the CPU's 254, "
+          "so the two fit different models, and it is slower below roughly 50000 "
+          "rows. auto takes a GPU where CatBoost sees one.",
+          {"options": ["cpu", "gpu", "auto"]}),
          ("suggest", "iterations", "int", "boosting iterations",
           "More iterations fit harder, and cost proportionally more time on every "
           "background refit. 1000 is CatBoost's own default.",
@@ -337,9 +319,9 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
          ("suggest", "balance_classes", "bool", "balance the classes",
           "Weight the loss by inverse class frequency, so a lopsided label set does "
           "not train the model to answer with the common state.", {}),
-         ("suggest", "pca_components", "int", "CNN components",
-          "CNN embeddings are reduced to this many components before fitting. Only "
-          "used when the CNN group is selected.",
+         ("suggest", "pca_components", "int", "embedding components",
+          "Each embedding in suggest.embeddings is reduced to this many PCA "
+          "components.",
           {"min": 2, "max": 256, "step": 2}),
      ]),
 
@@ -361,37 +343,14 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
      [
          ("suggest", "select_rule", "choice", "choose the next clip by",
           "'off' hands clips over in the GUI's shuffled order, so the labelled set "
-          "stays a random sample of the project. Any rule lets the model pick the "
-          "clips it is least sure of: fewer labels for the same model, but accuracy "
-          "measured on that set reads low. margin uses the gap between the top two "
-          "answers, least_confidence the top one, entropy the whole vector.",
-          {"options_from": _uncertainty_rules}),
+          "stays a random sample of the project. 'margin' lets the model pick the "
+          "clips whose top two answers are closest: fewer labels for the same "
+          "model, but accuracy measured on that set reads low.",
+          {"options": ["off", "margin"]}),
          ("suggest", "select_batch_size", "int", "clips per batch",
           "How many clips one ranking pass hands over. Twice 'retrain every N "
           "labels' is a good default, so a batch outlives the refit that made it.",
           {"min": 1, "max": 1000}),
-         ("suggest", "select_audit_share", "autonum", "audit share of a batch",
-          "Share of each batch drawn at random from the audit holdout instead of "
-          "being ranked. 'auto' is the audit holdout above, which keeps the audit "
-          "set growing at the same rate.",
-          {"numeric": "float", "min": 0.0, "max": 1.0, "step": 0.05,
-           "decimals": 3}),
-         ("suggest", "select_frame_gap", "autonum", "frames between ranked clips",
-          "Two clips of one track must start this many frames apart to be in the "
-          "same batch. 'auto' is the clip length, so no footage is judged twice. "
-          "0 turns it off.",
-          {"min": 0, "max": 100000}),
-         ("suggest", "select_target_quota", "int", "labels a class is chased to",
-          "Labels a class needs before batch slots go hunting for it. 0 is off, and "
-          "the default even with a rule set: chasing a rare class skews the label "
-          "balance the reliability gate is measured against.",
-          {"min": 0, "max": 100000}),
-         ("suggest", "select_target_rule", "choice", "how a starved class is chased",
-          "target_runner_up picks clips where the starved class is the model's "
-          "second choice, which fills slowly but is where a label moves the "
-          "decision. target_confident picks clips the model already calls that "
-          "class: fast, and it only confirms what the model believes.",
-          {"options_from": _target_rules}),
      ]),
 
     # -- predicting ---------------------------------------------------------- #
@@ -399,51 +358,18 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, str, str, dict]]]] = [
      "How the model labels every frame of every track, and how windows become "
      "bouts.",
      [
-         ("predict", "coverage", "choice", "what is scored",
-          "dense lays a window grid over every frame of every track. manifest scores "
-          "only the clips cut for annotation, leaving the gaps between them "
-          "unlabelled.",
-          {"options": ["dense", "manifest"]}),
-         ("predict", "window_frames", "autonum", "dense window length",
-          "Frames per dense window. Use the length the model was fitted at, since "
-          "another length changes what the features mean. 'auto' is min(clip "
-          "length, stride) and needs the clips to tile.",
-          {"min": 1, "max": 100000}),
          ("predict", "window_stride", "autonum", "dense window stride",
-          "How far the dense grid advances. 'auto' matches the window length, which "
-          "tiles. Smaller overlaps and needs a decode; larger leaves unscored gaps "
-          "and is refused.", {"min": 1, "max": 100000}),
-         ("predict", "window_scales", "intlist", "extra window lengths",
-          "Every window length to score at, the dense length included; empty is that "
-          "one length. A short scale catches a brief behaviour, a long one holds a "
-          "long bout together. Each extra scale needs a decode and the "
-          "length-invariant scope below.",
-          {"min": 1, "placeholder": "empty, or 25, 50, 100"}),
-         ("suggest", "feature_scope", "choice", "columns the model is fitted on",
-          "all: every column the feature groups produce. length_invariant: only the "
-          "columns that do not scale with the window length, which is what lets one "
-          "model be scored at several lengths. Changing it means retraining.",
-          {"options": ["all", "length_invariant"]}),
-         ("predict", "decode", "choice", "turn windows into bouts",
-          "none: one row per window. min_bout: absorb runs shorter than the floor "
-          "below. viterbi: the most likely label sequence under a sticky prior.",
-          {"options": ["none", "min_bout", "viterbi"]}),
+          "How far the window grid advances. 'auto' is the clip length, which "
+          "tiles. Smaller overlaps the windows; larger is refused.",
+          {"min": 1, "max": 100000}),
          ("predict", "min_bout_frames", "int", "shortest bout",
-          "Frames a bout must reach under min_bout: the briefest episode you would "
-          "accept as real. Must be at least 2, since 0 and 1 exclude nothing.",
+          "Frames a bout must reach; shorter runs join a neighbour. 0 keeps every "
+          "run.",
           {"min": 0, "max": 100000}),
-         ("predict", "self_transition", "autonum", "stickiness",
-          "viterbi only: the chance a frame keeps the previous frame's label. 'auto' "
-          "is 1 - 1/shortest bout, whose average run is that long. 0 and 1 are both "
-          "refused.",
-          {"numeric": "float", "min": 0.001, "max": 0.999, "step": 0.01, "decimals": 3}),
          ("predict", "min_frames", "int", "detections a window needs",
           "Detections a dense window needs before it is scored. 2 is the least any "
           "motion feature needs.",
           {"min": 1, "max": 100000}),
-         ("predict", "save_posteriors", "bool", "keep the per-frame posterior",
-          "Write the per-frame posterior beside the predictions. One row per frame "
-          "per track, so the file is far larger; useful while tuning a decode.", {}),
      ]),
 
     # -- exporting ----------------------------------------------------------- #
@@ -479,7 +405,7 @@ BASIC = {
 
 # Fields that need a second line under the row for something the value alone
 # cannot say. paths.model has its own (see :class:`_PathField`).
-HAS_STATUS = {"detection.device", "clips.stride"}
+HAS_STATUS = {"clips.stride"}
 
 # Changing these invalidates a clip cache that has already been built.
 NEEDS_REPREPARE = {
@@ -488,10 +414,10 @@ NEEDS_REPREPARE = {
     "tiling.enabled", "tiling.tile", "tiling.overlap", "tiling.merge_iou",
     "tracking.backend", "tracking.min_track_length", "tracking.greedy_max_dist_px",
     "tracking.border_margin_px", "tracking.border_max_frac",
-    "normalize.mode", "normalize.percentiles", "normalize.smooth_window",
+    "normalize.mode", "normalize.percentiles",
     "clips.frames", "clips.stride", "clips.window_mode", "clips.follow", "clips.pad",
     "clips.crop_size", "clips.max_size", "clips.min_clip_frames",
-    "clips.max_clips_per_track", "clips.context_tracks", "clips.thumbnails",
+    "clips.max_clips_per_track", "clips.context_tracks",
     "paths.video_dir", "paths.model", "keypoints.nodes",  # via KeypointEditor
 }
 
@@ -516,6 +442,8 @@ class ConfigForm(QScrollArea):
         # tells a setting somebody chose from one nobody has touched.
         self._absent: set[str] = set()
         self._at_load: dict[str, Any] = {}
+        # A field's own tooltip while mark() shows a warning in its place.
+        self._tips: dict[str, str] = {}
 
         body = QWidget()
         layout = QVBoxLayout(body)
@@ -650,21 +578,36 @@ class ConfigForm(QScrollArea):
             return _GroupPicker(self.changed)
         if kind == "autonum":
             return _AutoField(extra, self.changed)
-        if kind == "intlist":
-            return _IntListField(extra, self.changed)
         widget = QLineEdit()
         widget.textChanged.connect(self.changed)
         return widget
 
     # -- values ------------------------------------------------------------- #
     def load(self, data: dict) -> None:
-        """Fill the form from a raw config dict. Missing keys are left blank."""
+        """Fill the form from a raw config dict.
+
+        A key the file does not mention is shown at the value the LOADER would
+        use, not at whatever its spin box range starts at. The generated
+        config.yaml documents most settings and leaves the rest out, so the
+        difference is the whole suggester: `suggest.iterations` is absent and
+        1000 is what gets fitted, while the range starts at 10. Reading 10 off
+        the page is wrong twice over, because nudging it from there writes a
+        number a hundred times smaller than the one it replaced.
+
+        Still recorded as absent, so :meth:`values` keeps them out of the file
+        until somebody actually changes one.
+        """
+        from ..config import section_defaults
+
         self._absent = set()
         for dotted, widget in self._widgets.items():
             section, _, key = dotted.partition(".")
             block = data.get(section) or {}
             if key not in block:
                 self._absent.add(dotted)
+                fallback = section_defaults(section)
+                if key in fallback:
+                    self._set(widget, self._kinds[dotted], fallback[key])
                 continue
             self._set(widget, self._kinds[dotted], block[key])
         self._at_load = self._raw_values()
@@ -680,7 +623,7 @@ class ConfigForm(QScrollArea):
                 widget.setValue(int(value))
             elif kind == "float":
                 widget.setValue(float(value))
-            elif kind in ("dir", "file", "groups", "autonum", "intlist", "tristate"):
+            elif kind in ("dir", "file", "groups", "autonum", "tristate"):
                 widget.set_value(value)
             elif kind in ("strlist", "floatpair"):
                 text = ", ".join(str(v) for v in (value or []))
@@ -717,32 +660,8 @@ class ConfigForm(QScrollArea):
         frames = max(1, number("clips.frames", 50))
         stride = max(1, number("clips.stride", frames))
         clips = Clips(frames=frames, stride=stride)
-        dense = str(values.get("predict.coverage", "dense")) == "dense"
-        predict = Predict(
-            window_frames=values.get("predict.window_frames", "auto"),
-            window_stride=values.get("predict.window_stride", "auto"),
-            min_bout_frames=number("predict.min_bout_frames", 0),
-        )
-
-        # 'auto' for the dense window is min(clips.frames, clips.stride), which
-        # is two different intentions collapsed into one number and so has no
-        # answer once the clips overlap. load_config refuses it there, naming
-        # this key; saying so here is the same fact before the save.
-        overlapping = dense and stride < frames
-        window = None if overlapping else predict.resolved_window(clips)
-        blocked = "the clips overlap, write a number" if overlapping else ""
-        self._resolve("predict.window_frames", window, blocked)
-        self._resolve("predict.window_stride",
-                      None if overlapping else predict.resolved_stride(clips), blocked)
-        self._resolve("suggest.select_frame_gap", frames)
-        self._resolve("suggest.select_audit_share",
-                      number("suggest.audit_fraction", 0.10))
-        min_bout = number("predict.min_bout_frames", 0)
-        self._resolve(
-            "predict.self_transition",
-            predict.resolved_self_transition() if min_bout >= 2 else None,
-            "" if min_bout >= 2 else "needs a shortest bout of 2 or more",
-        )
+        predict = Predict(window_stride=values.get("predict.window_stride", "auto"))
+        self._resolve("predict.window_stride", predict.resolved_stride(clips))
         # crop_size resolves off the movies themselves, which nothing here has
         # read, so it keeps a bare 'auto'.
         self._resolve("clips.crop_size", None)
@@ -752,10 +671,7 @@ class ConfigForm(QScrollArea):
                             "The windows tile: every frame is in exactly one clip.")
         elif stride < frames:
             self.set_status(
-                "clips.stride",
-                f"The windows overlap by {frames - stride} frames, so the dense "
-                "window length cannot stay 'auto' - write the clip length under "
-                "Bulk labelling.")
+                "clips.stride", f"The windows overlap by {frames - stride} frames.")
         else:
             self.set_status("clips.stride",
                             f"{stride - frames} frames between one clip and the next "
@@ -832,7 +748,10 @@ class ConfigForm(QScrollArea):
             target.style().unpolish(target)
             target.style().polish(target)
             if message:
+                self._tips.setdefault(dotted, target.toolTip())
                 target.setToolTip(message)
+            elif dotted in self._tips:
+                target.setToolTip(self._tips.pop(dotted))
 
     def values(self) -> dict[str, Any]:
         """Dotted-key updates, ready for :func:`trackanno.project.write_config`.
@@ -863,20 +782,20 @@ class ConfigForm(QScrollArea):
                 out[dotted] = int(widget.value())
             elif kind == "float":
                 out[dotted] = round(float(widget.value()), 6)
-            elif kind in ("dir", "file", "groups", "autonum", "tristate"):
+            elif kind in ("dir", "file", "groups", "autonum",
+                          "tristate"):
                 out[dotted] = widget.value()
-            elif kind == "intlist":
-                # None while the text is malformed: problems() refuses the save,
-                # and leaving the key out keeps what is on disk meanwhile.
-                parsed = widget.value()
-                if parsed is not None:
-                    out[dotted] = parsed
             elif kind == "strlist":
                 out[dotted] = [p.strip() for p in widget.text().split(",") if p.strip()]
             elif kind == "floatpair":
                 parts = [p.strip() for p in widget.text().split(",") if p.strip()]
-                if len(parts) == 2:
-                    out[dotted] = [float(parts[0]), float(parts[1])]
+                # Half-typed ("0.5, -") is left out; warnings() flags it.
+                try:
+                    pair = [float(p) for p in parts]
+                except ValueError:
+                    continue
+                if len(pair) == 2:
+                    out[dotted] = pair
             else:
                 # A name, not a scalar: an annotator called 2024 is a name, and
                 # an empty box is the empty name rather than null - `null` here
@@ -999,79 +918,6 @@ class _TriStateField(QComboBox):
         return self.currentData()
 
 
-class _IntListField(QWidget):
-    """A list of whole numbers, typed as ``25, 50, 100``.
-
-    A malformed entry is refused HERE, with the entry named, rather than being
-    written for the loader to reject: the loader can only refuse the whole file,
-    and it would do it on the next autosave keystroke.
-    """
-
-    def __init__(self, extra: dict, changed_signal):
-        super().__init__()
-        self._min = int(extra.get("min", 1))
-        self.edit = QLineEdit()
-        self.edit.setPlaceholderText(extra.get("placeholder", "empty, or 1, 2, 3"))
-        self.edit.textChanged.connect(self._on_edited)
-        self._changed = changed_signal
-
-        self.note = QLabel("")
-        self.note.setWordWrap(True)
-        self.note.setProperty("role", "warning")
-        self.note.setVisible(False)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        layout.addWidget(self.edit)
-        layout.addWidget(self.note)
-
-    def _on_edited(self, _text: str) -> None:
-        self._refresh_note()
-        self._changed.emit()
-
-    def _refresh_note(self) -> None:
-        message = self.problem()
-        self.note.setText(message)
-        self.note.setVisible(bool(message))
-
-    def _parse(self) -> tuple[list[int] | None, str]:
-        entries = [p for p in self.edit.text().replace(",", " ").split() if p]
-        out: list[int] = []
-        for entry in entries:
-            try:
-                frames = int(entry)
-            except ValueError:
-                return None, f"{entry!r} is not a whole number of frames"
-            if frames < self._min:
-                return None, f"{frames} is below the smallest allowed, {self._min}"
-            if frames in out:
-                return None, (f"{frames} is listed twice, and a repeated length "
-                              "would be scored twice")
-            out.append(frames)
-        return out, ""
-
-    def problem(self) -> str:
-        return self._parse()[1]
-
-    def set_value(self, value) -> None:
-        text = ", ".join(str(v) for v in (value or []))
-        if self.edit.text() != text:
-            self.edit.blockSignals(True)
-            self.edit.setText(text)
-            self.edit.blockSignals(False)
-        self._refresh_note()
-
-    def value(self) -> list[int] | None:
-        return self._parse()[0]
-
-    def setToolTip(self, text):  # noqa: N802 (Qt naming)
-        super().setToolTip(text)
-        self.edit.setToolTip(text)
-
-
-
-
 class _GroupPicker(QWidget):
     """Which feature families the model may use, with the ones this project
     cannot compute disabled and labelled with the reason."""
@@ -1083,6 +929,8 @@ class _GroupPicker(QWidget):
         self._changed = changed_signal
         self._boxes: dict[str, QCheckBox] = {}
         self._available: dict[str, str] = {}
+        # Groups without a box (emb_<name>), kept as they are on save.
+        self._extra: list[str] = []
         self._guard = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1157,6 +1005,7 @@ class _GroupPicker(QWidget):
 
     def set_value(self, groups) -> None:
         wanted = set(groups or [])
+        self._extra = [g for g in (groups or []) if g not in self._boxes]
         self._guard = True
         try:
             for name, box in self._boxes.items():
@@ -1166,7 +1015,7 @@ class _GroupPicker(QWidget):
         self._refresh_note()
 
     def value(self) -> list:
-        return [n for n, b in self._boxes.items() if b.isChecked()]
+        return [n for n, b in self._boxes.items() if b.isChecked()] + list(self._extra)
 
     def setToolTip(self, text):  # noqa: N802 (Qt naming)
         super().setToolTip(text)
@@ -1596,8 +1445,8 @@ class KeypointEditor(QWidget):
         skeleton_box = QGroupBox("Skeleton (optional)")
         skeleton_layout = QVBoxLayout(skeleton_box)
         hint = QLabel(
-            "Only drawn on screen and written to the SLEAP export. It does not "
-            "affect detection, tracking or the features."
+            "Only drawn on screen. It does not affect detection, tracking or "
+            "the features."
         )
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")

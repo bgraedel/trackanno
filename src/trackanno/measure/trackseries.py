@@ -491,14 +491,14 @@ def _pose(
         if turn.size:
             out["body_rotation_speed"] = _safe(np.nanmean(np.abs(turn)) / dt)
 
-    # Same discipline as body_rotation_speed: unwrap on the gap-filled grid so
-    # a gap does not fold the branch, then keep only steps whose BOTH endpoints
-    # were really detected, so no bridged rotation reaches the rate.
+    # Unwrap the detected samples only: interpolating a wrapped angle across a
+    # gap can bridge a +-pi crossing and offset everything after it by 2 pi.
+    # Rate steps are kept only between adjacent detected frames.
     tip = win["tip_ang"]
-    tip_valid = np.isfinite(tip)
-    if tip_valid.sum() >= 8:
-        ang = np.unwrap(_interp_nan(tip[:, None])[:, 0])
-        out["tip_angle_std"] = _safe(np.std(ang[tip_valid]))
-        step = np.diff(ang)[tip_valid[1:] & tip_valid[:-1]]
+    idx = np.flatnonzero(np.isfinite(tip))
+    if idx.size >= 8:
+        ang = np.unwrap(tip[idx])
+        out["tip_angle_std"] = _safe(np.std(ang))
+        step = np.diff(ang)[np.diff(idx) == 1]
         if step.size:
             out["tip_angular_speed"] = _safe(np.mean(np.abs(step)) / dt)

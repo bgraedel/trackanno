@@ -1,11 +1,11 @@
 # Detection and the clip cache
 
 ```bash
-uv run prepare.py --list                       # visible movies
-uv run prepare.py
-uv run prepare.py --movies MOVIE_A --force     # redo one
-uv run prepare.py --limit-frames 100           # smoke test
-uv run prepare.py --self-test --tile 320       # check the tiling merge
+trackanno prepare --list                       # visible movies
+trackanno prepare
+trackanno prepare --movies MOVIE_A --force     # redo one
+trackanno prepare --limit-frames 100           # smoke test
+trackanno prepare --self-test --tile 320       # check the tiling merge
 ```
 
 **Device.** `detection.device: auto` selects the first CUDA device, then MPS,
@@ -14,23 +14,12 @@ written on, so an absent device is reported and the run continues on CPU. Detect
 & crop logs what `auto` actually resolved to, card name and all, so a slow run is
 never a guess.
 
-One probe answers both the list and the resolution, which is not free: torch
-will tell you CUDA is *available* and separately that it can enumerate *no
-device*, because those questions are answered by different layers and only one
-of them reads `CUDA_VISIBLE_DEVICES`. The list used to count devices while `auto`
-only asked whether CUDA existed and then assumed device 0, so the page could
-offer no GPU while the run picked one anyway. `cuda_devices()` is now the single
-answer, and `auto` takes the first entry on the list you were actually shown.
+`auto` takes the first device `cuda_devices()` enumerates, not merely whether
+CUDA reports itself available: torch answers those two questions in different
+layers, and only one of them reads `CUDA_VISIBLE_DEVICES`.
 
-The Configure page runs that probe on a worker thread, since importing torch
-costs the better part of ten seconds. Until it lands the list holds only `auto`
-and `cpu`, so the row says which it is doing: "checking this machine for GPUs"
-while it looks, then one line naming what `auto` picks here. A CPU answer says
-*why*, because `torch.cuda.is_available()` returns the same `False` for a
-CPU-only wheel, an absent driver and a laptop card asleep behind hybrid
-graphics, and those need different things from you. **Re-check** beside the row
-asks again without restarting: torch caches a device count only once it is
-non-zero, so a card that has since woken up is found.
+The Configure page's `detection.device` row is an editable list (`auto`, `cpu`,
+a CUDA index, `mps`); the machine is not probed for it.
 
 **Tiled inference.** Each frame is cut into overlapping tiles (`tiling.tile`,
 `tiling.overlap`), run as one batch, mapped back to full-frame coordinates and
@@ -56,7 +45,6 @@ available, and `greedy` selects a nearest-centroid tracker that is adequate at
 | `clips.parquet` | one row per clip, with its crop rectangle and scale |
 | `clip_boxes.parquet` | overlay geometry (target and neighbours) in cache coordinates |
 | `clips.dat` | pre-cropped pixels, uncompressed `uint8` memmap |
-| `thumbs.dat` | optional full-frame thumbnails for the minimap |
 | `norm.json` | the movie's fixed intensity mapping |
 | `detect_done.json` | the detection stage's marker, and what the clip stage cannot work out for itself |
 | `prepare_done.json` | resume marker; re-running skips finished movies |
@@ -68,7 +56,7 @@ annotating on another](#detecting-on-one-machine-annotating-on-another).
 
 **The cache is uncompressed** so that loading a clip is one contiguous ~1 MB read
 with no decoding. Keep `paths.work_dir` on a local disk; over a network share
-the per-clip latency dominates, and `prepare.py` warns on a UNC path.
+the per-clip latency dominates, and `trackanno prepare` warns on a UNC path.
 
 **Crop geometry.** The crop is centred on the track and sized to contain the
 animal on every frame of the window plus `clips.pad` of margin, which is what
@@ -78,9 +66,11 @@ every cached pixel maps back to an exact original coordinate. The crop is
 zero-padded where it overhangs the movie border; clamping it inside would park
 every border-swimming animal against the edge of its own crop.
 
-**Discarding tracks at the frame edge.** `tracking.border_margin_px` is 0 by
-default, which keeps every track. Set it and a track is discarded when its box
-comes within that many pixels of any side of the frame.
+**Excluding frames at the frame edge.** `tracking.border_margin_px` is 0 by
+default, which keeps every detection. Set it and a detection is excluded when
+its box comes within that many pixels of any side of the frame. The *frames* go,
+not the track: an animal that visits the edge and swims back is planned as usual
+either side of the excursion.
 
 The reason is pose, and it is not fixable downstream. At the edge the box is cut
 off by the picture rather than by the animal ending, so a keypoint model places
@@ -89,18 +79,23 @@ keypoints, curvature and wave direction and body length, is then wrong in a way
 nothing reports, because the detector is confident about the part it can see.
 There is no confidence score for "the rest of the animal is outside the frame".
 
-`tracking.border_max_frac` is how much of a track's life may be spent there
-before the whole track goes. `0.0`, the default once the margin is on, discards
-a track that reaches the edge at all; `0.1` lets one that passes through it
-survive. Detection reports how many tracks went and how much of the worst one's
-life was at the edge, so the pair can be tuned against a real movie rather than
-guessed.
+An excluded detection counts as no detection: it sets no crop, and it counts
+towards neither `tracking.min_track_length` nor a clip's `clips.min_clip_frames`.
+`tracking.border_max_frac` is how much of **one clip** may be spent at the edge
+before that clip goes. `0.0`, the default once the margin is on, cuts no clip
+that reaches the edge at all; `0.1` keeps one the animal only passes through.
+Without it a window mostly at the edge would still be cut around the few frames
+that were not. Detection reports how many tracks reached the edge and how much
+of the worst one's life was spent there, so the pair can be tuned against a real
+movie rather than guessed.
 
 Rows are **not** removed from `tracks.parquet`, which stays row-aligned with
-`instance_features.npy`; the track simply becomes no clips. The rule is applied
-to dense prediction as well, which is the one place `tracking.min_track_length`
-is deliberately *not* applied: that threshold is about annotation units, while
-this one is about whether the measurement means anything at all.
+`instance_features.npy`; those frames simply become no clip. The rule is applied
+to dense prediction as well - a contaminated window is written with a
+`skip_reason` rather than scored - which is the one place
+`tracking.min_track_length` is deliberately *not* applied: that threshold is
+about annotation units, while this one is about whether the measurement means
+anything at all.
 
 **One commit per movie.** Pixels, manifest, box table and cache header are
 written beside their real names and renamed into place at the end, so a
@@ -113,10 +108,17 @@ another clip's pixels looks normal during annotation.
 ## Shared models
 
 Weights do not have to be a file somebody copied onto this machine.
-**Choose shared model...**, in the detection model row on the Configure page,
-lists the models a GitHub release offers, downloads the one you pick into a
-shared cache, and applies the settings it was trained with. Only models this
-project can run are listed; the rest of the registry is counted below the list.
+**Choose shared model...**, in the detection model row on the Configure page and
+in *New project*, lists the models a GitHub release offers, downloads the one you
+pick into a shared cache, and applies the settings it was trained with. Only
+models this project can run are listed; the rest of the registry is counted below
+the list.
+
+From *New project* the download waits for the project: the dialog only records
+the choice, so cancelling it leaves nothing behind, and the fetch then runs in
+the background against the `config.yaml` just written. Both routes end in the
+same call, so what a manifest is allowed to decide does not depend on which
+screen it was chosen from.
 
 ```yaml
 model:
@@ -202,7 +204,7 @@ written where it is read.
 ```bash
 # on the GPU box - same registry, so model.source + sha256 give identical weights
 export TRACKANNO_MODEL_REGISTRY="github://you/your-models"
-trackanno-prepare --config /data/proj/config.yaml --stage detect --device 0
+trackanno prepare --config /data/proj/config.yaml --stage detect --device 0
 
 # back where you annotate: copy the four small files per movie, then just work
 rsync -a server:/data/proj/work/ ./work/
@@ -212,23 +214,35 @@ trackanno
 Without `--stage`, each movie gets whatever it is still missing, so step 3 finds
 the tracks already there and only cuts the clips. The movie list marks it
 `[detected]` and the button reads **Cut clips**. That half needs no model, so the
-page opens on a machine that has no `.pt` at all.
+page opens on a machine that has no `.pt` at all, and a run in which every ticked
+movie is `[detected]` is given the clip stage - it cannot reach for a detector,
+whatever else it finds.
 
 Paths differ between machines, and `Browse` writes an absolute one. Override them
 per run instead of editing `config.yaml`:
 
 ```bash
-trackanno-prepare --config ./config.yaml --stage detect \
+trackanno prepare --config ./config.yaml --stage detect \
     --video-dir /mnt/scope/run7 --work-dir /scratch/run7
 ```
 
 `--model` does the same for the weights and clears `model.source`, since naming a
 file says the shared model is no longer wanted.
 
-`detect_done.json` carries a digest of the `detection`, `tiling`, `tracking`,
-`features`, `normalize`, `nd2` and `tiff` sections. Cutting clips against a
-different one fails naming the section that changed. `detection.device` and
-`detection.batch` are excluded, so a CUDA box and a laptop agree.
+`detect_done.json` records the settings that change what detection finds
+(detection, tiling, tracker, features, normalize, channel, z and fps, which
+scales the tracker's `track_buffer`) and the sha256 of the weights. Device,
+batch, `--tile` and the clip-stage keys (`clips.*`, `tracking.min_track_length`,
+`tracking.border_*`) are left out, so a CUDA box and a laptop agree.
+`prepare_done.json` records the clip-stage keys the clips were cut with.
+
+Detections and clips are never replaced automatically, because new track ids or
+a new clip grid orphan the labels. A movie whose recorded settings no longer
+match is reported with the keys that changed, marked `[ stale ]` on the Prepare
+page, and skipped. `--force` (or "redo movies that are already prepared")
+detects and cuts it again; `--stage clips --force` re-cuts without detecting.
+Older handoffs that digested whole sections still count as fresh when only a
+clip-stage key differs.
 
 The handoff also carries the keypoint names, which a pose checkpoint resolves at
 load time (`kpt_shape`) and `config.yaml` may never list. The machine cutting the

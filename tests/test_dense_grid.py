@@ -17,13 +17,11 @@ about the change itself rather than about either mode:
   dividing it by ``length``, which is only an index while the grid tiles. Under
   overlap both bounds land short, and the failure is missing rows rather than an
   exception, so the check is that a track's windows actually span its lifetime;
-* that :func:`trackanno.infer.densepredict.coverage` has a caller at all. It is the
-  function that would have caught the index bug and it had been dead code
-  through two changes of the grid.
+* that :func:`trackanno.infer.densepredict.count_windows` counts the windows
+  the plan lays down.
 
 Nothing here reads pixels, features or a model: the grid is arithmetic, and the
-project built below is a config plus one ``tracks.parquet``, which is the least
-``coverage`` can be given.
+project built below is a config plus one ``tracks.parquet``.
 """
 
 from __future__ import annotations
@@ -34,7 +32,7 @@ import pytest
 from harness import check
 from trackanno.config import load_config
 from trackanno.infer.densepredict import (
-    coverage, plan_dense_windows, window_grid, window_length, window_stride,
+    count_windows, plan_dense_windows, window_grid, window_length, window_stride,
 )
 
 MOVIE = "grid_movie"
@@ -68,16 +66,15 @@ def cfg(root):
     """A real config with an overlapping stride, plus that ``tracks.parquet``.
 
     Written with the real ``write_config``, so ``load_config`` is what accepts
-    the stride: an overlapping one is only legal beside a decode, and a fixture
-    that bypassed the loader could assert against a config no user can have.
+    the stride.
     """
     from trackanno.project import create_project, write_config
 
     path = create_project(root / "grid")
     write_config(path, {
-        "predict.window_frames": LENGTH,
+        "clips.frames": LENGTH,
+        "clips.stride": LENGTH,
         "predict.window_stride": STRIDE,
-        "predict.decode": "min_bout",
         "predict.min_bout_frames": 5,
     })
     loaded = load_config(path)
@@ -106,13 +103,6 @@ def hits_per_frame(windows, n_frames: int) -> np.ndarray:
     for f_start, f_end in windows:
         hits[f_start:f_end] += 1
     return hits
-
-
-def dense_like(plan: dict) -> pd.DataFrame:
-    """The columns ``coverage`` reads out of a dense feature table."""
-    rows = [{"movie_id": MOVIE, "track_id": int(t), "f_start": int(s), "f_end": int(e)}
-            for t, windows in plan.items() for s, e in windows]
-    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -257,72 +247,33 @@ def test_a_track_shorter_than_one_window() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# the check that had no caller
+# the count
 # --------------------------------------------------------------------------- #
-def test_coverage_reports_what_is_true_in_both_modes(cfg) -> None:
-    """coverage() is the function that would have caught the index bug, and it
-    was in __all__ and called from nowhere while the grid changed under it. Its
-    claim was "exactly once", which an overlapping stride makes false by design;
-    what stays true in both modes is that no detected frame may be left
-    uncovered, and that the number of windows speaking for a frame is 1 while
-    tiling and length/stride under overlap."""
+def test_the_window_count_is_the_plan(cfg) -> None:
+    """count_windows walks the same plan the feature build does."""
     check("the config resolves to the length and stride it was written with",
           (window_length(cfg), window_stride(cfg)) == (LENGTH, STRIDE),
           f"{window_length(cfg)}, {window_stride(cfg)}")
-
-    tiled = coverage(cfg, dense_like(plan_dense_windows(TRACKS, N_FRAMES, LENGTH)))
-    row = tiled.iloc[0]
-    check("tiling leaves no detected frame uncovered", int(row["uncovered"]) == 0,
-          f"{int(row['uncovered'])} of {int(row['detected_frames'])}")
-    check("...and speaks for each of them exactly once",
-          int(row["windows_per_frame_max"]) == 1
-          and float(row["windows_per_frame_mean"]) == 1.0,
-          f"max {row['windows_per_frame_max']}, mean {row['windows_per_frame_mean']}")
-    check("...over every detection the movie has",
-          int(row["detected_frames"]) == len(TRACKS), str(int(row["detected_frames"])))
-
-    over = coverage(cfg, dense_like(plan_dense_windows(TRACKS, N_FRAMES, LENGTH, STRIDE)))
-    row = over.iloc[0]
-    check("an overlapping stride leaves no detected frame uncovered either",
-          int(row["uncovered"]) == 0,
-          f"{int(row['uncovered'])} of {int(row['detected_frames'])}")
-    # length/stride in the interior; one more at the very end, where the window
-    # moved flush with the last frame overlaps its neighbour by more than a
-    # stride. That is the price of dropping the short tail, and it is bounded.
-    check("...and no frame is in more windows than the grid can put there",
-          int(row["windows_per_frame_max"]) == LENGTH // STRIDE + 1,
-          str(int(row["windows_per_frame_max"])))
-    check("...with most frames in that many, not near one",
-          float(row["windows_per_frame_mean"]) > LENGTH // STRIDE - 1,
-          str(float(row["windows_per_frame_mean"])))
-    check("...so the overlap it reports is real and is what the decode has to resolve",
-          int(row["covered_once"]) < int(row["detected_frames"]),
-          f"{int(row['covered_once'])} of {int(row['detected_frames'])}")
-    check("both modes agree on how many detections there are",
-          int(row["detected_frames"]) == int(tiled.iloc[0]["detected_frames"]))
+    plan = plan_dense_windows(TRACKS, N_FRAMES, LENGTH, STRIDE)
+    n_windows, n_tracks = count_windows(cfg)
+    check("the count is the plan's windows",
+          n_windows == sum(len(w) for w in plan.values()), str(n_windows))
+    check("...over every track", n_tracks == 3, str(n_tracks))
+    hits = np.zeros(N_FRAMES, dtype=int)
+    for windows in plan.values():
+        for f_start, f_end in windows:
+            hits[f_start:f_end] = 1
+    check("no detected frame is left without a window",
+          bool(hits[TRACKS["frame"].to_numpy()].all()))
 
 
 # --------------------------------------------------------------------------- #
 # the two tables have to agree about what a feature IS
 # --------------------------------------------------------------------------- #
-class IdentityPCA:
-    """Stands in for the saved PCA. The delta must not depend on the map."""
-
-    def transform(self, block):
-        return np.asarray(block, dtype=float)
-
-
-def test_the_dense_cnn_delta_is_the_one_the_model_was_fitted_on() -> None:
-    """`cnn*_delta` is a mean over ADJACENT-FRAME steps, in both tables.
-
-    The dense side used to diff consecutive PRESENT rows, which bridges every
-    gap: a window missing four frames in the middle contributes one large step
-    the training table never sees. Same column name, different quantity, and
-    nothing raises - the model is simply scored on a feature it was not fitted
-    on. The two now share one function, so they cannot drift apart again.
-    """
-    from trackanno.infer.densepredict import _cnn_block
+def test_the_embedding_delta_is_measured_on_the_frame_grid() -> None:
+    """`emb_*_delta` is a mean over ADJACENT-FRAME steps; gaps are not bridged."""
     from trackanno.measure.clipfeatures import grid_delta
+    from trackanno.measure.embeddings import summarise
 
     span = 10
     offsets = np.array([0, 1, 2, 7, 8])
@@ -340,15 +291,24 @@ def test_the_dense_cnn_delta_is_the_one_the_model_was_fitted_on() -> None:
     check("...which is not what bridging the gap would give",
           not np.allclose(bridged, want), f"bridged {bridged}")
 
-    block = _cnn_block(IdentityPCA(), values, offsets, span)
-    check("the dense cnn block forms cnn*_delta the same way",
-          np.isclose(block["cnn0_delta"], want[0])
-          and np.isclose(block["cnn1_delta"], want[1]),
-          f"{block['cnn0_delta']}, {block['cnn1_delta']} vs {want}")
-    check("...and its mean and std are still over the present rows",
-          np.isclose(block["cnn0_mean"], values[:, 0].mean())
-          and np.isclose(block["cnn0_std"], values[:, 0].std()),
-          f"{block['cnn0_mean']}, {block['cnn0_std']}")
+    block = summarise("x", values, offsets, span)
+    check("the embedding summary forms its delta the same way",
+          np.isclose(block["emb_x_0_delta"], want[0])
+          and np.isclose(block["emb_x_1_delta"], want[1]),
+          f"{block['emb_x_0_delta']}, {block['emb_x_1_delta']} vs {want}")
+    check("...and its mean and std are over the present rows",
+          np.isclose(block["emb_x_0_mean"], values[:, 0].mean())
+          and np.isclose(block["emb_x_0_std"], values[:, 0].std()),
+          f"{block['emb_x_0_mean']}, {block['emb_x_0_std']}")
+
+    # A missing vector is a NaN row: skipped, not bridged across.
+    holed = np.vstack([values[:2], [[np.nan, np.nan]], values[2:]])
+    holed_block = summarise("x", holed, np.array([0, 1, 5, 2, 7, 8]), span)
+    check("a NaN row changes nothing",
+          all(np.isclose(holed_block[k], block[k]) for k in block), str(holed_block))
+    empty = summarise("x", np.full((3, 2), np.nan), np.array([0, 1, 2]), span)
+    check("a window with no vector at all is NaN, not zero",
+          all(np.isnan(v) for v in empty.values()), str(empty))
 
     # A window with no adjacent pair at all has measured no change, which is 0
     # rather than undefined: the quantity is a sum of steps and there were none.
@@ -357,14 +317,14 @@ def test_the_dense_cnn_delta_is_the_one_the_model_was_fitted_on() -> None:
           np.allclose(lonely, 0.0), str(lonely))
 
 
-def test_a_border_dropped_track_does_not_break_feature_alignment(root) -> None:
+def test_border_dropped_rows_do_not_break_feature_alignment(root) -> None:
     """instance_features.npy is row-aligned with the UNFILTERED tracks table.
 
-    `build_dense_features` drops border tracks before it plans, so checking the
-    feature count against the FILTERED table refuses a perfectly healthy project
-    the moment `tracking.border_margin_px` costs it a track. The row LABELS
-    survive the filter, so the lookups into the array were always right; only
-    the count they were checked against was wrong.
+    `build_dense_features` drops the detections at the frame edge before it
+    plans, so checking the feature count against the FILTERED table refuses a
+    perfectly healthy project the moment `tracking.border_margin_px` costs it a
+    row. The row LABELS survive the filter, so the lookups into the array were
+    always right; only the count they were checked against was wrong.
     """
     import json
 
@@ -374,9 +334,12 @@ def test_a_border_dropped_track_does_not_break_feature_alignment(root) -> None:
     height, width, n_frames = 200, 200, 120
     path = create_project(root / "border")
     write_config(path, {
-        "predict.window_frames": 30,
+        "clips.frames": 30,
+        "clips.stride": 30,
+        "clips.min_clip_frames": 20,
         "tracking.border_margin_px": 20,
         "tracking.border_max_frac": 0.5,
+        "suggest.embeddings": [{"name": "det", "source": "detector"}],
     })
     border_cfg = load_config(path)
     movie = border_cfg.movie_dir(MOVIE)
@@ -399,11 +362,20 @@ def test_a_border_dropped_track_does_not_break_feature_alignment(root) -> None:
     tracks.to_parquet(movie / "tracks.parquet", index=False)
     # Aligned with the file on disk, as prepare.py writes it: one row per
     # detection, border track included.
-    np.save(movie / "instance_features.npy",
-            np.zeros((len(tracks), 8), dtype=np.float32))
+    vectors = np.random.default_rng(0).normal(size=(len(tracks), 8)).astype(np.float32)
+    np.save(movie / "instance_features.npy", vectors)
+    from trackanno.measure import embeddings as emb
+
+    border_cfg.paths.work_dir.mkdir(parents=True, exist_ok=True)
+    emb.save_bases(border_cfg.paths.work_dir / emb.BASES_FILE,
+                   emb.fit_bases(border_cfg, {"det": {MOVIE: vectors}}))
 
     out = build_dense_features(border_cfg)
-    check("a project whose border rule drops a track still builds",
+    check("a project whose border rule drops rows still builds",
           len(out) > 0, f"{len(out)} rows")
-    check("...and the dropped track is absent from the dense table",
+    # This one is at the edge on every frame, so nothing of it is left to plan.
+    check("...and a track that is nothing but border rows is absent from it",
           set(out["track_id"]) == {WHOLE}, str(sorted(set(out["track_id"]))))
+    check("...and carries the embedding columns",
+          "emb_det_0_mean" in out.columns
+          and out.loc[out["skip_reason"] == "", "emb_det_0_mean"].notna().all())

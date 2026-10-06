@@ -1,7 +1,7 @@
 """Clip planning, crop geometry and the pre-cropped clip cache.
 
 A *clip* is ``clips.frames`` consecutive frames of one track, cropped to a
-square window around it and pre-extracted by ``prepare.py`` into an
+square window around it and pre-extracted by ``trackanno prepare`` into an
 uncompressed ``np.memmap``: one contiguous read (~1 MB) per clip, no decoding.
 
 Crop geometry rules:
@@ -28,8 +28,8 @@ import pandas as pd
 from ..config import Config
 
 __all__ = [
-    "ClipSpec", "clip_id_for", "plan_clips", "border_share", "drop_border_tracks",
-    "choose_crop_size", "finalise_geometry",
+    "ClipSpec", "clip_id_for", "plan_clips", "border_flags", "drop_border_rows",
+    "too_much_border", "choose_crop_size", "finalise_geometry",
     "build_box_table", "write_clip_cache", "ClipStore", "StagedWrite",
 ]
 
@@ -39,7 +39,6 @@ BOXES_FILE = "clip_boxes.parquet"
 ORIGINS_FILE = "clip_origins.npy"
 FEATURES_FILE = "instance_features.npy"
 HEADER_FILE = "cache.json"
-THUMBS_FILE = "thumbs.dat"
 TRACKS_FILE = "tracks.parquet"
 NORM_FILE = "norm.json"
 DONE_FILE = "prepare_done.json"
@@ -126,64 +125,82 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 
 BORDER_BOX_COLUMNS = ("x1", "y1", "x2", "y2")
+# Carried on the planner's own copy of the tracks table, so the border test is
+# run once per movie rather than once per window.
+_AT_BORDER = "_at_border"
 
 
-def border_share(tracks: pd.DataFrame, frame_size, margin_px: int) -> "pd.Series":
-    """Per track, the share of its detections whose box comes within
-    ``margin_px`` of any side of the frame. Empty without the box columns or the
-    frame size."""
-    if tracks.empty or frame_size is None:
-        return pd.Series(dtype=float)
-    if any(c not in tracks.columns for c in BORDER_BOX_COLUMNS):
-        return pd.Series(dtype=float)
-    height, width = int(frame_size[0]), int(frame_size[1])
-    m = float(margin_px)
-    x1 = pd.to_numeric(tracks["x1"], errors="coerce").to_numpy(dtype=float)
-    y1 = pd.to_numeric(tracks["y1"], errors="coerce").to_numpy(dtype=float)
-    x2 = pd.to_numeric(tracks["x2"], errors="coerce").to_numpy(dtype=float)
-    y2 = pd.to_numeric(tracks["y2"], errors="coerce").to_numpy(dtype=float)
-    at_edge = (
-        (x1 <= m) | (y1 <= m) | (x2 >= width - m) | (y2 >= height - m)
-    )
-    return pd.Series(at_edge, index=tracks.index).groupby(
-        tracks["track_id"].to_numpy()
-    ).mean()
-
-
-def drop_border_tracks(tracks: pd.DataFrame, frame_size, cfg: Config
-                       ) -> tuple[pd.DataFrame, dict[int, float]]:
-    """``tracks`` without the ones that live at the frame edge, and which went.
+def border_flags(tracks: pd.DataFrame, frame_size, cfg: Config) -> "pd.Series":
+    """Per detection, whether its box comes within
+    ``tracking.border_margin_px`` of any side of the frame.
 
     At the edge the box is truncated by the frame rather than by the animal
     ending, so a pose model places its keypoints against a shape that is not all
-    there. Off unless ``tracking.border_margin_px`` says otherwise, and refuses
-    rather than passing everything through when the frame size is unknown.
+    there. Such a detection is treated as no detection: it is the frames that
+    go, not the track, so an animal that visits the edge and swims back is
+    measured over the rest of its life as usual.
+
+    All False unless ``tracking.border_margin_px`` says otherwise, and refuses
+    rather than passing everything through when it cannot be measured.
     """
-    margin = int(cfg.tracking.border_margin_px)
-    if margin <= 0 or tracks.empty:
-        return tracks, {}
+    off = pd.Series(False, index=tracks.index, dtype=bool)
+    if int(cfg.tracking.border_margin_px) <= 0 or tracks.empty:
+        return off
     if frame_size is None:
         raise ValueError(
-            "tracking.border_margin_px is set, so tracks at the frame edge are "
-            "to be discarded, but this caller did not say how big the frame is "
-            "and the rule cannot be applied without it"
+            "tracking.border_margin_px is set, so detections at the frame edge "
+            "are to be excluded, but this caller did not say how big the frame "
+            "is and the rule cannot be applied without it"
         )
-    share = border_share(tracks, frame_size, margin)
-    if share.empty:
+    if any(c not in tracks.columns for c in BORDER_BOX_COLUMNS):
         raise ValueError(
             "tracking.border_margin_px is set, but this tracks table carries no "
             f"{', '.join(BORDER_BOX_COLUMNS)} columns, so how near the edge a "
             "detection sits cannot be measured. Re-run detection to rebuild it"
         )
-    limit = float(cfg.tracking.border_max_frac)
-    dropped = {int(t): float(v) for t, v in share.items() if v > limit}
-    if not dropped:
+    height, width = int(frame_size[0]), int(frame_size[1])
+    m = float(cfg.tracking.border_margin_px)
+    x1 = pd.to_numeric(tracks["x1"], errors="coerce").to_numpy(dtype=float)
+    y1 = pd.to_numeric(tracks["y1"], errors="coerce").to_numpy(dtype=float)
+    x2 = pd.to_numeric(tracks["x2"], errors="coerce").to_numpy(dtype=float)
+    y2 = pd.to_numeric(tracks["y2"], errors="coerce").to_numpy(dtype=float)
+    at_edge = (x1 <= m) | (y1 <= m) | (x2 >= width - m) | (y2 >= height - m)
+    return pd.Series(at_edge, index=tracks.index, dtype=bool)
+
+
+def drop_border_rows(tracks: pd.DataFrame, frame_size, cfg: Config
+                     ) -> tuple[pd.DataFrame, dict[int, float]]:
+    """``tracks`` without the detections at the frame edge, and the share of
+    each affected track that went.
+
+    The track itself survives: only the frames inside the margin are removed,
+    and what comes before and after them is planned as usual.
+    """
+    flags = border_flags(tracks, frame_size, cfg)
+    if not flags.any():
         return tracks, {}
-    return tracks[~tracks["track_id"].isin(dropped)], dropped
+    share = flags.groupby(tracks["track_id"].to_numpy()).mean()
+    return tracks[~flags.to_numpy()], {
+        int(t): float(v) for t, v in share.items() if v > 0
+    }
+
+
+def too_much_border(n_border: int, n_present: int, cfg: Config) -> bool:
+    """Whether a window spent too much of itself at the frame edge to be a unit.
+
+    ``tracking.border_max_frac`` is the share of a window's detections allowed
+    inside the margin. 0, the default, refuses a window that reaches the edge at
+    all; the same track's windows before and after the excursion are untouched.
+    Without this the edge frames would only be missing, and a window mostly at
+    the edge would still be cut around the few frames that were not.
+    """
+    if n_border <= 0:
+        return False
+    return n_border / (n_border + n_present) > float(cfg.tracking.border_max_frac)
 
 
 def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
-               frame_size=None, discarded: dict | None = None) -> list[ClipSpec]:
+               frame_size=None, at_border: dict | None = None) -> list[ClipSpec]:
     """Turn a movie's tracks table into clip specs. Reads no pixels.
 
     Crop size comes from the *per-frame* box (``crop_from: bbox``), not the
@@ -199,25 +216,29 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
     ``tracking.border_margin_px``; without it that setting cannot be applied and
     refuses rather than passing everything through.
 
-    ``discarded``, when given, is filled with ``{track_id: border share}`` for
-    the tracks dropped at the frame edge. A caller wanting to report them takes
-    them from here, since recomputing the number means restating which tracks
-    were candidates in the first place.
+    ``at_border``, when given, is filled with ``{track_id: share of its
+    detections at the frame edge}`` for every track that reached it. A caller
+    wanting to report them takes them from here, since recomputing the number
+    means restating which detections were candidates in the first place.
     """
     if tracks.empty:
         return []
 
-    counts = tracks.groupby("track_id").size()
-    keep = counts[counts >= cfg.tracking.min_track_length].index
-    tracks = tracks[tracks["track_id"].isin(keep)]
-    if tracks.empty:
-        return []
+    # A detection inside the margin is not one to measure, so it counts neither
+    # towards min_track_length nor towards a clip's frames. Marked rather than
+    # dropped, because a window still has to see how much of itself was there.
+    edge_flags = border_flags(tracks, frame_size, cfg).to_numpy()
+    if at_border is not None and edge_flags.any():
+        share = pd.Series(edge_flags).groupby(tracks["track_id"].to_numpy()).mean()
+        at_border.update({int(t): float(v) for t, v in share.items() if v > 0})
 
-    tracks, at_border = drop_border_tracks(tracks, frame_size, cfg)
-    if discarded is not None:
-        discarded.update(at_border)
+    counts = pd.Series(~edge_flags).groupby(tracks["track_id"].to_numpy()).sum()
+    keep = counts[counts >= cfg.tracking.min_track_length].index
+    kept_rows = tracks["track_id"].isin(keep).to_numpy()
+    tracks, edge_flags = tracks[kept_rows], edge_flags[kept_rows]
     if tracks.empty:
         return []
+    tracks = tracks.assign(**{_AT_BORDER: edge_flags})
 
     windows = _windows(cfg, n_frames)
     length = cfg.clips.frames
@@ -226,11 +247,15 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
     for track_id, tdf in tracks.groupby("track_id", sort=True):
         tdf = tdf.sort_values("frame")
         frames = tdf["frame"].to_numpy()
+        edge = tdf[_AT_BORDER].to_numpy()
         made = 0
         for f_start, f_end in windows:
-            sel = (frames >= f_start) & (frames < f_end)
+            inside = (frames >= f_start) & (frames < f_end)
+            sel = inside & ~edge
             n_present = int(sel.sum())
             if n_present < cfg.clips.min_clip_frames:
+                continue
+            if too_much_border(int((inside & edge).sum()), n_present, cfg):
                 continue
 
             sub = tdf.iloc[np.flatnonzero(sel)]
@@ -349,60 +374,82 @@ def finalise_geometry(specs: list[ClipSpec], size: int, n_frames: int) -> np.nda
 # overlay geometry (target + neighbours, in cache coordinates)
 # --------------------------------------------------------------------------- #
 def build_box_table(
-    specs: list[ClipSpec], origins: np.ndarray, tracks: pd.DataFrame, cfg: Config, n_kpts: int
+    specs: list[ClipSpec], origins: np.ndarray, tracks: pd.DataFrame, cfg: Config,
+    n_kpts: int,
 ) -> pd.DataFrame:
     """Per clip and frame: the target track's box plus any neighbour inside the
     crop, in *cache* pixels so the GUI needs to know nothing about the original
-    movie."""
-    if not specs:
+    movie.
+
+    One vectorised pass per clip, over the slice of a frame-sorted copy its
+    window covers. Per FRAME it was a DataFrame filter and an ``itertuples``
+    row, which is clips x clips.frames pandas calls: minutes of silence in the
+    middle of a run on a movie with a few thousand clips.
+    """
+    if not specs or tracks.empty:
         return pd.DataFrame()
 
-    by_frame = {f: df for f, df in tracks.groupby("frame", sort=False)}
+    # Stable, so detections keep their order within a frame and the table comes
+    # out in the order the per-frame loop produced.
+    order = np.argsort(tracks["frame"].to_numpy(), kind="stable")
+    frames = tracks["frame"].to_numpy()[order].astype(np.int64)
+    ids = tracks["track_id"].to_numpy()[order].astype(np.int64)
+    boxes = tracks[["x1", "y1", "x2", "y2"]].to_numpy(dtype=np.float64)[order]
+    confs = tracks["conf"].to_numpy(dtype=np.float64)[order]
+
     kx = [f"kp_x_{k}" for k in range(n_kpts)]
     ky = [f"kp_y_{k}" for k in range(n_kpts)]
     kc = [f"kp_c_{k}" for k in range(n_kpts)]
     has_kpts = n_kpts > 0 and all(c in tracks.columns for c in kx)
+    if has_kpts:
+        kpx = tracks[kx].to_numpy(dtype=np.float64)[order]
+        kpy = tracks[ky].to_numpy(dtype=np.float64)[order]
+        kpc = tracks[kc].to_numpy(dtype=np.float64)[order]
 
-    rows: list[dict] = []
+    parts: list[dict] = []
     for row, s in enumerate(specs):
-        sc = s.scale
-        for frame in range(s.f_start, s.f_end):
-            df = by_frame.get(frame)
-            if df is None:
-                continue
-            t = frame - s.f_start
-            x0, y0 = int(origins[row, t, 0]), int(origins[row, t, 1])
-            x1_lim, y1_lim = x0 + s.crop_w, y0 + s.crop_h
-            if cfg.clips.context_tracks:
-                inside = df[
-                    (df["x2"] > x0) & (df["x1"] < x1_lim)
-                    & (df["y2"] > y0) & (df["y1"] < y1_lim)
-                ]
-            else:
-                inside = df[df["track_id"] == s.track_id]
-            for rec in inside.itertuples(index=False):
-                entry = {
-                    "row": row,
-                    "t": t,
-                    "track_id": int(rec.track_id),
-                    "is_target": bool(int(rec.track_id) == s.track_id),
-                    "x1": (rec.x1 - x0) * sc,
-                    "y1": (rec.y1 - y0) * sc,
-                    "x2": (rec.x2 - x0) * sc,
-                    "y2": (rec.y2 - y0) * sc,
-                    "conf": float(rec.conf),
-                }
-                if has_kpts:
-                    for k in range(n_kpts):
-                        entry[kx[k]] = (getattr(rec, kx[k]) - x0) * sc
-                        entry[ky[k]] = (getattr(rec, ky[k]) - y0) * sc
-                        entry[kc[k]] = getattr(rec, kc[k])
-                rows.append(entry)
+        lo = int(np.searchsorted(frames, s.f_start, side="left"))
+        hi = int(np.searchsorted(frames, s.f_end, side="left"))
+        if hi <= lo:
+            continue
+        t = frames[lo:hi] - s.f_start
+        x0 = origins[row, t, 0].astype(np.float64)
+        y0 = origins[row, t, 1].astype(np.float64)
+        window, target = boxes[lo:hi], ids[lo:hi]
+        if cfg.clips.context_tracks:
+            keep = (
+                (window[:, 2] > x0) & (window[:, 0] < x0 + s.crop_w)
+                & (window[:, 3] > y0) & (window[:, 1] < y0 + s.crop_h)
+            )
+        else:
+            keep = target == s.track_id
+        pick = np.flatnonzero(keep)
+        if pick.size == 0:
+            continue
+        sc, x0, y0 = s.scale, x0[pick], y0[pick]
+        part = {
+            "row": np.full(pick.size, row, dtype=np.int32),
+            "t": t[pick].astype(np.int16),
+            "track_id": target[pick].astype(np.int32),
+            "is_target": target[pick] == s.track_id,
+            "x1": (window[pick, 0] - x0) * sc,
+            "y1": (window[pick, 1] - y0) * sc,
+            "x2": (window[pick, 2] - x0) * sc,
+            "y2": (window[pick, 3] - y0) * sc,
+            "conf": confs[lo:hi][pick],
+        }
+        if has_kpts:
+            for k in range(n_kpts):
+                part[kx[k]] = (kpx[lo:hi][pick, k] - x0) * sc
+                part[ky[k]] = (kpy[lo:hi][pick, k] - y0) * sc
+                part[kc[k]] = kpc[lo:hi][pick, k]
+        parts.append(part)
 
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.astype({"row": "int32", "t": "int16", "track_id": "int32"})
-    return out
+    if not parts:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {name: np.concatenate([p[name] for p in parts]) for name in parts[0]}
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -433,8 +480,6 @@ def write_clip_cache(
         "size": size,
         "dtype": "uint8",
         "movie": movie.describe(),
-        "thumbnails": bool(cfg.clips.thumbnails),
-        "thumbnail_size": int(cfg.clips.thumbnail_size),
     }
 
     # Staged beside the real names and renamed in at the very end, so a cancelled
@@ -460,12 +505,6 @@ def write_clip_cache(
             staged.path(CACHE_FILE), dtype=np.uint8, mode="w+",
             shape=(n_clips, length, size, size),
         )
-        thumbs = None
-        if cfg.clips.thumbnails:
-            ts = cfg.clips.thumbnail_size
-            thumbs = np.memmap(
-                staged.path(THUMBS_FILE), dtype=np.uint8, mode="w+", shape=(n_clips, ts, ts)
-            )
     except OSError as exc:
         staged.discard()
         # EINVAL here almost always means "something has this file mapped".
@@ -482,9 +521,6 @@ def write_clip_cache(
     for row, s in enumerate(specs):
         for f in range(s.f_start, s.f_end):
             needed.setdefault(f, []).append((row, s))
-    thumb_at: dict[int, list[int]] = {}
-    for row, s in enumerate(specs):
-        thumb_at.setdefault(s.f_start, []).append(row)
 
     height, width = movie.height, movie.width
     frames = sorted(needed)
@@ -493,10 +529,6 @@ def write_clip_cache(
     try:
         for frame_idx in iterator:
             u8 = normalizer.to_u8(movie.frame(frame_idx), frame_idx)
-            if thumbs is not None:
-                for row in thumb_at.get(frame_idx, []):
-                    ts = cfg.clips.thumbnail_size
-                    thumbs[row] = cv2.resize(u8, (ts, ts), interpolation=cv2.INTER_AREA)
 
             for row, s in needed[frame_idx]:
                 t = frame_idx - s.f_start
@@ -511,9 +543,6 @@ def write_clip_cache(
 
         cache.flush()
         del cache
-        if thumbs is not None:
-            thumbs.flush()
-            del thumbs
     except BaseException:
         # Cancelled, killed, or the share went away: discard the staged files.
         # Rebinding rather than `del`, which is what this used to do: on the
@@ -521,7 +550,7 @@ def write_clip_cache(
         # unconditional `del` raises NameError over the real error and skips the
         # discard. Windows cannot unlink a mapped file, so the references do
         # have to go before `staged.discard()`.
-        cache = thumbs = None  # noqa: F841 - releases the memmaps for discard()
+        cache = None  # noqa: F841 - releases the memmap for discard()
         staged.discard()
         raise
 
@@ -532,9 +561,9 @@ def write_clip_cache(
 class StagedWrite:
     """Write beside the real names, then rename everything into place at once.
 
-    ``os.replace`` is atomic per file, not across files, so a crash between the
-    renames can still interleave old and new; ``ClipStore`` rejects that,
-    manifest and header disagreeing.
+    ``os.replace`` is atomic per file, not across files. The live header goes
+    first and comes back last, so a crash between renames leaves no cache.json
+    and ``ClipStore`` refuses the movie.
     """
 
     SUFFIX = ".part"
@@ -551,8 +580,13 @@ class StagedWrite:
             self._names.append(name)
         return self.out_dir / (name + self.SUFFIX)
 
+    _LAST = (MANIFEST_FILE, HEADER_FILE)
+
     def commit(self) -> None:
-        for name in self._names:
+        if (self.out_dir / (HEADER_FILE + self.SUFFIX)).exists():
+            (self.out_dir / HEADER_FILE).unlink(missing_ok=True)
+        last = [n for n in self._LAST if n in self._names]
+        for name in [n for n in self._names if n not in last] + last:
             staged = self.out_dir / (name + self.SUFFIX)
             if staged.exists():
                 staged.replace(self.out_dir / name)
@@ -598,7 +632,7 @@ class ClipStore:
         self.work_dir = Path(work_dir)
         if not self.work_dir.exists():
             raise FileNotFoundError(
-                f"clip cache not found: {self.work_dir}\nRun `uv run prepare.py` first."
+                f"clip cache not found: {self.work_dir}\nRun `trackanno prepare` first."
             )
 
         manifests, boxes, self._headers = [], [], {}
@@ -636,7 +670,7 @@ class ClipStore:
 
         if not manifests:
             raise FileNotFoundError(
-                f"no prepared clips under {self.work_dir}\nRun `uv run prepare.py` first."
+                f"no prepared clips under {self.work_dir}\nRun `trackanno prepare` first."
             )
 
         self.manifest = (
@@ -650,7 +684,6 @@ class ClipStore:
         )
         self._closed = False
         self._mm: dict[str, np.memmap] = {}
-        self._thumb_mm: dict[str, np.memmap | None] = {}
         self._origins: dict[str, np.ndarray | None] = {}
         self._id_to_index = {cid: i for i, cid in enumerate(self.manifest["clip_id"])}
 
@@ -682,10 +715,10 @@ class ClipStore:
             return "clips.dat is missing"
         expected = n_clips * frames * size * size
         actual = cache_path.stat().st_size
-        if actual < expected:
+        if actual != expected:
             return (
-                f"clips.dat is {actual} bytes but {expected} are needed for "
-                f"{n_clips} clips; it was not written to the end"
+                f"clips.dat is {actual} bytes but {n_clips} clips need exactly "
+                f"{expected}; it does not belong to this manifest"
             )
         return ""
 
@@ -735,23 +768,6 @@ class ClipStore:
         arr = self._memmap(m["movie_id"])[int(m["row"])]
         _ = int(arr[0, 0, 0]) + int(arr[-1, -1, -1])
 
-    def thumbnail(self, index: int) -> np.ndarray | None:
-        m = self.meta(index)
-        movie_id = m["movie_id"]
-        if movie_id not in self._thumb_mm:
-            h = self._headers[movie_id]
-            path = self.work_dir / movie_id / THUMBS_FILE
-            self._thumb_mm[movie_id] = (
-                np.memmap(
-                    path, dtype=np.uint8, mode="r",
-                    shape=(h["n_clips"], h["thumbnail_size"], h["thumbnail_size"]),
-                )
-                if h.get("thumbnails") and path.exists()
-                else None
-            )
-        mm = self._thumb_mm[movie_id]
-        return None if mm is None else np.asarray(mm[int(m["row"])])
-
     def origins(self, index: int) -> np.ndarray | None:
         """(T, 2) top-left corners in ORIGINAL pixel coords, one per frame.
 
@@ -774,7 +790,7 @@ class ClipStore:
         is open fails with ``OSError: [Errno 22] Invalid argument``.
         """
         self._closed = True
-        for holder in (self._mm, self._thumb_mm, self._origins):
+        for holder in (self._mm, self._origins):
             for key in list(holder):
                 array = holder.pop(key, None)
                 handle = getattr(array, "_mmap", None)

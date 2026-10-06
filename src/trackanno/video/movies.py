@@ -39,26 +39,14 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # normalisation
 # --------------------------------------------------------------------------- #
-def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
-    if window <= 1 or values.size <= 2:
-        return values
-    half = max(1, window // 2)
-    padded = np.pad(values, half, mode="edge")
-    return np.array([
-        np.median(padded[i : i + 2 * half + 1]) for i in range(values.size)
-    ], dtype=np.float64)
-
-
 @dataclass
 class Normalizer:
     """Percentile -> uint8 mapping for one movie, optionally per frame.
 
-    These acquisitions drift, so one fixed mapping faithfully reproduces a movie
-    that visibly dims, while per-frame percentiles remove the drift but make
-    brightness breathe as animals enter and leave. ``smooth`` (the default) does
-    neither: percentiles measured on a subset of frames, median-filtered along
-    time, then interpolated to every frame. The curve is persisted so prepare,
-    the GUI and the renderer agree pixel-for-pixel.
+    ``fixed`` is one mapping for the whole movie, faithful to real intensity
+    changes; ``per_frame`` gives every frame its own percentiles, removing drift
+    and flicker. The curve is persisted so prepare, the GUI and the renderer
+    agree pixel-for-pixel.
     """
 
     lo: float | list[float]
@@ -128,25 +116,15 @@ class Normalizer:
 
         opt = options or Normalize()
         n = min(movie.n_frames, n_frames) if n_frames else movie.n_frames
-        if opt.mode == "none":
-            return cls(0.0, 255.0, mode="none")
-
         step = max(1, opt.subsample)
         pcts = opt.percentiles
 
         if opt.mode == "fixed":
             idx = np.unique(np.linspace(0, n - 1, min(20, n)).astype(int))
-        elif opt.mode == "per_frame":
+        else:
             # Every frame gets its own mapping: illumination here swings frame to
             # frame, so anything coarser leaves visible pulsing.
             idx = np.arange(n)
-        else:
-            every = opt.sample_every
-            if not isinstance(every, int):
-                every = max(1, n // 100)      # ~100 samples is plenty for slow drift
-            idx = np.unique(np.arange(0, n, max(1, int(every))))
-            if idx[-1] != n - 1:
-                idx = np.append(idx, n - 1)
 
         iterator = progress(idx) if progress else idx
         los, his = [], []
@@ -168,15 +146,8 @@ class Normalizer:
             lo, hi = float(np.median(los_a)), float(np.median(his_a))
             return cls(lo, max(hi, lo + 1.0), mode="fixed")
 
-        if opt.mode == "smooth":
-            los_a = _rolling_median(los_a, opt.smooth_window)
-            his_a = _rolling_median(his_a, opt.smooth_window)
-
-        frames = np.arange(n)
-        lo_curve = np.interp(frames, idx, los_a)
-        hi_curve = np.interp(frames, idx, his_a)
-        hi_curve = np.maximum(hi_curve, lo_curve + 1.0)
-        return cls(lo=lo_curve.tolist(), hi=hi_curve.tolist(), mode=opt.mode)
+        hi_curve = np.maximum(his_a, los_a + 1.0)
+        return cls(lo=los_a.tolist(), hi=hi_curve.tolist(), mode=opt.mode)
 
 
 # --------------------------------------------------------------------------- #
@@ -542,8 +513,50 @@ def _nd2_positions(path: Path, cfg: Config) -> list[int]:
     return out
 
 
+def _may_hold(path: Path, wanted: set[str]) -> bool:
+    """Whether this file could hold one of the wanted movies, by name alone.
+
+    A movie id is the file's stem, plus an ND2 position suffix where the file
+    holds several. So this answers without opening anything, and opening every
+    ND2 on a share to find out is the slowest thing discovery does.
+    """
+    return any(w == path.stem or w.startswith(f"{path.stem}__P") for w in wanted)
+
+
+def _open_movies(paths: list[Path], cfg: Config) -> list[MovieSource]:
+    """Every movie in these files; one unreadable file is skipped, not fatal."""
+    sources: list[MovieSource] = []
+    for path in paths:
+        try:
+            if path.suffix.lower() == ".nd2":
+                for pos in _nd2_positions(path, cfg):
+                    sources.append(ND2Movie(path, cfg, position=pos))
+            else:
+                sources.append(TiffMovie(path, cfg))
+        except Exception as exc:
+            warnings.warn(f"skipping {path.name}: {exc}", stacklevel=3)
+    return sources
+
+
+def _pick(sources: list[MovieSource], wanted: set[str]):
+    """The wanted movies, the ids on offer, and the rest closed."""
+    selected, seen = [], set()
+    for source in sources:
+        seen.add(source.id)
+        if source.id in wanted:
+            selected.append(source)
+        else:
+            source.close()
+    return selected, seen
+
+
 def discover_movies(cfg: Config, only: list[str] | None = None) -> list[MovieSource]:
-    """Open every movie under ``paths.video_dir``. ND2 positions become separate movies."""
+    """Open every movie under ``paths.video_dir``. ND2 positions become separate movies.
+
+    With ``only``, files whose name cannot hold one of those ids are not opened
+    at all: the GUI asks for one movie at a time, and opening the whole folder
+    to hand back one of it is minutes on a share.
+    """
     video_dir = cfg.paths.video_dir
     if not video_dir.exists():
         raise FileNotFoundError(f"paths.video_dir does not exist: {video_dir}")
@@ -555,32 +568,29 @@ def discover_movies(cfg: Config, only: list[str] | None = None) -> list[MovieSou
     if not files:
         raise FileNotFoundError(f"no files matching {cfg.paths.patterns} in {video_dir}")
 
-    sources: list[MovieSource] = []
-    for path in files:
-        try:
-            if path.suffix.lower() == ".nd2":
-                for pos in _nd2_positions(path, cfg):
-                    sources.append(ND2Movie(path, cfg, position=pos))
-            else:
-                sources.append(TiffMovie(path, cfg))
-        except Exception as exc:
-            warnings.warn(f"skipping {path.name}: {exc}", stacklevel=2)
+    wanted = set(only or ())
+    if not wanted:
+        return _open_movies(files, cfg)
 
-    if only:
-        wanted = set(only)
-        selected = [s for s in sources if s.id in wanted]
-        missing = wanted - {s.id for s in selected}
-        for s in sources:
-            if s.id not in wanted:
-                s.close()
-        if missing:
-            available = ", ".join(sorted(s.id for s in sources))
-            raise ValueError(f"unknown movie id(s): {sorted(missing)}. Available: {available}")
-        return selected
-    return sources
+    shortlist = [p for p in files if _may_hold(p, wanted)]
+    selected, seen = _pick(_open_movies(shortlist, cfg), wanted)
+    if wanted - seen and len(shortlist) != len(files):
+        # Only a shortcut, so anything it did not find is looked for properly
+        # rather than reported missing on the strength of a file name.
+        for source in selected:
+            source.close()
+        selected, seen = _pick(_open_movies(files, cfg), wanted)
+    missing = wanted - seen
+    if missing:
+        for source in selected:
+            source.close()
+        raise ValueError(
+            f"unknown movie id(s): {sorted(missing)}. Available: {', '.join(sorted(seen))}"
+        )
+    return selected
 
 
 def open_movie(cfg: Config, movie_id: str) -> MovieSource:
-    """Reopen a single movie by its id (used by the GUI minimap and the renderer)."""
+    """Reopen a single movie by its id (used by the renderer)."""
     sources = discover_movies(cfg, only=[movie_id])
     return sources[0]

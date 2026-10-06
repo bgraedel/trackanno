@@ -1,4 +1,4 @@
-"""Reusable project settings, saved from one project and applied to the next.
+"""Reusable project settings: the presets that ship, and the ones you save.
 
 A template is a whole ``config.yaml``, comments included, stored outside any
 project so it survives the project it came from.
@@ -11,24 +11,37 @@ chosen. ``ui.annotator`` is cleared: a template is a protocol, not a person.
 Saving copies the project's own file rather than re-serialising it, so the
 comments come along unchanged, and parses the result with the real loader, so a
 template that would not load cannot be saved.
+
+A *preset* is a template that ships with trackanno: a file under ``presets/``
+naming only the keys it changes, applied to the packaged default. They form a
+ladder, from hand annotation to a dense pose predictor, so a new project starts
+from one working set of settings rather than from every knob at once. Naming the
+changes rather than copying the whole file is what keeps a preset from drifting
+away from the defaults it was written against.
 """
 
 from __future__ import annotations
 
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
+
+import yaml
 
 from .yamledit import set_values
 
 __all__ = [
-    "Template", "BUILTIN_NAME", "templates_dir", "list_templates", "find_template",
-    "template_text", "save_template", "delete_template",
+    "Template", "Preset", "BUILTIN_NAME", "BUILTIN_SUMMARY", "templates_dir",
+    "list_templates", "find_template", "template_text", "save_template",
+    "delete_template", "list_presets", "find_preset", "preset_text",
 ]
 
 BUILTIN_NAME = "default"
+BUILTIN_SUMMARY = "The packaged config.yaml as it ships: boxes, the suggester on, no decode."
 TEMPLATES_DIRNAME = "templates"
+PRESETS_DIRNAME = "presets"
 
 # The typed name lives in the file, not only in the file name, so a template
 # keeps the name it was given ("trypanosome 100 fps", not "trypanosome-100-fps")
@@ -45,18 +58,45 @@ _PROJECT_PATHS = {
 
 
 @dataclass(frozen=True)
+class Preset:
+    """A set of overrides on the packaged default, shipped in ``presets/``.
+
+    ``id`` is the file name; ``overrides`` maps ``section.key`` to the value the
+    preset wants there.
+    """
+
+    id: str
+    name: str
+    summary: str = ""
+    about: str = ""
+    order: int = 0
+    overrides: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Template:
-    """A named set of settings. ``path`` is None for the built-in default."""
+    """A named set of settings.
+
+    Three kinds, told apart by which field is filled: the built-in default
+    (neither), a shipped preset (``preset``, its id) and one saved from a project
+    (``path``). Only the last can be deleted.
+    """
 
     name: str
     path: Path | None = None
+    preset: str = ""
+    summary: str = ""
+    about: str = ""
 
     @property
     def builtin(self) -> bool:
+        """Shipped with trackanno, so it is not ours to delete."""
         return self.path is None
 
     @property
     def label(self) -> str:
+        if self.preset:
+            return f"{self.name} (preset)"
         return f"{self.name} (built in)" if self.builtin else self.name
 
 
@@ -85,9 +125,88 @@ def _stored_name(path: Path) -> str:
     return path.stem
 
 
+def _preset_files() -> list:
+    """The shipped preset files, read through the package rather than the disk."""
+    try:
+        directory = resources.files(__package__).joinpath(PRESETS_DIRNAME)
+        return sorted(
+            (f for f in directory.iterdir() if f.name.endswith(".yaml")),
+            key=lambda f: f.name,
+        )
+    except (OSError, FileNotFoundError, ModuleNotFoundError, TypeError):
+        return []
+
+
+def _read_preset(file) -> Preset | None:
+    """One preset file, or None if it is unreadable or not a mapping."""
+    try:
+        data = yaml.safe_load(file.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ident = file.name[: -len(".yaml")]
+    overrides = data.get("set") or {}
+    if not isinstance(overrides, dict):
+        return None
+    return Preset(
+        id=ident,
+        name=str(data.get("name") or ident).strip(),
+        summary=" ".join(str(data.get("summary") or "").split()),
+        about=" ".join(str(data.get("about") or "").split()),
+        order=int(data.get("order") or 0),
+        overrides={str(k): v for k, v in overrides.items()},
+    )
+
+
+def list_presets() -> list[Preset]:
+    """The shipped presets, in ladder order.
+
+    Read on every call, so editing one in a checkout shows up without a
+    reinstall. A preset that will not parse is skipped rather than raised: a bad
+    file in the package must not stop a project being created.
+    """
+    found = [p for p in (_read_preset(f) for f in _preset_files()) if p is not None]
+    return sorted(found, key=lambda p: (p.order, p.name.lower()))
+
+
+def find_preset(name: str | None) -> Preset | None:
+    """Match a preset by its name, its slug or its file name. None if unknown."""
+    if name is None:
+        return None
+    wanted = str(name).strip().lower()
+    if not wanted:
+        return None
+    slugged = _slug(wanted)
+    for preset in list_presets():
+        candidates = {preset.id.lower(), preset.name.lower(), _slug(preset.name)}
+        if wanted in candidates or slugged in candidates:
+            return preset
+    return None
+
+
+def preset_text(preset: Preset | str | None) -> str:
+    """The ``config.yaml`` text a preset stands for: the default, overridden.
+
+    Every comment in the default survives, because the values are rewritten in
+    place rather than dumped afresh.
+    """
+    from .project import DEFAULT_CONFIG
+
+    if isinstance(preset, str) or preset is None:
+        preset = find_preset(preset)
+    if preset is None:
+        return DEFAULT_CONFIG
+    return set_values(DEFAULT_CONFIG, dict(preset.overrides))
+
+
 def list_templates() -> list[Template]:
-    """The built-in first, then saved ones alphabetically."""
-    out = [Template(BUILTIN_NAME)]
+    """The built-in default, then the presets in ladder order, then saved ones."""
+    out = [Template(BUILTIN_NAME, summary=BUILTIN_SUMMARY)]
+    out.extend(
+        Template(p.name, preset=p.id, summary=p.summary, about=p.about)
+        for p in list_presets()
+    )
     directory = templates_dir()
     try:
         files = sorted(directory.glob("*.yaml"), key=lambda p: p.stem.lower())
@@ -111,8 +230,12 @@ def find_template(name: str | None) -> Template | None:
     slugged = _slug(wanted)
     for template in list_templates():
         candidates = {template.name.lower()}
+        if template.path is not None or template.preset:
+            candidates |= {_slug(template.name)}
         if template.path is not None:
-            candidates |= {template.path.stem.lower(), _slug(template.name)}
+            candidates |= {template.path.stem.lower()}
+        if template.preset:
+            candidates |= {template.preset.lower()}
         if wanted in candidates or slugged in candidates:
             return template
     return None
@@ -129,7 +252,11 @@ def template_text(template: Template | str | None) -> str:
 
     if isinstance(template, str) or template is None:
         template = find_template(template)
-    if template is None or template.builtin or template.path is None:
+    if template is None:
+        return DEFAULT_CONFIG
+    if template.preset:
+        return preset_text(template.preset)
+    if template.builtin or template.path is None:
         return DEFAULT_CONFIG
     text = template.path.read_text(encoding="utf-8")
     # The header names the template, not the project; a config.yaml written from
@@ -153,6 +280,9 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
         raise ValueError("give the template a name")
     if name.lower() == BUILTIN_NAME:
         raise ValueError(f"{BUILTIN_NAME!r} is the built-in template; choose another name")
+    clash = find_preset(name)
+    if clash is not None:
+        raise ValueError(f"{clash.name!r} is a preset that ships with trackanno; choose another name")
 
     source = Path(config_path)
     text = set_values(source.read_text(encoding="utf-8"), dict(_PROJECT_PATHS))
@@ -179,7 +309,7 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
 
 
 def delete_template(name: str) -> bool:
-    """Remove a saved template. False if it was not there, or is the built-in."""
+    """Remove a saved template. False if it was not there, or ships with trackanno."""
     template = find_template(name)
     if template is None or template.builtin or template.path is None:
         return False

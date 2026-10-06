@@ -566,8 +566,39 @@ def test_tip_rotation_is_not_inflated_by_a_gap(cfg) -> None:
     check("a 40-frame gap does not inflate the tip rotation rate",
           close(got["tip_angular_speed"], w / dt, 1e-3),
           f"{got['tip_angular_speed']} vs {w / dt}; a folded bridge gives {folded:.2f}")
-    kept = np.concatenate([np.arange(40), np.arange(80, n)])
+
+    # The spread can only be recovered across a gap that rotates less than pi:
+    # beyond that the unwrap takes the shorter way round.
+    gone = np.arange(40, 60)
+    gapped = sub[~sub["frame"].isin(gone)]
+    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
+    kept = np.concatenate([np.arange(40), np.arange(60, n)])
     check("and the angle spread is still the one over the frames that were seen",
+          close(got["tip_angle_std"], w * np.std(kept), 1e-4),
+          f"{got['tip_angle_std']} vs {w * np.std(kept)}")
+
+
+def test_tip_angle_spread_survives_a_gap_across_the_branch_cut(cfg) -> None:
+    """A tip pointing near +-pi, lost while it crosses the cut, keeps its spread.
+
+    Interpolating the wrapped angle across the gap bridges +3.1 to -3.1 through
+    zero and leaves the samples after it 2 pi away from those before.
+    """
+    if cfg.n_keypoints < 3:
+        return
+    n, w, fps = 100, 0.002, 100.0
+    sub = spinning_tip_track(n, cfg.n_keypoints, w)
+    # Rotate the chain so the tip angle runs from pi - 0.1 to pi + 0.098.
+    base = np.pi - 0.1
+    for k in range(1, cfg.n_keypoints):
+        r = 6.0 * (k - 1)
+        ang = base + w * np.arange(n)
+        sub[f"kp_x_{k}"] = (200.0 + r * np.cos(ang)).astype(np.float32)
+        sub[f"kp_y_{k}"] = (200.0 + r * np.sin(ang)).astype(np.float32)
+    gapped = sub[~sub["frame"].isin(np.arange(45, 55))]
+    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
+    kept = np.concatenate([np.arange(45), np.arange(55, n)])
+    check("a gap across +-pi does not add 2 pi to the tip angle spread",
           close(got["tip_angle_std"], w * np.std(kept), 1e-4),
           f"{got['tip_angle_std']} vs {w * np.std(kept)}")
 

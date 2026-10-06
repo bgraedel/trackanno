@@ -1,6 +1,7 @@
-# Distribution and export
+# Label distribution and export
 
-One bar chart per category group, with a text summary flagging:
+The Model page's **Label distribution** tab draws one bar chart per category
+group, with a text summary flagging:
 
 * values with nothing labelled yet;
 * values below `suggest.min_per_class`, dropped at training time;
@@ -10,14 +11,14 @@ One bar chart per category group, with a text summary flagging:
 
 ---
 
-# 6 · `render.py`: labelled boxes on the original movie
+# 6 · `trackanno render`: labelled boxes on the original movie
 
 ```bash
-uv run render.py --list                          # movies with labels
-uv run render.py --movie MOVIE_A
-uv run render.py --group quality --hide-unlabelled
-uv run render.py --source both                   # hand labels and predictions
-uv run render.py --movie MOVIE_A --tif --max-frames 200
+trackanno render --list                          # movies with labels
+trackanno render --movie MOVIE_A
+trackanno render --group quality --hide-unlabelled
+trackanno render --source both                   # hand labels and predictions
+trackanno render --movie MOVIE_A --max-frames 200
 ```
 
 Reads `tracks.parquet` and the annotation CSV, and colours each track by the

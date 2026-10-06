@@ -1,6 +1,6 @@
-"""The annotation window, built offscreen and driven with real input.
+"""The annotation screen, built offscreen and driven with real input.
 
-Builds the real window against a generated clip cache, drives it with the same
+Builds the real widget against a generated clip cache, drives it with the same
 calls a keypress makes, and confirms the CSV, the resume path and the overlay
 renderer all behave. The marker check reads the painted pixmap rather than a
 flag, so "the marker is drawn" is measured where it matters.
@@ -119,11 +119,13 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
     """
     from qtpy.QtCore import Qt
 
-    from trackanno.gui.app import AnnotationWindow
+    from trackanno.gui.app import AnnotationWidget
 
     csv_path = cfg.paths.csv
     annotations = AnnotationStore(csv_path, cfg)
-    window = AnnotationWindow(cfg, store, annotations)
+    window = AnnotationWidget(cfg, store, annotations)
+    messages: list[str] = []
+    window.status_message.connect(lambda text, _timeout: messages.append(text))
     window.show()
     app.processEvents()
     check("window built", window.isVisible())
@@ -182,8 +184,7 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
     check("partial input is not saved", not annotations.is_done(partial_id))
     if multi:
         check("partial input warns the user",
-              "not saved" in window.statusBar().currentMessage(),
-              repr(window.statusBar().currentMessage()))
+              any("not saved" in m for m in messages[-3:]), repr(messages[-3:]))
 
     # Toggles must not crash, and the marker must actually reach the screen.
     from trackanno.view.overlay import FOLLOW_MODES
@@ -296,15 +297,37 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
     app.processEvents()
     check("undo removed a row", len(annotations) == n_before - 1, f"{n_before} -> {len(annotations)}")
 
+    window.shutdown()
     window.close()
 
     # --- resume ------------------------------------------------------------ #
     reloaded = AnnotationStore(csv_path, cfg)
-    window2 = AnnotationWindow(cfg, store, reloaded)
+    window2 = AnnotationWidget(cfg, store, reloaded)
     app.processEvents()
     resumed_id = window2._clip_ids[window2.order[window2.position]]
     check("resume lands on an unannotated clip", not reloaded.is_done(resumed_id))
+    window2.shutdown()
     window2.close()
 
     csv_path.unlink(missing_ok=True)
 
+
+
+def test_a_slot_exception_is_logged_not_fatal(app, monkeypatch, capsys) -> None:
+    """The installed hook prints the traceback and shows it in the status bar."""
+    import sys
+
+    from qtpy.QtWidgets import QMainWindow
+
+    from trackanno.gui.hub import install_excepthook
+
+    window = QMainWindow()
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    install_excepthook(window)
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        sys.excepthook(*sys.exc_info())
+    check("the traceback goes to stderr", "ValueError: boom" in capsys.readouterr().err)
+    check("...and the status bar says so", "boom" in window.statusBar().currentMessage())
+    window.deleteLater()

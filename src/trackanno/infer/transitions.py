@@ -1,6 +1,6 @@
 """Transition rates and dwell times over decoded bouts.
 
-    python -m trackanno.infer.transitions --config config.yaml
+    trackanno transitions --config config.yaml
 
 Reads ``predictions.parquet`` when it holds BOUTS, writes ``transitions.json``
 beside it, and prints the same numbers. Four rules decide what is counted:
@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .predict import RowKind, load_predictions, predictions_path, row_kind
+from .predict import load_predictions, predictions_path
 from ..annotate.clips import HEADER_FILE, StagedWrite
 from ..config import Config, load_config
 from ..learn.suggest import REPORT_FILE
@@ -46,7 +46,7 @@ from ..learn.suggest import REPORT_FILE
 __all__ = [
     "TRANSITIONS_FILE", "transitions_path", "movie_fps", "kaplan_meier",
     "exponential_fit", "analyse", "compute", "write_report", "summarise",
-    "plot", "plot_survival", "main",
+    "bout_state", "model_report", "main",
 ]
 
 TRANSITIONS_FILE = "transitions.json"
@@ -70,21 +70,12 @@ def transitions_path(cfg: Config) -> Path:
 # --------------------------------------------------------------------------- #
 # what a row has to be
 # --------------------------------------------------------------------------- #
-def _refusal(kind: RowKind) -> str:
-    """Why a non-bout predictions file cannot be turned into transitions."""
-    return (
-        f"these predictions are {kind.noun}, not bouts, and a transition is a "
-        "change between two consecutive BOUTS. A decode is what cuts bouts out "
-        "of the windows: set predict.coverage: dense and predict.decode: "
-        "min_bout with predict.min_bout_frames: N (or predict.decode: viterbi "
-        "with predict.self_transition), then run the labelling pass again."
-    )
-
-
 def _require_bouts(frame: pd.DataFrame) -> None:
-    kind = row_kind(frame)
-    if kind is not RowKind.BOUT:
-        raise ValueError(_refusal(kind))
+    if "bout_id" not in frame.columns:
+        raise ValueError(
+            "these predictions are not decoded bouts, and a transition is a change "
+            "between two consecutive BOUTS. Run the labelling pass again."
+        )
     missing = [c for c in BOUT_COLUMNS if c not in frame.columns]
     if missing:
         raise ValueError(
@@ -93,7 +84,7 @@ def _require_bouts(frame: pd.DataFrame) -> None:
         )
 
 
-def _state(value) -> str:
+def bout_state(value) -> str:
     """A bout's class name, or ``""`` for a run the decode could not label."""
     text = str(value).strip()
     return GAP if text.lower() in _NOT_A_LABEL else text
@@ -301,30 +292,6 @@ def _chain(counts: np.ndarray, at_risk: np.ndarray, ends: np.ndarray) -> dict:
     return {"rho": rho, "tau": tau, "q": q, "pi": pi}
 
 
-def _tally(bounds, state, index, usable, is_gap, dropped, f_start, f_end,
-           duration, censor_left, censor_right) -> tuple[np.ndarray, ...]:
-    """One transition matrix and one time-at-risk vector per track, the unit a
-    bootstrap resamples. Bouts whose own start was never seen are left out of
-    the time, as they are out of the Kaplan-Meier estimate."""
-    k, t = len(index), len(bounds)
-    counts = np.zeros((t, k, k), dtype=float)
-    at_risk = np.zeros((t, k), dtype=float)
-    ends = np.zeros((t, k), dtype=float)
-    for n, (lo, hi) in enumerate(bounds):
-        for i in range(lo, hi):
-            if not usable[i] or censor_left[i] or not np.isfinite(duration[i]):
-                continue
-            a = index[state[i]]
-            at_risk[n, a] += float(duration[i])
-            ends[n, a] += 0.0 if censor_right[i] else 1.0
-        for i in range(lo, hi - 1):
-            j = i + 1
-            if (f_end[i] == f_start[j] and not (is_gap[i] or is_gap[j])
-                    and not (dropped[i] or dropped[j])):
-                counts[n, index[state[i]], index[state[j]]] += 1.0
-    return counts, at_risk, ends
-
-
 def _spread(draws: list, shape: tuple) -> np.ndarray | None:
     """Bootstrap standard error. A cell fewer than two resamples could estimate
     comes back NaN rather than zero."""
@@ -468,23 +435,17 @@ def _markov(tally, classes, unit: str, dwell: dict, occupancy: dict,
 # --------------------------------------------------------------------------- #
 # the analysis
 # --------------------------------------------------------------------------- #
-def _floor(decode: str, min_bout_frames: int) -> tuple[int, str]:
+def _floor(min_bout_frames: int) -> tuple[int, str]:
     """The shortest bout that can exist, and the setting that says so."""
     n = int(min_bout_frames)
-    if decode == "min_bout" and n > 1:
+    if n > 1:
         return n, (
-            f"predict.decode: min_bout with predict.min_bout_frames: {n}. No bout "
-            f"shorter than {n} frame(s) can exist, so the left tail of every "
-            "dwell distribution below is set by that number and not by the animal"
-        )
-    if decode == "viterbi":
-        return 1, (
-            f"predict.decode: viterbi. predict.min_bout_frames: {n} sets the "
-            "self-transition prior, a preference for bouts about that long rather "
-            "than a hard floor; one frame is still the shortest possible bout"
+            f"predict.min_bout_frames: {n}. No bout shorter than {n} frame(s) can "
+            "exist, so the left tail of every dwell distribution below is set by "
+            "that number and not by the animal"
         )
     return 1, (
-        f"predict.decode: {decode}. No hard floor; one frame is the shortest "
+        f"predict.min_bout_frames: {n}. No hard floor; one frame is the shortest "
         "possible bout"
     )
 
@@ -525,7 +486,7 @@ def _analyse_group(
 ) -> dict:
     """Transitions and dwell times for one category group's bouts."""
     sub = sub.sort_values(["movie_id", "track_id", "f_start"], kind="stable")
-    state = np.array([_state(v) for v in sub[f"{group}_pred"]], dtype=object)
+    state = np.array([bout_state(v) for v in sub[f"{group}_pred"]], dtype=object)
     movie = sub["movie_id"].astype(str).to_numpy()
     track = pd.to_numeric(sub["track_id"], errors="coerce").to_numpy(dtype=np.int64)
     f_start = pd.to_numeric(sub["f_start"], errors="coerce").to_numpy(dtype=np.int64)
@@ -554,13 +515,29 @@ def _analyse_group(
             bounds.append((lo, i))
             lo = i
 
-    counts: dict[str, dict[str, int]] = {}
+    # Seconds throughout, unless a movie here has no frame rate at all; then
+    # frames, which are only comparable across movies acquired at one rate.
+    unit = ("seconds" if usable.any() and bool(np.isfinite(seconds[usable]).all())
+            else "frames")
+    duration = seconds if unit == "seconds" else frames
+
+    # Every counted pair joins two usable bouts, so the usable states are all
+    # the classes there are.
+    classes = sorted({s for s in state[usable]})
+    index = {c: i for i, c in enumerate(classes)}
+    k = len(classes)
+    # Per track, the unit a bootstrap resamples: pair counts, time at risk, and
+    # observed ends. Left-open bouts are out of the time, as they are out of
+    # the Kaplan-Meier estimate.
+    pair_counts = np.zeros((len(bounds), k, k), dtype=float)
+    at_risk = np.zeros((len(bounds), k), dtype=float)
+    ends = np.zeros((len(bounds), k), dtype=float)
     skipped = {"gap": 0, "not_adjacent": 0, "human_overlap": 0}
     n_pairs = 0
     censor_left = np.zeros(len(sub), dtype=bool)
     censor_right = np.zeros(len(sub), dtype=bool)
 
-    for lo, hi in bounds:
+    for n, (lo, hi) in enumerate(bounds):
         for i in range(lo, hi):
             if not usable[i]:
                 continue
@@ -571,6 +548,10 @@ def _analyse_group(
             censor_right[i] = (
                 after == hi or f_end[i] != f_start[after] or is_gap[after]
             )
+            if not censor_left[i] and np.isfinite(duration[i]):
+                a = index[state[i]]
+                at_risk[n, a] += float(duration[i])
+                ends[n, a] += 0.0 if censor_right[i] else 1.0
         for i in range(lo, hi - 1):
             j = i + 1
             n_pairs += 1
@@ -581,14 +562,16 @@ def _analyse_group(
             elif dropped[i] or dropped[j]:
                 skipped["human_overlap"] += 1
             else:
-                counts.setdefault(state[i], {})
-                counts[state[i]][state[j]] = counts[state[i]].get(state[j], 0) + 1
+                pair_counts[n, index[state[i]], index[state[j]]] += 1.0
 
-    observed = sorted({s for s in state[usable]})
-    classes = sorted(set(observed) | set(counts) | {t for row in counts.values() for t in row})
-    row_totals = {c: int(sum(counts.get(c, {}).values())) for c in classes}
+    total = pair_counts.sum(0)
+    counts = {
+        c: {classes[b]: int(total[a, b]) for b in range(k) if total[a, b]}
+        for a, c in enumerate(classes)
+    }
+    row_totals = {c: int(sum(counts[c].values())) for c in classes}
     probabilities = {
-        c: {t: _f(n / row_totals[c]) for t, n in sorted(counts.get(c, {}).items())}
+        c: {t: _f(n / row_totals[c]) for t, n in counts[c].items()}
         for c in classes if row_totals[c]
     }
     n_counted = int(sum(row_totals.values()))
@@ -619,11 +602,6 @@ def _analyse_group(
             "mean_n_covering": _nanmean(covering[member]),
         }
 
-    # Seconds throughout, unless a movie here has no frame rate at all; then
-    # frames, which are only comparable across movies acquired at one rate.
-    unit = ("seconds" if usable.any() and bool(np.isfinite(seconds[usable]).all())
-            else "frames")
-    duration = seconds if unit == "seconds" else frames
     held = float(np.nansum(duration[usable]))
     occupancy = {
         name: (_f(float(np.nansum(duration[members[name]])) / held)
@@ -631,10 +609,7 @@ def _analyse_group(
         for name in classes
     }
     markov = _markov(
-        _tally(bounds, state, {c: i for i, c in enumerate(classes)}, usable,
-               is_gap, dropped, f_start, f_end, duration, censor_left,
-               censor_right),
-        classes, unit, dwell, occupancy,
+        (pair_counts, at_risk, ends), classes, unit, dwell, occupancy,
         n_boot=int(n_bootstrap), seed=int(bootstrap_seed),
     )
 
@@ -648,7 +623,7 @@ def _analyse_group(
         "n_movies": int(len(set(movie.tolist()))),
         "mean_n_covering": _nanmean(covering[usable]),
         "transitions": {
-            "counts": {c: dict(sorted(counts.get(c, {}).items())) for c in classes},
+            "counts": counts,
             "row_totals": row_totals,
             "probabilities": probabilities,
             "n_pairs_considered": n_pairs,
@@ -692,7 +667,6 @@ def analyse(
     frame: pd.DataFrame,
     *,
     fps=None,
-    decode: str = "none",
     min_bout_frames: int = 0,
     exclude_human_overlap: bool = False,
     source: str | None = None,
@@ -705,13 +679,13 @@ def analyse(
 
     ``frame`` must hold bouts; a windows or clips table is refused. ``fps`` is a
     rate or a {movie_id: rate} mapping and is what puts seconds beside frames.
-    ``decode`` and ``min_bout_frames`` are the settings the bouts were cut with,
-    and are reported as the floor on the dwell distribution.
+    ``min_bout_frames`` is the setting the bouts were cut with, and is reported
+    as the floor on the dwell distribution.
     """
     _require_bouts(frame)
     movies = sorted(frame["movie_id"].astype(str).unique())
     rates = _fps_table(fps, movies)
-    floor_frames, floor_source = _floor(str(decode), int(min_bout_frames))
+    floor_frames, floor_source = _floor(int(min_bout_frames))
     uniform = sorted({rates[m] for m in movies if m in rates})
 
     groups = sorted(frame["group"].astype(str).unique())
@@ -728,9 +702,7 @@ def analyse(
         "written": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": {
             "predictions": source,
-            "row_kind": RowKind.BOUT.value,
             "n_rows": int(len(frame)),
-            "decode": str(decode),
             "min_bout_frames": int(min_bout_frames),
             "suggest_report": model_report_path,
         },
@@ -771,7 +743,8 @@ def analyse(
 # --------------------------------------------------------------------------- #
 # reading and writing
 # --------------------------------------------------------------------------- #
-def _model_report(cfg: Config) -> tuple[dict | None, str | None]:
+def model_report(cfg: Config) -> tuple[dict | None, str | None]:
+    """The saved suggest_report.json and its path; (None, None) without one."""
     path = cfg.paths.work_dir / REPORT_FILE
     if not path.exists():
         return None, None
@@ -784,11 +757,10 @@ def _model_report(cfg: Config) -> tuple[dict | None, str | None]:
 def compute(cfg: Config, *, exclude_human_overlap: bool = False) -> dict:
     """Measure the project's predictions, without writing anything."""
     frame = load_predictions(cfg)
-    report, report_path = _model_report(cfg)
+    report, report_path = model_report(cfg)
     return analyse(
         frame,
         fps=movie_fps(cfg),
-        decode=str(cfg.predict.decode),
         min_bout_frames=int(cfg.predict.min_bout_frames),
         exclude_human_overlap=exclude_human_overlap,
         source=str(predictions_path(cfg)),
@@ -828,371 +800,75 @@ def _pm(value, se, spec: str = ".3g") -> str:
     return text if se is None else f"{text} +- {format(float(se), '.2g')}"
 
 
-def _pair(frames_value, seconds_value) -> str:
-    """A duration as frames and, where the frame rate is known, seconds."""
-    if frames_value is None:
-        return "-"
-    text = f"{float(frames_value):.4g} f"
-    return text if seconds_value is None else f"{text}  {float(seconds_value):.3g} s"
-
-
 def summarise(report: dict) -> str:
-    """The whole report as text: what follows what, how long, and on what evidence."""
-    src = report["source"]
-    fps = report["fps"]
-    lines = ["transitions and dwell times over decoded bouts"]
-    lines.append(
-        f"  source: {src.get('predictions') or 'an in-memory bout table'} "
-        f"({src['n_rows']} bout row(s), predict.decode: {src['decode']}, "
-        f"predict.min_bout_frames: {src['min_bout_frames']})"
-    )
+    """The report as two short tables per group."""
+    src, fps = report["source"], report["fps"]
+    lines = [
+        f"transitions and dwell times over {src['n_rows']} decoded bout row(s), "
+        f"predict.min_bout_frames: {src['min_bout_frames']}"
+    ]
     if fps["uniform"]:
-        lines.append(
-            f"  {fps['uniform']:g} fps across {len(fps['per_movie'])} movie(s)"
-        )
+        lines.append(f"  {fps['uniform']:g} fps")
     elif fps["per_movie"]:
-        rates = ", ".join(f"{m} {r:g}" for m, r in sorted(fps["per_movie"].items()))
-        lines.append(f"  frame rate differs between movies: {rates}")
+        lines.append("  fps: " + ", ".join(
+            f"{m} {r:g}" for m, r in sorted(fps["per_movie"].items())))
     if fps["missing"]:
-        lines.append(
-            f"  no frame rate for {', '.join(fps['missing'])}; those bouts are "
-            "measured in frames only"
-        )
-    for caveat in report["caveats"]:
-        lines.append(f"  ! {caveat}")
+        lines.append(f"  no frame rate for {', '.join(fps['missing'])} (frames only)")
+    lines += [f"  ! {caveat}" for caveat in report["caveats"]]
 
     for group, g in report["groups"].items():
-        lines.append("")
-        lines.append(
-            f"{group}: {len(g['classes'])} class(es), {g['n_bouts_used']} usable "
-            f"bout(s) of {g['n_bouts']} over {g['n_tracks']} track(s) in "
-            f"{g['n_movies']} movie(s)"
-        )
-        lines.append(
-            f"  {g['n_bouts_gap']} bout(s) the decode could not label, "
-            f"{g['n_bouts_human_overlap']} overlapping hand-labelled frames, "
-            f"mean {_n(g['mean_n_covering'])} window(s) covering each bout"
-        )
+        t, d, m = g["transitions"], g["dwell"], g["markov"]
+        in_seconds = m["unit"] == "seconds"
+        lines += ["", (
+            f"{group}: {g['n_bouts_used']} of {g['n_bouts']} bouts used, "
+            f"{g['n_tracks']} track(s), {g['n_movies']} movie(s); "
+            f"{t['n_counted']} of {t['n_pairs_considered']} pairs counted"
+        )]
         model = g.get("model")
         if model:
             worst = model.get("most_confused")
-            note = (
-                f", most often mistakes {worst['from']} for {worst['to']} "
-                f"({worst['n']} of {worst['of']} = {100 * worst['frac']:.0f}%)"
-                if worst else ""
-            )
             lines.append(
-                f"  model: kappa {_n(model['kappa'], '+.3f')}, accuracy "
-                f"{_n(model['accuracy'])}{note}"
-            )
-
-        t = g["transitions"]
-        lines.append("")
-        lines.append("  what follows what   P(next | this bout ended), with counts")
+                f"  model kappa {_n(model['kappa'], '+.3f')}" + (
+                    f", mistakes {worst['from']} for {worst['to']} "
+                    f"({100 * worst['frac']:.0f}%)" if worst else ""))
+        lines.append(f"  {'class':<14} next: p (count)")
         for name in g["classes"]:
-            total = t["row_totals"].get(name, 0)
             row = t["probabilities"].get(name, {})
-            body = "   ".join(
+            body = "  ".join(
                 f"{to} {p:.2f} ({t['counts'][name][to]})"
                 for to, p in sorted(row.items(), key=lambda kv: -(kv[1] or 0.0))
-            ) or "nothing follows it in this data"
-            lines.append(f"    {name:<14} n={total:<5} -> {body}")
-        skipped = t["skipped"]
+            ) or "-"
+            lines.append(f"  {name:<14} n={t['row_totals'].get(name, 0):<4} {body}")
         lines.append(
-            f"    {t['n_counted']} pair(s) counted of {t['n_pairs_considered']} "
-            f"consecutive; skipped {skipped['gap']} across a gap, "
-            f"{skipped['not_adjacent']} not touching, "
-            f"{skipped['human_overlap']} at a hand-labelled bout"
+            f"  {'class':<14} {'compl':>5} {'cens':>5} {'drop':>5} {'median':>8} "
+            f"{'KM mean':>8} {'lifetime':>16} {'steady':>7} {'measured':>8}"
         )
-        lines.append(
-            f"    {t['n_track_ends']} track-final bout(s) across "
-            f"{t['n_movie_ends']} movie(s) have no successor by construction"
-        )
-        lines.append(f"    {t['note']}")
-
-        d = g["dwell"]
-        lines.append("")
-        lines.append(
-            f"  how long each state lasts   shortest bout the decode can emit: "
-            f"{d['floor_frames']} frame(s)"
-        )
-        lines.append(
-            f"    {'class':<14} {'compl':>6} {'cens':>5} {'drop':>5} "
-            f"{'median (complete)':>22} {'mean (Kaplan-Meier)':>24}"
-        )
+        steady = m["steady_state"] or {}
         for name in g["classes"]:
-            row = d["per_class"][name]
+            row, life = d["per_class"][name], m["lifetime"][name]
+            spans = row["seconds"] if in_seconds else row["frames"]
+            km = row["km_seconds"] if in_seconds else row["km_frames"]
             lines.append(
-                f"    {name:<14} {row['n_complete']:>6} "
-                f"{row['n_right_censored']:>5} {row['n_left_open_dropped']:>5} "
-                f"{_pair(row['frames']['median'], row['seconds']['median']):>22} "
-                f"{_pair(row['km_frames']['restricted_mean'], row['km_seconds']['restricted_mean']):>24}"
+                f"  {name:<14} {row['n_complete']:>5} {row['n_right_censored']:>5} "
+                f"{row['n_left_open_dropped']:>5} {_n(spans['median']):>8} "
+                f"{_n(km['restricted_mean']):>8} {_pm(life['mean'], life['se']):>16} "
+                f"{_n((steady.get(name) or {}).get('p')):>7} "
+                f"{_n(m['occupancy_observed'].get(name)):>8}"
             )
         lines.append(
-            "    compl = a bout with an observed bout on both sides. cens = ran "
-            "to a track end or into a gap, so its true length is at least what "
-            "was seen; folded in by Kaplan-Meier. drop = started at a track "
-            "start or out of a gap, so its own start was never seen."
+            f"  durations in {m['unit']}; shortest possible bout "
+            f"{d['floor_frames']} frame(s); +- over {m['bootstrap']['resamples']} "
+            "track resamples"
         )
-        lines.append(f"    {d['floor_source']}")
-
-        lines.extend(_markov_lines(g))
     return "\n".join(lines)
-
-
-def _markov_lines(g: dict) -> list[str]:
-    """The fitted chain: lifetimes, steady state, and the rates between states."""
-    m, unit = g["markov"], g["markov"]["unit"]
-    boot = m["bootstrap"]
-    short = "s" if unit == "seconds" else "f"
-    lines = ["", f"  the Markov chain fitted to those bouts   lifetimes in {unit}"]
-
-    lines.append(f"    {'class':<14} {'lifetime':>22} {'ends':>6} "
-                 f"{'Kaplan-Meier':>14} {'worst gap':>10}")
-    for name in m["classes"]:
-        row = m["lifetime"][name]
-        lines.append(
-            f"    {name:<14} {_pm(row['mean'], row['se']) + ' ' + short:>22} "
-            f"{row['n_ends']:>6} "
-            f"{_n(row['km_restricted_mean']) + ' ' + short:>14} "
-            f"{_n(row['fit_max_deviation'], '.2f'):>10}"
-        )
-    lines.append(
-        "    lifetime is the mean of an exponential fitted to the durations, "
-        "censored bouts contributing time but no end. Kaplan-Meier is the same "
-        "mean measured without assuming a shape, and worst gap is the widest "
-        "distance between the fitted curve and the measured one: above ~0.1 the "
-        "state does not leave at a constant rate and one number cannot stand "
-        "for its lifetime."
-    )
-
-    lines.append("")
-    lines.append("  how much of the record each state holds")
-    if m["steady_state"] is None:
-        lines.append(f"    no steady state: {m['steady_state_refusal']}")
-    else:
-        lines.append(f"    {'class':<14} {'steady state':>18} {'measured':>10}")
-        for name in m["classes"]:
-            row = m["steady_state"][name]
-            lines.append(
-                f"    {name:<14} {_pm(row['p'], row['se'], '.4g'):>18} "
-                f"{_n(m['occupancy_observed'].get(name), '.4g'):>10}"
-            )
-        lines.append(
-            "    steady state is what the fitted chain predicts in the long "
-            "run; measured is the share of time these bouts actually spend "
-            "there. The two disagreeing means the chain does not describe them."
-        )
-
-    lines.append("")
-    lines.append(f"  what follows what, and how fast   rates per {unit[:-1]}")
-    for name in m["classes"]:
-        jump = m["jump"].get(name)
-        if not jump:
-            continue
-        rates = m["rates"].get(name, {})
-        body = "   ".join(
-            f"{to} {_pm(cell['p'], cell['se'], '.2f')} "
-            f"(q {_n((rates.get(to) or {}).get('q'))})"
-            for to, cell in sorted(jump.items(), key=lambda kv: -(kv[1]["p"] or 0.0))
-        )
-        lines.append(
-            f"    {name:<14} exits {_n(m['exit_rate'].get(name))}   {body}"
-        )
-    lines.append(
-        f"    every +- is the spread over {boot['resamples']} bootstrap "
-        f"resamples of the {boot['n_tracks']} track(s), the track being the "
-        "unit because the bouts within one are not independent"
-    )
-    lines.append(f"    {m['caveat']}")
-    return lines
 
 
 # --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
-
-def _pyplot():
-    """matplotlib, imported here because it is a dependency of the drawing only.
-
-    Agg is forced only while pyplot is not yet imported, so a headless CLI run
-    gets a writable backend and a notebook or GUI that already chose an
-    interactive one keeps it.
-    """
-    try:
-        import matplotlib
-        if "matplotlib.pyplot" not in sys.modules:
-            matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise RuntimeError(
-            "drawing needs matplotlib, which this project does not depend on. "
-            "Install it, or read the numbers in " + TRANSITIONS_FILE + "."
-        ) from exc
-    return plt
-
-
-def plot_survival(report: dict, group: str, out_path, *,
-                  drop: tuple[str, ...] = ()) -> "object":
-    """Draw P(T > t) per class with its exponential fit. Returns the figure.
-
-    The measured Kaplan-Meier curve as points, the fitted constant-hazard
-    survival as a line over it. On the log axis an exponential is a straight
-    line, so a class whose points bend away from its line does not leave at a
-    constant rate and has no single lifetime.
-    """
-    plt = _pyplot()
-    m = report["groups"][group]["markov"]
-    classes = [c for c in m["classes"]
-               if c not in drop and m["survival"].get(c, {}).get("t")]
-    if not classes:
-        raise ValueError("no class here has a survival curve to draw")
-
-    unit = "s" if m["unit"] == "seconds" else "frames"
-    colours = plt.get_cmap("tab10")
-    fig, ax = plt.subplots(figsize=(7.2, 5.4))
-    for i, name in enumerate(classes):
-        curve, life = m["survival"][name], m["lifetime"][name]
-        colour = colours(i % 10)
-        ax.plot(curve["t"], curve["p"], "o", ms=4.2, color=colour, alpha=0.85,
-                label="{}   {} {} {}".format(
-                    name, _pm(life["mean"], life["se"]), unit,
-                    "" if life["fit_max_deviation"] is None
-                    else "(gap {:.2f})".format(life["fit_max_deviation"])))
-        if any(v is not None for v in curve["fit"]):
-            ax.plot(curve["t"], curve["fit"], "-", lw=1.4, color="black",
-                    alpha=0.8, zorder=3)
-
-    ax.set_yscale("log")
-    ax.set_xlabel("t ({})".format(unit))
-    ax.set_ylabel("P(T > t)")
-    ax.set_title("{}: how long each state lasts, over {} decoded bouts".format(
-        group, report["groups"][group]["n_bouts_used"]), fontsize=12, pad=12)
-    ax.legend(title="mean lifetime", fontsize=8.4, title_fontsize=8.6,
-              frameon=False, loc="upper right")
-    ax.grid(True, which="both", lw=0.4, alpha=0.25)
-    fig.text(0.5, -0.06,
-             "Points are Kaplan-Meier, so a bout running to a track end counts "
-             "as a lower bound rather than an end. The black line is the "
-             "exponential fitted to the same bouts; where the points leave it, "
-             "one lifetime does not describe the state.",
-             ha="center", fontsize=7.8, color="#666", wrap=True)
-    fig.savefig(out_path, dpi=170, bbox_inches="tight", facecolor="white")
-    return fig
-
-
-def plot(report: dict, group: str, out_path, *, min_prob: float = 0.0,
-         drop: tuple[str, ...] = ()) -> "object":
-    """Draw one group's fitted chain as a state diagram. Returns the figure.
-
-    Node area is the steady-state share of time, edge width is
-    P(next | this bout ended), and each edge carries the rate behind it.
-    """
-    plt = _pyplot()
-    from matplotlib.patches import Circle, FancyArrowPatch
-    import numpy as np
-
-    g = report["groups"][group]
-    classes = [c for c in g["classes"] if c not in drop]
-    if not classes:
-        raise ValueError("no classes left to draw after dropping " + repr(list(drop)))
-    probs, counts = g["transitions"]["probabilities"], g["transitions"]["counts"]
-    per, m = g["dwell"]["per_class"], g["markov"]
-    steady, unit = m["steady_state"], ("s" if m["unit"] == "seconds" else "f")
-
-    def n_bouts(c):
-        d = per.get(c, {})
-        return int(d.get("n_complete", 0)) + int(d.get("n_right_censored", 0))
-
-    def share(c):
-        """The steady state where the chain has one, else the measured share."""
-        if steady is not None and steady.get(c, {}).get("p") is not None:
-            return float(steady[c]["p"])
-        return float(m["occupancy_observed"].get(c) or 0.0)
-
-    weight = {c: share(c) for c in classes}
-    total = sum(weight.values()) or 1.0
-
-    theta = np.linspace(np.pi / 2, np.pi / 2 + 2 * np.pi, len(classes) + 1)[:-1]
-    pos = {c: (float(np.cos(t)), float(np.sin(t))) for c, t in zip(classes, theta)}
-
-    fig, ax = plt.subplots(figsize=(9.6, 8.4))
-    ax.set_xlim(-2.0, 2.0)
-    ax.set_ylim(-1.8, 1.8)
-    ax.set_aspect("equal")
-    ax.axis("off")
-
-    edges = [(a, b, float(probs.get(a, {}).get(b, 0.0)),
-              int(counts.get(a, {}).get(b, 0)))
-             for a in classes for b in classes
-             if a != b and float(probs.get(a, {}).get(b, 0.0)) > min_prob]
-    for a, b, pr, n in sorted(edges, key=lambda e: e[2]):
-        thin = n < 10
-        ax.add_patch(FancyArrowPatch(
-            pos[a], pos[b], connectionstyle="arc3,rad=0.17", arrowstyle="-|>",
-            mutation_scale=13 + 20 * pr, linewidth=0.6 + 6.0 * pr,
-            shrinkA=34, shrinkB=38, alpha=0.30 + 0.60 * pr, zorder=1,
-            color="#C9A227" if thin else "#B0413E",
-            linestyle="--" if thin else "-"))
-        mx, my = (pos[a][0] + pos[b][0]) / 2, (pos[a][1] + pos[b][1]) / 2
-        dx, dy = pos[b][0] - pos[a][0], pos[b][1] - pos[a][1]
-        q = (m["rates"].get(a, {}).get(b) or {}).get("q")
-        ax.text(mx - dy * 0.115, my + dx * 0.115,
-                "{:.2f}\n({})".format(pr, n) if q is None else
-                "{:.2f}  ({})\n{:.3g} /{}".format(pr, n, q, unit),
-                ha="center", va="center",
-                fontsize=8.4, color="#7a6416" if thin else "#7a2c2a",
-                bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none",
-                          alpha=0.86), zorder=3)
-
-    radius = {c: 0.135 + 0.135 * (weight[c] / total) ** 0.5 for c in classes}
-    for c in classes:
-        r = radius[c]
-        ax.add_patch(Circle(pos[c], r, facecolor="#4C6EA8", edgecolor="white",
-                            linewidth=2.0, zorder=4, alpha=0.93))
-        ax.text(pos[c][0], pos[c][1], c.replace("-to-", "-to-\n"), ha="center",
-                va="center", fontsize=9.0, color="white", zorder=5,
-                fontweight="bold")
-        life = m["lifetime"].get(c, {})
-        label = "{} bouts".format(n_bouts(c))
-        if life.get("mean") is not None:
-            label += "\nlasts {} {}".format(_pm(life["mean"], life["se"]), unit)
-        if steady is not None and steady.get(c, {}).get("p") is not None:
-            label += "\nholds {} of the record".format(
-                _pm(steady[c]["p"], steady[c]["se"], ".3g"))
-        # Radially outside the circle, so a big node never sits on its caption.
-        out = 1.0 + radius[c] + 0.12
-        ax.text(pos[c][0] * out, pos[c][1] * out, label, ha="center",
-                va="bottom" if pos[c][1] > 0.0 else "top",
-                fontsize=8.2, color="#444", zorder=5)
-
-    src, mdl = report.get("source", {}), (g.get("model") or {})
-    ax.set_title("{}: the chain fitted to {} decoded bouts".format(
-        group, g["n_bouts_used"]), fontsize=12.5, pad=16)
-    sub = "{} bouts from a {} decode  |  {} pairs counted, {} skipped across a gap".format(
-        src.get("n_rows", "?"), src.get("decode", "?"),
-        g["transitions"]["n_counted"], g["transitions"]["skipped"]["gap"])
-    if mdl.get("kappa") is not None:
-        sub += "  |  model kappa {:+.3f}, accuracy {:.3f}".format(
-            mdl["kappa"], mdl.get("accuracy", float("nan")))
-    ax.text(0.5, 0.962, sub, transform=fig.transFigure, ha="center",
-            fontsize=8.6, color="#555")
-    ax.text(0.5, 0.021,
-            "Edge label is P(next | this bout ended) with the count behind it, "
-            "over the rate q = that probability / lifetime. Dashed amber edges "
-            "rest on fewer than 10 observations.\nNode area is the share of "
-            "time the state holds in the long run"
-            + ("" if steady is not None else
-               ", measured off the record because the chain has no steady state")
-            + ". These are DECODED PREDICTIONS: classes the model confuses make "
-            "transitions the animal never made.",
-            transform=fig.transFigure, ha="center", fontsize=8.0, color="#666")
-    fig.savefig(out_path, dpi=170, bbox_inches="tight", facecolor="white")
-    return fig
-
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="transitions",
+        prog="trackanno transitions",
         description="Transition rates and dwell times over decoded bouts.",
     )
     p.add_argument("--config", default=None, help="path to config.yaml")
@@ -1202,17 +878,6 @@ def main(argv: list[str] | None = None) -> int:
              "data, so they are not independent evidence about the model. The "
              "counts either way are in the report",
     )
-    p.add_argument("--plot", default=None, metavar="PATH",
-                   help="also draw the state diagram to this image file")
-    p.add_argument("--plot-survival", default=None, metavar="PATH",
-                   help="also draw P(T > t) and its exponential fit to this "
-                        "image file")
-    p.add_argument("--plot-group", default=None,
-                   help="which category group to draw (default: the first)")
-    p.add_argument("--plot-drop", default="", metavar="A,B",
-                   help="classes to leave out of the drawing")
-    p.add_argument("--plot-min-prob", type=float, default=0.0,
-                   help="hide transitions below this probability")
     p.add_argument(
         "--no-write", action="store_true",
         help=f"print the summary without writing {TRANSITIONS_FILE}",
@@ -1225,24 +890,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(summarise(report))
-    if args.plot or args.plot_survival:
-        groups = report["groups"]
-        group = args.plot_group or next(iter(groups), "")
-        if group not in groups:
-            print(
-                f"error: nothing to draw for {group!r}; this report has "
-                + (", ".join(groups) if groups else "no category groups at all"),
-                file=sys.stderr,
-            )
-            return 2
-        drop = tuple(x.strip() for x in args.plot_drop.split(",") if x.strip())
-        if args.plot:
-            plot(report, group, args.plot, min_prob=args.plot_min_prob, drop=drop)
-            print(f"diagram written to {args.plot}")
-        if args.plot_survival:
-            plot_survival(report, group, args.plot_survival, drop=drop)
-            print(f"survival curves written to {args.plot_survival}")
-
     if not args.no_write:
         print(f"\nWrote {write_report(cfg, report)}")
     return 0

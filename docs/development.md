@@ -32,20 +32,18 @@ rather than the expression. A run therefore reports checks as well as tests.
 | `test_reassociate.py` | label repair, largely the cases where it must decline |
 | `test_models.py` | the model registry, largely the cases where a fetch must be refused |
 | `test_defaults_lock.py` | every knob this branch added is off in a project a new user makes |
-| `test_multiscale.py` | one model at several window lengths: off is unchanged, the scales weigh equally, length-dependent columns are refused |
-| `test_bout_corrections.py` | correcting a boundary: the partition stays gapless, and what a correction does not imply |
+| `test_presets.py` | the shipped presets: every key still exists, every one loads clean, and each rung's claim |
 | `test_selection_wiring.py` | the candidate pool a selector ranks, and what must stay out of it |
 | `test_selection_queue.py` | which clip the annotator is handed, and what the CSV records about why |
 | `test_audit_stability.py` | the holdout is the same clips tomorrow that it is today |
-| `test_discover.py` | sub-behaviours found where they were planted, and the batch effect that is not one |
-| `test_bout_review.py` | reading decoded bouts back, including a file that holds windows instead |
+| `test_bout_review.py` | reading decoded bouts back |
 | `test_review_mode.py` | reading a labelling session back: the queue, the provenance that must survive an edit |
-| `test_agreement.py` | which annotation windows the folds contradicted, that this is the confusion matrix's own off-diagonal, and the walk through them |
+| `test_agreement.py` | which annotation windows the folds contradicted, and that this is the confusion matrix's own off-diagonal |
 | `test_transitions.py` | transitions, dwell times and the fitted chain, against planted bouts |
-| `test_bouts.py` | frame posteriors and the two decoders, against closed forms |
+| `test_bouts.py` | frame posteriors and the min_bout decoder, against closed forms |
 | `test_dense_grid.py` | the window grid at every stride, and the frames a plan must reach |
 | `test_select.py` | which clip to annotate next, and what the audit draw must ignore |
-| `test_subcluster.py` | structure recovered where it was planted, and refused where it was not |
+| `test_feature_choice.py` | choosing the model's columns by name, and the ways two of the three cuts contradict each other |
 | `test_store_provenance.py` | why a clip was chosen, surviving the CSV and its repairs |
 | `test_suggest_window.py` | the window length a model was trained at, and the skew it closes |
 
@@ -61,7 +59,7 @@ establishes only that they agree.
 To compare the tiled path against a whole-frame run:
 
 ```bash
-uv run prepare.py --self-test --tile 320 --movies <id>
+trackanno prepare --self-test --tile 320 --movies <id>
 ```
 
 # Notes
@@ -78,7 +76,5 @@ uv run prepare.py --self-test --tile 320 --movies <id>
 * `opencv-python` is overridden out of the resolution in favour of
   `opencv-python-headless`. ultralytics pulls the former, which ships its own Qt
   plugins and conflicts with PyQt at startup.
-* `uv sync --extra sleap` with `prepare.py --sleap` writes a SLEAP `.h5` per
-  movie for keypoint-MoSeq compatibility.
 * Project data is gitignored: `work/`, `annotations.csv`, `predictions.parquet`
   and `config.yaml`, which carries absolute paths to the recordings.

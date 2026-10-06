@@ -15,8 +15,7 @@ Five things are worth testing separately:
   dropped;
 * the Kaplan-Meier estimate is the textbook one, and collapses to the sample
   mean when nothing is censored;
-* a predictions file that holds windows or clips is refused with a message
-  naming the settings that turn a decode on.
+* a predictions file that does not hold bouts is refused.
 """
 
 from __future__ import annotations
@@ -93,7 +92,7 @@ def test_a_planted_sequence_yields_exactly_the_transitions_planted() -> None:
         ("swim", 20), ("turn", 30), ("swim", 40), ("turn", 50),
         ("stop", 60), ("swim", 70),
     ]))
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
     check("the planted transitions are counted exactly once each",
@@ -129,7 +128,7 @@ def test_a_gap_breaks_the_transition_rather_than_joining_across_it() -> None:
     frame = table(plant([
         ("swim", 20), ("turn", 30), ("", 40), ("stop", 50), ("swim", 60),
     ]))
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
     check("only the two pairs that touch a labelled bout on both sides count",
@@ -158,7 +157,7 @@ def test_a_track_boundary_and_a_movie_boundary_are_not_transitions() -> None:
         # Same track id, other movie, again picking up where the last left off.
         plant([("turn", 50), ("stop", 60)], movie="movie_b", track=1, start=100),
     )
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
     check("the three within-track changes are the only ones counted",
@@ -180,8 +179,8 @@ def test_excluding_hand_labelled_bouts_breaks_the_pair_it_sits_in() -> None:
     frame = table(plant(
         [("swim", 20), ("turn", 30), ("stop", 40)], human=(1,)
     ))
-    kept = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
-    dropped = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12,
+    kept = analyse(frame, fps=100.0, min_bout_frames=12)
+    dropped = analyse(frame, fps=100.0, min_bout_frames=12,
                       exclude_human_overlap=True)
 
     check("with the hand-labelled bout kept, both changes are counted",
@@ -219,7 +218,7 @@ def test_a_track_final_bout_does_not_enter_the_dwell_estimate_as_if_complete() -
         ("swim", 10), ("turn", 20), ("swim", 30),
         ("turn", 300), ("swim", 40), ("turn", 200),
     ]))
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    report = analyse(frame, fps=100.0, min_bout_frames=12)
     turn, swim = dwell(report, "turn"), dwell(report, "swim")
 
     check("the track-final bout is counted as censored, not as complete",
@@ -251,7 +250,7 @@ def test_a_gap_censors_the_bouts_on_either_side_of_it() -> None:
     frame = table(plant([
         ("swim", 10), ("turn", 20), ("", 30), ("stop", 40), ("swim", 50),
     ]))
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    report = analyse(frame, fps=100.0, min_bout_frames=12)
 
     check("the bout that runs into the gap is right-censored, not complete",
           dwell(report, "turn")["n_right_censored"] == 1
@@ -267,9 +266,8 @@ def test_a_gap_censors_the_bouts_on_either_side_of_it() -> None:
 def test_the_floor_the_decode_imposes_is_in_the_output() -> None:
     """The shortest possible bout is a setting, and the report says so."""
     frame = table(plant([("swim", 20), ("turn", 30), ("swim", 40)]))
-    floored = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
-    free = analyse(frame, fps=100.0, decode="none", min_bout_frames=0)
-    soft = analyse(frame, fps=100.0, decode="viterbi", min_bout_frames=25)
+    floored = analyse(frame, fps=100.0, min_bout_frames=12)
+    free = analyse(frame, fps=100.0, min_bout_frames=0)
 
     check("min_bout reports its floor as a number, not only as prose",
           floored["groups"][GROUP]["dwell"]["floor_frames"] == 12)
@@ -280,13 +278,10 @@ def test_the_floor_the_decode_imposes_is_in_the_output() -> None:
           any("min_bout_frames: 12" in c for c in floored["caveats"]),
           f"got {floored['caveats']}")
     check("the floor reaches the printed summary",
-          "shortest bout the decode can emit: 12 frame(s)" in summarise(floored))
+          "shortest possible bout 12 frame(s)" in summarise(floored))
     check("without a decode there is no floor to declare",
           free["groups"][GROUP]["dwell"]["floor_frames"] == 1
           and "No hard floor" in free["groups"][GROUP]["dwell"]["floor_source"])
-    check("viterbi's floor is named as a prior rather than a hard limit",
-          soft["groups"][GROUP]["dwell"]["floor_frames"] == 1
-          and "rather than a hard floor" in soft["groups"][GROUP]["dwell"]["floor_source"])
     check("the observed shortest bout is reported beside the settable floor",
           dwell(floored, "swim")["observed_min_frames"] == 20.0)
 
@@ -334,7 +329,7 @@ def test_a_lifetime_is_the_time_at_risk_over_the_ends_seen() -> None:
     against 3, and the two means come apart by exactly that censoring.
     """
     frame = table(plant(ALTERNATING))
-    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+    m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
 
     check("the lifetimes are in seconds where a frame rate is known",
           m["unit"] == "seconds")
@@ -366,7 +361,7 @@ def test_the_exponential_fit_is_the_textbook_estimate() -> None:
 def test_a_rate_is_a_jump_probability_over_a_lifetime() -> None:
     """q(i->j) = P(next=j | in i) / lifetime(i), on the same planted bouts."""
     frame = table(plant(ALTERNATING))
-    report = analyse(frame, fps=100.0, decode="none", min_bout_frames=0)
+    report = analyse(frame, fps=100.0, min_bout_frames=0)
     m = markov(report)
     probabilities = report["groups"][GROUP]["transitions"]["probabilities"]
 
@@ -384,7 +379,7 @@ def test_a_rate_is_a_jump_probability_over_a_lifetime() -> None:
     check("with no floor imposed the rates are not called lower bounds",
           "LOWER BOUNDS" not in m["caveat"])
 
-    floored = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    floored = analyse(frame, fps=100.0, min_bout_frames=12)
     check("with a floor imposed the rates are called lower bounds",
           "LOWER BOUNDS" in markov(floored)["caveat"])
 
@@ -397,7 +392,7 @@ def test_the_steady_state_weights_a_state_by_how_long_it_is_held() -> None:
     against 0.5 s they come to 3/8 and 5/8.
     """
     frame = table(plant(ALTERNATING))
-    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+    m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
     steady = m["steady_state"]
 
     check("the steady state is stated",
@@ -414,7 +409,7 @@ def test_the_steady_state_weights_a_state_by_how_long_it_is_held() -> None:
 def test_a_state_with_no_successor_has_no_steady_state_and_says_so() -> None:
     """Three classes in a row that never returns has no stationary law."""
     frame = table(plant([("a", 10), ("b", 10), ("c", 10)]))
-    m = markov(analyse(frame, fps=100.0, decode="none", min_bout_frames=0))
+    m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
 
     check("no steady state is invented", m["steady_state"] is None)
     check("the refusal names the reason",
@@ -425,8 +420,7 @@ def test_a_state_with_no_successor_has_no_steady_state_and_says_so() -> None:
 
 def test_the_error_bars_come_from_resampling_whole_tracks() -> None:
     """One track cannot support an error bar; eight unequal ones can."""
-    one = markov(analyse(table(plant(ALTERNATING)), fps=100.0, decode="none",
-                         min_bout_frames=0))
+    one = markov(analyse(table(plant(ALTERNATING)), fps=100.0, min_bout_frames=0))
     check("a single track leaves every error unstated",
           one["lifetime"]["turn"]["se"] is None
           and one["bootstrap"]["n_tracks"] == 1)
@@ -436,7 +430,7 @@ def test_the_error_bars_come_from_resampling_whole_tracks() -> None:
                ("turn", 30 + 10 * t), ("swim", 20)], track=t)
         for t in range(8)
     ])
-    m = markov(analyse(spread, fps=100.0, decode="none", min_bout_frames=0))
+    m = markov(analyse(spread, fps=100.0, min_bout_frames=0))
     check("eight tracks are eight bootstrap units", m["bootstrap"]["n_tracks"] == 8)
     check("the resampling unit is named", m["bootstrap"]["unit"] == "track")
     check("a lifetime that differs between tracks carries an error bar",
@@ -444,7 +438,7 @@ def test_the_error_bars_come_from_resampling_whole_tracks() -> None:
     check("so does a steady state probability",
           m["steady_state"]["swim"]["se"] > 0.0)
 
-    again = markov(analyse(spread, fps=100.0, decode="none", min_bout_frames=0))
+    again = markov(analyse(spread, fps=100.0, min_bout_frames=0))
     check("the same bouts and the same seed give the same error bar",
           again["lifetime"]["turn"]["se"] == m["lifetime"]["turn"]["se"])
 
@@ -515,7 +509,7 @@ def test_seconds_come_from_each_movies_own_frame_rate() -> None:
         plant([("swim", 10), ("turn", 100), ("swim", 10)], movie="fast"),
         plant([("swim", 10), ("turn", 100), ("swim", 10)], movie="slow", track=1),
     )
-    report = analyse(frame, fps={"fast": 100.0, "slow": 10.0}, decode="none")
+    report = analyse(frame, fps={"fast": 100.0, "slow": 10.0})
 
     check("the two complete turn bouts convert to 1 s and 10 s, mean 5.5",
           abs(dwell(report, "turn")["seconds"]["mean"] - 5.5) < TOL
@@ -528,7 +522,7 @@ def test_seconds_come_from_each_movies_own_frame_rate() -> None:
           report["fps"]["uniform"] is None
           and report["fps"]["per_movie"] == {"fast": 100.0, "slow": 10.0})
 
-    partial = analyse(frame, fps={"fast": 100.0}, decode="none")
+    partial = analyse(frame, fps={"fast": 100.0})
     check("a movie with no frame rate is named rather than assumed",
           partial["fps"]["missing"] == ["slow"])
     check("bouts with no frame rate are counted and left out of seconds",
@@ -542,7 +536,7 @@ def test_seconds_come_from_each_movies_own_frame_rate() -> None:
 # what the file has to be
 # --------------------------------------------------------------------------- #
 def test_a_windows_file_is_refused_with_an_actionable_message() -> None:
-    """A window grid has no bouts in it, and the refusal says how to get some."""
+    """A window grid has no bouts in it, and is refused."""
     windows = pd.DataFrame({
         "clip_id": ["a", "b"],
         "movie_id": ["movie_a", "movie_a"],
@@ -566,19 +560,9 @@ def test_a_windows_file_is_refused_with_an_actionable_message() -> None:
     clips_message = refusal(clips)
 
     check("a dense windows file is refused rather than measured",
-          windows_message != "")
-    check("the refusal says what the rows actually are",
-          "dense windows" in windows_message, windows_message)
-    check("the refusal names the setting that turns a decode on",
-          "predict.decode" in windows_message and
-          "min_bout" in windows_message and "viterbi" in windows_message,
-          windows_message)
-    check("the refusal names the min_bout_frames the decode needs",
-          "predict.min_bout_frames" in windows_message, windows_message)
-    check("the refusal names the coverage a decode needs",
-          "predict.coverage: dense" in windows_message, windows_message)
-    check("a clip manifest is refused by the same rule and named as clips",
-          clips_message != "" and "clips" in clips_message, clips_message)
+          "not decoded bouts" in windows_message, windows_message)
+    check("a clip manifest is refused by the same rule",
+          "not decoded bouts" in clips_message, clips_message)
 
     thin = table(plant([("swim", 20), ("turn", 30)])).drop(columns=["n_covering_mean"])
     check("a bout table missing a required column is refused by name",
@@ -599,7 +583,7 @@ def test_the_report_says_these_are_predictions_and_points_at_the_confusion() -> 
         "accuracy": 0.83,
         "reliable": True,
     }}
-    report = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12,
+    report = analyse(frame, fps=100.0, min_bout_frames=12,
                      model_report=model, model_report_path="work/suggest_report.json")
     text = summarise(report)
 
@@ -619,7 +603,7 @@ def test_the_report_says_these_are_predictions_and_points_at_the_confusion() -> 
     check("the model's agreement score is carried beside it",
           abs(report["groups"][GROUP]["model"]["kappa"] - 0.61) < TOL)
 
-    silent = analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12)
+    silent = analyse(frame, fps=100.0, min_bout_frames=12)
     check("with no report beside the predictions the absence is stated",
           any("there is no suggest_report.json" in c for c in silent["caveats"]),
           f"got {silent['caveats']}")
@@ -632,33 +616,22 @@ def test_the_printed_summary_answers_the_four_questions() -> None:
                ("swim", 60)], track=0),
         plant([("turn", 25), ("stop", 35), ("turn", 45)], track=1, start=200),
     )
-    text = summarise(analyse(frame, fps=100.0, decode="min_bout", min_bout_frames=12))
+    text = summarise(analyse(frame, fps=100.0, min_bout_frames=12))
 
-    check("the printed form asks what follows what",
-          "what follows what" in text, text)
     check("a probability is printed beside its count",
           "turn 1.00 (2)" in text, text)
     check("a row denominator is printed",
           "n=2" in text, text)
-    check("the printed form asks how long each state lasts",
-          "how long each state lasts" in text, text)
     check("the dwell table names the complete, censored and dropped counts",
           "compl" in text and "cens" in text and "drop" in text)
-    check("durations are printed in frames and seconds",
-          " f  " in text and " s " in text, text)
+    check("the unit the durations are in is named",
+          "durations in seconds" in text, text)
     check("the evidence behind the counts is printed",
-          "pair(s) counted of" in text and "track-final bout(s)" in text, text)
-    check("the fitted chain is printed with the unit its lifetimes are in",
-          "the Markov chain fitted to those bouts   lifetimes in seconds" in text,
-          text)
-    check("the printed form asks how much of the record each state holds",
-          "how much of the record each state holds" in text, text)
+          "pairs counted" in text, text)
     check("the steady state is printed beside the share measured off the record",
-          "steady state" in text and "measured" in text, text)
-    check("the rates are printed with their unit",
-          "what follows what, and how fast   rates per second" in text, text)
+          "steady" in text and "measured" in text, text)
     check("an error bar says what it was resampled over",
-          "bootstrap resamples of the 2 track(s)" in text, text)
+          "track resamples" in text, text)
 
 
 def test_the_report_is_json_with_no_nan_in_it() -> None:
@@ -669,7 +642,7 @@ def test_the_report_is_json_with_no_nan_in_it() -> None:
         # statistic undefined.
         plant([("stop", 40)], track=9, start=500),
     )
-    report = analyse(frame, fps=None, decode="none")
+    report = analyse(frame, fps=None)
     text = json.dumps(report, indent=2, allow_nan=False)
 
     check("the whole report serialises without a NaN",
@@ -697,8 +670,6 @@ def test_a_project_is_measured_from_its_own_files(root) -> None:
     project = root / "measured"
     config_path = create_project(project)
     write_config(config_path, {
-        "predict.coverage": "dense",
-        "predict.decode": "min_bout",
         "predict.min_bout_frames": 12,
     })
     cfg = load_config(config_path)
@@ -721,8 +692,7 @@ def test_a_project_is_measured_from_its_own_files(root) -> None:
 
     report = compute(cfg)
     check("the decode settings are read from the config, not guessed",
-          report["source"]["decode"] == "min_bout"
-          and report["source"]["min_bout_frames"] == 12)
+          report["source"]["min_bout_frames"] == 12)
     check("the floor comes through to the dwell section",
           report["groups"][GROUP]["dwell"]["floor_frames"] == 12)
     check("the transitions are the planted ones",

@@ -35,6 +35,8 @@ def format_scalar(value: Any) -> str:
         value = str(value).replace("\\", "/")
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(format_scalar(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k}: {format_scalar(v)}" for k, v in value.items()) + "}"
     text = str(value)
     if text == "":
         return '""'

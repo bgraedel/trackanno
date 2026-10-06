@@ -1,0 +1,13 @@
+# trackanno preset. The keys under `set` are applied to the packaged
+# default_config.yaml, so a key not named here keeps its shipped value and the
+# comment that documents it.
+name: annotator
+order: 1
+summary: Detect, cut clips, label them by hand. No model beyond the detector.
+about: >
+  The annotation screen and nothing else. Detection cuts the clips, one keypress
+  labels each one, and export paints those labels back onto the movies. Boxes,
+  not keypoints: this is the rung for a plain detection model, and the two above
+  it want pose weights.
+set:
+  suggest.enabled: false

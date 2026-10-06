@@ -1,6 +1,6 @@
 """Entry point 3: burn labelled boxes back onto the original movie.
 
-    uv run render.py --movie <movie_id> [--group behaviour] [--source both]
+    trackanno render --movie <movie_id> [--group behaviour] [--source both]
 
 Reads the tracks table (original full-frame coordinates) and the annotation CSV,
 colours each track by the category of the clip covering that frame, and writes an
@@ -27,7 +27,6 @@ from ..annotate.clips import NORM_FILE, TRACKS_FILE
 from ..config import Config, load_config
 from ..video.movies import MovieSource, Normalizer, open_movie
 from .overlay import draw_detections, gray_to_rgb, hex_to_rgb
-from ..infer.predict import row_kind
 from ..annotate.store import MULTI_SEP
 
 SOURCES = ("labels", "predictions", "both")
@@ -82,16 +81,8 @@ def build_frame_marks(
     opinion appended to the caption; untouched tracks keep the dashed mark.
 
     TWO BOUTS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this function
-    raises if they do: a decode cuts a track's frames into runs between inferred
-    boundaries, so within one group bouts are disjoint by construction and a
-    collision means the decode or the file is wrong. WINDOW rows are not
-    guarded, because overlapping windows are a legitimate geometry -
-    ``predict.coverage: manifest`` with ``clips.stride`` below ``clips.frames``
-    gives one track consecutive clips that share frames on purpose - so they get
-    the labels pass's rule instead: whichever row comes later in the file wins
-    the shared frames.
-
-    Which of the two a file holds comes from :func:`trackanno.infer.predict.row_kind`.
+    raises if they do: within one group bouts are disjoint by construction, so a
+    collision means the decode or the file is wrong.
 
     A hand label landing on a frame a prediction already claimed is NOT a
     collision: it is what ``--source both`` is for, and the labels pass below
@@ -113,9 +104,6 @@ def build_frame_marks(
     out: dict[int, dict[int, Mark]] = {}
     if source in ("predictions", "both") and predictions is not None:
         column, conf_column = f"{group_name}_pred", f"{group_name}_conf"
-        # Bouts are disjoint by construction and windows need not be; see the
-        # docstring. Asked once, off the file, not once per row.
-        disjoint = row_kind(predictions).bouts
         # One entry per painted ROW, not per painted frame, so the guard below can
         # name the row it collided with without carrying a second frame-sized dict.
         claimed: dict[int, list[tuple[int, int, str]]] = {}
@@ -133,12 +121,11 @@ def build_frame_marks(
             f_start, f_end = int(row["f_start"]), int(row["f_end"])
             for frame in range(f_start, f_end):
                 marks = out.setdefault(frame, {})
-                if disjoint and track_id in marks:
+                if track_id in marks:
                     raise ValueError(_overlap_message(claimed, track_id, frame,
                                                       f_start, f_end, value))
                 marks[track_id] = mark
-            if disjoint:
-                claimed.setdefault(track_id, []).append((f_start, f_end, value))
+            claimed.setdefault(track_id, []).append((f_start, f_end, value))
 
     if source in ("labels", "both"):
         if group_name not in annotations.columns:
@@ -154,12 +141,9 @@ def build_frame_marks(
                 continue
             mark = Mark(colour_of(value), value, False)
             track_id = int(row["track_id"])
-            # No overlap guard on this pass, and the same last-writer-wins rule
-            # the predictions pass above gives a WINDOW: a hand label overwriting
-            # a prediction is what 'both' means, and two annotation rows
+            # No overlap guard on this pass: a hand label overwriting a
+            # prediction is what 'both' means, and two annotation rows
             # overlapping is what `clips.stride` below `clips.frames` asks for.
-            # Only a bout is guarded, because only a bout is disjoint by
-            # construction.
             for frame in range(int(row["f_start"]), int(row["f_end"])):
                 existing = out.get(frame, {}).get(track_id)
                 text = value
@@ -199,7 +183,7 @@ def _overlap_message(
         "exported with comes from the order the rows happen to sit in the file "
         "rather than from the model, so the movie would look entirely normal and "
         "be wrong. Either predictions.parquet was edited or concatenated from "
-        "two runs, or the decode itself is broken - re-run predict.py and, if it "
+        "two runs, or the decode itself is broken - re-run `trackanno predict` and, if it "
         "happens again, report it. Do not render this file as it stands"
     )
 
@@ -221,7 +205,6 @@ def render_movie(
     out_path: Path,
     hide_unlabelled: bool = False,
     max_frames: int | None = None,
-    write_tif: bool = False,
     reporter=None,
     predictions: pd.DataFrame | None = None,
     source: str = "labels",
@@ -238,7 +221,7 @@ def render_movie(
         Normalizer.load(norm_path) if norm_path.exists()
         else Normalizer.from_movie(movie, cfg.normalize)
     )
-    # A curve built with `prepare.py --limit-frames N` covers only N frames;
+    # A curve built with `trackanno prepare --limit-frames N` covers only N frames;
     # clamping past its end reuses frame N-1's mapping and jumps the brightness.
     if not normalizer.covers(n_frames):
         reporter.log(
@@ -258,13 +241,10 @@ def render_movie(
     fps = movie.fps if cfg.render.fps == "auto" else float(cfg.render.fps)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stack: list[np.ndarray] = []
-    writer = None
-    if not write_tif:
-        writer = imageio.get_writer(
-            str(out_path), fps=fps, codec=cfg.render.codec,
-            quality=cfg.render.quality, macro_block_size=1,
-        )
+    writer = imageio.get_writer(
+        str(out_path), fps=fps, codec=cfg.render.codec,
+        quality=cfg.render.quality, macro_block_size=1,
+    )
 
     try:
         for frame_idx in reporter.track(range(n_frames), f"{movie.id}  drawing", n_frames):
@@ -302,34 +282,15 @@ def render_movie(
                     show_skeleton=cfg.render.show_skeleton,
                     dashed=dashed,
                 )
-            if writer is not None:
-                writer.append_data(_pad_even(rgb))
-            else:
-                stack.append(rgb)
+            writer.append_data(_pad_even(rgb))
     finally:
-        if writer is not None:
-            writer.close()
-
-    if write_tif:
-        import tifffile
-
-        tifffile.imwrite(str(out_path), np.stack(stack, axis=0))
+        writer.close()
     return out_path
 
 
 # --------------------------------------------------------------------------- #
 # batch driver - shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
-def prediction_unit(predictions: pd.DataFrame) -> str:
-    """The noun the Export page counts rows in, from :func:`trackanno.infer.predict.row_kind`.
-
-    Two words for three kinds: a clip and a dense window are both a fixed span
-    the predictor was handed, and only a bout is a run between inferred
-    boundaries. A caller that needs the third distinction asks ``row_kind``.
-    """
-    return "predicted bouts" if row_kind(predictions).bouts else "predicted windows"
-
-
 def annotated_movies(cfg: Config) -> dict[str, int]:
     """{movie_id: annotated clip count}, straight from the CSV. Never raises: a
     throw on the GUI's project-open path, which startup repeats, would lock the
@@ -351,9 +312,8 @@ def render_all(
     cfg: Config,
     movie_ids: list[str] | None = None,
     group_name: str | None = None,
-    hide_unlabelled: bool = False,
+    hide_unlabelled: bool | None = None,
     max_frames: int | None = None,
-    write_tif: bool = False,
     out_path: Path | None = None,
     reporter=None,
     source: str = "labels",
@@ -362,7 +322,10 @@ def render_all(
 
     ``source`` is ``labels`` (the CSV, default), ``predictions`` or ``both``; a
     missing predictions file raises rather than rendering an empty overlay,
-    which looks exactly like "the model had no opinion"."""
+    which looks exactly like "the model had no opinion". ``hide_unlabelled``
+    None means ``cfg.render.hide_unlabelled``."""
+    if hide_unlabelled is None:
+        hide_unlabelled = cfg.render.hide_unlabelled
     from ..progress import Cancelled, NullReporter
 
     reporter = reporter or NullReporter()
@@ -403,7 +366,7 @@ def render_all(
     if unknown:
         raise ValueError(f"no annotations for {unknown}. Annotated movies: {available}")
 
-    suffix = ".tif" if write_tif else ".mp4"
+    suffix = ".mp4"
     # Provenance in the name: never overwrite or impersonate a hand-coloured one.
     tag = "" if source == "labels" else f"__{source}"
     written: list[Path] = []
@@ -432,12 +395,12 @@ def render_all(
             reporter.log(f"{movie_id}: {len(subset)} annotated clips -> {target}")
             if pred_subset is not None:
                 reporter.log(
-                    f"{movie_id}: {len(pred_subset)} {prediction_unit(pred_subset)}"
+                    f"{movie_id}: {len(pred_subset)} predicted bouts"
                 )
             render_movie(
                 cfg, movie, tracks, subset, group_name, target,
-                hide_unlabelled=hide_unlabelled or cfg.render.hide_unlabelled,
-                max_frames=max_frames, write_tif=write_tif, reporter=reporter,
+                hide_unlabelled=hide_unlabelled,
+                max_frames=max_frames, reporter=reporter,
                 predictions=pred_subset, source=source,
             )
             written.append(target)
@@ -456,7 +419,7 @@ def render_all(
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="render",
+        prog="trackanno render",
         description="Draw annotated bounding boxes onto the original movie.",
     )
     p.add_argument("--config", default=None, help="path to config.yaml")
@@ -467,10 +430,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="colour by your labels, the model's predictions, or both "
                         "(a prediction is drawn dashed, with its confidence)")
     p.add_argument("--out", default=None, help="output file (single movie only)")
-    p.add_argument("--hide-unlabelled", action="store_true",
-                   help="draw only tracks that carry an annotation")
+    p.add_argument("--hide-unlabelled", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="draw only tracks that carry an annotation "
+                        "(default: render.hide_unlabelled)")
     p.add_argument("--max-frames", type=int, default=None, help="stop after N frames")
-    p.add_argument("--tif", action="store_true", help="write a TIFF stack instead of mp4")
     p.add_argument("--list", action="store_true", help="list annotated movies and exit")
     return p
 
@@ -495,7 +459,6 @@ def main(argv: list[str] | None = None) -> int:
             cfg, args.movie, args.group,
             hide_unlabelled=args.hide_unlabelled,
             max_frames=args.max_frames,
-            write_tif=args.tif,
             out_path=Path(args.out) if args.out else None,
             reporter=ConsoleReporter(),
             source=args.source,

@@ -1,12 +1,10 @@
 """Clip-level features for the suggestion model.
 
-Two halves. **Kinematic** (~25 features from ``tracks.parquet``): the annotated
-categories are mostly *motion*, which no single frame shows, so speed,
-straightness, turn rate and beat frequency carry the signal. **CNN**
-(PCA-reduced ROI features): these encode individual identity almost perfectly,
-so a model can score well by recognising animals rather than behaviours. Fit the
-PCA on *per-instance* vectors, not on the handful of clip vectors, and judge the
-payoff by grouped cross-validation in :mod:`trackanno.learn.suggest`.
+**Kinematic** features from ``tracks.parquet`` (speed, straightness, turning,
+beat frequency), optional **context** over a longer centred span, and optional
+**embeddings** summarised from per-detection vectors
+(:mod:`trackanno.measure.embeddings`). Embeddings can re-identify individuals,
+so judge them by the grouped cross-validation in :mod:`trackanno.learn.suggest`.
 """
 
 from __future__ import annotations
@@ -19,18 +17,15 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
-from ..annotate.clips import FEATURES_FILE, MANIFEST_FILE, TRACKS_FILE
+from ..annotate.clips import MANIFEST_FILE, TRACKS_FILE
 from ..config import Config
+from . import embeddings as emb
 
-__all__ = ["build_clip_features", "grid_delta", "CLIP_FEATURES_FILE", "PCA_FILE"]
+__all__ = ["build_clip_features", "grid_delta", "window_features",
+           "CLIP_FEATURES_FILE", "CONTEXT_PREFIX"]
 
 CLIP_FEATURES_FILE = "clip_features.parquet"
-PCA_FILE = "feature_pca.joblib"
-# Clip-level CNN aggregate BEFORE any PCA, row-aligned with the parquet, so
-# cross-validation can refit PCA inside each fold. A PCA fitted on all movies has
-# seen the held-out movie's pixels, and between-movie variance is a dominant
-# axis, so that leak is first-order.
-CLIP_CNN_RAW_FILE = "clip_cnn_raw.npy"
+CONTEXT_PREFIX = "ctx_"
 
 # Rates are per SECOND everywhere, so movies acquired at different frame rates
 # stay comparable (ND2 files report their own fps; TIFF takes it from config).
@@ -166,8 +161,10 @@ def _beat_estimate(lateral: np.ndarray, fps: float) -> dict:
     n = sig.shape[0]
     t = np.arange(n)
     # Remove per-keypoint drift so slow body reorientation does not dominate.
-    for c in range(sig.shape[1]):
-        sig[:, c] -= np.polyval(np.polyfit(t, sig[:, c], 1), t)
+    # `polyfit` takes a 2-D y and fits each column independently, so this is one
+    # call for every keypoint.
+    slope, intercept = np.polyfit(t, sig, 1)
+    sig -= t[:, None] * slope + intercept
 
     # A flagellum that does not move has no beat, yet the argmax of an all-zero
     # spectrum returns a real-looking number. A DEGENERACY test, not a
@@ -322,7 +319,40 @@ def _body_frame_motion(px: np.ndarray, py: np.ndarray, dt: float = 1.0) -> dict:
 # --------------------------------------------------------------------------- #
 # per-track measurement
 # --------------------------------------------------------------------------- #
-def _beat_on_window(tdf: pd.DataFrame, cfg: Config, fps: float,
+class _KeypointGrid:
+    """One track's keypoints on its full frame grid, built once and sliced.
+
+    :func:`_on_grid` is a scatter with no interpolation, so a slice of the whole
+    track's grid equals the array a per-window call builds.
+    """
+
+    __slots__ = ("px", "py", "present", "first", "last")
+
+    def __init__(self, tdf: pd.DataFrame, n_keypoints: int):
+        frames = tdf["frame"].to_numpy(dtype=int)
+        self.first, self.last = int(frames.min()), int(frames.max()) + 1
+        n = self.last - self.first
+        kx = [f"kp_x_{k}" for k in range(n_keypoints)]
+        ky = [f"kp_y_{k}" for k in range(n_keypoints)]
+        self.px = _on_grid(tdf, kx, n, self.first)
+        self.py = _on_grid(tdf, ky, n, self.first)
+        # Which frames have a row. Not the same as which are finite: a row of
+        # all-NaN keypoints is still a row, and is measured.
+        self.present = np.zeros(n, dtype=bool)
+        self.present[frames - self.first] = True
+
+    @staticmethod
+    def maybe(tdf: pd.DataFrame, cfg: Config) -> "_KeypointGrid | None":
+        """The grid, or None on a detect project or a table without keypoints."""
+        if not cfg.is_pose:
+            return None
+        needed = [f"kp_{a}_{k}" for k in range(cfg.n_keypoints) for a in ("x", "y")]
+        if not all(c in tdf.columns for c in needed):
+            return None
+        return _KeypointGrid(tdf, cfg.n_keypoints)
+
+
+def _beat_on_window(grid: "_KeypointGrid | None", cfg: Config, fps: float,
                     f_start: int, f_end: int) -> dict:
     """Beat amplitude and frequency on a window CENTRED on the clip.
 
@@ -331,10 +361,9 @@ def _beat_on_window(tdf: pd.DataFrame, cfg: Config, fps: float,
     on the same window as the waveform series, or beat_freq_hz off 25 frames sits
     beside wave_freq_hz off 75 and one row carries two answers to one question.
     """
-    if not cfg.is_pose:
+    if grid is None:
         return {}
-    frames = tdf["frame"].to_numpy(dtype=int)
-    first, last = int(frames.min()), int(frames.max()) + 1
+    first, last = grid.first, grid.last
     span = int(cfg.spectral.window)
     centre = (int(f_start) + int(f_end)) // 2
     hi = min(max(centre + span // 2, first + span), last)
@@ -342,14 +371,10 @@ def _beat_on_window(tdf: pd.DataFrame, cfg: Config, fps: float,
     n = hi - lo
     if n < 8:
         return {}
-    sub = tdf[(tdf["frame"] >= lo) & (tdf["frame"] < hi)]
-    if sub.empty:
+    lo_i, hi_i = lo - first, hi - first
+    if not grid.present[lo_i:hi_i].any():
         return {}
-    kx = [f"kp_x_{k}" for k in range(cfg.n_keypoints)]
-    ky = [f"kp_y_{k}" for k in range(cfg.n_keypoints)]
-    if not all(c in sub.columns for c in kx + ky):
-        return {}
-    px, py = _on_grid(sub, kx, n, lo), _on_grid(sub, ky, n, lo)
+    px, py = grid.px[lo_i:hi_i], grid.py[lo_i:hi_i]
     motion = _body_frame_motion(px, py, 1.0 / max(fps, 1e-6))
     lateral = motion.pop("_lateral", None)
     # body_rotation_speed belongs to the clip, not the measurement window:
@@ -360,8 +385,37 @@ def _beat_on_window(tdf: pd.DataFrame, cfg: Config, fps: float,
     return out
 
 
+def _context_span(first: int, last: int, f_start: int, f_end: int, n: int
+                  ) -> tuple[int, int]:
+    """``n`` frames centred on the window, clipped to ``[first, last)``."""
+    centre = (int(f_start) + int(f_end)) // 2
+    hi = min(max(centre + n - n // 2, first + n), last)
+    lo = max(first, hi - n)
+    return lo, max(hi, lo + 1)
+
+
+_CONTEXT_CACHE: tuple[str, ...] | None = None
+
+
+def _context_keys() -> tuple[str, ...]:
+    """The kinematic trackseries features the context family repeats."""
+    global _CONTEXT_CACHE
+    if _CONTEXT_CACHE is None:
+        from . import trackseries
+
+        _CONTEXT_CACHE = tuple(k for k in trackseries.feature_names()
+                               if group_of(k) == "kinematic")
+    return _CONTEXT_CACHE
+
+
+def context_names() -> list[str]:
+    """Every column of the context family."""
+    return [CONTEXT_PREFIX + k for k in _context_keys()]
+
+
 def window_features(
-    tdf: pd.DataFrame, cfg: Config, fps: float, windows: Sequence[tuple[int, int]]
+    tdf: pd.DataFrame, cfg: Config, fps: float, windows: Sequence[tuple[int, int]],
+    codes: dict[str, np.ndarray] | None = None,
 ) -> list[dict]:
     """Features for several windows of ONE track, measured once over the track.
 
@@ -381,10 +435,16 @@ def window_features(
     `beat_*` block is not: :func:`_beat_on_window` pays a fresh mask over the
     whole track and a fresh FFT per window, so cost is linear in the window
     count over a substantial constant. See docs/prediction.md for the timings.
+
+    ``tdf`` must be sorted by frame. ``codes`` maps an embedding name to PCA
+    codes row-aligned with ``tdf``; each window gets their summary. With
+    ``suggest.context_frames`` set, each window also gets the ``ctx_`` family.
     """
     from . import trackseries, wavespectra
 
     frames = tdf["frame"].to_numpy(dtype=int)
+    first, last = int(frames.min()), int(frames.max()) + 1
+    n_context = int(cfg.suggest.context_frames)
     lo = min(int(frames.min()), min(int(w[0]) for w in windows))
     hi = max(int(frames.max()) + 1, max(int(w[1]) for w in windows))
     series = trackseries.build_series(tdf, cfg, fps, lo, hi - lo)
@@ -394,18 +454,34 @@ def window_features(
         spectra = wavespectra.track_spectral_series(
             tdf, cfg.n_keypoints, fps,
             window=cfg.spectral.window, hop=cfg.spectral.hop,
+            flow_frames=cfg.spectral.flow_frames,
         )
+
+    # Both hold the per-track work; the loop below only slices them.
+    grid = _KeypointGrid.maybe(tdf, cfg)
+    waves = wavespectra.WindowSource(spectra) if spectra is not None else None
 
     rows = []
     for f_start, f_end in windows:
         entry = trackseries.aggregate_window(series, int(f_start), int(f_end), fps, cfg)
-        entry.update(_beat_on_window(tdf, cfg, fps, int(f_start), int(f_end)))
-        if spectra is not None and len(spectra):
-            entry.update(wavespectra.window_values(spectra, int(f_start), int(f_end)))
+        entry.update(_beat_on_window(grid, cfg, fps, int(f_start), int(f_end)))
+        if waves is not None and len(spectra):
+            entry.update(waves.at(int(f_start), int(f_end)))
         # One schema whatever the task or the data: a detect project, or a track
         # too short to transform, still produces the same columns.
         for key in feature_schema():
             entry.setdefault(key, np.nan)
+        if n_context > 0:
+            c_lo, c_hi = _context_span(first, last, int(f_start), int(f_end), n_context)
+            context = trackseries.aggregate_window(series, c_lo, c_hi, fps, cfg)
+            entry.update({CONTEXT_PREFIX + k: context.get(k, np.nan)
+                          for k in _context_keys()})
+        if codes:
+            sel = (frames >= int(f_start)) & (frames < int(f_end))
+            offsets = frames[sel] - int(f_start)
+            for name, values in codes.items():
+                entry.update(emb.summarise(
+                    name, values[sel], offsets, int(f_end) - int(f_start)))
         rows.append(entry)
     return rows
 
@@ -413,80 +489,64 @@ def window_features(
 # --------------------------------------------------------------------------- #
 # build
 # --------------------------------------------------------------------------- #
-def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.DataFrame:
-    """Compute (and cache) one feature row per clip across every prepared movie."""
+def movie_codes(cfg: Config, movie_dir: Path, tracks: pd.DataFrame, embeddings: dict
+                ) -> dict[str, np.ndarray]:
+    """PCA codes row-aligned with ``tracks``, for ``{name: (spec, pca)}``."""
+    return {
+        name: emb.to_codes(pca, emb.detection_vectors(cfg, spec, movie_dir, tracks),
+                           name, movie_dir.name)
+        for name, (spec, pca) in embeddings.items()
+    }
+
+
+def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
+                        write: bool = True) -> pd.DataFrame:
+    """Compute (and cache) one feature row per clip across every prepared movie.
+
+    Fits one PCA per declared embedding over every detection and summarises each
+    clip. With ``write`` the table and the bases are saved; the table is stamped
+    with the basis hashes and ``context_frames`` it was built with.
+    """
     from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir
     movie_dirs = sorted(p for p in work.iterdir() if p.is_dir() and (p / MANIFEST_FILE).exists())
     if not movie_dirs:
-        raise FileNotFoundError(f"no prepared movies under {work}; run prepare.py first")
+        raise FileNotFoundError(f"no prepared movies under {work}; run `trackanno prepare` first")
 
-    manifests, tracks_by_movie, feats_by_movie = [], {}, {}
+    manifests, tracks_by_movie = [], {}
     for d in movie_dirs:
         man = pd.read_parquet(d / MANIFEST_FILE)
         if man.empty:
             continue
         manifests.append(man)
-        tracks_by_movie[d.name] = pd.read_parquet(d / TRACKS_FILE)
-        fpath = d / FEATURES_FILE
-        feats_by_movie[d.name] = np.load(fpath) if fpath.exists() else None
+        tracks_by_movie[d.name] = pd.read_parquet(d / TRACKS_FILE).reset_index(drop=True)
 
     manifest = pd.concat(manifests, ignore_index=True)
 
-    # -- PCA on per-instance vectors, pooled across movies -------------------- #
-    pca, dim = None, 0
-    usable = {k: v for k, v in feats_by_movie.items() if v is not None}
-    if usable:
-        # The CNN vector's width follows the model's channel widths (1920-d for
-        # an x-model, 448-d for a nano); numpy's own error on concatenating two
-        # widths names neither the movie nor the model. Say it properly.
-        widths = {k: int(v.shape[1]) for k, v in usable.items()}
-        if len(set(widths.values())) > 1:
-            by_width: dict[int, list[str]] = {}
-            for movie_id, width in sorted(widths.items()):
-                by_width.setdefault(width, []).append(movie_id)
-            detail = "\n".join(
-                f"    {width:>5}-d : {', '.join(ids)}" for width, ids in sorted(by_width.items())
-            )
-            raise RuntimeError(
-                "these movies were prepared with different detection models, so their "
-                f"CNN features cannot be pooled:\n{detail}\n"
-                "The vector width follows the model's channel widths. Re-prepare every "
-                "movie with the same weights (Detect & crop, with 'redo' ticked), or set "
-                "features.enabled: false to use the kinematic features alone."
-            )
-        stacked = np.concatenate([v for v in usable.values()], axis=0).astype(np.float32)
-        n_comp = int(min(cfg.suggest.pca_components, stacked.shape[0], stacked.shape[1]))
-        if n_comp >= 2:
-            from sklearn.decomposition import PCA
-
-            pca = PCA(n_components=n_comp, random_state=cfg.suggest.seed)
-            pca.fit(stacked)
-            dim = n_comp
-            var = float(pca.explained_variance_ratio_.sum())
-            message = (
-                f"PCA: {stacked.shape[0]} instance vectors x {stacked.shape[1]}-d "
-                f"-> {n_comp} comps ({var:.1%} variance)"
-            )
-            reporter.log(message)
-            if verbose:
-                print(f"  {message}")
-        del stacked
+    specs = emb.active(cfg)
+    bases = emb.fit_bases(cfg, {
+        spec.name: {
+            movie_id: (len(tracks), lambda s=spec, m=movie_id, t=tracks:
+                       emb.detection_vectors(cfg, s, work / m, t))
+            for movie_id, tracks in tracks_by_movie.items()
+        }
+        for spec in specs
+    }, reporter)
+    inputs = {spec.name: (spec, bases[spec.name]) for spec in specs}
 
     rows: list[dict] = []
-    raw_rows: list[np.ndarray | None] = []
     reporter.stage("clip features", len(manifest))
     for movie_id, man in manifest.groupby("movie_id", sort=True):
         tracks = tracks_by_movie[movie_id]
-        feats = feats_by_movie.get(movie_id)
+        # One movie's codes at a time.
+        codes = movie_codes(cfg, work / movie_id, tracks, inputs)
         fps = float(json.loads((work / movie_id / "cache.json").read_text())["movie"]["fps"])
         by_track = {t: df for t, df in tracks.groupby("track_id", sort=False)}
 
-        # Grouped by TRACK, not walked clip by clip: the series and the sliding
-        # transform are built once per track and each window is a slice, so
-        # overlapping windows (the dense grid, any stride < frames) are free.
+        # Grouped by TRACK: the series and the sliding transform are built once
+        # per track and each window is a slice.
         by_spec: dict[int, list] = {}
         for spec in man.itertuples(index=False):
             by_spec.setdefault(int(spec.track_id), []).append(spec)
@@ -497,19 +557,17 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
             if tdf is None:
                 reporter.advance(len(specs))
                 continue
-            # Sort rather than trust parquet order: nothing asserts it is
-            # frame-major, and the CNN delta below is order-dependent.
             tdf = tdf.sort_values("frame")
+            frames = tdf["frame"].to_numpy(dtype=int)
+            rows_idx = tdf.index.to_numpy()
             windows = [(int(s.f_start), int(s.f_end)) for s in specs]
-            measured = window_features(tdf, cfg, fps, windows)
+            measured = window_features(
+                tdf, cfg, fps, windows, {n: c[rows_idx] for n, c in codes.items()})
 
             for spec, features in zip(specs, measured):
                 reporter.advance()
-                mask = (tdf["frame"] >= spec.f_start) & (tdf["frame"] < spec.f_end)
-                sub = tdf[mask]
-                if sub.empty:
+                if not ((frames >= spec.f_start) & (frames < spec.f_end)).any():
                     continue
-
                 entry = {
                     "clip_id": spec.clip_id,
                     "movie_id": movie_id,
@@ -517,67 +575,26 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
                     "f_start": int(spec.f_start),
                 }
                 entry.update(features)
-
-                if pca is not None and feats is not None:
-                    rows_idx = sub.index.to_numpy()
-                    # instance_features.npy is row-aligned with tracks.parquet.
-                    # Assert it rather than trust it: these vectors re-identify
-                    # individuals almost perfectly, so a mis-pairing shows up not
-                    # as lower accuracy but as a model that tests well and fails
-                    # later.
-                    if len(feats) != len(tracks) or rows_idx.max(initial=0) >= len(feats):
-                        raise RuntimeError(
-                            f"{movie_id}: instance_features.npy has {len(feats)} rows but "
-                            f"tracks.parquet has {len(tracks)}; features are not row-aligned"
-                        )
-                    block = feats[rows_idx].astype(np.float32)
-                    codes = pca.transform(block)
-                    entry.update({f"cnn{i}_mean": float(v) for i, v in enumerate(codes.mean(axis=0))})
-                    entry.update({f"cnn{i}_std": float(v) for i, v in enumerate(codes.std(axis=0))})
-
-                    # Frame-to-frame change on the frame grid. `grid_delta` is
-                    # shared with the dense table so the two cannot drift.
-                    span = int(spec.f_end - spec.f_start)
-                    offsets = sub["frame"].to_numpy(dtype=int) - int(spec.f_start)
-                    inside = (offsets >= 0) & (offsets < span)
-                    delta = grid_delta(codes[inside], offsets[inside], span)
-                    entry.update({f"cnn{i}_delta": float(v) for i, v in enumerate(delta)})
-
-                    # Same aggregation, un-reduced, for fold-wise PCA at CV time.
-                    raw_delta = grid_delta(
-                        block[inside], offsets[inside], span
-                    ).astype(np.float32)
-                    raw_rows.append(
-                        np.concatenate([block.mean(axis=0), block.std(axis=0), raw_delta])
-                    )
-                elif pca is not None:
-                    raw_rows.append(None)
                 rows.append(entry)
 
     out = pd.DataFrame(rows)
     if out.empty:
         raise RuntimeError("no clip features could be built")
-    # Keep NaN: it means "undefined", and both HistGradientBoosting and CatBoost
-    # handle it natively. See `_safe`.
+    # NaN means "undefined"; both HistGradientBoosting and CatBoost handle it.
     out = out.replace([np.inf, -np.inf], np.nan)
-    # Stamped into the table, not kept beside it, so a copy, move or partial sync
-    # cannot separate the version from the data it describes.
     out["_feature_version"] = FEATURE_VERSION
-    out.to_parquet(work / CLIP_FEATURES_FILE, index=False)
-    if pca is not None:
-        import joblib
+    out["_context_frames"] = int(cfg.suggest.context_frames)
+    out["_embedding_basis"] = json.dumps(
+        {n: emb.basis_hash(p) for n, p in bases.items()}, sort_keys=True)
+    if write:
+        out.to_parquet(work / CLIP_FEATURES_FILE, index=False)
+        emb.save_bases(work / emb.BASES_FILE, bases)
 
-        joblib.dump(pca, work / PCA_FILE)
-        if raw_rows and len(raw_rows) == len(out) and all(r is not None for r in raw_rows):
-            np.save(work / CLIP_CNN_RAW_FILE, np.stack(raw_rows).astype(np.float32))
-        else:
-            (work / CLIP_CNN_RAW_FILE).unlink(missing_ok=True)
-    else:
-        (work / CLIP_CNN_RAW_FILE).unlink(missing_ok=True)
-
-    n_kin = len([c for c in out.columns if not c.startswith("cnn")]) - 4
-    n_cnn = len([c for c in out.columns if c.startswith("cnn")])
-    summary = f"{len(out)} clips x {n_kin} kinematic + {n_cnn} CNN features -> {CLIP_FEATURES_FILE}"
+    n_emb = len([c for c in out.columns if c.startswith("emb_")])
+    n_ctx = len([c for c in out.columns if c.startswith(CONTEXT_PREFIX)])
+    n_kin = len([c for c in out.columns if c not in META_COLUMNS]) - n_emb - n_ctx
+    summary = (f"{len(out)} clips x {n_kin} kinematic + {n_ctx} context + "
+               f"{n_emb} embedding features -> {CLIP_FEATURES_FILE}")
     reporter.log(summary)
     if verbose:
         print(f"  {summary}")
@@ -595,14 +612,21 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None) -> pd.
 #    rates; rotation-invariant shape_*; circular static mode as cos/sin
 # 3  censored windows excluded from wave_freq_drift_hz / wave_freq_track_sd_hz;
 #    tip_angular_speed no longer bridges gaps
-FEATURE_VERSION = 3
+# 4  wave_flow, wave_flow_coherence, wave_flow_direction: the wave direction
+#    from the phase gradient over `spectral.flow_frames`, needing no resolvable
+#    beat. Added beside the spectral direction, which is unchanged
+# 5  cnn* replaced by emb_<name>_* from one project-wide PCA per embedding;
+#    optional ctx_* context family
+FEATURE_VERSION = 5
 
 # Carried in the table, never fed to a model: `n_windows` and `centre_offset`
 # describe HOW the series was read out, not the cell, so a model given them
-# learns the readout grid.
+# learns the readout grid. `f_end`, `n_present` and `skip_reason` say where a
+# dense window sits and what could be measured in it, and `skip_reason` is a
+# string, so a caller taking "every feature column" must not be handed them.
 META_COLUMNS = (
-    "clip_id", "movie_id", "track_id", "f_start", "_row",
-    "_feature_version", "n_windows", "centre_offset",
+    "clip_id", "movie_id", "track_id", "f_start", "f_end",
+    "_feature_version", "_context_frames", "_embedding_basis", "n_windows", "centre_offset", "n_present", "skip_reason",
 )
 
 # `needs` lets the GUI say WHY a group is unavailable rather than leaving it off.
@@ -636,14 +660,12 @@ FEATURE_GROUPS: dict[str, dict] = {
                  "profiles, and the wavelength. Needs keypoints.",
         "prefixes": ("wave_",),
     },
-    "cnn": {
-        "needs": "features",
-        "label": "CNN appearance",
-        "about": "PCA of per-detection embeddings from the detector's own "
-                 "forward pass. Powerful, but they re-identify individuals "
-                 "almost perfectly, so they reward memorising animals rather "
-                 "than learning behaviour. Needs features.enabled.",
-        "prefixes": ("cnn",),
+    "context": {
+        "needs": "context",
+        "label": "longer context",
+        "about": "The trajectory and box features again, over "
+                 "suggest.context_frames centred on the window.",
+        "prefixes": (CONTEXT_PREFIX,),
     },
 }
 
@@ -652,6 +674,9 @@ def group_of(column: str) -> str | None:
     """Which feature group a column belongs to, or None if it is metadata."""
     if column in META_COLUMNS:
         return None
+    match = emb.EMBEDDING_COLUMN.match(column)
+    if match:
+        return f"emb_{match['name']}"
     for name, spec in FEATURE_GROUPS.items():
         if any(column.startswith(p) for p in spec["prefixes"]):
             return name
@@ -665,19 +690,37 @@ def available_groups(cfg: Config) -> dict[str, str]:
         need = spec["needs"]
         if need == "pose" and not cfg.is_pose:
             out[name] = "needs detection.task: pose"
-        elif need == "features" and not cfg.features.enabled:
-            out[name] = "needs features.enabled: true"
+        elif need == "context" and int(cfg.suggest.context_frames) <= 0:
+            out[name] = "needs suggest.context_frames above 0"
         else:
             out[name] = ""
+    for spec in cfg.suggest.embeddings:
+        out[spec.group] = ("needs features.enabled: true"
+                           if spec.source == "detector" and not cfg.features.enabled
+                           else "")
     return out
+
+
+def known_columns(cfg: Config | None = None) -> list[str]:
+    """Every column a built feature table could hold, without reading one.
+
+    Without ``cfg`` the context family is included. Embedding columns are an
+    upper bound: the PCA may keep fewer than ``suggest.pca_components``.
+    """
+    columns = list(feature_schema())
+    if cfg is None or int(cfg.suggest.context_frames) > 0:
+        columns += context_names()
+    if cfg is not None:
+        for spec in cfg.suggest.embeddings:
+            columns += emb.column_names(spec.name, cfg.suggest.pca_components)
+    return columns
 
 
 def feature_columns(frame: pd.DataFrame, groups=None) -> list[str]:
     """The model's input columns, optionally restricted to certain groups.
 
-    Restricting is a modelling decision, not tidiness: the CNN columns
-    fingerprint individuals, so a project wanting a behaviour model rather than a
-    re-identification one may want them out entirely.
+    Restricting is a modelling decision: embedding columns can fingerprint
+    individuals, so a behaviour model may want them out.
     """
     columns = [c for c in frame.columns if c not in META_COLUMNS]
     if groups is None:

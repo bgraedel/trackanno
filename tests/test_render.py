@@ -1,25 +1,14 @@
 """What the renderer refuses to paint, and what it is happy to paint over.
 
 ``build_frame_marks`` collapses rows spanning frames into one mark per (frame,
-track), so anything that lands on a frame twice has to have a rule. There are
-four different rules here and they are easy to mistake for one another:
+track), so anything that lands on a frame twice has to have a rule:
 
 * two BOUTS on one frame is a broken upstream invariant and raises - a decode
   cuts a track's frames into disjoint runs, so no setting can ask for it;
-* two prediction WINDOWS on one frame is a geometry, not a fault:
-  ``predict.coverage: manifest`` scores the annotation clips themselves, and
-  ``clips.stride`` below ``clips.frames`` makes consecutive clips of a track
-  share frames on purpose;
 * a hand label on a frame a prediction claims is what ``--source both`` IS, and
   must keep working;
-* two ANNOTATION rows on one frame is the same overlapping clip grid seen from
-  the labels side, and must keep working too.
-
-Only the first is an error, and the point of this suite is that the other three
-never become one. The guard used to fire on all prediction rows alike, which
-made every movie of a manifest-coverage project over an overlapping clip grid
-fail to render - the file permitted and refused identical geometry in two
-adjacent loops.
+* two ANNOTATION rows on one frame is an overlapping clip grid, and must keep
+  working too.
 """
 
 from __future__ import annotations
@@ -44,18 +33,11 @@ def cfg(root: Path):
     return load_config(create_project(Path(root) / "render"))
 
 
-def _prediction(track_id: int, f_start: int, f_end: int, value: str, conf: float = 0.9):
-    """A row off a GRID: a dense window, or under manifest coverage a clip."""
-    return {"movie_id": MOVIE, "track_id": track_id, "f_start": f_start,
-            "f_end": f_end, f"{GROUP}_pred": value, f"{GROUP}_conf": conf}
-
-
 def _bout(track_id: int, f_start: int, f_end: int, value: str, conf: float = 0.9):
-    """A row a DECODE produced. ``bout_id`` is what says so, and it is what the
-    renderer probes: the file has to answer this, because ``predict.decode`` can
-    be edited after the run that wrote it."""
-    return dict(_prediction(track_id, f_start, f_end, value, conf),
-                bout_id=f"{MOVIE}__t{track_id:04d}__f{f_start:06d}-{f_end:06d}")
+    """A row the decode produced."""
+    return {"movie_id": MOVIE, "track_id": track_id, "f_start": f_start,
+            "f_end": f_end, f"{GROUP}_pred": value, f"{GROUP}_conf": conf,
+            "bout_id": f"{MOVIE}__t{track_id:04d}__f{f_start:06d}-{f_end:06d}"}
 
 
 def _label(track_id: int, f_start: int, f_end: int, value: str):
@@ -109,52 +91,6 @@ def test_two_decoded_bouts_on_one_frame_stop_the_render(cfg) -> None:
         check("...on the 'both' path too", True)
 
 
-def test_manifest_predictions_that_share_frames_render_rather_than_raising(cfg) -> None:
-    """The same overlap the labels pass calls a configuration, one loop earlier.
-
-    ``predict.coverage: manifest`` writes one prediction row per ANNOTATION clip,
-    so a project whose ``clips.stride`` is below ``clips.frames`` has consecutive
-    clips of a track sharing frames - by construction, not by accident. Guarding
-    that raised inside ``render_movie``, which ``render_all`` catches per movie
-    and logs as FAILED, so every movie of such a project produced no file at all.
-
-    Nothing in ``predictions.parquet`` can say a window came off the annotation
-    grid rather than the dense one - a dense window's ``clip_id`` is deliberately
-    formed to collide with an annotation clip's - so the rule for windows is the
-    labels pass's rule: the later row wins.
-    """
-    from trackanno.view.render import build_frame_marks
-
-    # clips.frames 50, clips.stride 25: the second clip of the track starts
-    # halfway through the first, exactly as the clip cutter laid them out.
-    predictions = pd.DataFrame([
-        _prediction(3, 0, 50, "swimming"),
-        _prediction(3, 25, 75, "immotile"),
-        _prediction(3, 50, 100, "swimming"),
-    ])
-    marks = build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
-
-    check("overlapping window rows paint instead of stopping the render",
-          len(marks) == 100, str(len(marks)))
-    check("...the frames only the first clip covers keep its answer",
-          marks[10][3].text.startswith("~swimming"), marks[10][3].text)
-    check("...the shared frames go to the later row, as the labels pass does",
-          marks[30][3].text.startswith("~immotile"), marks[30][3].text)
-    check("...and the last clip's own frames are its own",
-          marks[80][3].text.startswith("~swimming"), marks[80][3].text)
-    check("they are still drawn dashed, so an overlap resolved this way can "
-          "never read as a hand label", marks[30][3].predicted)
-
-    # The guard is a property of the ROW KIND, not of the geometry: the very same
-    # spans carrying a bout_id are refused.
-    as_bouts = pd.DataFrame([_bout(3, 0, 50, "swimming"), _bout(3, 25, 75, "immotile")])
-    try:
-        build_frame_marks(pd.DataFrame(), as_bouts, cfg, GROUP, "predictions")
-        check("...while the identical spans as bouts still raise", False, "it painted them")
-    except ValueError:
-        check("...while the identical spans as bouts still raise", True)
-
-
 def test_disjoint_bouts_paint_without_complaint(cfg) -> None:
     """The guard defends disjointness, not equal length.
 
@@ -165,10 +101,10 @@ def test_disjoint_bouts_paint_without_complaint(cfg) -> None:
     from trackanno.view.render import build_frame_marks
 
     predictions = pd.DataFrame([
-        _prediction(3, 0, 137, "swimming"),
-        _prediction(3, 137, 300, "immotile"),
-        _prediction(3, 300, 412, "swimming"),
-        _prediction(4, 50, 412, "unclear"),        # another track, same frames
+        _bout(3, 0, 137, "swimming"),
+        _bout(3, 137, 300, "immotile"),
+        _bout(3, 300, 412, "swimming"),
+        _bout(4, 50, 412, "unclear"),        # another track, same frames
     ])
     marks = build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
 
@@ -193,7 +129,7 @@ def test_a_hand_label_over_a_prediction_is_not_a_collision(cfg) -> None:
     from trackanno.view.render import build_frame_marks
 
     labels = pd.DataFrame([_label(3, 100, 150, "swimming")])
-    predictions = pd.DataFrame([_prediction(3, 100, 150, "immotile", 0.73)])
+    predictions = pd.DataFrame([_bout(3, 100, 150, "immotile", 0.73)])
 
     marks = build_frame_marks(labels, predictions, cfg, GROUP, "both")
     mark = marks[120][3]
@@ -222,22 +158,40 @@ def test_overlapping_annotations_are_a_configuration_not_a_fault(cfg) -> None:
           marks[130][3].text == "immotile", marks[130][3].text)
 
 
-def test_a_prediction_row_is_counted_as_what_it_is(cfg) -> None:
-    """Calling a prediction row a clip was true of neither kind of row.
+def test_hide_unlabelled_argument_overrides_the_config(root: Path, monkeypatch) -> None:
+    """An explicit False must turn off ``render.hide_unlabelled``; None follows it."""
+    from trackanno.annotate.clips import TRACKS_FILE
+    from trackanno.config import load_config
+    from trackanno.project import create_project
+    from trackanno.view import render
 
-    A dense row is a window off the predictor's own grid; a decoded row is a
-    bout. The count is read off the FILE and not off ``predict.decode``, so
-    editing the config after a run cannot make the Export page describe a run
-    that has not happened yet.
-    """
-    from trackanno.view.render import prediction_unit
+    cfg = load_config(create_project(Path(root) / "render_hide"))
+    cfg.render.hide_unlabelled = True
+    cfg.paths.csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([_label(3, 0, 10, "swimming")]).to_csv(cfg.paths.csv, index=False)
+    cfg.movie_dir(MOVIE).mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"track_id": [3]}).to_parquet(cfg.movie_dir(MOVIE) / TRACKS_FILE)
 
-    windows = pd.DataFrame([_prediction(3, 0, 50, "swimming")])
-    check("a row off a grid is a window", prediction_unit(windows) == "predicted windows",
-          prediction_unit(windows))
+    seen: list = []
 
-    bouts = windows.assign(bout_id=[f"{MOVIE}__t0003__f000000-000050"])
-    check("a row carrying a bout_id is a bout", prediction_unit(bouts) == "predicted bouts",
-          prediction_unit(bouts))
-    check("neither is called a clip",
-          "clip" not in prediction_unit(windows) and "clip" not in prediction_unit(bouts))
+    class _Movie:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(render, "open_movie", lambda *a, **k: _Movie())
+    monkeypatch.setattr(render, "render_movie",
+                        lambda *a, **k: seen.append(k["hide_unlabelled"]))
+    for given in (None, False, True):
+        render.render_all(cfg, [MOVIE], GROUP, hide_unlabelled=given)
+    check("None follows the config, an explicit value wins",
+          seen == [True, False, True], str(seen))
+
+    # The CLI: no flag means the config value.
+    args: list = []
+    monkeypatch.setattr(render, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(render, "render_all",
+                        lambda *a, **k: args.append(k["hide_unlabelled"]))
+    for argv in ([], ["--no-hide-unlabelled"], ["--hide-unlabelled"]):
+        render.main(argv)
+    check("the CLI passes None when the flag is absent",
+          args == [None, False, True], str(args))

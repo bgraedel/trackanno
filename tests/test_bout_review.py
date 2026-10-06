@@ -1,21 +1,9 @@
 """Looking at what a decode produced, without being lied to by the picture.
 
 A bout is a claim about WHEN an animal changed what it was doing, and a timeline
-is the only shape that claim can be checked in. That makes the drawing itself
-load-bearing in a way a bar chart of counts is not: an edge drawn as a hairline
-asserts a frame-accurate boundary, a fixed grid window drawn on a frame axis
-looks exactly like a bout with suspiciously round numbers, and a bout sitting on
-frames a person already labelled looks like the model agreeing with them.
+is the only shape that claim can be checked in. The checks here:
 
-So the checks here are about what the widget refuses to imply, not about whether
-it renders. Four of them matter:
-
-* the file decides what a row IS - ``bout_id``, never ``predict.decode``, which
-  describes the run somebody is about to do;
-* a boundary carries the stride's error band, and the stride is MEASURED off the
-  window grid on disk rather than read out of the config;
-* the bar height is the mean of the per-frame posterior, and the two are checked
-  against each other on a real decode;
+* the file decides what a row IS - ``bout_id``, never the config;
 * a track with no rows, a file of the older kind and a project with no
   predictions at all are three normal states, each with a sentence.
 
@@ -61,7 +49,7 @@ def ink(frame: np.ndarray) -> int:
     return int(len(flat) - counts.max())
 
 
-def bout_row(f_start, f_end, label, conf, human=0.0, covering=5.0, reason="",
+def bout_row(f_start, f_end, label, conf, reason="",
              movie="m", track=1, group=GROUP, groups=(GROUP,)) -> dict:
     """One row of the bout schema :func:`trackanno.infer.predict._bout_predictions`
     writes, including the columns of every OTHER group left empty - that shape
@@ -71,8 +59,7 @@ def bout_row(f_start, f_end, label, conf, human=0.0, covering=5.0, reason="",
         "bout_id": f"{movie}__t{track:04d}__f{f_start:06d}-{f_end:06d}",
         "movie_id": movie, "track_id": track,
         "f_start": f_start, "f_end": f_end, "n_frames": f_end - f_start,
-        "group": group, "n_covering_mean": covering, "skip_reason": reason,
-        "human_overlap_frac": human, "human_labelled": human > 0.0,
+        "group": group, "skip_reason": reason,
     }
     for other in groups:
         row[f"{other}_pred"] = label if other == group else ""
@@ -89,19 +76,34 @@ def synthetic(root):
     worth reading, including the ones a happy path never produces."""
     from test_predict import build_case
 
+    cfg, _ = build_case(root, "review-synthetic")
+    write_bouts(cfg, [
+        bout_row(0, 120, "swimming", 0.91),
+        bout_row(120, 160, "immotile", 0.42),          # marginal
+        bout_row(160, 180, "", np.nan,
+                 reason="no window over frames 160-180 could be featurised"),
+        bout_row(180, 300, "swimming", 0.77),
+    ])
+    return cfg
+
+
+def write_bouts(cfg, rows) -> None:
+    """Put a hand-built bout table where the review reads predictions."""
     from trackanno.infer.predict import PREDICTIONS_FILE
 
-    cfg, _ = build_case(root, "review-synthetic")
-    rows = [
-        bout_row(0, 120, "swimming", 0.91, human=0.0),
-        bout_row(120, 160, "immotile", 0.42, human=0.0),          # marginal
-        bout_row(160, 180, "", np.nan, covering=0.0,
-                 reason="no window over frames 160-180 could be featurised"),
-        bout_row(180, 300, "swimming", 0.77, human=0.35, covering=1.4),
-    ]
     pd.DataFrame(rows).to_parquet(
         cfg.paths.work_dir / PREDICTIONS_FILE, index=False)
-    return cfg
+
+
+def first_movie_bouts(cfg) -> list[dict]:
+    """A few bouts on the first prepared movie's first track."""
+    from trackanno.annotate.clips import TRACKS_FILE
+
+    movie = next(p for p in sorted(cfg.paths.work_dir.iterdir())
+                 if p.is_dir() and (p / TRACKS_FILE).exists())
+    track = int(pd.read_parquet(movie / TRACKS_FILE)["track_id"].min())
+    return [bout_row(0, 40, "swimming", 0.9, movie=movie.name, track=track),
+            bout_row(40, 100, "immotile", 0.6, movie=movie.name, track=track)]
 
 
 def test_the_reader_maps_every_column_a_bout_carries(synthetic) -> None:
@@ -111,9 +113,6 @@ def test_the_reader_maps_every_column_a_bout_carries(synthetic) -> None:
 
     reader = PredictionReader(synthetic)
     check("the file opens", reader.problem == "", reader.problem)
-    check("a bout_id column makes these bouts", reader.bouts)
-    check("...and the noun comes from render.prediction_unit, not from here",
-          reader.unit == "predicted bouts", reader.unit)
     check("the predicted group is found from its _pred column",
           reader.groups == [GROUP], str(reader.groups))
 
@@ -139,57 +138,6 @@ def test_the_reader_maps_every_column_a_bout_carries(synthetic) -> None:
     check("...and it keeps the skip_reason that says why",
           "could be featurised" in gap.skip_reason, gap.skip_reason)
 
-    check("human_overlap_frac survives as a fraction, not as a flag",
-          abs(lane[3].human_frac - 0.35) < 1e-9, str(lane[3].human_frac))
-    check("and so does how many windows spoke for the frames",
-          abs(lane[3].n_covering - 1.4) < 1e-9, str(lane[3].n_covering))
-
-
-def test_the_caption_says_what_the_picture_cannot(synthetic) -> None:
-    """Each sentence is a fact about THESE rows.
-
-    A caption that appeared whatever the data said would be decoration, and a
-    paragraph explaining what a bar IS is exactly that: true of every track, so
-    it takes room from the picture on all of them. That half lives behind the
-    panel's `?` instead, and what is left here is conditional.
-    """
-    from trackanno.gui.timeline import (
-        REVIEW_HELP, PredictionReader, caption_lines,
-    )
-
-    reader = PredictionReader(synthetic)
-    track = reader.track("m", 1)
-    lines = caption_lines(track, reader.resolution, min_confidence=0.55)
-    joined = " ".join(lines)
-
-    check("it counts the spans that overlap hand labels",
-          "1 hatched" in joined, joined)
-    check("it counts the spans resting on almost no windows",
-          "on <2 windows/frame" in joined, joined)
-    check("it names the confidence bar the project already applies",
-          "suggest.min_confidence 0.55" in joined, joined)
-    check("...and says the per-frame posterior is not on disk for this run",
-          "no per-frame posterior" in joined, joined)
-    check("every line is a field, not a sentence about one",
-          all(len(line) <= 80 for line in lines),
-          max(lines, key=len) if lines else "")
-
-    check("what a bar IS is under the ? instead", "decoded" in REVIEW_HELP
-          and "mean posterior" in REVIEW_HELP)
-    check("...and so is what the second lane of each pair is",
-          "the record" in REVIEW_HELP.lower())
-    check("...and why hand-labelled frames are not evidence about the model",
-          "not evidence about it" in REVIEW_HELP)
-    check("...and the reason a held-out prediction is the only fair comparison",
-          "memorised" in REVIEW_HELP)
-    check("none of that is repeated under the picture",
-          "mean posterior" not in joined and "hairline" not in joined, joined)
-
-    empty = reader.track("m", 99)
-    check("a track with nothing in it gets no caption at all rather than a "
-          "sentence about bouts it does not have",
-          caption_lines(empty, reader.resolution) == [])
-
 
 def test_a_track_with_no_predictions_is_a_normal_state(app, synthetic) -> None:
     """Not an error, not an empty widget: a sentence saying it is normal.
@@ -204,14 +152,12 @@ def test_a_track_with_no_predictions_is_a_normal_state(app, synthetic) -> None:
     reader = PredictionReader(synthetic)
     track = reader.track("m", 4242)
     check("the reader answers with an empty track rather than raising", track.empty)
-    check("...which still knows what kind of file it came from",
-          track.bouts and track.unit == "predicted bouts")
 
     panel = BoutReviewPanel(synthetic)
     panel.resize(900, 320)
     panel.show()
     app.processEvents()
-    panel.timeline.set_track(track, reader.resolution)
+    panel.timeline.set_track(track)
     panel.timeline.resize(900, 200)
     app.processEvents()
     check("the empty timeline paints without raising", ink(painted(panel.timeline)) > 0)
@@ -227,36 +173,23 @@ def test_a_track_with_no_predictions_is_a_normal_state(app, synthetic) -> None:
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
 def decoded(root):
-    """The planted 300-frame track, decoded at stride 10, posterior kept.
-
-    The same case :mod:`test_predict` measures boundary error on, so the numbers
-    the timeline reports can be checked against the ones the decode produced
-    rather than against themselves.
-    """
+    """The planted 300-frame track, decoded at stride 10."""
     from test_predict import planted_case
 
     from trackanno.infer.predict import predict_all
 
-    cfg, movie = planted_case(root, "review-decoded", 10,
-                              **{"predict.save_posteriors": True})
+    cfg, movie = planted_case(root, "review-decoded", 10)
     predict_all(cfg)
     return cfg, movie
 
 
 def test_a_real_decode_reaches_the_timeline_intact(decoded) -> None:
-    """The bar height and the line over it are the same number twice.
-
-    ``conf`` is the MEAN of the per-frame posterior of the bout's own class, and
-    the whole reason the trace is drawn is that a mean cannot say whether it came
-    from a flat 0.8 or from 0.99/0.4/0.99. If the two are ever computed from
-    different columns the picture stops being an argument about the same bout.
-    """
+    """The decoded bouts tile the track and keep the planted transition."""
     from trackanno.gui.timeline import PredictionReader
 
     cfg, movie = decoded
     reader = PredictionReader(cfg)
     check("the decoded file opens", reader.problem == "", reader.problem)
-    check("and it is read as bouts", reader.bouts and reader.unit == "predicted bouts")
 
     track = reader.track(movie, 1)
     lane = track.lanes[GROUP]
@@ -268,145 +201,6 @@ def test_a_real_decode_reaches_the_timeline_intact(decoded) -> None:
           len({s.label for s in lane if s.label}) == 2,
           str([s.label for s in lane]))
 
-    check("the run saved a posterior and the reader found it",
-          GROUP in track.trace, str(list(track.trace)))
-    trace = track.trace[GROUP]
-    worst = 0.0
-    for segment in lane:
-        if not segment.label:
-            continue
-        block = trace[segment.f_start - track.f_lo: segment.f_end - track.f_lo]
-        worst = max(worst, abs(float(np.nanmean(block)) - segment.conf))
-    check("every bar's height is the mean of the trace drawn over it",
-          worst < 1e-9, f"worst disagreement {worst:.3g}")
-
-
-def test_the_boundary_band_is_measured_off_the_grid_not_read_off_the_config(
-    decoded,
-) -> None:
-    """A crisp edge would claim a precision the method does not have.
-
-    The measured error against a planted transition (docs/prediction.md) is
-    ``stride/4`` on
-    average and ``stride/2`` at worst, and the stride comes from the window grid
-    on disk. Reading ``predict.window_stride`` instead would size the band from
-    a setting anybody can edit between the run and this window opening - and
-    unlike a wrong caption, a wrong band is read as "the boundary is somewhere
-    in here".
-    """
-    from trackanno.config import load_config
-    from trackanno.gui.timeline import PredictionReader, measure_stride
-    from trackanno.project import write_config
-
-    cfg, _ = decoded
-    resolution = measure_stride(cfg)
-    check("the stride is measured from the window grid", resolution.known)
-    check("...and it is the stride the run actually used",
-          resolution.stride == 10, str(resolution.stride))
-    check("a single-scale run reports the one grid it has: 50-frame windows "
-          "every 10 frames",
-          resolution.scales == ((50, 10),), str(resolution.scales))
-    check("the worst-case band is half a stride",
-          resolution.worst_error == 5.0, str(resolution.worst_error))
-    check("and the average error a quarter of one",
-          resolution.mean_error == 2.5, str(resolution.mean_error))
-    check("the sentence quotes both, and where the stride came from",
-          "10-frame window stride" in resolution.sentence()
-          and "2.5" in resolution.sentence()
-          and "dense_clip_features.parquet" in resolution.sentence(),
-          resolution.sentence())
-
-    # The config now says something else. The band must not move: it describes
-    # the run that wrote these rows, not the run this config would produce.
-    write_config(cfg.path, {"predict.window_stride": 25})
-    edited = load_config(cfg.path)
-    check("editing predict.window_stride does not move the band",
-          measure_stride(edited).stride == 10, str(measure_stride(edited).stride))
-    check("...and the reader agrees",
-          PredictionReader(edited).resolution.stride == 10)
-    write_config(cfg.path, {"predict.window_stride": 10})
-
-
-def test_the_band_under_several_window_scales_is_the_coarsest_grid_s(root) -> None:
-    """A multi-scale file must not be read as a fine-grained single-scale one.
-
-    ``predict.window_scales`` puts several grids in one dense table and their
-    window starts INTERLEAVE - 0, 0, 0, 25, 50, 50, 75, 100 - so one mode over
-    the whole file returns the FINEST grid's stride and the band comes out at
-    half its true width, on exactly the files most likely to need it. A band that
-    understates is worse than no band: it is a claim, in pixels, that a boundary
-    is somewhere it may well not be.
-
-    The band is the coarsest grid's, because the decode averages every window
-    covering a frame whatever its length, and a transition is no better placed
-    than the bluntest evidence that went into it.
-    """
-    from test_predict import build_case
-
-    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
-    from trackanno.gui.timeline import measure_stride
-
-    cfg, _ = build_case(root, "review-scales")
-    rows = [
-        {"movie_id": "m", "track_id": track, "f_start": start,
-         "f_end": start + length, "clip_id": f"m__t{track:04d}__f{start:06d}"}
-        for track in (1, 2)
-        for length in (25, 50, 100)
-        for start in range(0, 400 - length + 1, length)
-    ]
-    pd.DataFrame(rows).to_parquet(
-        cfg.paths.work_dir / DENSE_FEATURES_FILE, index=False)
-
-    union = np.diff(np.sort(np.array([r["f_start"] for r in rows if r["track_id"] == 1])))
-    modal = int(pd.Series([g for g in union if g > 0]).mode().iat[0])
-    check("the failure this prevents is real: the modal gap over the whole file "
-          "is the finest grid's stride", modal == 25, str(modal))
-
-    resolution = measure_stride(cfg)
-    check("each grid is measured on its own rows, by the window length the file "
-          "records for them",
-          resolution.scales == ((25, 25), (50, 50), (100, 100)),
-          str(resolution.scales))
-    check("the stride reported is the coarsest grid's, not the modal one",
-          resolution.stride == 100, str(resolution.stride))
-    check("...so the band is 50 frames and not the 12 a mode would have drawn",
-          resolution.worst_error == 50.0, str(resolution.worst_error))
-    check("the sentence names every scale, so the number can be argued with",
-          "3 window lengths" in resolution.sentence()
-          and "25 frames at stride 25" in resolution.sentence()
-          and "100 frames at stride 100" in resolution.sentence(),
-          resolution.sentence())
-    check("...and says which of them the band came from",
-          "COARSEST" in resolution.sentence(), resolution.sentence())
-
-
-def test_a_window_clipped_against_the_end_of_a_movie_is_not_a_scale(root) -> None:
-    """A length that appears once per track is not a grid.
-
-    The dense grid emits one short window at the end of a tiling movie, so the
-    file holds spans of a length no scale ever asked for. It has no gap to
-    measure - there is only one of it per track - and it is skipped rather than
-    given a stride from its own length, which would put a band on the screen that
-    no row on disk supports.
-    """
-    from test_predict import build_case
-
-    from trackanno.infer.densepredict import DENSE_FEATURES_FILE
-    from trackanno.gui.timeline import measure_stride
-
-    cfg, _ = build_case(root, "review-tail")
-    rows = [{"movie_id": "m", "track_id": 1, "f_start": start,
-             "f_end": min(start + 50, 320)} for start in range(0, 320, 50)]
-    check("the fixture really does end in a short window",
-          rows[-1]["f_end"] - rows[-1]["f_start"] == 20, str(rows[-1]))
-    pd.DataFrame(rows).to_parquet(
-        cfg.paths.work_dir / DENSE_FEATURES_FILE, index=False)
-
-    resolution = measure_stride(cfg)
-    check("the clipped tail is not reported as a second scale",
-          resolution.scales == ((50, 50),), str(resolution.scales))
-    check("...and the band is the real grid's", resolution.stride == 50,
-          str(resolution.stride))
 
 
 def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
@@ -425,30 +219,21 @@ def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
     check("the track selector offers the decoded track", panel.track.count() >= 1)
     check("the headline counts the rows and names what they are",
           "predicted bouts" in panel.headline.text(), panel.headline.text())
-    check("nothing warns that these are windows",
-          "fixed windows" not in panel.headline.text(), panel.headline.text())
 
     panel.timeline.resize(940, 200)
     app.processEvents()
     check("the timeline actually paints", ink(painted(panel.timeline)) > 500,
           str(ink(painted(panel.timeline))))
-    model_hits = [h for h in panel.timeline._hits if h[3] == "model"]
-    check("every drawn model span is hit-testable, so the detail has somewhere "
+    hits = panel.timeline._hits
+    check("every drawn span is hit-testable, so the detail has somewhere "
           "to live",
-          len(model_hits) == panel.timeline.track.n_segments,
-          f"{len(model_hits)} rects for "
-          f"{panel.timeline.track.n_segments} segments")
-    check("...and the record lane below it is hit-testable too, or a reviewer "
-          "could not click a span to correct it",
-          len([h for h in panel.timeline._hits if h[3] == "record"])
-          == sum(len(p) for p in panel.timeline.track.partitions.values()))
+          len(hits) == panel.timeline.track.n_segments,
+          f"{len(hits)} rects for {panel.timeline.track.n_segments} segments")
 
-    group, segment = model_hits[0][1], model_hits[0][2]
+    group, segment = hits[0][1], hits[0][2]
     tip = panel.timeline._describe(group, segment)
     check("the tooltip says confidence is a mean and not a peak",
           "MEAN posterior" in tip and "not its peak" in tip, tip)
-    check("...and repeats the resolution limit where the edge is",
-          "10-frame" in tip and "at worst" in tip, tip)
     panel.close()
     app.processEvents()
 
@@ -482,54 +267,29 @@ def test_a_track_the_predictions_never_mention_is_still_selectable(decoded) -> N
 # --------------------------------------------------------------------------- #
 # the older kind of file
 # --------------------------------------------------------------------------- #
-def test_an_old_style_windows_file_is_named_as_such(app, root) -> None:
-    """Fixed windows off a grid are not bouts and must not be drawn as if.
-
-    Their edges are multiples of the window length the predictor chose - a fact
-    about the grid, not about the animal - so they are drawn (still worth
-    seeing) but captioned, and no boundary band is placed around them: there is
-    no inferred boundary there to be uncertain about.
-    """
+def test_a_windows_file_is_refused_with_a_sentence(app, root) -> None:
+    """Only decoded bouts are reviewed; a file of fixed windows says so."""
     from test_predict import build_case
 
-    from trackanno.gui.timeline import BoutReviewPanel, PredictionReader, caption_lines
-    from trackanno.infer.predict import predict_all
+    from trackanno.gui.timeline import BoutReviewPanel, PredictionReader
 
-    cfg, manifest = build_case(root, "review-windows", labels=2)
-    predict_all(cfg)
+    cfg, _ = build_case(root, "review-windows")
+    rows = [{k: v for k, v in bout_row(0, 50, "swimming", 0.9).items()
+             if k not in ("bout_id", "group")}]
+    write_bouts(cfg, rows)
 
     reader = PredictionReader(cfg)
-    check("a file with no bout_id is not read as bouts", not reader.bouts)
-    check("...and is counted in the noun render.prediction_unit gives it",
-          reader.unit == "predicted windows", reader.unit)
-    check("no boundary band is offered for a grid",
-          not reader.resolution.known, str(reader.resolution.stride))
-
-    movie = reader.movies[0]
-    track_id = next(t for t, n in reader.tracks(movie) if n)
-    track = reader.track(movie, track_id)
-    lines = " ".join(caption_lines(track, reader.resolution))
-    check("the caption says these are windows, not bouts, in as many words",
-          "NOT decoded bouts" in lines, lines)
-    check("...and says how to get bouts instead", "predict.decode" in lines, lines)
-    check("a window's hand-labelled flag reads through as a fraction",
-          all(f in (0.0, 1.0) for f in
-              [s.human_frac for lane in track.lanes.values() for s in lane]),
-          str([s.human_frac for lane in track.lanes.values() for s in lane]))
+    check("a file with no bout_id is not read as bouts",
+          "not decoded bouts" in reader.problem, reader.problem)
 
     panel = BoutReviewPanel(cfg)
     panel.resize(1000, 400)
     panel.show()
     app.processEvents()
-    check("the panel warns before anything is read off the picture",
-          "fixed windows" in panel.headline.text(), panel.headline.text())
-    panel.timeline.resize(940, 200)
-    app.processEvents()
-    check("and it still draws them - a windows file is worth looking at",
-          ink(painted(panel.timeline)) > 500, str(ink(painted(panel.timeline))))
+    check("the panel shows the reason where the timeline would be",
+          "not decoded bouts" in panel.timeline.note, panel.timeline.note)
     panel.close()
     app.processEvents()
-    check("the case really was a manifest run", len(manifest) > 0)
 
 
 def test_a_project_with_no_predictions_says_so_instead_of_raising(app, root) -> None:
@@ -564,17 +324,16 @@ def test_the_timeline_takes_the_width_the_window_gives_it(app, root) -> None:
     Three separate ways this stopped happening, each of which put the lanes
     behind a horizontal scrollbar on a normal window: the timeline's
     minimumSizeHint returned its PREFERRED width and so overrode its own
-    minimum; the correction controls were one unwrappable row about 1670px
-    wide, which the whole panel then could not go under; and the splitter gave
-    a shrinking window's remaining pixels to the film rather than to the lanes.
+    minimum; a control row was too wide for the panel to go under; and the
+    splitter gave a shrinking window's remaining pixels to the film rather than
+    to the lanes.
     """
     from test_predict import build_case
 
     from trackanno.gui.timeline import BoutReviewPanel
-    from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "review-resize", labels=2)
-    predict_all(cfg)
+    write_bouts(cfg, first_movie_bouts(cfg))
     panel = BoutReviewPanel(cfg)
     panel.show()
     app.processEvents()
@@ -621,13 +380,12 @@ def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
     gating the review on the same verdict that gates the run would hide exactly
     the predictions most worth arguing with.
 
-    The panel is built on arrival rather than at startup, because building it
-    opens three files, and it is torn down with the page.
+    The panel is built on arrival rather than at startup, and it is torn down
+    with the page.
     """
     from test_predict import build_case
 
     from trackanno.gui.hub import PAGES, Hub, ModelPage, ReviewPage
-    from trackanno.infer.predict import predict_all
 
     cfg, _ = build_case(root, "review-page", labels=2)
     hub = Hub(str(cfg.path))
@@ -636,27 +394,23 @@ def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
     model, review = hub.page(ModelPage), hub.page(ReviewPage)
     try:
         check("Review is a step in its own right, after Model",
-              PAGES.index("Review") == PAGES.index("Model") + 1
+              PAGES.index("Review") > PAGES.index("Model")
               and len(PAGES) == hub.sidebar.count()
               and len(PAGES) == len(hub.pages), str(PAGES))
         check("with no predictions the page says so rather than opening empty",
               "nothing has been predicted yet" in review.blocker())
         check("...and nothing was built to say it with", review.panel is None)
-        check("the Model page's button is dead while there is nothing to review",
-              not model.review_button.isEnabled())
 
-        predict_all(cfg)
+        write_bouts(cfg, first_movie_bouts(cfg))
         hub.reload_project()
         app.processEvents()
         check("the file alone unblocks the page", review.blocker() == "")
-        check("the file alone enables the hand-over button",
-              model.review_button.isEnabled())
         check("but the panel is still not built until somebody goes there",
               review.panel is None)
 
-        model.review_button.click()
+        hub.go_to(PAGES.index("Review"))
         app.processEvents()
-        check("the button navigates rather than opening a window",
+        check("going there shows the page in the window",
               hub.sidebar.currentRow() == PAGES.index("Review")
               and hub.stack.currentWidget() is review)
         check("arriving builds the panel", review.panel is not None
@@ -679,8 +433,8 @@ def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
         check("coming back reuses the one panel rather than stacking them",
               review.panel is panel)
     finally:
-        # shutdown() before close(): ModelPage keeps three background threads
-        # (keypoint reader, device probe, model probe) that close() does not
+        # shutdown() before close(): ModelPage keeps background threads
+        # (keypoint reader, model probe) that close() does not
         # cancel, and a live QThread at interpreter exit kills the process after
         # the tests have already passed.
         model.shutdown()

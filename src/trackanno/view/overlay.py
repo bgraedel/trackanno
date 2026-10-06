@@ -5,7 +5,7 @@ Two consumers, two jobs:
 * The **GUI** draws no pixels. ``build_clip_view`` turns a clip's box table into
   a :class:`ClipView` and the Qt canvas paints the marker as vector graphics, so
   the reticle stays one hairline wide at 8x zoom.
-* ``render.py`` burns the category-labelled overlay onto the full-resolution
+* ``trackanno render`` burns the category-labelled overlay onto the full-resolution
   movie.
 
 ``render_clip_rgb`` rasterises the same geometry for a caller that wants pixels.
@@ -37,13 +37,12 @@ TARGET_RGB = (255, 196, 0)     # the track you are annotating
 CONTEXT_RGB = (0, 168, 255)    # other tracks that happen to be in the crop
 
 # How the view centre is derived from the target's trajectory. Cycled with "s".
-FOLLOW_MODES = ("centred", "smooth", "locked")
+FOLLOW_MODES = ("centred", "locked")
 
 # What each mode does, beside the modes themselves: every window that offers the
 # choice says the same thing about it. Short in a combo, long in a tooltip.
 FOLLOW_LABELS = {
     "centred": "centred - one view on the track's median position, all motion visible",
-    "smooth": "smooth - the view follows a moving average: drift removed, beat kept",
     "locked": "locked - re-centred every frame: best for shape, hides translation",
 }
 
@@ -311,25 +310,12 @@ def _hold_fill_rows(values: np.ndarray) -> np.ndarray:
     return out
 
 
-def _smooth_path(path: np.ndarray, window: int) -> np.ndarray:
-    """Centred moving average with edge padding, along axis 0."""
-    if window <= 1 or path.shape[0] <= 2:
-        return path
-    half = max(1, min(window // 2, path.shape[0] - 1))
-    padded = np.pad(path, ((half, half), (0, 0)), mode="edge")
-    kernel = np.ones(2 * half + 1) / (2 * half + 1)
-    return np.stack(
-        [np.convolve(padded[:, c], kernel, mode="valid") for c in range(path.shape[1])], axis=1
-    )
-
-
 def build_clip_view(
     boxes,
     n_frames: int,
     size: int,
     mode: str = "centred",
     zoom: float = 1.0,
-    smooth_window: int = 15,
     with_context: bool = False,
     n_kpts: int = 0,
 ) -> ClipView:
@@ -339,7 +325,6 @@ def build_clip_view(
 
     ``centred``  one fixed view on the *median of the track's own path*, not the
                  crop centre, so a border clip's animal is not parked in a corner.
-    ``smooth``   a moving average of the path: drift removed, beat kept.
     ``locked``   re-centred every frame - translation invisible by construction.
 
     ``zoom`` > 1 shrinks the visible square around that centre. Nothing is
@@ -378,8 +363,6 @@ def build_clip_view(
 
     if mode == "locked":
         centre = path
-    elif mode == "smooth":
-        centre = _smooth_path(path, smooth_window)
     else:
         centre = np.repeat(np.median(path, axis=0, keepdims=True), n_frames, axis=0)
 

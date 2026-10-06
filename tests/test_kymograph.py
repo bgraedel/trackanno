@@ -30,7 +30,7 @@ def test_curvature_matches_closed_form() -> None:
 
     for radius in (20.0, 50.0, 120.0):
         theta = np.linspace(0, np.pi / 2, 9)
-        _, kappa, length, _ = resample_centreline(
+        _, kappa, length = resample_centreline(
             radius * np.cos(theta), radius * np.sin(theta), 128, smooth_px=0.0)
         check(f"circle R={radius:.0f} gives kappa = 1/R",
               close(float(np.nanmedian(kappa)), 1.0 / radius, 1e-4),
@@ -40,7 +40,7 @@ def test_curvature_matches_closed_form() -> None:
         check(f"...and it is constant along the arc ({radius:.0f})",
               float(np.nanstd(kappa)) < 1e-3, f"{np.nanstd(kappa):.2e}")
 
-    _, kappa, length, _ = resample_centreline(
+    _, kappa, length = resample_centreline(
         np.linspace(0, 100, 8), np.zeros(8), 64, smooth_px=0.0)
     check("a straight chain has zero curvature",
           float(np.nanmax(np.abs(kappa))) < 1e-9, f"{np.nanmax(np.abs(kappa)):.2e}")
@@ -49,7 +49,7 @@ def test_curvature_matches_closed_form() -> None:
     amplitude, wavelength = 8.0, 60.0
     x = np.linspace(0, wavelength, 25)
     y = amplitude * np.sin(2 * np.pi * x / wavelength)
-    points, kappa, _, _ = resample_centreline(x, y, 400, smooth_px=0.0)
+    points, kappa, _ = resample_centreline(x, y, 400, smooth_px=0.0)
     crest = int(np.argmax(points[:, 1]))
     expected = -amplitude * (2 * np.pi / wavelength) ** 2
     check("a sine's crest curvature is -A(2pi/lam)^2",
@@ -66,11 +66,11 @@ def test_curvature_is_invariant_to_where_the_cell_is() -> None:
 
     theta = np.linspace(0, np.pi / 2, 9)
     x, y = 40.0 * np.cos(theta), 40.0 * np.sin(theta)
-    _, reference, _, _ = resample_centreline(x, y, 64, smooth_px=0.0)
+    _, reference, _ = resample_centreline(x, y, 64, smooth_px=0.0)
 
     for angle, dx, dy in ((0.7, 300, -120), (2.1, -40, 900), (-1.3, 0, 0)):
         cos, sin = np.cos(angle), np.sin(angle)
-        _, moved, _, _ = resample_centreline(
+        _, moved, _ = resample_centreline(
             x * cos - y * sin + dx, x * sin + y * cos + dy, 64, smooth_px=0.0)
         check(f"rotating by {angle:+.1f} rad and shifting changes nothing",
               float(np.nanmax(np.abs(moved - reference))) < 1e-9,
@@ -78,7 +78,7 @@ def test_curvature_is_invariant_to_where_the_cell_is() -> None:
 
     # A mirror flips the sign. Stated as a test because the sign is the whole
     # signal in a diverging plot, so it must be a decision rather than an accident.
-    _, mirrored, _, _ = resample_centreline(x, -y, 64, smooth_px=0.0)
+    _, mirrored, _ = resample_centreline(x, -y, 64, smooth_px=0.0)
     check("a mirrored chain flips the sign",
           float(np.nanmax(np.abs(mirrored + reference))) < 1e-9)
 
@@ -163,59 +163,6 @@ def test_the_chain_order_sets_the_sign() -> None:
           curvature_kymograph(kx, ky, n_samples=32, smooth_px=0.0).n_nodes == 9)
 
 
-def test_the_tangent_angle_is_unwrapped_in_both_directions() -> None:
-    """psi = atan2(dy, dx) wraps at +-pi. Along the arclength that puts a 2*pi
-    cliff wherever the flagellum happens to cross it; along time it is worse,
-    because the node that crosses MOVES as the wave travels, so a fixed
-    arclength position jumps a full turn between consecutive frames.
-    wavespectra.spectral_series guards against the same bug for the same reason;
-    when it was missing there, every measured amplitude came out near 2*pi
-    regardless of the real beat."""
-    from trackanno.measure.kymograph import curvature_kymograph
-
-    # A wave big enough that the tangent angle really does swing past +-pi.
-    kymo = curvature_kymograph(*_wave(60, 13, period=14.0, cycles=2, length=60.0),
-                               n_samples=96, smooth_px=0.0)
-    check("the tangent angle is computed alongside the curvature",
-          kymo.psi is not None and kymo.psi.shape == kymo.kappa.shape)
-
-    psi = kymo.psi[np.isfinite(kymo.psi).all(axis=1)]
-    check("there is something to unwrap", len(psi) > 20)
-    along_s = np.abs(np.diff(psi, axis=1)).max()
-    along_t = np.abs(np.diff(psi, axis=0)).max()
-    check("no 2*pi cliff along the arclength", along_s < np.pi, f"{along_s:.3f}")
-    check("no 2*pi cliff along time", along_t < np.pi, f"{along_t:.3f}")
-
-    # Whole-cell rotation is removed, so psi describes shape and not heading -
-    # the same invariance curvature has for free.
-    kx, ky = _wave(60, 13, period=14.0, cycles=2, length=60.0)
-    angle = 0.9
-    cos, sin = np.cos(angle), np.sin(angle)
-    turned = curvature_kymograph(kx * cos - ky * sin + 40.0,
-                                 kx * sin + ky * cos - 25.0,
-                                 n_samples=96, smooth_px=0.0)
-    a, b = kymo.psi, turned.psi
-    good = np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1)
-    check("rotating the cell leaves the tangent angle field alone",
-          float(np.nanmax(np.abs(a[good] - b[good]))) < 1e-3,
-          f"{np.nanmax(np.abs(a[good] - b[good])):.2e}")
-
-    # And it is the same physical quantity as the curvature: kappa = dpsi/ds.
-    frame = int(np.flatnonzero(good)[len(np.flatnonzero(good)) // 2])
-    ds = kymo.length_px[frame] / (kymo.n_samples - 1)
-    derived = np.gradient(kymo.psi[frame].astype(np.float64), ds)
-    direct = kymo.kappa[frame].astype(np.float64)
-    # Compared on the MEDIAN error, not the worst point: np.gradient is a finite
-    # difference and the curvature here is analytic, so the two differ most at
-    # the peaks, where a central difference of a curved function always lags.
-    # The claim under test is that they are the same quantity, not that a
-    # three-point stencil reproduces a spline exactly.
-    inner = slice(4, -4)
-    rel = (np.median(np.abs(derived[inner] - direct[inner]))
-           / np.mean(np.abs(direct[inner])))
-    check("d(psi)/ds agrees with the curvature", rel < 0.05, f"relative {rel:.4f}")
-
-
 def test_the_mirror_ambiguity_is_decided_or_declined() -> None:
     """A 2D image cannot tell a cell from its mirror image, so the same beat
     comes out blue in one clip and red in the next. On 20 real clips it was 11
@@ -270,8 +217,6 @@ def test_the_mirror_ambiguity_is_decided_or_declined() -> None:
         check("the flip is a single global factor",
               float(np.nanstd(ratio)) < 1e-6, f"{np.nanstd(ratio):.2e}")
 
-    absolute, _ = right.with_sign("absolute")
-    check("absolute mode discards the sign", float(np.nanmin(absolute.kappa)) >= 0.0)
     raw, v = right.with_sign("raw")
     check("raw mode changes nothing", raw is right and v.confident)
 
@@ -353,10 +298,10 @@ def test_untrackable_frames_stay_empty() -> None:
 
     # Too few points for a cubic, and a chain of duplicated points, both of
     # which a tracker that loses a keypoint really does produce.
-    points, kappa, length, _ = resample_centreline([0.0, 1.0, 2.0], [0.0, 1.0, 0.0], 16)
+    points, kappa, length = resample_centreline([0.0, 1.0, 2.0], [0.0, 1.0, 0.0], 16)
     check(f"fewer than {MIN_NODES} points is refused rather than guessed",
           points is None and kappa is None and np.isnan(length))
-    points, _, _, _ = resample_centreline([5.0] * 6, [5.0] * 6, 16)
+    points, _, _ = resample_centreline([5.0] * 6, [5.0] * 6, 16)
     check("a chain collapsed onto one point is refused", points is None)
 
     blank = curvature_kymograph(np.full((5, 9), np.nan), np.full((5, 9), np.nan))
@@ -483,21 +428,12 @@ def test_the_widget_draws_and_scrubs(app) -> None:
     check("...to roughly where it was clicked", 42 <= picked[0] <= 48, repr(picked))
     check("...and the cursor moved with it", view.frame == picked[0])
 
-    # Filtering is a display choice; it must not touch the data.
-    view.set_interpolate(False)
-    app.processEvents()
-    raw = view.kymo.kappa.copy()
-    view.set_interpolate(True)
-    app.processEvents()
-    check("filtering the display leaves the values alone",
-          bool(np.array_equal(np.nan_to_num(raw), np.nan_to_num(view.kymo.kappa))))
-    check("...and the flag is what was asked for", view.interpolate)
-
     # A theme change must rebuild the image, not keep the old palette.
+    from trackanno.gui.theme import current
+
     before = view._image
-    apply_theme(app, "light")
-    view.restyle()
-    app.processEvents()
+    apply_theme(app, "dark" if current() == "light" else "light")
+    view.grab()
     check("a theme change repaints the field", view._image is not before)
     view.close()
 
@@ -529,8 +465,6 @@ def test_the_panel_shows_it_only_for_pose(app, root: Path) -> None:
     app.processEvents()
 
     check("the kymograph is shown on a pose project", panel.kymo_view.isVisible())
-    check("it follows ui.kymo_interpolate",
-          panel.kymo_view.interpolate == cfg.ui.kymo_interpolate)
     check("...and it has data", panel.kymo_view.kymo is not None
           and panel.kymo_view.kymo.usable)
     check("...one column per frame of the clip",
@@ -560,21 +494,16 @@ def test_the_panel_shows_it_only_for_pose(app, root: Path) -> None:
     from trackanno.project import write_config as _write
 
     before_position = panel.position
-    _write(cfg.path, {"ui.kymo_field": "tangent", "ui.kymo_sign": "absolute",
-                      "ui.kymo_interpolate": False})
+    _write(cfg.path, {"ui.kymo_sign": "raw"})
     panel.apply_view_settings(_load(cfg.path))
     app.processEvents()
-    check("the field switches without a reload",
-          panel.kymo_view.field_kind == "tangent", panel.kymo_view.field_kind)
-    check("...and the sign convention with it",
-          panel.kymo_view.sign_mode == "absolute", panel.kymo_view.sign_mode)
-    check("...and the filtering", panel.kymo_view.interpolate is False)
+    check("the sign convention switches without a reload",
+          panel.kymo_view.sign_mode == "raw", panel.kymo_view.sign_mode)
     check("...without losing your place", panel.position == before_position)
     check("...and the panel adopted the new config",
-          panel.cfg.ui.kymo_field == "tangent")
-    check("the tangent view actually paints", not panel.kymo_view.grab().isNull())
-    _write(cfg.path, {"ui.kymo_field": "curvature", "ui.kymo_sign": "canonical",
-                      "ui.kymo_interpolate": True})
+          panel.cfg.ui.kymo_sign == "raw")
+    check("the raw view actually paints", not panel.kymo_view.grab().isNull())
+    _write(cfg.path, {"ui.kymo_sign": "canonical"})
     panel.apply_view_settings(_load(cfg.path))
     app.processEvents()
 

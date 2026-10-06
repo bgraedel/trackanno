@@ -1,33 +1,16 @@
-"""One track's predictions along the frame axis, drawn rather than tabulated.
+"""One track's predicted bouts along the frame axis, beside the footage.
 
-A row of ``predictions.parquet`` is either a fixed window off a grid or, under
-``predict.decode``, a bout: a variable-length run between two inferred
-behavioural boundaries. Which of the two a file holds comes from
-:func:`trackanno.infer.predict.row_kind`, which reads the file.
+A row of ``predictions.parquet`` is a decoded bout: a variable-length run
+between two inferred behavioural boundaries. The panel is read-only.
 
-The footage sits beside the drawing, because whether a boundary is in the right
-place is a question about the animal at that frame and no timeline can answer
-it. Every frame is cut from the movie, at one crop for the whole session and
-centred on the track's own boxes: the clip cache is cut per movie and centred
-per annotation window, so a picture taken partly from it stepped in size and in
-centring wherever a window ran out. What that costs against the window the label
-was applied in is said under the picture.
-
-Boundaries are drawn as bands the width of the measured error against a planted
-transition, a bout's mean posterior as a fill height, and a span overlapping
-hand-labelled frames is hatched. Corrections are recorded in
-``bout_corrections.csv`` (:mod:`trackanno.annotate.corrections`) and never in
-``predictions.parquet`` or ``annotations.csv``; nothing here re-decodes,
-retrains or writes a prediction back. The correction lane deliberately carries
-no bar height, because what is now asserted about a stretch of frames is not a
-posterior over it.
+Every frame of the footage is cut from the movie, at one crop for the whole
+session and centred on the track's own boxes, never from the clip cache.
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -36,31 +19,21 @@ from qtpy.QtCore import (
 )
 from qtpy.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from qtpy.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QToolTip, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
+    QSplitter, QToolTip, QVBoxLayout, QWidget,
 )
 
 from ..config import Config
-from ..annotate.corrections import (
-    CorrectionStore, Partition, Span, apply_corrections, build_corrections,
-    corrections_path, derivation_report, derive_window_labels, manifest_windows,
-)
 from ..view.overlay import build_clip_view
 from ..annotate.store import MULTI_SEP
 from .theme import help_button, tokens
 from .viewer import SimpleViewer, follow_combo
 
 __all__ = [
-    "Segment", "TrackPredictions", "Resolution", "PredictionReader",
-    "caption_lines", "ReviewCrop", "review_crop", "MovieFrames", "TrackFootage",
+    "Segment", "TrackPredictions", "PredictionReader",
+    "ReviewCrop", "review_crop", "MovieFrames", "TrackFootage",
     "BoutTimeline", "BoutReviewPanel",
 ]
-
-# The measured boundary error from docs/prediction.md, as divisors of the stride.
-# Divisors rather than frames, because the stride is a per-project setting.
-MEAN_ERROR_DIVISOR = 4.0
-WORST_ERROR_DIVISOR = 2.0
 
 # What the review window opens on, rather than ui.follow. That setting is chosen
 # for one 25-frame clip, where a moving average removes drift and keeps the beat.
@@ -71,19 +44,16 @@ REVIEW_FOLLOW = "locked"
 
 @dataclass(frozen=True)
 class Segment:
-    """One drawn span: a decoded bout, or a window off a grid.
+    """One decoded bout.
 
     ``label`` is ``""`` for a stretch the model has no opinion about, drawn as a
-    hole rather than dropped. ``conf``, ``human_frac`` and ``n_covering`` are
-    NaN where the file does not record them, never 0.0.
+    hole rather than dropped. ``conf`` is NaN where the file does not record it.
     """
 
     f_start: int
     f_end: int
     label: str
     conf: float
-    human_frac: float
-    n_covering: float
     skip_reason: str
 
     @property
@@ -97,27 +67,9 @@ class TrackPredictions:
 
     movie_id: str
     track_id: int
-    bouts: bool                 # decoded bouts, as opposed to grid windows
-    unit: str                   # the noun prediction_unit() counts these in
     f_lo: int = 0
     f_hi: int = 0
     lanes: dict = field(default_factory=dict)        # group -> [Segment]
-    # group -> (n_frames,) posterior of the DECODED class per frame, or {} when
-    # frame_posteriors.parquet is absent. NaN where no window covered the frame.
-    trace: dict = field(default_factory=dict)
-
-    # group -> the RECORD: the model's bouts with this reviewer's corrections
-    # laid over them. Kept apart from `lanes` so both claims stay visible.
-    partitions: dict = field(default_factory=dict)   # group -> Partition
-    # Corrections that no longer land on any predicted frame, because the run
-    # that wrote these rows covered a different span. Reported, never dropped.
-    orphans: list = field(default_factory=list)
-    # Corrections only PART of which lands on a predicted frame. Drawn short and
-    # saved long, and listed separately because nothing else on screen says so.
-    partly_shown: list = field(default_factory=list)
-    # Why this track cannot be corrected, or "". Set rather than raised: a
-    # windows file or a silent track is a normal state.
-    edit_problem: str = ""
 
     @property
     def empty(self) -> bool:
@@ -126,142 +78,6 @@ class TrackPredictions:
     @property
     def n_segments(self) -> int:
         return sum(len(v) for v in self.lanes.values())
-
-    @property
-    def n_corrected(self) -> int:
-        return sum(len(p.corrected_spans()) for p in self.partitions.values())
-
-
-# --------------------------------------------------------------------------- #
-# how sharp a boundary can be
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class Resolution:
-    """The window stride these bouts were cut on, and how far to trust an edge.
-
-    ``stride`` is 0 when it could not be measured, and then the limit is
-    reported as a ratio and no band is drawn. ``scales`` is ``(window length,
-    that length's stride)`` for every grid found in the dense table, narrowest
-    first; ``stride`` is the COARSEST of them (see :func:`measure_stride`).
-    """
-
-    stride: int = 0
-    provenance: str = ""        # where the stride came from, or why there is none
-    scales: tuple[tuple[int, int], ...] = ()
-
-    @property
-    def known(self) -> bool:
-        return self.stride > 0
-
-    @property
-    def mean_error(self) -> float:
-        return self.stride / MEAN_ERROR_DIVISOR
-
-    @property
-    def worst_error(self) -> float:
-        return self.stride / WORST_ERROR_DIVISOR
-
-    def brief(self) -> str:
-        """The edge tolerance as a number. The reasoning is under the panel's ?."""
-        if not self.known:
-            return "boundary tolerance unmeasured, no band drawn"
-        out = (f"boundary +-{self.worst_error:.0f} f worst, "
-               f"{self.mean_error:.1f} f mean (stride {self.stride})")
-        if len(self.scales) > 1:
-            out += f", coarsest of {len(self.scales)} window lengths"
-        return out
-
-    def sentence(self) -> str:
-        if not self.known:
-            return (
-                "A boundary is resolved to the window grid, not to the frame: "
-                "about a quarter of the window stride out on average and half of "
-                f"it at worst. {self.provenance}, so no band is drawn and the "
-                "edges below look sharper than they are."
-            )
-        out = (
-            f"Boundaries are resolved to the {self.stride}-frame window stride, "
-            f"not to the frame: {self.mean_error:.1f} frames out on average, "
-            f"{self.worst_error:.0f} at worst, measured against a planted "
-            f"transition. The band at each edge is that worst case. {self.provenance}."
-        )
-        if len(self.scales) > 1:
-            listed = ", ".join(f"{length} frames at stride {step}"
-                               for length, step in self.scales)
-            out += (
-                f" This run scored at {len(self.scales)} window lengths "
-                f"({listed}), and the band is the COARSEST grid's: a boundary is "
-                "no better placed than the widest window that voted on it."
-            )
-        return out
-
-
-def measure_stride(cfg: Config) -> Resolution:
-    """The window grids on disk, measured, never read off the config.
-
-    ``dense_clip_features.parquet`` is the plan the decode ran over, so the gap
-    between one window start and the next is the stride that produced the bouts.
-    Modal rather than minimal: a track whose windows do not divide evenly leaves
-    one short step at the end.
-
-    Measured per window length. Under ``predict.window_scales`` the table holds
-    several grids whose starts interleave, and one mode over the union would
-    report the finest grid's. The stride returned is the COARSEST grid's,
-    because the decode averages every window covering a frame and a transition
-    is no better placed than the bluntest window that voted on it. A length
-    appearing once per track has no gap to measure and is skipped.
-
-    A dense table written after the predictions is still measured, but the
-    provenance says so.
-    """
-    from ..infer.densepredict import dense_features_path
-    from ..infer.predict import predictions_path
-
-    path = dense_features_path(cfg)
-    if not path.exists():
-        return Resolution(0, f"{path.name} is not in this project")
-    try:
-        frame = pd.read_parquet(
-            path, columns=["movie_id", "track_id", "f_start", "f_end"]
-        )
-    except (OSError, ValueError, KeyError) as exc:
-        return Resolution(0, f"{path.name} could not be read ({exc})")
-    if frame.empty:
-        return Resolution(0, f"{path.name} has no windows in it")
-
-    starts = pd.to_numeric(frame["f_start"], errors="coerce").to_numpy(dtype=float)
-    ends = pd.to_numeric(frame["f_end"], errors="coerce").to_numpy(dtype=float)
-    lengths = ends - starts
-    keys = frame[["movie_id", "track_id"]].astype({"movie_id": str})
-    grids: dict[int, int] = {}
-    for length in np.unique(lengths[np.isfinite(lengths) & (lengths > 0)]):
-        # Positions, not index labels: `starts` is a plain array off the column
-        # and a parquet read need not hand back a 0..n-1 index to align with it.
-        rows = np.flatnonzero(lengths == length)
-        steps: list[int] = []
-        for positions in keys.iloc[rows].groupby(
-            ["movie_id", "track_id"], sort=False
-        ).indices.values():
-            run = np.sort(starts[rows[np.asarray(positions)]])
-            steps.extend(int(g) for g in np.diff(run) if np.isfinite(g) and g > 0)
-        if steps:
-            grids[int(length)] = int(pd.Series(steps).mode().iat[0])
-    if not grids:
-        return Resolution(0, f"every track in {path.name} has a single window")
-
-    scales = tuple(sorted(grids.items()))
-    predictions = predictions_path(cfg)
-    rebuilt = (
-        predictions.exists()
-        and path.stat().st_mtime > predictions.stat().st_mtime
-    )
-    where = f"Measured from the window grid in {path.name}"
-    if rebuilt:
-        where += (
-            ", rebuilt after these predictions were written, so it may not be the "
-            "grid they came off"
-        )
-    return Resolution(max(grids.values()), where, scales)
 
 
 # --------------------------------------------------------------------------- #
@@ -278,11 +94,7 @@ def _labelled(values: pd.Series) -> pd.Series:
 
 
 class PredictionReader:
-    """``predictions.parquet`` and, if it is there, the posterior beside it.
-
-    Built once per open of the review window and then queried per track. Both
-    files are read whole, but the posterior is one row per (movie, track, frame)
-    and is read lazily, on the first track a reviewer looks at.
+    """``predictions.parquet``, read once per open and then queried per track.
 
     ``problem`` is set instead of raising, because a traceback out of a Qt slot
     takes the window down.
@@ -292,34 +104,12 @@ class PredictionReader:
         self.cfg = cfg
         self.problem = ""
         self.frame = pd.DataFrame()
-        self.bouts = False
-        self.unit = ""
         self.groups: list[str] = []
         self.movies: list[str] = []
         self.stale = ""
-        self._posterior: pd.DataFrame | None = None
-        self._posterior_read = False
         self._tracks: dict[str, list[tuple[int, int]]] = {}
-        self.resolution = Resolution()
-        self.corrections: CorrectionStore | None = None
-        # Annotation windows whose label is not what the model suggests, most
-        # confident first. Empty until there are both labels and a model.
-        self.disagreements: list = []
-        self.agreement: dict = {}
 
-        from ..infer.predict import load_predictions, row_kind, staleness
-        from ..view.render import prediction_unit
-
-        # Before the predictions, and fatal when it fails: a corrections file
-        # that will not parse would leave the timeline drawing the model's bouts
-        # over frames a person has already overruled.
-        try:
-            self.corrections = CorrectionStore(
-                corrections_path(cfg), getattr(cfg.ui, "annotator", "")
-            )
-        except (OSError, ValueError) as exc:
-            self.problem = str(exc)
-            return
+        from ..infer.predict import load_predictions, staleness
 
         try:
             self.frame = load_predictions(cfg)
@@ -327,8 +117,12 @@ class PredictionReader:
             self.problem = str(exc)
             return
 
-        self.bouts = row_kind(self.frame).bouts
-        self.unit = prediction_unit(self.frame)
+        if "bout_id" not in self.frame.columns:
+            self.problem = (
+                "these predictions are not decoded bouts; label every clip with "
+                "the model again"
+            )
+            return
         self.stale = staleness(cfg)
         self.groups = sorted(
             c[: -len("_pred")] for c in self.frame.columns if c.endswith("_pred")
@@ -340,42 +134,6 @@ class PredictionReader:
             )
             return
         self.movies = sorted(self.frame["movie_id"].astype(str).unique())
-        # Only where an inferred boundary exists to be uncertain about: a window
-        # edge is a grid multiple the predictor chose, not a measurement.
-        if self.bouts:
-            self.resolution = measure_stride(cfg)
-        self._read_agreement()
-
-    def _read_agreement(self) -> None:
-        """Every labelled window the last fit's folds labelled differently.
-
-        One comparison per annotation window, against the out-of-fold
-        prediction: the saved model was fitted on these labels, so its own
-        opinion of one is not evidence about it. Sets ``agreement["problem"]``
-        instead of raising, since no CSV and no model are both normal.
-        """
-        from ..infer.agreement import find, load_cv_predictions, summarise
-
-        path = getattr(self.cfg.paths, "csv", None)
-        if not path or not Path(path).exists():
-            return
-        try:
-            labels = pd.read_csv(path, dtype=str, keep_default_na=False)
-        except (OSError, ValueError, UnicodeDecodeError):
-            return
-        if labels.empty or "clip_id" not in labels.columns:
-            return
-        groups = [g.name for g in self.cfg.categories]
-        try:
-            answers, problem = load_cv_predictions(self.cfg)
-            if problem:
-                self.agreement = {"problem": problem}
-                return
-            self.disagreements = find(labels, answers, groups)
-            self.agreement = summarise(labels, answers, self.disagreements, groups)
-        except Exception as exc:                     # noqa: BLE001 - see above
-            self.disagreements = []
-            self.agreement = {"problem": f"the fold predictions could not be read ({exc})"}
 
     # -- what can be selected ------------------------------------------------ #
     def tracks(self, movie_id: str) -> list[tuple[int, int]]:
@@ -420,10 +178,7 @@ class PredictionReader:
 
     # -- one track ----------------------------------------------------------- #
     def track(self, movie_id: str, track_id: int) -> TrackPredictions:
-        out = TrackPredictions(
-            movie_id=str(movie_id), track_id=int(track_id),
-            bouts=self.bouts, unit=self.unit,
-        )
+        out = TrackPredictions(movie_id=str(movie_id), track_id=int(track_id))
         rows = self.frame[
             (self.frame["movie_id"].astype(str) == str(movie_id))
             & (pd.to_numeric(self.frame["track_id"], errors="coerce") == int(track_id))
@@ -437,64 +192,11 @@ class PredictionReader:
         out.f_hi = int(ends.max())
         for group in self.groups:
             out.lanes[group] = self._segments(rows, group)
-        out.trace = self._traces(out)
-        self._record(out)
         return out
 
-    def _record(self, track: TrackPredictions) -> None:
-        """The model's bouts with this project's corrections laid over them.
-
-        Every way this can fail is a sentence on ``edit_problem`` rather than an
-        exception: the file holds windows and not bouts, the track has no rows
-        at all, or one group's rows overlap or leave a hole. A partition is
-        refused rather than patched, since patching would invent frames.
-        """
-        if track.empty:
-            track.edit_problem = (
-                "this track has no predicted rows, so there is nothing to correct"
-            )
-            return
-        if not track.bouts:
-            track.edit_problem = (
-                "these rows are fixed windows off a grid, not decoded bouts. Set "
-                "predict.decode and label again to get bouts; to relabel a "
-                "window, annotate it."
-            )
-            return
-        store = self.corrections
-        for group, segments in track.lanes.items():
-            if not segments:
-                continue
-            try:
-                model = Partition(
-                    [Span(s.f_start, s.f_end, s.label, False) for s in segments],
-                    segments[0].f_start, segments[-1].f_end,
-                )
-            except ValueError as exc:
-                track.edit_problem = (
-                    f"the {group} rows for this track are not a usable decode: {exc}"
-                )
-                return
-            saved = store.for_track(track.movie_id, track.track_id, group) \
-                if store is not None else []
-            try:
-                partition, orphans, clipped = apply_corrections(model, saved)
-            except ValueError as exc:
-                track.edit_problem = f"a saved correction cannot be applied: {exc}"
-                return
-            track.partitions[group] = partition
-            track.orphans.extend(orphans)
-            track.partly_shown.extend(clipped)
-
     def _segments(self, rows: pd.DataFrame, group: str) -> list[Segment]:
-        """One group's spans out of one track's rows, in frame order.
-
-        A bout table carries one row per (group, bout), so a group owns only the
-        rows whose ``group`` column names it. A windows table has no ``group``
-        column and every row speaks for every group at once.
-        """
-        if self.bouts:
-            rows = rows[rows["group"].astype(str) == group]
+        """One group's bouts out of one track's rows, in frame order."""
+        rows = rows[rows["group"].astype(str) == group]
         if rows.empty:
             return []
 
@@ -507,21 +209,8 @@ class PredictionReader:
         ).to_numpy(dtype=float)
         starts = pd.to_numeric(rows["f_start"], errors="coerce").to_numpy(dtype=float)
         ends = pd.to_numeric(rows["f_end"], errors="coerce").to_numpy(dtype=float)
-        # A windows file records a flag, a bout file a fraction, and a file with
-        # neither reports NaN rather than 0.0.
-        if "human_overlap_frac" in rows.columns:
-            human = pd.to_numeric(rows["human_overlap_frac"], errors="coerce")
-        elif "human_labelled" in rows.columns:
-            human = rows["human_labelled"].astype(bool).astype(float)
-        else:
-            human = blank
-        covering = pd.to_numeric(
-            rows["n_covering_mean"] if "n_covering_mean" in rows.columns else blank,
-            errors="coerce",
-        ).to_numpy(dtype=float)
         reason = (rows["skip_reason"].astype(str) if "skip_reason" in rows.columns
                   else pd.Series("", index=rows.index)).to_numpy()
-        human = human.to_numpy(dtype=float)
         names = pred.to_numpy()
 
         out = []
@@ -535,81 +224,9 @@ class PredictionReader:
                 f_start=int(starts[i]), f_end=int(ends[i]),
                 label=str(names[i]) if known[i] else "",
                 conf=float(conf[i]) if known[i] else float("nan"),
-                human_frac=float(human[i]),
-                n_covering=float(covering[i]),
                 skip_reason="" if text.lower() == "nan" else text,
             ))
         out.sort(key=lambda s: (s.f_start, s.f_end))
-        return out
-
-    # -- the posterior the bouts were cut from -------------------------------- #
-    def posterior(self) -> pd.DataFrame | None:
-        """``frame_posteriors.parquet``, or None when the run did not save one.
-
-        ``predict.save_posteriors`` is off by default, so None is the common
-        case. Read once, on the first track a reviewer looks at.
-        """
-        if self._posterior_read:
-            return self._posterior
-        self._posterior_read = True
-        from ..infer.predict import posteriors_path
-
-        path = posteriors_path(self.cfg)
-        if not path.exists():
-            return None
-        try:
-            self._posterior = pd.read_parquet(path)
-        except (OSError, ValueError) as exc:
-            # Not fatal and not silent: the timeline is worth drawing without a
-            # trace, but the reviewer is told the file is unreadable.
-            self.problem = f"{path.name} could not be read ({exc})"
-            self._posterior = None
-        return self._posterior
-
-    def _traces(self, track: TrackPredictions) -> dict:
-        """Per-frame posterior of the DECODED class, per group.
-
-        ``conf`` is a mean over the bout's frames and cannot separate a flat
-        value from one that swings either side of a trough. Only the decoded
-        class's column is followed, since that is the number ``conf`` is the
-        mean of.
-        """
-        table = self.posterior()
-        if table is None or table.empty or not track.lanes:
-            return {}
-        rows = table[
-            (table["movie_id"].astype(str) == track.movie_id)
-            & (pd.to_numeric(table["track_id"], errors="coerce") == track.track_id)
-        ]
-        if rows.empty:
-            return {}
-        frames = pd.to_numeric(rows["frame"], errors="coerce").to_numpy(dtype=np.int64)
-        order = np.argsort(frames, kind="stable")
-        frames = frames[order]
-
-        out: dict[str, np.ndarray] = {}
-        n = max(track.f_hi - track.f_lo, 0)
-        index = frames - track.f_lo
-        # A posterior written by a different run need not span the same frames
-        # as the bouts. Neither this nor `index` depends on the segment.
-        in_span = (index >= 0) & (index < n)
-        columns: dict[str, np.ndarray] = {}
-        for group, segments in track.lanes.items():
-            trace = np.full(n, np.nan)
-            for segment in segments:
-                column = f"{group}__p__{segment.label}"
-                if not segment.label or column not in rows.columns:
-                    continue
-                if column not in columns:
-                    columns[column] = pd.to_numeric(
-                        rows[column], errors="coerce"
-                    ).to_numpy(dtype=float)[order]
-                inside = (
-                    (frames >= segment.f_start) & (frames < segment.f_end) & in_span
-                )
-                trace[index[inside]] = columns[column][inside]
-            if np.isfinite(trace).any():
-                out[group] = trace
         return out
 
 
@@ -622,120 +239,14 @@ REVIEW_HELP = """
 behavioural boundaries. Bar height is the bout's mean posterior for its own
 class, so a marginal bout is a <i>short</i> bar, never a pale one.</p>
 
-<p>Every category group gets <b>two lanes</b>. The upper one is the model's
-bouts. The lower one is <b>the record</b>: the same bouts with your corrections
-laid over them, a corrected span filled solid and outlined, a span still the
-model's faded and dashed. The record lane has no bar height, because what a
-person asserts about a stretch of frames is not a posterior over it.</p>
-
-<p>A boundary <b>you</b> placed is a hairline; one the <b>decode</b> placed keeps
-its error band, since only the decode's is uncertain to the window stride.</p>
-
-<h3>Correcting one</h3>
-<p>Drag a boundary, or type a frame range and press <b>Set class</b>. Dragging,
-splitting, merging and relabelling are one operation, <i>name a class over a
-frame range</i>, with different arguments, so the run-length encoding stays
-gapless.</p>
-
-<p>Every accepted edit is saved immediately to <b>bout_corrections.csv</b>,
-beside annotations.csv. There is no Save button to forget, and nothing is lost
-by navigating away. <b>predictions.parquet and your annotation CSV are never
-written to.</b></p>
-
-<p>A file of <b>fixed windows</b> cannot be corrected, and offers no controls.
-A window's edges are stride multiples the predictor chose, so moving one
-corrects nothing about the animal, and a window relabelled by hand is a clip
-label, which the annotation CSV already holds.</p>
-
-<h3>Where the model and a label disagree</h3>
-<p>The <b>&lt; disagreement</b> and <b>disagreement &gt;</b> buttons walk every
-annotation window whose recorded label differs from what a model fitted
-<i>without that window's movie</i> predicted, surest first. Those are the same
-predictions the report's confusion matrix tallies.</p>
-
-<p>It has to be a held-out prediction. The saved model was fitted on every label
-there is, so its opinion of one is an opinion of a row it memorised, and it
-reproduces almost all of them however wrong they are.</p>
-
-<p>To <b>change</b> a label, use <i>review disagreements</i> on the Annotate
-page, which walks the same list and can edit it. This walk is for seeing where
-the boundary sits around one.</p>
-
-<h3>Hatching and thin spans</h3>
-<p>A <b>hatched</b> span overlaps frames you labelled by hand, which trained
-this model, so agreement there is not evidence about it. The fraction covers
-every predicted group at once, so it over-reports for any one of them.</p>
-
-<p>A span resting on <b>fewer than two windows per frame</b> is near a track's
-end, where only one window reaches: the posterior there is one window's
-opinion.</p>
-
-<p>A correction reaching past what these predictions cover is drawn cut short at
-the ends of the track. <b>The file keeps its real ends</b>, nothing is truncated
-by being displayed.</p>
-
-<p>With <b>predict.save_posteriors</b> off, the per-frame posterior behind each
-bar was never written, so only the bout's mean is available to draw.</p>
+<p>A hatched stretch is one no window could score; hover it for the reason.</p>
 
 <h3>The video</h3>
-<p>Every frame is cut from the movie, never from the clip cache, at one crop for
-the whole session. It has no scrubber of its own: the lanes are the frame axis,
-and they span the whole track.</p>
+<p>Click or drag on the lanes to move the video there. Every frame is cut from
+the movie, never from the clip cache, at one crop for the whole session. It has
+no scrubber of its own: the lanes are the frame axis, and they span the whole
+track.</p>
 """
-
-
-def caption_lines(
-    track: TrackPredictions, resolution: Resolution, min_confidence: float = 0.0,
-    has_trace: bool = False,
-) -> list[str]:
-    """What is true of THIS track, and nothing that is true of every one.
-
-    The general explanation lives in :data:`REVIEW_HELP`, behind the panel's
-    `?`: read once and then permanent, it is a paragraph taking room from the
-    picture it is about. What stays here is conditional - a count, a warning
-    that applies to this track and not the next.
-
-    Separate from the painting so the claims can be tested without a screenshot.
-    """
-    if track.empty:
-        return []
-    lines: list[str] = []
-    if track.bouts:
-        lines.append(resolution.brief())
-    else:
-        lines.append(
-            f"{track.unit}, NOT decoded bouts - set predict.decode and relabel"
-        )
-
-    hand = [s for lane in track.lanes.values() for s in lane
-            if np.isfinite(s.human_frac) and s.human_frac > 0]
-    if hand:
-        lines.append(f"{len(hand)} hatched (overlaps hand labels)")
-
-    thin = [s for lane in track.lanes.values() for s in lane
-            if np.isfinite(s.n_covering) and s.n_covering < 2.0]
-    if thin:
-        lines.append(f"{len(thin)} span(s) on <2 windows/frame")
-
-    if track.partitions:
-        corrected = track.n_corrected
-        lines.append(f"{corrected} span(s) corrected" if corrected
-                     else "no corrections on this track")
-    if track.orphans:
-        lines.append(
-            f"{len(track.orphans)} correction(s) off these predictions (kept, "
-            "not drawn)"
-        )
-    if track.partly_shown:
-        listed = ", ".join(f"{c.f_start}-{c.f_end}" for c in track.partly_shown[:4])
-        lines.append(
-            f"{len(track.partly_shown)} correction(s) drawn cut short ({listed})"
-        )
-    if min_confidence > 0 and track.bouts:
-        lines.append(f"dashed line = suggest.min_confidence {min_confidence:g}")
-    if track.bouts and not has_trace:
-        lines.append("no per-frame posterior (predict.save_posteriors was off)")
-    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -746,53 +257,34 @@ class BoutTimeline(QWidget):
 
     LANE = 52
     BAR = 34
-    RECORD_LANE = 38
-    RECORD_BAR = 22
-    GAP = 6
     TOP = 10
     AXIS = 26
     RIGHT = 12
-    # How near a boundary a press has to land to grab it rather than select the
-    # span. In PIXELS, not frames: the reviewer is aiming with a mouse.
-    GRAB_PX = 5.0
 
-    # (group, f_start, f_end) of the record span the reviewer clicked, so the
-    # panel's frame boxes can be filled from the picture rather than typed.
-    spanClicked = Signal(str, int, int)
-    # (group, boundary was at, boundary dragged to). The widget does not apply
-    # it; the partition is what enforces the invariant.
-    boundaryMoved = Signal(str, int, int)
     # The frame the reviewer pointed at, so the video can go there. Emitted on
-    # press and on every drag, because scrubbing is how a boundary is checked.
+    # press and on every drag.
     positionPicked = Signal(int)
 
     def __init__(self, cfg: Config | None = None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
-        self.track = TrackPredictions("", 0, False, "")
-        self.resolution = Resolution()
+        self.track = TrackPredictions("", 0)
         self.note = ""
-        self.selected: tuple[str, int, int] | None = None
         # The frame the video is showing, or None before it shows one.
         self.position: int | None = None
         self._scrub = False
-        self._hits: list[tuple[QRectF, str, object, str]] = []
+        self._hits: list[tuple[QRectF, str, Segment]] = []
         # Set on every paint so the mouse handlers measure with the same ruler
         # the picture was drawn with.
         self._geom: tuple[float, float] = (0.0, 0.0)
-        self._drag: tuple[str, int, int] | None = None
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMinimumWidth(420)
         self.setMouseTracking(True)
 
-    def set_track(self, track: TrackPredictions, resolution: Resolution,
-                  note: str = "") -> None:
+    def set_track(self, track: TrackPredictions, note: str = "") -> None:
         self.track = track
-        self.resolution = resolution
         self.note = note
-        self.selected = None
         self.position = None
-        self._drag = None
         self._scrub = False
         self.updateGeometry()
         self.update()
@@ -808,9 +300,7 @@ class BoutTimeline(QWidget):
 
     def sizeHint(self) -> QSize:
         lanes = max(1, len(self.track.lanes))
-        records = len(self.track.partitions)
-        return QSize(760, self.TOP + lanes * self.LANE
-                     + records * self.RECORD_LANE + self.AXIS + 8)
+        return QSize(760, self.TOP + lanes * self.LANE + self.AXIS + 8)
 
     def minimumSizeHint(self) -> QSize:
         """As narrow as ``minimumWidth`` allows, and no shorter than its lanes,
@@ -818,25 +308,9 @@ class BoutTimeline(QWidget):
         return QSize(self.minimumWidth(), self.sizeHint().height())
 
     # -- geometry ------------------------------------------------------------ #
-    def _lane_plan(self) -> list[tuple[str, str, float]]:
-        """``[(kind, group, y)]`` top to bottom, the model lane then its record.
-
-        One list for the painter and the hit tests, so a lane cannot be drawn at
-        one height and clicked at another.
-        """
-        out: list[tuple[str, str, float]] = []
-        y = float(self.TOP)
-        for group in self.track.lanes:
-            out.append(("model", group, y))
-            y += self.LANE
-            if group in self.track.partitions:
-                out.append(("record", group, y))
-                y += self.RECORD_LANE
-        return out
-
     def _gutter(self, metrics=None) -> float:
         metrics = metrics if metrics is not None else self.fontMetrics()
-        names = list(self.track.lanes) + (["record"] if self.track.partitions else [])
+        names = list(self.track.lanes)
         return min(
             max(70.0, max(metrics.horizontalAdvance(n) for n in names or [""]) + 16.0),
             max(80.0, self.width() * 0.28),
@@ -850,8 +324,7 @@ class BoutTimeline(QWidget):
         return gutter + (frame - self.track.f_lo) * scale
 
     def _frame_at(self, x: float) -> int:
-        """The frame under a pixel, clamped to the track. Rounded, not floored,
-        so a boundary is dragged to the same frame from either side of it."""
+        """The frame under a pixel, clamped to the track."""
         gutter, scale = self._geom
         if scale <= 0:
             return self.track.f_lo
@@ -880,26 +353,16 @@ class BoutTimeline(QWidget):
         gutter = self._gutter(metrics)
         scale = self._scale(gutter)
         self._geom = (gutter, scale)
-        bottom = float(self.TOP)
-        for kind, group, y in self._lane_plan():
-            if kind == "model":
-                self._paint_lane(painter, t, group, self.track.lanes[group], y,
-                                 gutter, scale)
-                bottom = y + self.LANE
-            else:
-                self._paint_record(painter, t, group,
-                                   self.track.partitions[group], y, gutter, scale)
-                bottom = y + self.RECORD_LANE
-        self._paint_axis(painter, t, bottom, gutter, scale)
-        self._paint_position(painter, t, bottom, gutter, scale)
+        y = float(self.TOP)
+        for group, segments in self.track.lanes.items():
+            self._paint_lane(painter, t, group, segments, y, gutter, scale)
+            y += self.LANE
+        self._paint_axis(painter, t, y, gutter, scale)
+        self._paint_position(painter, t, y, gutter, scale)
         painter.end()
 
     def _paint_position(self, painter, t, bottom, gutter, scale) -> None:
-        """The frame the video is on, across every lane at once.
-
-        Last, so it is over the bars: it is the one mark here that says where
-        you are rather than what was predicted.
-        """
+        """The frame the video is on, across every lane at once, over the bars."""
         if self.position is None or not self.track.f_hi > self.track.f_lo:
             return
         if not self.track.f_lo <= self.position <= self.track.f_hi:
@@ -917,8 +380,8 @@ class BoutTimeline(QWidget):
         """The empty state, spelled out: a track with no predicted rows is a
         normal outcome, and a blank widget would read as a broken one."""
         return (
-            f"No {self.track.unit or 'predicted rows'} for track "
-            f"{self.track.track_id} of {self.track.movie_id}.\n\n"
+            f"No predicted bouts for track {self.track.track_id} of "
+            f"{self.track.movie_id}.\n\n"
             "That is normal, not an error: a track with no featurisable window "
             "over it gets no row at all."
         )
@@ -939,30 +402,8 @@ class BoutTimeline(QWidget):
         painter.setBrush(QColor(t["raised"]))
         painter.drawRoundedRect(bar, 4, 4)
 
-        # Under the bars: a band is a statement about the edges between them and
-        # must not obscure the fills.
-        if self.track.bouts and self.resolution.known and len(segments) > 1:
-            half = max(1.0, self.resolution.worst_error * scale)
-            band = QColor(t["border_hi"])
-            band.setAlpha(90)
-            painter.setBrush(band)
-            for segment in segments[1:]:
-                x = self._x(segment.f_start, gutter, scale)
-                painter.drawRect(QRectF(x - half, bar.top(), 2 * half, self.BAR))
-
         for segment in segments:
             self._paint_segment(painter, t, group, segment, bar, gutter, scale)
-
-        floor = float(getattr(getattr(self.cfg, "suggest", None), "min_confidence", 0.0) or 0.0)
-        if self.track.bouts and 0.0 < floor < 1.0:
-            level = bar.bottom() - floor * self.BAR
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(t["border_hi"]), 1, Qt.DashLine))
-            painter.drawLine(QPointF(bar.left(), level), QPointF(bar.right(), level))
-
-        trace = self.track.trace.get(group)
-        if trace is not None:
-            self._paint_trace(painter, t, trace, bar, gutter, scale)
 
     def _colour(self, group: str, label: str, t) -> QColor:
         """The class's own colour from the config, matching the exported movie.
@@ -976,94 +417,11 @@ class BoutTimeline(QWidget):
         colour = QColor(option.color) if option is not None else QColor(t["faint"])
         return colour if colour.isValid() else QColor(t["faint"])
 
-    def _paint_record(self, painter, t, group, partition, y, gutter, scale) -> None:
-        """The record lane: what is now asserted about every frame of this track.
-
-        Deliberately without a bar height: the record has no confidence number,
-        and a correction cut out of a bout does not inherit the bout's mean.
-        """
-        bar_top = y + (self.RECORD_LANE - self.RECORD_BAR) / 2
-        bar = QRectF(gutter, bar_top, max(0.0, self.width() - gutter - self.RIGHT),
-                     self.RECORD_BAR)
-
-        painter.setPen(QColor(t["muted"]))
-        painter.drawText(QRectF(2, bar_top, gutter - 8, self.RECORD_BAR),
-                         int(Qt.AlignVCenter | Qt.AlignRight), "record")
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(t["raised"]))
-        painter.drawRoundedRect(bar, 3, 3)
-
-        # A boundary the DECODE placed keeps the stride band; one a person placed
-        # does not, because only an inferred boundary is uncertain to the stride.
-        model_cuts = {s.f_start for s in self.track.lanes.get(group, [])[1:]}
-        if self.resolution.known:
-            half = max(1.0, self.resolution.worst_error * scale)
-            band = QColor(t["border_hi"])
-            band.setAlpha(90)
-            painter.setBrush(band)
-            painter.setPen(Qt.NoPen)
-            for cut in partition.boundaries():
-                if cut in model_cuts:
-                    x = self._x(cut, gutter, scale)
-                    painter.drawRect(QRectF(x - half, bar.top(), 2 * half,
-                                            self.RECORD_BAR))
-
-        metrics = painter.fontMetrics()
-        for span in partition.spans:
-            x0 = self._x(span.f_start, gutter, scale)
-            x1 = self._x(span.f_end, gutter, scale)
-            rect = QRectF(x0, bar.top(), max(1.0, x1 - x0), self.RECORD_BAR)
-            self._hits.append((rect, group, span, "record"))
-            if not span.label:
-                hatch = QColor(t["faint"])
-                hatch.setAlpha(70)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(hatch, Qt.FDiagPattern))
-                painter.drawRect(rect)
-                continue
-            colour = self._colour(group, span.label, t)
-            if not span.corrected:
-                # Faded and dashed: this span is still the model's.
-                colour.setAlpha(90)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(colour)
-            painter.drawRect(rect)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(t["text"]), 2) if span.corrected
-                           else QPen(QColor(t["border"]), 1, Qt.DashLine))
-            painter.drawRect(rect)
-            text = span.label if span.corrected else f"({span.label})"
-            if rect.width() > metrics.horizontalAdvance(text) + 8:
-                painter.setPen(QColor(t["text"] if span.corrected else t["muted"]))
-                painter.drawText(rect, int(Qt.AlignCenter), text)
-
-        # A boundary a person placed, drawn as the hairline it is entitled to be.
-        painter.setPen(QPen(QColor(t["text"]), 1))
-        for cut in partition.boundaries():
-            if cut not in model_cuts:
-                x = self._x(cut, gutter, scale)
-                painter.drawLine(QPointF(x, bar.top() - 3),
-                                 QPointF(x, bar.bottom() + 3))
-
-        if self.selected is not None and self.selected[0] == group:
-            _, f_start, f_end = self.selected
-            x0 = self._x(f_start, gutter, scale)
-            x1 = self._x(f_end, gutter, scale)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(t["accent"]), 2))
-            painter.drawRect(QRectF(x0 - 1, bar.top() - 3, max(2.0, x1 - x0) + 2,
-                                    self.RECORD_BAR + 6))
-
-        if self._drag is not None and self._drag[0] == group:
-            x = self._x(self._drag[2], gutter, scale)
-            painter.setPen(QPen(QColor(t["accent"]), 2, Qt.DashLine))
-            painter.drawLine(QPointF(x, bar.top() - 6), QPointF(x, bar.bottom() + 6))
-
     def _paint_segment(self, painter, t, group, segment, bar, gutter, scale) -> None:
         x0 = self._x(segment.f_start, gutter, scale)
         x1 = self._x(segment.f_end, gutter, scale)
         rect = QRectF(x0, bar.top(), max(1.0, x1 - x0), self.BAR)
-        self._hits.append((rect, group, segment, "model"))
+        self._hits.append((rect, group, segment))
 
         if not segment.label:
             # A hole, drawn as one: no fill, a hatch, and the skip_reason in the
@@ -1086,14 +444,6 @@ class BoutTimeline(QWidget):
         painter.setBrush(colour)
         painter.drawRect(fill)
 
-        if np.isfinite(segment.human_frac) and segment.human_frac > 0:
-            # Hatched over the whole span: the file records what fraction of the
-            # bout a person judged, never which frames.
-            mark = QColor(t["warning"])
-            mark.setAlpha(int(90 + 120 * min(1.0, segment.human_frac)))
-            painter.setBrush(QBrush(mark, Qt.BDiagPattern))
-            painter.drawRect(rect)
-
         painter.setPen(QPen(colour.darker(140), 1))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(rect)
@@ -1104,29 +454,6 @@ class BoutTimeline(QWidget):
         if rect.width() > metrics.horizontalAdvance(text) + 8:
             painter.setPen(QColor(t["text"]))
             painter.drawText(rect, int(Qt.AlignCenter), text)
-
-    def _paint_trace(self, painter, t, trace, bar, gutter, scale) -> None:
-        """The per-frame posterior of the decoded class, on the bars' own scale.
-
-        Broken at every undefined frame rather than bridged, so no line is drawn
-        across frames no window covered.
-        """
-        pen = QPen(QColor(t["text"]), 1.2)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        polygon = QPolygonF()
-        for i, value in enumerate(trace):
-            if not np.isfinite(value):
-                if polygon.count() > 1:
-                    painter.drawPolyline(polygon)
-                polygon = QPolygonF()
-                continue
-            polygon.append(QPointF(
-                self._x(self.track.f_lo + i + 0.5, gutter, scale),
-                bar.bottom() - float(value) * self.BAR,
-            ))
-        if polygon.count() > 1:
-            painter.drawPolyline(polygon)
 
     def _paint_axis(self, painter, t, y, gutter, scale) -> None:
         painter.setPen(QPen(QColor(t["border"]), 1))
@@ -1157,53 +484,21 @@ class BoutTimeline(QWidget):
         return super().event(e)
 
     def _at(self, point):
-        for rect, group, item, kind in self._hits:
+        for rect, group, segment in self._hits:
             if rect.contains(QPointF(point)):
-                return group, item, kind
+                return group, segment
         return None
 
-    # -- editing with the mouse ---------------------------------------------- #
+    # -- scrubbing with the mouse --------------------------------------------- #
     def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
-        """Grab a boundary if the press is near one, otherwise select a span and
-        take the video to the frame under the mouse.
-
-        A boundary is grabbed on the record lane only: the model lane is a
-        picture of what the run produced and is never edited. Everything else is
-        a scrub, including a click on a span, because "which frames are these?"
-        is answered by watching them.
-        """
+        """Take the video to the frame under the mouse."""
         if event.button() != Qt.LeftButton or self.note or self.track.empty:
             super().mousePressEvent(event)
             return
-        hit = self._at(event.pos())
-        if hit is not None and hit[2] == "record":
-            group, span, _ = hit
-            partition = self.track.partitions.get(group)
-            if partition is not None:
-                gutter, scale = self._geom
-                near = [c for c in partition.boundaries()
-                        if abs(self._x(c, gutter, scale) - event.pos().x())
-                        <= self.GRAB_PX]
-                if near:
-                    cut = min(near, key=lambda c: abs(self._x(c, gutter, scale)
-                                                      - event.pos().x()))
-                    self._drag = (group, cut, cut)
-                    self.update()
-                    return
-                self.selected = (group, span.f_start, span.f_end)
-                self.spanClicked.emit(group, span.f_start, span.f_end)
         self._scrub = True
         self._pick(event.pos().x())
 
     def mouseMoveEvent(self, event):  # noqa: N802 (Qt naming)
-        if self._drag is not None:
-            group, cut, _ = self._drag
-            self._drag = (
-                group, cut,
-                self._clamp_boundary(group, cut, self._frame_at(event.pos().x())),
-            )
-            self.update()
-            return
         if self._scrub:
             self._pick(event.pos().x())
             return
@@ -1213,14 +508,7 @@ class BoutTimeline(QWidget):
         if self._scrub:
             self._scrub = False
             return
-        if self._drag is None:
-            super().mouseReleaseEvent(event)
-            return
-        group, cut, moved = self._drag
-        self._drag = None
-        self.update()
-        if moved != cut:
-            self.boundaryMoved.emit(group, cut, moved)
+        super().mouseReleaseEvent(event)
 
     def _pick(self, x: float) -> None:
         frame = self._frame_at(x)
@@ -1228,27 +516,7 @@ class BoutTimeline(QWidget):
         self.positionPicked.emit(frame)
         self.update()
 
-    def _clamp_boundary(self, group: str, cut: int, frame: int) -> int:
-        """Where a dragged boundary is allowed to end up.
-
-        Inside the two spans it separates and no further: a drag past a
-        neighbour's far edge would delete that span, which is what the merge
-        buttons are for.
-        """
-        partition = self.track.partitions.get(group)
-        if partition is None:
-            return cut
-        index = partition.index_at(cut)
-        if index <= 0:
-            return cut
-        left, right = partition.spans[index - 1], partition.spans[index]
-        return int(min(max(frame, left.f_start + 1), right.f_end - 1))
-
-    def _describe(self, group: str, item, kind: str = "model") -> str:
-        if kind == "record":
-            return self._describe_span(group, item)
-        segment = item
-        noun = "bout" if self.track.bouts else "window"
+    def _describe(self, group: str, segment: Segment) -> str:
         lines = [
             f"{group}: {segment.label or '(no prediction)'}",
             f"frames {segment.f_start}-{segment.f_end} ({segment.n_frames} frames)",
@@ -1256,59 +524,10 @@ class BoutTimeline(QWidget):
         if np.isfinite(segment.conf):
             lines.append(
                 f"confidence {segment.conf:.3f} - the MEAN posterior for this "
-                f"class over this {noun}'s own frames, not its peak"
-            )
-        if np.isfinite(segment.human_frac):
-            if segment.human_frac > 0:
-                lines.append(
-                    f"{100 * segment.human_frac:.0f}% of these frames were labelled "
-                    "by hand and trained this model, so agreement here measures "
-                    "nothing (the fraction covers every predicted group)"
-                )
-            else:
-                lines.append("no hand-labelled frames overlap this span")
-        if np.isfinite(segment.n_covering):
-            lines.append(
-                f"{segment.n_covering:.1f} windows per frame on average went into "
-                "the posterior here"
-            )
-        if self.track.bouts and self.resolution.known:
-            lines.append(
-                f"both edges are resolved to the {self.resolution.stride}-frame "
-                f"stride: {self.resolution.mean_error:.1f} frames out on average, "
-                f"{self.resolution.worst_error:.0f} at worst"
+                "class over this bout's own frames, not its peak"
             )
         if segment.skip_reason:
             lines.append(segment.skip_reason)
-        return "\n".join(lines)
-
-    def _describe_span(self, group: str, span) -> str:
-        """The record's own account of a stretch of frames.
-
-        It says who is claiming it and never how confident anyone is: a
-        corrected span has no posterior, and a model span cut down by a
-        correction no longer has the one its bout was measured with.
-        """
-        lines = [
-            f"{group}: {span.label or '(no prediction)'}",
-            f"frames {span.f_start}-{span.f_end} ({span.n_frames} frames)",
-        ]
-        if span.corrected:
-            lines.append(
-                "asserted by a person, so it carries no confidence. The model's "
-                "own answer for these frames is the lane above, unchanged."
-            )
-        elif span.label:
-            lines.append(
-                "the model's, uncorrected. Where a correction has cut it short, "
-                "the confidence in the lane above is still the mean over the whole "
-                "bout it came from."
-            )
-        else:
-            lines.append(
-                "no window over these frames could be featurised, so nothing has "
-                "scored them. A person may still say what they are."
-            )
         return "\n".join(lines)
 
 
@@ -1336,6 +555,8 @@ def _axis_ticks(f_lo: int, f_hi: int, target: int = 6) -> list[int]:
 # enough to arrive quickly, long enough to play through.
 REVIEW_CHUNK = 50
 CHUNKS_KEPT = 5
+# Frames between two deliveries of a chunk still being cut.
+PARTIAL_EVERY = 5
 
 
 @dataclass(frozen=True)
@@ -1352,16 +573,12 @@ class ReviewCrop:
 
     side: int
     size: int
-    source: str                  # where the number came from, in a phrase
 
     @property
     def scale(self) -> float:
         """Delivered pixels per movie pixel."""
         return self.size / float(self.side)
 
-    def sentence(self) -> str:
-        shown = "" if self.size == self.side else f" shown at {self.size} px"
-        return f"{self.side} px crop{shown}, the same on every track and movie here"
 
 
 def review_crop(cfg: Config) -> ReviewCrop:
@@ -1378,7 +595,6 @@ def review_crop(cfg: Config) -> ReviewCrop:
     from ..annotate.clips import MANIFEST_FILE
 
     widths: list[np.ndarray] = []
-    movies = 0
     work = getattr(getattr(cfg, "paths", None), "work_dir", None)
     if work is not None and work.exists():
         for movie_dir in sorted(p for p in work.iterdir() if p.is_dir()):
@@ -1392,21 +608,16 @@ def review_crop(cfg: Config) -> ReviewCrop:
             values = pd.to_numeric(column, errors="coerce").dropna().to_numpy(float)
             if values.size:
                 widths.append(values)
-                movies += 1
 
     ceiling = max(32, int(getattr(cfg.clips, "max_size", 256) or 256))
     if widths:
         pooled = np.concatenate(widths)
         side = int(np.ceil(float(np.percentile(pooled, 99)) / 16.0) * 16)
-        source = (f"sized to hold 99% of the {pooled.size} windows this "
-                  f"project's cache was cut over, across {movies} movie(s)")
     else:
         declared = getattr(cfg.clips, "crop_size", "auto")
-        named = "clips.crop_size" if isinstance(declared, int) else "clips.max_size"
         side = int(declared) if isinstance(declared, int) else ceiling
-        source = f"{named}, there being no clip manifest to measure"
     side = max(16, side)
-    return ReviewCrop(side=side, size=min(side, ceiling), source=source)
+    return ReviewCrop(side=side, size=min(side, ceiling))
 
 
 class MovieFrames(QObject):
@@ -1429,6 +640,10 @@ class MovieFrames(QObject):
     # together, because a second request overwrites whatever the worker keeps
     # and the pixels and the marker on them must be the same chunk.
     ready = Signal(int, int, object)
+    # The same, for the frames cut so far. After the first frame and then
+    # every `PARTIAL_EVERY`, so a reader on a share sees a frame after one
+    # read rather than after fifty. Read-aheads arrive whole.
+    partial = Signal(int, int, object)
     failed = Signal(int, str)
 
     AHEAD = 0                      # the request id a read-ahead arrives under
@@ -1459,19 +674,28 @@ class MovieFrames(QObject):
         self._path: np.ndarray | None = None      # (n_frames, 2) crop centres
 
     # -- the request -------------------------------------------------------- #
-    def want(self, request_id: int, first: int) -> None:
-        """Ask for the chunk at ``first`` now. Latest wins: a scrub produces a
-        request per mouse move and only the last is worth decoding."""
+    def want(self, request_id: int, first: int, last: int | None = None) -> None:
+        """Ask for frames ``first`` to ``last`` now, ``first + chunk`` by default.
+        Latest wins: a scrub produces a request per mouse move and only the
+        last is worth decoding."""
         with self._lock:
-            self._request = (int(request_id), int(first))
+            self._request = (int(request_id), int(first),
+                             None if last is None else int(last))
         self._start()
 
-    def read_ahead(self, firsts) -> None:
+    def read_ahead(self, chunks) -> None:
         """Queue the chunks the playhead is about to reach, behind the urgent
-        one. The same worker, because one movie handle is not two threads' to
-        seek."""
+        one: each a first frame, or ``(first, last)``. The same worker,
+        because one movie handle is not two threads' to seek."""
+        ahead = []
+        for chunk in chunks:
+            try:
+                first, last = chunk
+            except TypeError:
+                first, last = chunk, None
+            ahead.append((int(first), None if last is None else int(last)))
         with self._lock:
-            self._ahead = [int(f) for f in firsts]
+            self._ahead = ahead
         self._start()
 
     def _start(self) -> None:
@@ -1501,16 +725,20 @@ class MovieFrames(QObject):
             with self._lock:
                 request, self._request = self._request, None
                 if request is None and self._ahead:
-                    request = (self.AHEAD, self._ahead.pop(0))
+                    request = (self.AHEAD, *self._ahead.pop(0))
             if request is None:
                 self._wake.wait(timeout=0.25)
                 self._wake.clear()
                 continue
             if self._stop:
                 break
-            request_id, first = request
+            request_id, first, last = request
             try:
-                self.ready.emit(request_id, first, self._cut(first))
+                emit = None
+                if request_id != self.AHEAD:
+                    def emit(payload, rid=request_id, f=first):
+                        self.partial.emit(rid, f, payload)
+                self.ready.emit(request_id, first, self._cut(first, last, emit))
             except Exception as exc:   # a missing movie is a sentence, not a crash
                 # A read-ahead that fails is silent: it is routinely asked for
                 # frames past the end of the movie, and nobody is looking at it.
@@ -1646,13 +874,20 @@ class MovieFrames(QObject):
         return out
 
     # -- the pixels --------------------------------------------------------- #
-    def _cut(self, first: int) -> tuple[np.ndarray, pd.DataFrame]:
+    def _cut(self, first: int, last: int | None = None, emit=None,
+             ) -> tuple[np.ndarray, pd.DataFrame]:
+        """Frames ``first`` to ``last``, ``first + chunk`` by default, cropped.
+
+        ``emit`` is handed the frames cut so far, after the first and then
+        every ``PARTIAL_EVERY``, and never the finished chunk.
+        """
         import cv2
 
         from ..annotate.clips import _crop
 
         movie = self._open()
-        n = min(self.chunk, max(0, int(len(movie)) - int(first)))
+        wanted = self.chunk if last is None else int(last) - int(first)
+        n = min(max(1, wanted), max(0, int(len(movie)) - int(first)))
         if n <= 0:
             raise ValueError(f"frame {first} is past the end of {self.movie_id}")
         side, size = self.crop.side, self.crop.size
@@ -1669,6 +904,8 @@ class MovieFrames(QObject):
                 interp = cv2.INTER_AREA if crop.shape[0] > size else cv2.INTER_LINEAR
                 crop = cv2.resize(crop, (size, size), interpolation=interp)
             out[t] = crop
+            if emit is not None and t + 1 < n and (t == 0 or (t + 1) % PARTIAL_EVERY == 0):
+                emit((out[:t + 1].copy(), self._marks(first, t + 1, origins[:t + 1])))
         return out, self._marks(first, n, origins)
 
     def _marks(self, first: int, n: int, origins: np.ndarray) -> pd.DataFrame:
@@ -1737,9 +974,7 @@ class TrackFootage(QWidget):
 
     Two things about it differ from the annotation window on purpose - the crop,
     which is one size for the project rather than one per movie, and the view,
-    which re-centres every frame rather than following ``ui.follow``. Both are
-    said under the picture, because a difference discovered mid-review is read
-    as a difference in the recording.
+    which re-centres every frame rather than following ``ui.follow``.
 
     With no movie the picture goes away rather than going black: a dark
     rectangle reads as a decoder that failed, and the question worth answering
@@ -1774,8 +1009,6 @@ class TrackFootage(QWidget):
         self.source = QLabel("")
         self.source.setWordWrap(True)
         self.source.setProperty("role", "muted")
-        # The full caption, of which the label may be showing an elided line.
-        self._caption_text = ""
 
         # The annotation window's own two controls over the same rendering. Both
         # are display-time transforms of one decoded array, so either can change
@@ -1813,6 +1046,8 @@ class TrackFootage(QWidget):
         self._movie: MovieFrames | None = None
         self._problem = ""                         # why there is no video, or ""
         self._chunks: dict[int, tuple] = {}        # first frame -> (pixels, marks)
+        # The chunk being cut for the frame asked for: (first, last, request).
+        self._inflight: tuple[int, int, int] | None = None
         self._movie_id, self._track_id = "", 0
         self._span = (0, 0)
         self._loaded = -1                          # first frame of the array shown
@@ -1868,8 +1103,10 @@ class TrackFootage(QWidget):
         # frame nobody is looking at any more.
         self._request += 1
         self._resume_at = self._awaiting = -1
+        self._inflight = None
         if movie is not None:
             movie.ready.disconnect()
+            movie.partial.disconnect()
             movie.failed.disconnect()
             if not movie.stop():
                 print("[trackanno] review decode thread did not stop in time")
@@ -1878,10 +1115,16 @@ class TrackFootage(QWidget):
     # -- one track ----------------------------------------------------------- #
     def set_track(self, movie_id: str, track_id: int, f_lo: int, f_hi: int) -> None:
         self.viewer.pause()
-        self._release_movie()
-        # The frames of the track being left, which are not this one's.
-        self._chunks.clear()
-        self._movie_id, self._track_id = str(movie_id), int(track_id)
+        key = (str(movie_id), int(track_id))
+        if key == (self._movie_id, self._track_id) and self._movie is not None:
+            # The same animal: its decoder, the frames already cut and any
+            # chunk still being cut all stay. `show_frame` asks afresh.
+            self._resume_at = self._awaiting = -1
+        else:
+            self._release_movie()
+            # The frames of the track being left, which are not this one's.
+            self._chunks.clear()
+        self._movie_id, self._track_id = key
         self._span = (int(f_lo), int(f_hi))
         self._loaded = -1
         self._position = -1
@@ -1892,6 +1135,11 @@ class TrackFootage(QWidget):
     def position(self) -> int:
         """The movie frame on screen, or -1 when there is nothing to show."""
         return self._position
+
+    @property
+    def loading(self) -> bool:
+        """Whether a chunk is still being cut for the frame asked for."""
+        return self._inflight is not None
 
     @property
     def showing(self) -> str:
@@ -1906,43 +1154,32 @@ class TrackFootage(QWidget):
             return None
         return np.asarray(array[min(self.viewer._frame, array.shape[0] - 1)])
 
-    @property
-    def caption(self) -> str:
-        """The whole line under the picture, elided or not.
-
-        The label may be showing only as much of it as fits; this is what it
-        says, and it is what the tooltip carries.
-        """
-        return self._caption_text
-
     def _set_caption(self, text: str) -> None:
-        """The line under the picture, at a height that does not move.
-
-        Elided to one line while there is video, so the caption cannot take a
-        line out of it; wrapped in full when there is none. All of it is on the
-        tooltip either way.
-        """
-        self._caption_text = text
-        showing = self.viewer.isVisible()
-        self.source.setWordWrap(not showing)
-        shown = (
-            self.source.fontMetrics().elidedText(
-                text, Qt.ElideRight, max(60, self.source.width()))
-            if showing else text
-        )
-        if shown != self.source.text():
-            self.source.setText(shown)
-        # Set here, since this is what decides how much is on screen.
-        self.source.setToolTip(
-            (text + "\n\n" + self._difference()) if showing else text
-        )
-
-    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
-        super().resizeEvent(event)
-        if self._caption_text:
-            self._set_caption(self._caption_text)
+        if text != self.source.text():
+            self.source.setText(text)
 
     # -- moving ------------------------------------------------------------- #
+    def _chunk_bounds(self, frame: int) -> tuple[int, int]:
+        """The frames the chunk holding ``frame`` covers.
+
+        The grid cell, cut down to the span: a 25-frame window is then read
+        once and not padded to fifty, and on a share each frame is a network
+        read. A frame the clamped cell does not hold gets the plain cell.
+        """
+        lo, hi = self._span
+        cell = (int(frame) // REVIEW_CHUNK) * REVIEW_CHUNK
+        first, last = max(cell, lo), min(cell + REVIEW_CHUNK, hi)
+        if not first <= int(frame) < last:
+            return cell, cell + REVIEW_CHUNK
+        return first, last
+
+    def _held(self, frame: int):
+        """``(first, payload)`` of the held chunk holding ``frame``, or None."""
+        for first, payload in self._chunks.items():
+            if first <= int(frame) < first + len(payload[0]):
+                return first, payload
+        return None
+
     def show_frame(self, frame: int) -> None:
         """Put ``frame`` of this track on screen, from the movie."""
         frame = int(frame)
@@ -1953,21 +1190,32 @@ class TrackFootage(QWidget):
         if self._problem:
             self._no_video(self._problem)
             return
-        first = (frame // REVIEW_CHUNK) * REVIEW_CHUNK
-        held = self._chunks.get(first)
+        held = self._held(frame)
         if held is not None:
-            self._show_chunk(first, held, frame)
-            self._read_ahead(first)
+            first, payload = held
+            # Nothing is waited for now: a piece of a chunk asked for earlier
+            # must not put that earlier frame back up when it lands.
+            self._pending = (-1, frame)
+            self._show_chunk(first, payload, frame)
+            self._read_ahead(frame)
             return
+        cutting = self._inflight
+        if cutting is not None and cutting[0] <= frame < cutting[1]:
+            # Being cut now: wait for the piece that holds it, under the
+            # request already out, rather than ask for the chunk again.
+            self._pending = (cutting[2], frame)
+            self._awaiting = frame
+            return
+        first, last = self._chunk_bounds(frame)
         self._request += 1
         self._pending = (self._request, frame)
         self._awaiting = frame
-        self._frames().want(self._request, first)
-        self._read_ahead(first)
+        self._inflight = (first, last, self._request)
+        self._frames().want(self._request, first, last)
+        self._read_ahead(frame)
         if not self._length:
             self._set_caption(
-                f"reading frames {first}-{first + REVIEW_CHUNK} of "
-                f"{self._movie_id}..."
+                f"reading frames {first}-{last} of {self._movie_id}..."
             )
 
     def _frames(self) -> MovieFrames:
@@ -1976,10 +1224,11 @@ class TrackFootage(QWidget):
             self._movie = MovieFrames(self.cfg, self._movie_id, self._track_id,
                                       self.crop, REVIEW_CHUNK)
             self._movie.ready.connect(self._on_chunk)
+            self._movie.partial.connect(self._on_partial)
             self._movie.failed.connect(self._on_failed)
         return self._movie
 
-    def _read_ahead(self, first: int) -> None:
+    def _read_ahead(self, frame: int) -> None:
         """Decode the chunks the playhead is about to reach, on the same worker.
 
         A scrub asks for a frame per mouse move and playback walks straight off
@@ -1989,12 +1238,22 @@ class TrackFootage(QWidget):
         movie = self._movie
         if movie is None or not int(getattr(self.cfg.ui, "prefetch", 0) or 0):
             return
-        end = max(self._span[1], self._span[0] + 1)
-        movie.read_ahead([
-            f for f in (first + REVIEW_CHUNK, first - REVIEW_CHUNK,
-                        first + 2 * REVIEW_CHUNK)
-            if 0 <= f < end and f not in self._chunks
-        ])
+        lo, hi = self._span
+        first, last = self._chunk_bounds(frame)
+        after = self._chunk_bounds(last) if last < hi else None
+        wanted = [
+            after,
+            self._chunk_bounds(first - 1) if first > lo else None,
+            self._chunk_bounds(after[1]) if after is not None and after[1] < hi else None,
+        ]
+        queue: list[tuple[int, int]] = []
+        for chunk in wanted:
+            if (chunk is None or chunk[0] >= chunk[1] or chunk in queue
+                    or self._held(chunk[0]) is not None
+                    or (self._inflight is not None and chunk[0] == self._inflight[0])):
+                continue
+            queue.append(chunk)
+        movie.read_ahead(queue)
 
     def _keep(self, first: int, payload) -> None:
         """Hold the decoded chunks nearest the playhead and let the rest go."""
@@ -2004,9 +1263,9 @@ class TrackFootage(QWidget):
 
     def _show_chunk(self, first: int, payload, frame: int) -> None:
         array, marks = payload
-        if self._loaded != int(first):
+        if self._loaded != int(first) or int(len(array)) != self._length:
             # The frame goes in with the pixels: seeking afterwards paints
-            # frame 0 of the new chunk first.
+            # frame 0 of the new chunk first. A chunk that grew goes in again.
             offset = int(min(max(frame - int(first), 0), max(0, len(array) - 1)))
             self.viewer.set_clip(array, self._view(marks, array), frame=offset)
             self._mark()
@@ -2037,7 +1296,6 @@ class TrackFootage(QWidget):
             self._boxes, self._shape[0], self._shape[1],
             mode=self.follow,
             zoom=float(getattr(ui, "view_zoom", 1.0)),
-            smooth_window=int(getattr(ui, "smooth_window", 15)),
             with_context=bool(getattr(ui, "show_context_tracks", False)),
             n_kpts=(int(getattr(self.cfg, "n_keypoints", 0))
                     if getattr(ui, "show_skeleton", False) else 0),
@@ -2140,20 +1398,48 @@ class TrackFootage(QWidget):
             self.viewer.play()
 
     # -- what the decoder sends back ----------------------------------------- #
+    def _on_partial(self, request_id: int, first: int, payload) -> None:
+        """The frames cut so far of a chunk still being cut."""
+        if self.sender() is not self._movie:
+            return
+        self._keep(first, payload)
+        self._deliver(request_id, first, payload)
+
     def _on_chunk(self, request_id: int, first: int, payload) -> None:
         if self.sender() is not self._movie:
             # A read the track before this one had out. Its frames are of
             # another animal and must not reach the chunks kept here.
             return
         self._keep(first, payload)
-        if int(request_id) != self._request:
+        if self._inflight is not None and self._inflight[0] == int(first):
+            self._inflight = None
+        self._deliver(request_id, first, payload)
+
+    def _deliver(self, request_id: int, first: int, payload) -> None:
+        """Put the pending frame up if these frames hold it.
+
+        A piece that does not yet reach the frame asked for leaves the picture
+        alone, unless there is none yet, when its last frame goes up meanwhile.
+        A piece that does, while the chunk is already playing, goes in at the
+        frame playback has reached rather than back at the one first asked for.
+        """
+        if int(request_id) != self._pending[0]:
             return                        # a read-ahead, or a scrub moved on
-        self._awaiting = -1
-        array, _ = payload
-        frame = int(min(max(self._pending[1], first), first + len(array) - 1))
+        first, array = int(first), payload[0]
+        covered = first + int(len(array))
+        wanted = self._pending[1]
+        if wanted >= covered:
+            if self._length:
+                return
+            frame = covered - 1
+        else:
+            frame = wanted
+            self._awaiting = -1
+            if self._loaded == first and frame < self._position < covered:
+                frame = self._position
         self._show_chunk(first, payload, frame)
         if self._resume_at == frame:
-            # Playback stopped at the edge of a chunk waiting for these.
+            # Playback stopped at the edge of what was cut, waiting for these.
             self._resume_at = -1
             self.viewer.play()
 
@@ -2161,7 +1447,7 @@ class TrackFootage(QWidget):
         """Asked once and then remembered: a movie that has moved will not be
         back by the next mouse move, and re-opening it per scrub would hang the
         window on a dead share."""
-        if self.sender() is not self._movie or int(request_id) != self._request:
+        if self.sender() is not self._movie or int(request_id) != self._pending[0]:
             return
         self._awaiting = -1
         self._release_movie()
@@ -2173,36 +1459,16 @@ class TrackFootage(QWidget):
 
     # -- what there is to say ------------------------------------------------ #
     def _note(self) -> str:
-        """One line under the picture: which frame this is, and the two ways it
-        is deliberately not the frame the annotation window would show."""
+        """One line under the picture: which frame this is."""
         crop = self.crop
-        note = (
-            f"frame {self._position} of track {self._track_id}, cut from "
-            f"{self._movie_id}."
-        )
+        note = f"frame {self._position} of track {self._track_id}"
         if crop is not None:
-            note += f" {crop.sentence()}, centred on the track every frame."
+            note += f", {crop.side} px crop"
+        note += "."
         gap = getattr(self._movie, "skeleton_problem", "")
         if gap and bool(getattr(self.cfg.ui, "show_skeleton", False)):
             note += f" {gap}."
         return note
-
-    def _difference(self) -> str:
-        """The long form, on hover: what this window does that the annotation
-        window does not, and why."""
-        crop = self.crop
-        return (
-            "Every frame is cut from the movie, never from the clip cache: the "
-            "cache is cut per movie and centred per annotation window, so a "
-            "picture taken from both would change size and centring wherever a "
-            "window ran out.\n\n"
-            f"The crop is {crop.source if crop else 'not measured yet'}. It "
-            "follows a moving average over the whole track, so a frame is cut the "
-            "same way in every read, and the view re-centres on the animal every "
-            "frame.\n\n"
-            "The normalisation and the marker are the annotation window's. The "
-            "crop and the view are the only two differences."
-        )
 
     def clear(self, reason: str = "") -> None:
         """No track under review, and the reason if there is one."""
@@ -2241,17 +1507,10 @@ class TrackFootage(QWidget):
 # the panel and its window
 # --------------------------------------------------------------------------- #
 class BoutReviewPanel(QWidget):
-    """Movie, track, timeline, captions, and the controls that correct a bout.
+    """Movie, track, the bout timeline and the footage it is a picture of.
 
-    Every failure the files can present is a sentence in this panel rather than
-    an exception. Every editing gesture goes through :meth:`assert_class`, which
-    is :meth:`trackanno.annotate.corrections.Partition.assert_class` plus a save: on a
-    gapless run-length encoding, setting a class, merging either way and
-    dragging a boundary are four gestures over one operation.
-
-    A save happens on every accepted edit rather than on a Save button, so the
-    file is the state, as ``annotations.csv`` is. Undo is a stack of whole
-    partitions, so an undo is a save too.
+    Read-only. Every failure the files can present is a sentence in this panel
+    rather than an exception.
     """
 
     def __init__(self, cfg: Config | None = None, parent=None):
@@ -2262,7 +1521,6 @@ class BoutReviewPanel(QWidget):
         # currentIndexChanged from addItems, once per item added.
         self._loading = False
         self._track: TrackPredictions | None = None
-        self._undo: list[tuple[str, Partition]] = []
 
         # Elided rather than laid out at full width: a movie id is long, and
         # unelided the two of them set a floor under the whole page.
@@ -2281,27 +1539,6 @@ class BoutReviewPanel(QWidget):
         self.headline = QLabel("")
         self.headline.setWordWrap(True)
         self.headline.setTextFormat(Qt.RichText)
-
-        # Where in the disagreement walk this panel is. -1 is "not started", so
-        # the first press lands on the worst one rather than on the second.
-        self._disagree_at = -1
-        self.prev_disagreement = QPushButton("< disagreement")
-        self.next_disagreement = QPushButton("disagreement >")
-        for button, step in ((self.prev_disagreement, -1),
-                             (self.next_disagreement, 1)):
-            button.setToolTip(
-                "Go to a window somebody labelled by hand that the model would "
-                "have labelled differently, worst agreement first and across "
-                "every movie. A confusion matrix says which classes a model "
-                "confuses; this says which frames."
-            )
-            button.clicked.connect(lambda _=False, s=step: self._step_disagreement(s))
-        # A sentence, so it gets a line of its own rather than a slot between
-        # two combo boxes: unwrapped in the top row it set a 750px floor under
-        # the whole panel.
-        self.agreement_note = QLabel("")
-        self.agreement_note.setWordWrap(True)
-        self.agreement_note.setProperty("role", "muted")
         self.help_button = help_button(self, "Reviewing predictions", REVIEW_HELP)
 
         top = QHBoxLayout()
@@ -2310,23 +1547,17 @@ class BoutReviewPanel(QWidget):
         top.addSpacing(12)
         top.addWidget(QLabel("track"))
         top.addWidget(self.track, 1)
-        top.addSpacing(16)
-        top.addWidget(self.prev_disagreement)
-        top.addWidget(self.next_disagreement)
         top.addStretch(1)
         top.addWidget(self.help_button)
 
         self.timeline = BoutTimeline(cfg)
-        self.timeline.spanClicked.connect(self._on_span_clicked)
-        self.timeline.boundaryMoved.connect(self._on_boundary_moved)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.timeline)
 
         # The picture and the pixels it is a picture of, side by side and tied
         # both ways: scrubbing the timeline moves the video, playing the video
-        # moves the marker. Whether a boundary is in the right place is not a
-        # question a drawing can answer on its own.
+        # moves the marker.
         self.footage = TrackFootage(cfg)
         # Bounded on both sides. The film is a square of reference and the frame
         # axis is the thing being read, so every pixel the window gains belongs
@@ -2344,105 +1575,13 @@ class BoutReviewPanel(QWidget):
         self.split.setStretchFactor(1, 1)
         self.split.setSizes([400, 760])
 
-        self.caption = QLabel("")
-        self.caption.setWordWrap(True)
-        self.caption.setTextFormat(Qt.RichText)
-        self.caption.setProperty("role", "muted")
-
         layout = QVBoxLayout(self)
         layout.addLayout(top)
-        layout.addWidget(self.agreement_note)
         layout.addWidget(self.headline)
         layout.addWidget(self.split, 1)
-        self.edit_row = self._build_edit_row()
-        layout.addWidget(self.edit_row)
-        layout.addWidget(self.status)
-        layout.addWidget(self.caption)
 
         if cfg is not None:
             self.reload()
-
-    def _build_edit_row(self) -> QWidget:
-        """The correction controls, as one widget that can be taken away whole.
-
-        Two lines so the row fits a normal window: an assertion, then the
-        actions on it. Never gated on a config key, since whether a project can
-        be corrected is a property of the file on disk; where the file settles
-        it the row is hidden rather than greyed out.
-        """
-        self.group = QComboBox()
-        self.group.setMinimumWidth(120)
-        self.group.currentIndexChanged.connect(self._on_group)
-        self.from_frame = QSpinBox()
-        self.to_frame = QSpinBox()
-        for box in (self.from_frame, self.to_frame):
-            box.setRange(0, 10_000_000)
-            box.setMinimumWidth(90)
-        self.klass = QComboBox()
-        self.klass.setMinimumWidth(120)
-
-        self.apply_button = QPushButton("Set class")
-        self.apply_button.setToolTip(
-            "Record that these frames are this class. Moving a boundary, splitting "
-            "a bout and merging two are the same thing over a different range."
-        )
-        self.apply_button.clicked.connect(self._on_apply)
-        # Short labels with the sentence in the tooltip: the row has to fit a
-        # window, and "Merge into previous" is three words of button.
-        self.merge_left = QPushButton("Merge <")
-        self.merge_left.setToolTip(
-            "Take the PREVIOUS span's class over the selected frames."
-        )
-        self.merge_left.clicked.connect(lambda: self._on_merge(-1))
-        self.merge_right = QPushButton("Merge >")
-        self.merge_right.setToolTip(
-            "Take the NEXT span's class over the selected frames."
-        )
-        self.merge_right.clicked.connect(lambda: self._on_merge(1))
-        self.undo_button = QPushButton("Undo")
-        self.undo_button.clicked.connect(self._on_undo)
-        self.revert_button = QPushButton("Revert track")
-        self.revert_button.setToolTip(
-            "Delete every correction on this track and group, restoring the "
-            "model's own bouts."
-        )
-        self.revert_button.clicked.connect(self._on_revert)
-        self.derive_button = QPushButton("Derived labels")
-        self.derive_button.setToolTip(
-            "Show which annotation windows these corrections would label, and "
-            "which straddle a boundary and cannot be labelled. Writes nothing."
-        )
-        self.derive_button.clicked.connect(self._on_derive)
-
-        self.status = QLabel("")
-        self.status.setWordWrap(True)
-
-        claim = QHBoxLayout()
-        claim.addWidget(QLabel("frames"))
-        claim.addWidget(self.from_frame)
-        claim.addWidget(QLabel("to"))
-        claim.addWidget(self.to_frame)
-        claim.addWidget(QLabel("are"))
-        claim.addWidget(self.klass, 1)
-        claim.addWidget(QLabel("in"))
-        claim.addWidget(self.group, 1)
-        claim.addWidget(self.apply_button)
-        claim.addStretch(1)
-
-        actions = QHBoxLayout()
-        for button in (self.merge_left, self.merge_right, self.undo_button,
-                       self.revert_button, self.derive_button):
-            actions.addWidget(button)
-        actions.addStretch(1)
-
-        rows = QVBoxLayout()
-        rows.setContentsMargins(0, 0, 0, 0)
-        rows.setSpacing(4)
-        rows.addLayout(claim)
-        rows.addLayout(actions)
-        holder = QWidget()
-        holder.setLayout(rows)
-        return holder
 
     # -- loading -------------------------------------------------------------- #
     def set_config(self, cfg: Config | None) -> None:
@@ -2463,9 +1602,8 @@ class BoutReviewPanel(QWidget):
         super().hideEvent(event)
 
     def showEvent(self, event):  # noqa: N802 (Qt naming)
-        """Put the footage back. The movie was let go of when this window was
-        last hidden, and the Model page reuses one dialog for the life of the
-        session, so re-showing it must not leave a sentence where the video
+        """Put the footage back. The movie was let go of when this panel was
+        last hidden, so re-showing it must not leave a sentence where the video
         was."""
         super().showEvent(event)
         track = self._track
@@ -2481,8 +1619,7 @@ class BoutReviewPanel(QWidget):
         super().closeEvent(event)
 
     def reload(self) -> None:
-        """Re-read the files and rebuild the selectors. Cheap enough to call on
-        every open; the posterior is not touched until a track is picked."""
+        """Re-read the predictions and rebuild the selectors."""
         self._loading = True
         try:
             self.movie.clear()
@@ -2490,131 +1627,15 @@ class BoutReviewPanel(QWidget):
             if self.cfg is None:
                 self.reader = None
                 self._say("", "no project open")
-                self._refresh_agreement_note()
                 return
             self.reader = PredictionReader(self.cfg)
             if self.reader.problem:
                 self._say("", self.reader.problem)
-                self._refresh_agreement_note()
                 return
             self.movie.addItems(self.reader.movies)
         finally:
             self._loading = False
-        self._disagree_at = -1
-        self._refresh_agreement_note()
         self._fill_tracks()
-
-    # -- where the model and a hand label disagree ---------------------------- #
-    def _refresh_agreement_note(self) -> None:
-        """How many labelled windows the suggestion contradicts, out of how many.
-
-        The denominator and the refusals both, because a count on its own reads
-        as a model that agrees with everything it was not asked about.
-        """
-        found = self.reader.disagreements if self.reader is not None else []
-        summary = self.reader.agreement if self.reader is not None else {}
-        for button in (self.prev_disagreement, self.next_disagreement):
-            button.setEnabled(bool(found))
-        problem = summary.get("problem") if summary else None
-        if problem:
-            self.agreement_note.setText(f"nothing to compare against: {problem}")
-            return
-        if not summary:
-            self.agreement_note.setText("nothing has been labelled by hand yet")
-            return
-        held = (
-            f"; {summary['n_unanswered']} more no fold scored, being in the audit "
-            "holdout, without a feature row, or labelled since the last fit"
-            if summary["n_unanswered"] else ""
-        )
-        if not summary["n_compared"]:
-            self.agreement_note.setText(
-                "no labelled window was scored by a fold, so nothing here has "
-                "been compared" + held
-            )
-            return
-        if not found:
-            self.agreement_note.setText(
-                f"held out, the model predicted the recorded label on all "
-                f"{summary['n_compared']} window(s) it scored{held}"
-            )
-            return
-        note = (
-            f"{summary['n_disagree']} of {summary['n_compared']} labelled "
-            f"window(s) got a different class from the folds{held}"
-        )
-        worst = summary.get("most_common")
-        if worst:
-            note += (
-                f". Most often you said {worst['label']} where a fold said "
-                f"{worst['suggestion']} ({worst['n']})"
-            )
-        self.agreement_note.setText(note)
-
-    def _step_disagreement(self, step: int) -> None:
-        """Move through the disagreements, worst agreement first and wrapping.
-
-        Across tracks and across movies: the interesting ones are wherever they
-        are, and hunting for them by hand is the work this replaces.
-        """
-        found = self.reader.disagreements if self.reader is not None else []
-        if not found:
-            self.status.setText(
-                "nothing to walk: no clips labelled by hand, no model to ask, or "
-                "the model suggests exactly what was recorded on every one of them"
-            )
-            return
-        if self._disagree_at < 0:
-            self._disagree_at = 0 if step > 0 else len(found) - 1
-        else:
-            self._disagree_at = (self._disagree_at + step) % len(found)
-        self._show_disagreement(found[self._disagree_at], len(found))
-
-    def _show_disagreement(self, d, total: int) -> None:
-        """Select the track it is on, aim the edit row at it, and say what it is."""
-        if self.reader is None:
-            return
-        if self.movie.currentText() != d.movie_id:
-            index = self.movie.findText(d.movie_id)
-            if index < 0:
-                self.status.setText(
-                    f"{d.movie_id} is labelled but is not in these predictions"
-                )
-                return
-            self._loading = True
-            try:
-                self.movie.setCurrentIndex(index)
-            finally:
-                self._loading = False
-            self._fill_tracks()
-        row = self.track.findData(int(d.track_id))
-        if row < 0:
-            self.status.setText(
-                f"track {d.track_id} of {d.movie_id} is labelled but is not in "
-                "these predictions"
-            )
-            return
-        if row != self.track.currentIndex():
-            self.track.setCurrentIndex(row)
-        else:
-            self._paint()
-        # After the paint: it refills the group combo and clears the position.
-        group_row = self.group.findText(d.group)
-        if group_row >= 0:
-            self.group.setCurrentIndex(group_row)
-        self.from_frame.setValue(int(d.f_start))
-        self.to_frame.setValue(int(d.f_end))
-        self.timeline.set_position(d.frame)
-        self.footage.show_frame(d.frame)
-        self.status.setText(
-            f"{self._disagree_at + 1} of {total}: frames {d.f_start}-{d.f_end} "
-            f"of track {d.track_id} were labelled {d.label} in {d.group}, and "
-            f"a model fitted without this movie said {d.suggestion} "
-            + ("at confidence unknown" if d.confidence is None
-               else f"at confidence {d.confidence:.2f}")
-            + ". One of the two is wrong, and the clip is the only thing that "
-              "says which"
-        )
 
     def _on_movie(self, _index: int) -> None:
         if not getattr(self, "_loading", False):
@@ -2650,8 +1671,7 @@ class BoutReviewPanel(QWidget):
 
         track = self.reader.track(movie_id, int(track_id))
         self._track = track
-        self._undo.clear()
-        self.timeline.set_track(track, self.reader.resolution)
+        self.timeline.set_track(track)
         if track.empty:
             self.footage.clear(
                 f"track {track.track_id} of {track.movie_id} has no predicted "
@@ -2659,22 +1679,14 @@ class BoutReviewPanel(QWidget):
             )
         else:
             self.footage.set_track(movie_id, int(track_id), track.f_lo, track.f_hi)
-        self._fill_groups()
         t = tokens()
         head = (
-            f"<b>{self.reader.unit}</b> over {len(self.reader.groups)} category "
+            f"<b>predicted bouts</b> over {len(self.reader.groups)} category "
             f"group(s); this track has <b>{track.n_segments}</b> row(s) across "
             f"frames {track.f_lo}-{track.f_hi}."
             if not track.empty else
-            f"<b>{self.reader.unit}</b>; this track has none."
+            "<b>predicted bouts</b>; this track has none."
         )
-        if not track.bouts:
-            # Said before anything is drawn: a window grid on a frame axis looks
-            # like a bout table with suspiciously regular boundaries.
-            head += (
-                f"<br><span style='color:{t['warning']}'>These are fixed windows "
-                "off a grid, not decoded bouts.</span>"
-            )
         if self.reader.stale:
             head += (
                 f"<br><span style='color:{t['warning']}'>These predictions may be "
@@ -2682,352 +1694,8 @@ class BoutReviewPanel(QWidget):
             )
         self.headline.setText(head)
 
-        self._caption()
-
-    def _caption(self) -> None:
-        track, floor = self._track, 0.0
-        if track is None or self.reader is None:
-            return
-        if self.cfg is not None:
-            floor = float(getattr(self.cfg.suggest, "min_confidence", 0.0) or 0.0)
-        lines = caption_lines(
-            track, self.reader.resolution, floor, has_trace=bool(track.trace)
-        )
-        # Separated rather than stacked: these are fields about one track, and a
-        # line each turns four facts into a paragraph-shaped block of text that
-        # takes its height out of the picture above it.
-        self.caption.setText("&nbsp;&nbsp;.&nbsp;&nbsp;".join(lines))
-        self.caption.setToolTip("\n".join(lines))
-
     def _say(self, head: str, problem: str) -> None:
         self.headline.setText(head)
-        self.caption.setText("")
         self._track = None
-        self.timeline.set_track(
-            TrackPredictions("", 0, False, ""), Resolution(), note=problem
-        )
+        self.timeline.set_track(TrackPredictions("", 0), note=problem)
         self.footage.clear(problem)
-        self._refresh_edit_gate()
-
-    # -- correcting ----------------------------------------------------------- #
-    def current_group(self) -> str:
-        return str(self.group.currentText())
-
-    def _fill_groups(self) -> None:
-        """The groups this track can be corrected in, and their classes.
-
-        Rebuilt per track rather than per project, because which groups have a
-        partition depends on the rows this track actually has.
-        """
-        track = self._track
-        self._loading = True
-        try:
-            self.group.clear()
-            for group in (track.partitions if track is not None else {}):
-                self.group.addItem(group)
-        finally:
-            self._loading = False
-        self._on_group(0)
-
-    def _on_group(self, _index: int = 0) -> None:
-        if getattr(self, "_loading", False):
-            return
-        self._fill_classes()
-        self._refresh_edit_gate()
-
-    def _fill_classes(self) -> None:
-        """Only classes the config declares, and only for a single-choice group.
-
-        A class the config does not name could not be coloured, trained on or
-        exported. A multi group's class is a combination of options rather than
-        one of them, which this control cannot assert.
-        """
-        self.klass.clear()
-        spec = self.cfg.group(self.current_group()) if self.cfg is not None else None
-        if spec is None or spec.is_multi:
-            return
-        self.klass.addItems([o.name for o in spec.options])
-
-    def _group_problem(self, group: str | None = None) -> str:
-        """Why one group cannot be corrected, or "".
-
-        Takes the group rather than always reading the combo, so an edit
-        arriving from the timeline is judged against its own lane.
-        """
-        track = self._track
-        if track is None or self.reader is None:
-            return "no track is open"
-        if track.edit_problem:
-            return track.edit_problem
-        group = group or self.current_group()
-        if group not in track.partitions:
-            return "this track has no decoded bouts in that group"
-        spec = self.cfg.group(group) if self.cfg is not None else None
-        if spec is None:
-            return (
-                f"the config no longer declares a category group called {group!r}, "
-                "so there is no set of classes to correct these bouts to"
-            )
-        if spec.is_multi:
-            return (
-                f"{group} is a multi-select group: one of its predictions is a "
-                "COMBINATION of options, not one of them, and this control can "
-                "only set a single class. Correcting a multi-select group is not "
-                "supported."
-            )
-        return ""
-
-    def _refresh_edit_gate(self) -> None:
-        problem = self._group_problem()
-        # A refusal that belongs to the FILE rather than to one lane: no other
-        # group would make these controls work, so they go away instead of
-        # sitting there greyed out, inviting the gesture they would refuse.
-        settled = bool(self._track is not None and self._track.edit_problem)
-        self.edit_row.setVisible(not settled)
-        for button in (self.apply_button, self.merge_left, self.merge_right,
-                       self.revert_button, self.derive_button):
-            button.setEnabled(not problem)
-        for box in (self.from_frame, self.to_frame, self.klass):
-            box.setEnabled(not problem)
-        # The group combo stays live whatever the problem is: the refusals are
-        # per group, so disabling it would trap the reviewer in one lane.
-        self.group.setEnabled(self.group.count() > 1)
-        self.undo_button.setEnabled(bool(self._undo) and not problem)
-        if problem:
-            self.status.setText(problem)
-
-    def _on_span_clicked(self, group: str, f_start: int, f_end: int) -> None:
-        if self.group.currentText() != group:
-            self.group.setCurrentText(group)
-        self.from_frame.setValue(int(f_start))
-        self.to_frame.setValue(int(f_end))
-        partition = (self._track.partitions.get(group)
-                     if self._track is not None else None)
-        span = partition.at(f_start) if partition is not None else None
-        if span is not None and span.label:
-            index = self.klass.findText(span.label)
-            if index >= 0:
-                self.klass.setCurrentIndex(index)
-        self.status.setText("")
-
-    def _on_boundary_moved(self, group: str, was: int, now: int) -> None:
-        """A dragged boundary, as the assertion it is.
-
-        The DIRECTION decides which class is asserted: dragging right extends
-        the span on the left over the frames swept, dragging left the one on the
-        right.
-        """
-        track = self._track
-        partition = track.partitions.get(group) if track is not None else None
-        if partition is None:
-            return
-        index = partition.index_at(was)
-        if index <= 0:
-            return
-        left, right = partition.spans[index - 1], partition.spans[index]
-        source = left if now > was else right
-        f_start, f_end = (was, now) if now > was else (now, was)
-        if not source.label:
-            self.status.setText(
-                f"frames {source.f_start}-{source.f_end} have no class: no window "
-                "over them could be featurised. Set a class over the range instead "
-                "of dragging a boundary into it."
-            )
-            return
-        self.status.setText(self.assert_class(f_start, f_end, source.label, group))
-
-    def _on_apply(self) -> None:
-        self.status.setText(self.assert_class(
-            self.from_frame.value(), self.to_frame.value(), self.klass.currentText()
-        ))
-
-    def _on_merge(self, direction: int) -> None:
-        """Merge the selected span into a neighbour: assert the neighbour's class
-        over it. There is no separate merge in the data model, only this."""
-        track = self._track
-        group = self.current_group()
-        partition = track.partitions.get(group) if track is not None else None
-        if partition is None:
-            return
-        index = partition.index_at(self.from_frame.value())
-        if index < 0:
-            self.status.setText(
-                f"frame {self.from_frame.value()} is not on this track "
-                f"({partition.f_lo}-{partition.f_hi}); click a span to select it"
-            )
-            return
-        neighbour = index + direction
-        if not 0 <= neighbour < len(partition):
-            self.status.setText(
-                "no bout on that side to merge into: this one is at the end of "
-                "the track"
-            )
-            return
-        span, other = partition.spans[index], partition.spans[neighbour]
-        if not other.label:
-            self.status.setText(
-                f"frames {other.f_start}-{other.f_end} have no class: nothing could "
-                "score them, so there is nothing to merge into"
-            )
-            return
-        self.status.setText(
-            self.assert_class(span.f_start, span.f_end, other.label, group)
-        )
-
-    def assert_class(self, f_start: int, f_end: int, label: str,
-                     group: str | None = None) -> str:
-        """Record that a person says these frames are this class. "" on success.
-
-        A refusal comes back as a sentence rather than an exception, since a
-        drag that ran backwards or a range off the end of the track is a normal
-        outcome. The FILE IS WRITTEN FIRST and the partition on screen advances
-        only if the write succeeded.
-        """
-        group = group or self.current_group()
-        problem = self._group_problem(group)
-        if problem:
-            return problem
-        track = self._track
-        partition = track.partitions.get(group)
-        if partition is None:
-            return "this track has no decoded bouts in that group"
-        spec = self.cfg.group(group) if self.cfg is not None else None
-        if spec is not None and spec.option(str(label)) is None:
-            # Refused here and not on the way in: the file must still LOAD a
-            # class the config has since dropped, because that row records what
-            # a person judged. Only a NEW judgement is refused.
-            return (
-                f"{group} declares no class called {str(label)!r}, so nothing else "
-                "in the project could colour, train on or export it. Add it to "
-                "config.yaml first, or pick one of: "
-                + ", ".join(o.name for o in spec.options)
-            )
-        try:
-            edited = partition.assert_class(f_start, f_end, label)
-        except ValueError as exc:
-            return str(exc)
-        return self._commit(group, partition, edited,
-                            f"frames {f_start}-{f_end} are {label}")
-
-    def _commit(self, group: str, before: Partition, after: Partition,
-                what: str, record_undo: bool = True) -> str:
-        track, reader = self._track, self.reader
-        if track is None or reader is None or reader.corrections is None:
-            return "no project open"
-        store = reader.corrections
-        try:
-            store.replace_track(track.movie_id, track.track_id, group, build_corrections(
-                after, track.movie_id, track.track_id, group,
-                getattr(self.cfg.ui, "annotator", "") if self.cfg else "",
-                model_bouts=self._model_bouts(group),
-                previous=store.for_track(track.movie_id, track.track_id, group),
-            ))
-        except (OSError, ValueError) as exc:
-            return f"the correction could not be saved, so it was not made: {exc}"
-        if record_undo:
-            self._undo.append((group, before))
-        track.partitions[group] = after
-        self.timeline.selected = None
-        self.timeline.update()
-        self.timeline.updateGeometry()
-        self._caption()
-        self._refresh_edit_gate()
-        return f"saved: {what}"
-
-    def _model_bouts(self, group: str) -> list[dict]:
-        """What the model said over this track, for the record of what a
-        correction overruled. Read off the drawn segments, so it is the same
-        rows the reviewer was looking at."""
-        track = self._track
-        if track is None:
-            return []
-        return [
-            {"f_start": s.f_start, "f_end": s.f_end, "label": s.label, "conf": s.conf}
-            for s in track.lanes.get(group, [])
-        ]
-
-    def _on_undo(self) -> None:
-        if not self._undo:
-            self.status.setText("nothing to undo on this track")
-            return
-        group, previous = self._undo.pop()
-        current = self._track.partitions.get(group) if self._track else None
-        if current is None:
-            return
-        # An undo is not itself undoable, so the button walks back through the
-        # edits instead of ping-ponging between two versions.
-        message = self._commit(group, current, previous, "undone", record_undo=False)
-        self.status.setText(message)
-
-    def _on_revert(self) -> None:
-        """Drop every correction on this track and group. Confirmed first,
-        because it is the one action here that destroys a human judgement rather
-        than recording one."""
-        track, group = self._track, self.current_group()
-        if track is None or self.reader is None or self.reader.corrections is None:
-            return
-        saved = self.reader.corrections.for_track(track.movie_id, track.track_id, group)
-        if not saved:
-            self.status.setText("this track has no corrections in that group")
-            return
-        key = (track.movie_id, track.track_id, group)
-        # The rows that are NOT on screen are counted before they are destroyed,
-        # so the reviewer knows they are in the number they are confirming.
-        unseen = len([c for c in track.orphans + track.partly_shown if c.key == key])
-        answer = QMessageBox.question(
-            self, "Delete corrections",
-            f"Delete all {len(saved)} correction(s) on track {track.track_id} of "
-            f"{track.movie_id} ({group})?\n\nThe model's own bouts come back. "
-            "Nothing else changes and no prediction is rewritten."
-            + (f"\n\n{unseen} of them cover frames these predictions have no row "
-               "for, so they are not on the timeline. They are deleted too."
-               if unseen else ""),
-        )
-        if answer != QMessageBox.Yes:
-            return
-        segments = track.lanes.get(group, [])
-        model = Partition(
-            [Span(s.f_start, s.f_end, s.label, False) for s in segments],
-            segments[0].f_start, segments[-1].f_end,
-        )
-        try:
-            self.reader.corrections.replace_track(
-                track.movie_id, track.track_id, group, []
-            )
-        except (OSError, ValueError) as exc:
-            self.status.setText(f"the corrections could not be deleted: {exc}")
-            return
-        self._undo.clear()
-        track.partitions[group] = model
-        track.orphans = [c for c in track.orphans if c.key != key]
-        track.partly_shown = [c for c in track.partly_shown if c.key != key]
-        self.timeline.selected = None
-        self.timeline.update()
-        self._caption()
-        self._refresh_edit_gate()
-        self.status.setText(f"{len(saved)} correction(s) deleted")
-
-    # -- what the corrections would mean for the training set ------------------ #
-    def _on_derive(self) -> None:
-        QMessageBox.information(self, "Derived window labels", self.derivation_text())
-
-    def derivation_text(self) -> str:
-        """The derivation report for this movie, as prose. Writes nothing.
-
-        A string rather than a dialog full of labels, so the numbers in it can
-        be checked by a test.
-        """
-        track, reader = self._track, self.reader
-        if track is None or reader is None or reader.corrections is None:
-            return "no project open"
-        windows = manifest_windows(self.cfg, track.movie_id)
-        if not windows:
-            return (
-                f"{track.movie_id} has no clip manifest, so there are no annotation "
-                "windows to derive anything for. The corrections are still recorded."
-            )
-        derivation = derive_window_labels(
-            reader.corrections.for_movie(track.movie_id), windows
-        )
-        return derivation_report(derivation)
-

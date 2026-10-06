@@ -73,11 +73,8 @@ TRAILING_COLUMNS = [
 # --------------------------------------------------------------------------- #
 # one JSON object in one CSV cell
 # --------------------------------------------------------------------------- #
-# One codec, shared by `selected_by` here and by `overruled` in
-# bout_corrections.csv. A second implementation drifts on the value hardest to
-# reconcile afterwards - a non-finite float - and a file whose cells were written
-# under two rules cannot be read under either. What a column additionally
-# requires of its own payload is layered on top, not built in here.
+# One codec for `selected_by`. What a column additionally requires of its own
+# payload is layered on top, not built in here.
 def plain_json(value):
     """A value in the form ``json`` will take, exactly, and never rounded.
 
@@ -91,8 +88,7 @@ def plain_json(value):
     * **A non-finite float becomes ``None``, written as ``null``.** NaN and
       Infinity are not JSON - ``json.dumps`` spells them as bare tokens a strict
       reader rejects - and ``null`` is the JSON spelling of "no value", which is
-      what a NaN here means: :mod:`trackanno.learn.select` scores a uniform draw NaN
-      because it EARNED no score. ``null`` reads back as ``None``, which is
+      what a NaN here means. ``null`` reads back as ``None``, which is
       still not ``0.0``, so "nobody measured this" stays distinguishable from
       "the model was certain".
 
@@ -416,18 +412,16 @@ class AnnotationStore:
                 "renumbering the tracks.",
                 stacklevel=2,
             )
-        # Said once per open, and only when non-zero: on a project that has
-        # never been re-detected the count is zero, so a non-zero one is the
-        # only way anyone finds out theirs has been. Not a warning per row -
+        # Said once per open, and only when non-zero. Not a warning per row:
         # disagreement is the case this column exists to handle, not an error.
         if by_record:
             warnings.warn(
                 f"{self.path.name}: {by_record} of {len(self.rows)} labelled clip(s) "
                 "are held to the audit membership recorded when they were labelled, "
-                "which is no longer what their clip_id hashes to. That is what "
-                "re-running detection does - it renumbers the tracks, so the ids "
-                "change - and the recorded value is the one that keeps the holdout "
-                "honest across it. Nothing to fix.",
+                "which is no longer what their track hashes to. Re-running detection "
+                "renumbers the tracks, and stamps written before the holdout was drawn "
+                "per track were drawn per clip; the recorded value keeps the holdout "
+                "the model was judged under. Nothing to fix.",
                 stacklevel=2,
             )
 

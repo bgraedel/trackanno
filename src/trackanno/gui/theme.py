@@ -17,7 +17,7 @@ from qtpy.QtGui import QColor, QFont, QPalette, QPen
 from qtpy.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 __all__ = ["THEMES", "apply_theme", "tokens", "role", "Heading", "current",
-           "theme_icon", "app_icon", "banner_style", "compact_button", "set_role",
+           "app_icon", "banner_style", "compact_button", "set_role",
            "set_flag", "show_help", "help_button", "RADIUS"]
 
 # --------------------------------------------------------------------------- #
@@ -556,31 +556,6 @@ class Heading(QWidget):
         self.subtitle.setWordWrap(True)
         self.subtitle.setVisible(bool(subtitle))
         layout.addWidget(self.subtitle)
-
-
-def theme_icon(size: int = 16) -> "QIcon":
-    """A half-filled circle, painted rather than typed: a font glyph depends on
-    the font carrying it and on it not being promoted to a colour emoji."""
-    from qtpy.QtCore import QRectF
-    from qtpy.QtGui import QIcon, QPainter, QPixmap
-
-    t = tokens()
-    pixmap = QPixmap(size, size)
-    pixmap.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-
-    inset = 1.5
-    rect = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
-    painter.setPen(QPen(QColor(t["text"]), 1.4))
-    painter.setBrush(Qt.NoBrush)
-    painter.drawEllipse(rect)
-    # Fill the half that stands for the theme you would switch TO.
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor(t["text"]))
-    painter.drawPie(rect, 90 * 16, 180 * 16)
-    painter.end()
-    return QIcon(pixmap)
 
 
 def app_icon() -> "QIcon":

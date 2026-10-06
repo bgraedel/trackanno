@@ -15,12 +15,11 @@ Four things are worth testing separately:
   transition planted at frame 137 and 50-frame windows, a tiling grid can only
   answer 100 or 150; an overlapping one must land within about a stride of 137,
   and closer than the tiling grid does;
-* the decoders do what their docstrings say - a short spurious run is absorbed
-  and a long one is not, flicker the per-frame argmax cannot resist is suppressed,
-  and the absorption goes to the class the absorbed frames' own posterior
-  prefers;
-* undefined frames stay undefined. A gap is never bridged, never absorbed, never
-  carried across by a Viterbi path, and comes out of ``runs_to_bouts`` as a row
+* the decoder does what its docstring says - a short spurious run is absorbed
+  and a long one is not, and the absorption goes to the class the absorbed
+  frames' own posterior prefers;
+* undefined frames stay undefined. A gap is never bridged, never absorbed, and
+  comes out of ``runs_to_bouts`` as a row
   with an empty label rather than as a hole in the frame coverage.
 """
 
@@ -29,10 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from harness import check
-from trackanno.infer.bouts import (
-    decode_min_bout, decode_viterbi, frame_posterior, runs_to_bouts,
-    self_transition_for,
-)
+from trackanno.infer.bouts import decode_min_bout, frame_posterior, runs_to_bouts
 
 TOL = 1e-12
 
@@ -231,7 +227,6 @@ def test_overlap_localises_the_boundary() -> None:
     dense_post, dense_count = frame_posterior(
         dense, window_fractions(truth, dense, 2), 0, n_frames)
     dense_edge = boundary(decode_min_bout(dense_post, 25))
-    dense_viterbi = boundary(decode_viterbi(dense_post, self_transition_for(25)))
 
     check("both grids cover every frame of the track",
           bool((tile_count > 0).all() and (dense_count > 0).all()),
@@ -243,9 +238,6 @@ def test_overlap_localises_the_boundary() -> None:
     check("which is closer than the tiling grid manages",
           abs(dense_edge - cut) < abs(tile_edge - cut),
           f"dense {dense_edge}, tiled {tile_edge}, truth {cut}")
-    check("the Viterbi decode agrees with the constrained one on where it is",
-          abs(dense_viterbi - cut) <= stride and dense_viterbi == dense_edge,
-          f"viterbi {dense_viterbi}, min_bout {dense_edge}")
     # The resolution is the stride and nothing finer: between one window start
     # and the next the set of covering windows does not change, so neither can
     # the mean. Worth stating, so nobody reads a 3-frame agreement as 3-frame
@@ -256,7 +248,7 @@ def test_overlap_localises_the_boundary() -> None:
     check("and does change at the next one, so the resolution is the stride",
           not np.allclose(block[0], dense_post[cut - cut % stride - 1], atol=TOL),
           str(dense_post[cut - cut % stride - 1]))
-    check("both decodes see exactly two bouts and no flicker",
+    check("the decode sees exactly two bouts and no flicker",
           len(spans(decode_min_bout(dense_post, 25), dense_post)) == 2)
 
 
@@ -396,117 +388,6 @@ def test_min_bout_leaves_nothing_short_behind() -> None:
     print(f"  --  {before} short runs before the sweep, {islands} island(s) left after")
 
 
-# --------------------------------------------------------------------------- #
-# decode_viterbi
-# --------------------------------------------------------------------------- #
-def noisy_two_bouts(
-    n_frames: int, cut: int, flicker: tuple[int, ...], seed: int = 7
-) -> tuple[np.ndarray, np.ndarray]:
-    """A two-bout posterior with per-frame noise and named single-frame lies.
-
-    The flicker frames favour the WRONG class by 0.58 to 0.42 - enough for a
-    per-frame argmax, nowhere near the cost of leaving a bout and coming back.
-    """
-    rng = np.random.default_rng(seed)
-    truth = two_bouts(n_frames, cut)
-    right = 0.72 + rng.uniform(-0.06, 0.06, n_frames)
-    posterior = np.empty((n_frames, 2))
-    posterior[np.arange(n_frames), truth] = right
-    posterior[np.arange(n_frames), 1 - truth] = 1.0 - right
-    for f in flicker:
-        posterior[f, truth[f]] = 0.42
-        posterior[f, 1 - truth[f]] = 0.58
-    return truth, posterior
-
-
-def test_viterbi_recovers_the_bouts_and_suppresses_flicker() -> None:
-    """The transition cost is what a single frame's evidence has to beat.
-
-    At ``self_transition_for(40)`` leaving a bout and returning costs
-    ``2 * log(0.975 / 0.025)`` = 7.3 nats, against the 0.32 a single flickering
-    frame offers. The per-frame argmax has no such term and takes every one.
-    """
-    truth, posterior = noisy_two_bouts(200, 120, (17, 55, 88, 140, 175))
-    plain = decode_min_bout(posterior, 1)
-    decoded = decode_viterbi(posterior, self_transition_for(40))
-
-    check("the per-frame argmax follows every planted flicker",
-          bool((plain[[17, 55, 88, 140, 175]] != truth[[17, 55, 88, 140, 175]]).all())
-          and len(spans(plain, posterior)) >= 7,
-          str(len(spans(plain, posterior))))
-    check("Viterbi recovers the planted labels exactly",
-          bool((decoded == truth).all()), str(np.flatnonzero(decoded != truth)))
-    check("so it reports two bouts, cut where the truth was cut",
-          spans(decoded, posterior) == [(0, 120, "a"), (120, 200, "b")],
-          str(spans(decoded, posterior)))
-    # Stickiness has to be a knob, not a constant: a chain barely stickier than
-    # uniform must give the flicker back, or the parameter is doing nothing.
-    check("a weak self-transition stops suppressing the flicker",
-          len(spans(decode_viterbi(posterior, 0.51), posterior)) >= 7,
-          str(len(spans(decode_viterbi(posterior, 0.51), posterior))))
-
-
-def test_viterbi_decodes_the_segments_around_a_gap_independently() -> None:
-    """A gap breaks the chain, so what is after it cannot depend on what is before.
-
-    Checked both ways round: the whole-array decode must equal the two segments
-    decoded on their own, and flipping the evidence BEFORE the gap must leave
-    every label after it untouched. A path allowed to run through the gap would
-    fail the second even when it passes the first.
-    """
-    first, second = 60, 80
-    posterior = np.empty((first + 10 + second, 2))
-    _, before = noisy_two_bouts(first, first, (), seed=3)          # all class 0
-    _, after = noisy_two_bouts(second, 0, (), seed=5)              # all class 1
-    posterior[:first] = before
-    posterior[first:first + 10] = np.nan
-    posterior[first + 10:] = after
-    stay = self_transition_for(30)
-
-    decoded = decode_viterbi(posterior, stay)
-    check("the gap decodes to -1 rather than to a carried-over state",
-          bool((decoded[first:first + 10] == -1).all()), str(decoded[first - 2:first + 12]))
-    check("each segment equals the same frames decoded alone",
-          bool((decoded[:first] == decode_viterbi(before, stay)).all()
-               and (decoded[first + 10:] == decode_viterbi(after, stay)).all()),
-          str(decoded))
-
-    flipped = posterior.copy()
-    flipped[:first] = after[:first]                                # class 1 before the gap
-    check("flipping the evidence before the gap changes nothing after it",
-          bool((decode_viterbi(flipped, stay)[first + 10:] == decoded[first + 10:]).all()),
-          str(decode_viterbi(flipped, stay)[first + 10:first + 20]))
-    check("and does change the labels before it, so the test is not vacuous",
-          bool((decode_viterbi(flipped, stay)[:first] == 1).all()))
-    check("the bout table spans the gap as a row, not as a hole",
-          [name for _, _, name in spans(decoded, posterior)] == ["a", "", "b"],
-          str(spans(decoded, posterior)))
-
-
-# --------------------------------------------------------------------------- #
-# the identity behind the prior
-# --------------------------------------------------------------------------- #
-def test_self_transition_matches_the_geometric_holding_time() -> None:
-    """``1 / (1 - a)`` is the mean of the geometric holding time, summed to check.
-
-    The identity is the whole justification for handing the same number to both
-    decoders, so it is worth evaluating rather than asserting: the mean bout
-    length of a chain with self-transition ``a`` is ``sum_k k a**(k-1) (1 - a)``.
-    """
-    check("self_transition_for(50) is 0.98", self_transition_for(50) == 0.98,
-          repr(self_transition_for(50)))
-    for frames in (2, 10, 25, 50, 200):
-        a = self_transition_for(frames)
-        k = np.arange(1, 200_000)
-        expected = float((k * a ** (k - 1) * (1.0 - a)).sum())
-        check(f"a bout at self_transition_for({frames}) lasts {frames} frames",
-              abs(expected - frames) < 1e-6 * frames
-              and abs(1.0 / (1.0 - a) - frames) < 1e-9,
-              f"{expected} vs {frames}")
-    check("a floor below 2 frames is refused rather than returning a=0",
-          all(_refused(self_transition_for, n) for n in (1, 0, -5)))
-
-
 def _refused(fn, *args) -> bool:
     try:
         fn(*args)
@@ -590,30 +471,31 @@ def test_a_misuse_is_refused_rather_than_answered() -> None:
           _refused(frame_posterior, windows, flat([[np.nan, 1.0], [0.1, 0.9]]), 0, 10))
     check("an empty frame span is refused",
           _refused(frame_posterior, windows, proba, 5, 5))
-    check("a self-transition of 0 or 1 is refused",
-          _refused(decode_viterbi, np.full((4, 2), 0.5), 0.0)
-          and _refused(decode_viterbi, np.full((4, 2), 0.5), 1.0)
-          and _refused(decode_viterbi, np.full((4, 2), 0.5), 1.5))
     check("a class list that does not match the posterior is refused",
           _refused(runs_to_bouts, np.zeros(4, dtype=int), np.full((4, 2), 0.5), ["a"], 0)
           and _refused(runs_to_bouts, np.zeros(3, dtype=int), np.full((4, 2), 0.5),
                        ["a", "b"], 0))
 
-    # A single-class project is degenerate, not broken: the off-diagonal
-    # transition would divide by n_classes - 1, so it is answered trivially.
-    single = np.full((6, 1), 1.0)
-    single[2:4] = np.nan
-    check("a single-class posterior decodes trivially rather than dividing by zero",
-          list(decode_viterbi(single, 0.9)) == [0, 0, -1, -1, 0, 0],
-          str(decode_viterbi(single, 0.9)))
-    check("a probability of exactly zero does not become an infinite emission",
-          list(decode_viterbi(flat([[1.0, 0.0]] * 3 + [[0.0, 1.0]] * 3), 0.6))
-          == [0, 0, 0, 1, 1, 1])
     check("an empty span of frames decodes to an empty answer",
           decode_min_bout(np.zeros((0, 2)), 5).size == 0
-          and decode_viterbi(np.zeros((0, 2)), 0.9).size == 0
           and runs_to_bouts(np.zeros(0, dtype=int), np.zeros((0, 2)), ["a", "b"], 0) == [])
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_a_viterbi_config_warns_that_it_was_removed() -> None:
+    import warnings
+
+    from trackanno.config import Predict
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parsed = Predict.parse({"decode": "viterbi", "self_transition": 0.9,
+                                "min_bout_frames": 5})
+    text = " ".join(str(w.message) for w in caught)
+    check("the warning names Viterbi and the hard floor",
+          "Viterbi" in text and "hard floor" in text, text)
+    check("and is not the generic unknown-key one", "unknown key" not in text, text)
+    check("min_bout_frames still loads", parsed.min_bout_frames == 5)

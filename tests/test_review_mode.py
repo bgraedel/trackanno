@@ -169,8 +169,6 @@ def test_review_walks_what_was_labelled_in_the_order_it_was_labelled(
         check("the counter says what it is counting",
               "reviewing 1 / 3 labelled" in widget.counter.text(),
               widget.counter.text())
-        check("the unannotated filter is switched off, being meaningless here",
-              not widget.unannotated_only.isEnabled())
 
         widget.next_clip()
         app.processEvents()
@@ -179,8 +177,6 @@ def test_review_walks_what_was_labelled_in_the_order_it_was_labelled(
         set_mode(widget, app, "annotate")
         check("going back to annotate restores the working queue",
               len(widget.order) == len(store))
-        check("...and the unannotated filter with it",
-              widget.unannotated_only.isEnabled())
     finally:
         widget.close()
         app.processEvents()
@@ -203,43 +199,24 @@ def test_review_with_nothing_labelled_says_so_rather_than_opening_blank(
 
 
 # --------------------------------------------------------------------------- #
-# the shortlist of labels that might be wrong
+# labels that might be wrong
 # --------------------------------------------------------------------------- #
-def test_the_disagreement_queue_is_only_the_labels_the_model_argues_with(
+def test_the_note_says_what_the_held_out_model_said_instead(
     cfg, store, root, app,
 ) -> None:
-    """A wrong label is what teaches the next model to be wrong, so the labels
-    worth checking are the ones the model already doubts.
-
-    Surest first: one it would change at 0.95 is either a label to fix or a
-    model failure worth understanding, and one at 0.4 is the model shrugging.
-    """
-    widget, annotations, _ = build(cfg, store, root, "disagree-queue")
+    """A wrong label is what teaches the next model to be wrong, so the review
+    says where a held-out model doubts it."""
+    widget, annotations, _ = build(cfg, store, root, "disagree-note")
     try:
         group = cfg.categories[0]
         first = label(widget, app, option=0)
-        second = label(widget, app, option=0)
-        third = label(widget, app, option=0)
         other = group.options[-1].name
         check("there are two values to disagree about",
               other != group.options[0].name)
 
-        arm(widget, {
-            first: {group.name: (other, 0.62)},
-            second: {group.name: (group.options[0].name, 0.99)},
-            third: {group.name: (other, 0.91)},
-        })
-        set_mode(widget, app, "disagree")
-
-        check("only the two it argues with are queued", len(widget.order) == 2,
-              str([widget._clip_ids[i] for i in widget.order]))
-        check("...surest first",
-              [widget._clip_ids[i] for i in widget.order] == [third, first],
-              str([widget._clip_ids[i] for i in widget.order]))
-        check("the one it agrees with is not queued",
-              second not in [widget._clip_ids[i] for i in widget.order])
-        check("the counter says what it is counting",
-              widget.counter.text() == "disagreement 1 / 2", widget.counter.text())
+        arm(widget, {first: {group.name: (other, 0.91)}})
+        set_mode(widget, app, "review")
+        check("it opens on the label", current(widget) == first)
 
         note = widget.review_note.text()
         check("the note says what the held-out model said instead",
@@ -267,9 +244,9 @@ def test_changing_the_label_clears_the_disagreement_on_the_spot(
         first = label(widget, app, option=0)
         other = group.options[-1].name
         arm(widget, {first: {group.name: (other, 0.88)}})
-        set_mode(widget, app, "disagree")
+        set_mode(widget, app, "review")
 
-        check("it is queued as a disagreement", len(widget.order) == 1)
+        check("it is queued for review", len(widget.order) == 1)
         check("and the note says so",
               "held out, the model said" in widget.review_note.text(),
               widget.review_note.text())
@@ -293,49 +270,17 @@ def test_changing_the_label_clears_the_disagreement_on_the_spot(
         app.processEvents()
 
 
-def test_an_empty_shortlist_says_which_of_the_three_reasons_it_is(
-    cfg, store, root, app,
-) -> None:
-    """No model, nothing labelled, and a model that agrees are three different
-    facts, and only one of them means the labels are in good shape."""
-    widget, _, _ = build(cfg, store, root, "disagree-empty")
-    try:
-        set_mode(widget, app, "disagree")
-        check("with nothing labelled it says that first of all",
-              "nothing labelled here yet" in widget.counter.text(),
-              widget.counter.text())
-
-        set_mode(widget, app, "annotate")
-        group = cfg.categories[0]
-        first = label(widget, app, option=0)
-        set_mode(widget, app, "disagree")
-        check("with labels but no saved fold predictions it says to retrain",
-              "Train the model again" in widget.counter.text(),
-              widget.counter.text())
-
-        set_mode(widget, app, "annotate")
-        arm(widget, {first: {group.name: (group.options[0].name, 0.9)}})
-        set_mode(widget, app, "disagree")
-        check("and folds that reproduced every label is a good outcome, not an "
-              "empty filter",
-              "every label here matches what the folds predicted"
-              in widget.counter.text(), widget.counter.text())
-    finally:
-        widget.close()
-        app.processEvents()
-
-
-def test_the_mode_control_is_labelled_and_offers_all_three(cfg, store, root, app) -> None:
+def test_the_mode_control_is_labelled_and_offers_both(cfg, store, root, app) -> None:
     """Unlabelled, it sat at the far left reading `annotate` and was taken for
     part of the movie filter beside it."""
     from qtpy.QtWidgets import QLabel
 
     widget, _, _ = build(cfg, store, root, "disagree-labelled")
     try:
-        check("all three modes are offered",
+        check("both modes are offered",
               [widget.mode_combo.itemData(i)
                for i in range(widget.mode_combo.count())]
-              == ["annotate", "review", "disagree"],
+              == ["annotate", "review"],
               str([widget.mode_combo.itemText(i)
                    for i in range(widget.mode_combo.count())]))
         top = widget.layout().itemAt(0).layout()
@@ -418,51 +363,6 @@ def test_revising_a_label_keeps_the_reason_its_clip_was_shown(
         check("the label was revised", after[group.name] == group.options[-1].name)
         check("...and the reason it was shown survived the revision",
               after[PROVENANCE_COLUMN] == reason, after[PROVENANCE_COLUMN])
-    finally:
-        widget.close()
-        app.processEvents()
-
-
-def test_a_revision_keeps_its_reason_once_a_batch_has_been_served(
-    cfg, store, root, app,
-) -> None:
-    """The same guard, in the session it is actually at risk in.
-
-    ``_provenance_for`` answers *not recorded* only while no batch has been
-    served. Once one has, every clip outside it reads as ``annotator_navigated``
-    - so a review session would stamp that over the selector's own reason, and
-    the test above would not notice because it never serves a batch.
-    """
-    from trackanno.annotate.store import encode_provenance
-    from trackanno.gui.app import MANUAL_RULE
-
-    widget, annotations, path = build(cfg, store, root, "review-provenance-served")
-    try:
-        first = label(widget, app)
-        reason = encode_provenance({"rule": "margin", "score": 0.9, "rank": 0})
-        row = dict(annotations.get(first))
-        row[PROVENANCE_COLUMN] = reason
-        annotations.rows[first] = row
-        annotations.rewrite()
-
-        # A batch HAS been served this session, and this clip is not in it: the
-        # exact state in which the reason used to be overwritten.
-        widget._served["a-clip-from-some-other-batch"] = {"rule": "margin", "score": 0.1}
-        check("the clip about to be revised is not in that batch",
-              first not in widget._served)
-
-        set_mode(widget, app, "review")
-        group = cfg.categories[0]
-        widget.categories.toggle(group.name, group.options[-1].name)
-        widget._commit()
-        app.processEvents()
-
-        after = rows_of(path)[first]
-        check("the label was revised", after[group.name] == group.options[-1].name)
-        check("...and the selector's reason survived it",
-              after[PROVENANCE_COLUMN] == reason, after[PROVENANCE_COLUMN])
-        check("...rather than being replaced by the navigated marker",
-              MANUAL_RULE not in after[PROVENANCE_COLUMN], after[PROVENANCE_COLUMN])
     finally:
         widget.close()
         app.processEvents()

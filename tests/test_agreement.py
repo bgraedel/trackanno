@@ -1,10 +1,8 @@
 """Annotation windows whose label is not what the model suggests.
 
 Two halves. The first plants a label table and a set of suggestions by hand, so
-the expected answer is available by reading: which windows disagree, in what
-order, and what the denominator is. The second drives the real review panel over
-a real project and checks that pressing the button lands on the track the
-disagreement is on.
+the expected answer is available by reading: which windows disagree and in what
+order. The second checks the fold predictions they are measured against.
 
 The suggestions are planted rather than fitted. Whether a real classifier would
 disagree with a label is a statement about a classifier; what this suite is
@@ -16,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from harness import check
-from trackanno.infer.agreement import differs, find, summarise
+from trackanno.infer.agreement import differs, find
 
 GROUP = "behaviour"
 SECOND = "posture"
@@ -126,40 +124,6 @@ def test_a_confidence_nobody_measured_is_not_a_confidence_of_zero() -> None:
           str([(d.f_start, d.confidence) for d in found]))
 
 
-def test_the_summary_counts_what_was_asked_and_what_was_refused() -> None:
-    """`3 disagree` reads as a good model without the two numbers beside it.
-
-    Four labelled windows, the model answers about two of them: the other two
-    are in the holdout or have no feature row, and a walk that quietly dropped
-    them would be reporting agreement it never measured.
-    """
-    hand = labels(("swim", 0), ("swim", 25), ("turn", 50), ("turn", 75))
-    answers = said((0, "swim", 0.9), (25, "turn", 0.8))
-    found = find(hand, answers)
-    report = summarise(hand, answers, found, [GROUP])
-
-    check("every hand label is counted", report["n_labelled"] == 4)
-
-    # Un-named, the groups come from the suggestions rather than from the
-    # columns: a CSV is mostly notes, annotator and timestamps, and counting
-    # those as labels would put a denominator under this that nothing judged.
-    noisy = hand.copy()
-    noisy["notes"] = "a note on every row"
-    noisy["annotator"] = "somebody"
-    check("a column nobody labelled is not a label",
-          summarise(noisy, answers, find(noisy, answers))["n_labelled"] == 4,
-          str(summarise(noisy, answers, find(noisy, answers))))
-    check("and the ones the model answered about separately",
-          report["n_compared"] == 2)
-    check("...as are the ones it would not answer about",
-          report["n_unanswered"] == 2)
-    check("of those answered, one disagrees", report["n_disagree"] == 1)
-    check("the report is per group", report["per_group"] == {GROUP: 1})
-    check("and names the pair of classes it happens on most",
-          report["most_common"] == {"label": "swim", "suggestion": "turn", "n": 1},
-          str(report["most_common"]))
-
-
 def test_every_group_is_compared_not_only_the_first() -> None:
     """A suggestion is per group, and so is a disagreement about one."""
     hand = labels(("swim", 0), ("swim", 25))
@@ -173,9 +137,6 @@ def test_every_group_is_compared_not_only_the_first() -> None:
     check("the second group's disagreement is found",
           [(d.group, d.f_start) for d in found] == [(SECOND, 0)],
           str([(d.group, d.f_start) for d in found]))
-    check("and the summary attributes it to that group",
-          summarise(hand, answers, found, [GROUP, SECOND])["per_group"]
-          == {SECOND: 1})
 
 
 def test_one_definition_of_a_disagreement_serves_both_screens() -> None:
@@ -311,119 +272,6 @@ def test_training_leaves_the_fold_predictions_on_disk(root) -> None:
     check("...with a confidence that is a probability",
           all(0.0 <= v[1] <= 1.0 for g in answers.values() for v in g.values()))
     path.unlink(missing_ok=True)
-
-
-# --------------------------------------------------------------------------- #
-# the walk
-# --------------------------------------------------------------------------- #
-def test_the_review_panel_walks_to_the_window_a_suggestion_contradicts(
-    app, root,
-) -> None:
-    """The button is the point: a confusion matrix says which classes a model
-    confuses, and this says which clip to open."""
-    from test_predict import build_case
-
-    from trackanno.gui.timeline import BoutReviewPanel
-    from trackanno.infer.predict import predict_all
-
-    cfg, _ = build_case(root, "agreement-walk", labels=6)
-    predict_all(cfg)
-
-    panel = BoutReviewPanel(cfg)
-    panel.show()
-    app.processEvents()
-    try:
-        # The stub model this fixture installs agrees with everything, so the
-        # disagreements are planted here rather than hoped for.
-        hand = pd.read_csv(cfg.paths.csv, dtype=str, keep_default_na=False)
-        group = cfg.categories[0].name
-        other = cfg.categories[0].options[-1].name
-        planted = [
-            row for row in hand.to_dict("records")
-            if str(row.get(group, "")) and str(row[group]) != other
-        ]
-        check("the fixture labelled something to disagree about", bool(planted),
-              str(hand.get(group, pd.Series(dtype=str)).tolist()))
-        answers = {
-            str(row["clip_id"]): {group: (other, 0.6 + 0.1 * i)}
-            for i, row in enumerate(planted[:3])
-        }
-        panel.reader.disagreements = find(hand, answers, [group])
-        panel.reader.agreement = summarise(hand, answers,
-                                           panel.reader.disagreements, [group])
-        panel._refresh_agreement_note()
-        app.processEvents()
-
-        found = panel.reader.disagreements
-        check("the planted disagreements are there", bool(found))
-        check("the note says how many, out of how many the folds scored",
-              "different class from the folds" in panel.agreement_note.text(),
-              panel.agreement_note.text())
-        check("and the buttons are live", panel.next_disagreement.isEnabled())
-
-        panel.next_disagreement.click()
-        app.processEvents()
-        first = found[0]
-        check("it starts on the one the model is surest about",
-              first.confidence == max(d.confidence for d in found),
-              str([d.confidence for d in found]))
-        check("the walk selected the movie it is on",
-              panel.movie.currentText() == first.movie_id,
-              f"{panel.movie.currentText()} vs {first.movie_id}")
-        check("...and the track", panel.track.currentData() == first.track_id,
-              f"{panel.track.currentData()} vs {first.track_id}")
-        check("...and put the playhead inside the window",
-              first.f_start <= panel.timeline.position < first.f_end,
-              str(panel.timeline.position))
-        check("...and aimed the edit row at exactly those frames",
-              panel.from_frame.value() == first.f_start
-              and panel.to_frame.value() == first.f_end,
-              f"{panel.from_frame.value()}-{panel.to_frame.value()}")
-        check("the status says both claims and how sure the fold was",
-              first.label in panel.status.text()
-              and first.suggestion in panel.status.text()
-              and "fitted without this movie" in panel.status.text()
-              and f"{first.confidence:.2f}" in panel.status.text(),
-              panel.status.text())
-
-        check("it counts from one", panel.status.text().startswith("1 of "))
-        panel.prev_disagreement.click()
-        app.processEvents()
-        check("stepping back from the first wraps to the last",
-              panel.status.text().startswith(f"{len(found)} of "),
-              panel.status.text())
-    finally:
-        panel.close()
-        app.processEvents()
-
-
-def test_no_model_is_a_sentence_rather_than_an_empty_walk(app, root) -> None:
-    """A project with labels and no model has nothing to compare, which is not
-    the same as a model that agrees with everything."""
-    from fixtures import make_project
-
-    from trackanno.config import load_config
-    from trackanno.gui.timeline import BoutReviewPanel
-
-    cfg = load_config(make_project(root))
-    panel = BoutReviewPanel(cfg)
-    panel.show()
-    app.processEvents()
-    try:
-        note = panel.agreement_note.text()
-        check("the buttons are dead", not panel.next_disagreement.isEnabled()
-              and not panel.prev_disagreement.isEnabled())
-        check("and the reason is on screen rather than a zero",
-              "no suggestions to compare" in note or "labelled" in note, note)
-        # Directly, not through the button: a disabled button does not fire,
-        # so this branch guards a list emptied between a paint and a click.
-        panel._step_disagreement(1)
-        app.processEvents()
-        check("walking anyway explains itself rather than doing nothing",
-              "nothing to walk" in panel.status.text(), panel.status.text())
-    finally:
-        panel.close()
-        app.processEvents()
 
 
 def test_the_single_movie_refusal_does_not_name_an_arbitrary_class(root) -> None:

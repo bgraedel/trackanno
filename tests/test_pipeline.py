@@ -90,26 +90,30 @@ class SyntheticMovie(MovieSource):
 
 
 # --------------------------------------------------------------------------- #
-def test_a_track_at_the_frame_edge_can_be_discarded(cfg, movie) -> None:
+def test_frames_at_the_frame_edge_are_excluded_but_the_track_survives(cfg, movie) -> None:
     """Pose is the reason, so the rule is about the box reaching the frame.
 
     At the edge the box is cut off by the picture rather than by the animal
     ending, and a keypoint model places its parts against a shape that is not
     all there. Nothing downstream reports it - the detector is confident about
-    the part it can see - so the track has to be excluded rather than detected.
+    the part it can see - so those detections have to be excluded rather than
+    detected. Only they go: discarding the whole track would cost every animal
+    that swims anywhere near the wall of the dish most of its life.
     """
-    from trackanno.annotate.clips import border_share, drop_border_tracks
+    from trackanno.annotate.clips import border_flags, drop_border_rows
 
     frame_size = (movie.height, movie.width)
+    length = cfg.clips.frames
     rows = []
-    for f in range(cfg.clips.frames):
-        # 1 stays in the middle, 2 is pinned against the left edge, 3 grazes
-        # the bottom on one frame out of the window.
+    # Two windows' worth, so a track can spend one of them at the edge.
+    for f in range(2 * length):
+        # 1 stays in the middle, 2 is pinned against the left edge, 3 spends its
+        # first window there and the second in the middle.
         rows.append({"frame": f, "track_id": 1, "x1": 200.0, "y1": 100.0,
                      "x2": 220.0, "y2": 120.0, "conf": 0.9})
         rows.append({"frame": f, "track_id": 2, "x1": 0.0, "y1": 100.0,
                      "x2": 20.0, "y2": 120.0, "conf": 0.9})
-        low = f == 0
+        low = f < length
         rows.append({
             "frame": f, "track_id": 3, "x1": 200.0,
             "y1": float(movie.height - 20) if low else 100.0,
@@ -119,43 +123,51 @@ def test_a_track_at_the_frame_edge_can_be_discarded(cfg, movie) -> None:
     tracks = pd.DataFrame(rows)
     cfg.tracking.min_track_length = 1
     cfg.clips.min_clip_frames = 1
-
-    shares = border_share(tracks, frame_size, 4)
-    check("a track in the middle never reaches the edge", shares[1] == 0.0)
-    check("one pinned against it always does", shares[2] == 1.0)
-    check("one that grazes it reports the share, not a yes or no",
-          abs(shares[3] - 1.0 / cfg.clips.frames) < 1e-9, str(shares[3]))
+    cfg.clips.stride = length
+    cfg.clips.window_mode = "all"
+    cfg.clips.max_clips_per_track = 0
 
     check("off by default, so an existing project plans what it always did",
           cfg.tracking.border_margin_px == 0
-          and drop_border_tracks(tracks, frame_size, cfg)[0] is tracks)
+          and drop_border_rows(tracks, frame_size, cfg)[0] is tracks)
 
     cfg.tracking.border_margin_px = 4
-    kept, dropped = drop_border_tracks(tracks, frame_size, cfg)
-    check("with no tolerance, any frame at the edge takes the track",
-          sorted(dropped) == [2, 3], str(dropped))
-    check("...and the middle one survives",
-          sorted(kept["track_id"].unique()) == [1])
+    flags = border_flags(tracks, frame_size, cfg).to_numpy()
+    at_edge = tracks[flags]
+    check("a track in the middle never reaches the edge",
+          1 not in set(at_edge["track_id"]))
+    check("one pinned against it does so on every frame",
+          int((at_edge["track_id"] == 2).sum()) == 2 * length)
+    check("one that visits it loses those frames and no others",
+          sorted(at_edge.loc[at_edge["track_id"] == 3, "frame"]) == list(range(length)))
 
-    cfg.tracking.border_max_frac = 0.5
-    kept, dropped = drop_border_tracks(tracks, frame_size, cfg)
-    check("a tolerance keeps a track that only grazes it",
-          sorted(dropped) == [2] and sorted(kept["track_id"].unique()) == [1, 3],
-          str(dropped))
+    kept, share = drop_border_rows(tracks, frame_size, cfg)
+    check("the rows at the edge are what goes",
+          len(kept) == len(tracks) - len(at_edge), f"{len(kept)} of {len(tracks)}")
+    check("...and the visitor keeps the rest of its track",
+          int((kept["track_id"] == 3).sum()) == length,
+          str(int((kept["track_id"] == 3).sum())))
+    check("the share reported is per track, not a yes or no",
+          share[2] == 1.0 and share[3] == 0.5, str(share))
 
-    cfg.tracking.border_max_frac = 0.0
     at_border: dict = {}
-    specs = plan_clips(tracks, movie.id, cfg.clips.frames, cfg,
-                       frame_size=frame_size, discarded=at_border)
-    check("and no clip is cut for a discarded track",
-          sorted({s.track_id for s in specs}) == [1],
-          str(sorted({s.track_id for s in specs})))
-    # prepare warns from this dict, so it has to be what was actually dropped:
-    # a caller recomputing it would have to restate which tracks were candidates.
-    check("plan_clips reports what it discarded, and only that",
+    specs = plan_clips(tracks, movie.id, 2 * length, cfg,
+                       frame_size=frame_size, at_border=at_border)
+    made = sorted((s.track_id, s.f_start) for s in specs)
+    check("the track that never left the middle is cut in both windows",
+          [f for t, f in made if t == 1] == [0, length], str(made))
+    check("the one pinned against the edge is cut in neither",
+          [f for t, f in made if t == 2] == [], str(made))
+    # The point of the change: the window at the edge goes, the one after it
+    # does not. Discarding the track would have cost both.
+    check("the visitor loses only the window it spent there",
+          [f for t, f in made if t == 3] == [length], str(made))
+    # prepare warns from this dict, so it has to be what was actually excluded:
+    # a caller recomputing it would have to restate which rows were candidates.
+    check("plan_clips reports which tracks reached the edge, and only those",
           sorted(at_border) == [2, 3], str(at_border))
-    check("...with the share of its life each spent at the edge",
-          at_border[2] == 1.0 and 0.0 < at_border[3] < 1.0, str(at_border))
+    check("...with the share of its life each spent there",
+          at_border[2] == 1.0 and at_border[3] == 0.5, str(at_border))
 
 
 def test_the_border_rule_refuses_rather_than_silently_passing_everything(
@@ -166,11 +178,11 @@ def test_the_border_rule_refuses_rather_than_silently_passing_everything(
     A caller that cannot say how big the frame is cannot apply this rule, and
     quietly planning every clip anyway is the failure that looks like success.
     """
-    from trackanno.annotate.clips import drop_border_tracks
+    from trackanno.annotate.clips import drop_border_rows
 
     cfg.tracking.border_margin_px = 8
     try:
-        drop_border_tracks(tracks, None, cfg)
+        drop_border_rows(tracks, None, cfg)
         raised = ""
     except ValueError as exc:
         raised = str(exc)
@@ -179,7 +191,7 @@ def test_the_border_rule_refuses_rather_than_silently_passing_everything(
           raised or "nothing raised")
 
     try:
-        drop_border_tracks(tracks.drop(columns=["x1"]), (movie.height, movie.width), cfg)
+        drop_border_rows(tracks.drop(columns=["x1"]), (movie.height, movie.width), cfg)
         raised = ""
     except ValueError as exc:
         raised = str(exc)

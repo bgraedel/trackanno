@@ -197,8 +197,8 @@ def test_a_decision_carries_the_rule_and_the_score_that_earned_it() -> None:
 def test_a_value_that_is_no_number_is_written_as_null_and_never_as_zero() -> None:
     """The non-finite rule, stated once because it is implemented once.
 
-    `select` scores a uniform audit draw NaN deliberately: that clip earned no
-    score, and 0.0 would read as "the model was certain it was wrong". NaN is
+    A clip that earned no score must not read as 0.0, "the model was certain
+    it was wrong". NaN is
     not JSON - `json.dumps` spells it as a bare token a strict reader rejects -
     so the cell says `null`, which reads back as None and is still not zero.
     """
@@ -219,19 +219,6 @@ def test_a_value_that_is_no_number_is_written_as_null_and_never_as_zero() -> Non
               encode_provenance({"rule": "margin", "score": float("inf")})
           )["score"] is None)
 
-    # The same rule, reached through the other column that uses the codec: a
-    # bout nothing could score has no confidence, and a correction over it is
-    # not evidence that the model was confidently wrong.
-    from trackanno.annotate.corrections import decode_overruled, encode_overruled
-
-    bouts = decode_overruled(encode_overruled([
-        {"f_start": 0, "f_end": 40, "label": "swimming", "conf": 0.9},
-        {"f_start": 40, "f_end": 80, "label": "", "conf": float("nan")},
-    ]))["bouts"]
-    check("the overruled column answers non-finite the same way, being one codec",
-          bouts[1]["conf"] is None and bouts[0]["conf"] == 0.9, str(bouts))
-    check("...and refuses a quoted bout that will not say which frames it covers",
-          "both ends" in _refusal(encode_overruled, [{"label": "swimming"}]))
 
 
 def test_a_numpy_scalar_survives_the_cell_rather_than_aborting_the_save() -> None:
@@ -484,7 +471,7 @@ def test_what_the_selector_actually_emits_goes_in_whole(root: Path) -> None:
     """
     import numpy as np
 
-    from trackanno.learn.select import AUDIT_RULE, select_batch
+    from trackanno.learn.select import select_batch
 
     cfg = _cfg(root, "selector")
     store = AnnotationStore(cfg.paths.csv, cfg)
@@ -508,15 +495,6 @@ def test_what_the_selector_actually_emits_goes_in_whole(root: Path) -> None:
           all(decode_provenance(
               reloaded.get(_meta(i)["clip_id"])[PROVENANCE_COLUMN])["rule"]
               for i in (1, 2)))
-
-    # The selector's own marker for a clip drawn by a coin. It must stay
-    # distinguishable from a row that simply does not know, or the audit stratum
-    # - the only unbiased accuracy estimate in the tool - cannot be recovered.
-    at_random = encode_provenance({"rule": AUDIT_RULE, "score": 0.0, "rank": 0})
-    check("a reserved random draw is recorded as such",
-          decode_provenance(at_random)["rule"] == AUDIT_RULE)
-    check("...and is not the same fact as an unrecorded row",
-          decode_provenance(at_random) != decode_provenance(""))
 
 
 def test_the_other_readers_of_this_file_still_read_it(root: Path) -> None:

@@ -40,7 +40,7 @@ def follow_combo(mode: str = "centred") -> QComboBox:
     combo.setFocusPolicy(Qt.NoFocus)
     combo.setToolTip(
         "\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES)
-        + "\n\nAll three read the same cached pixels, so switching is free."
+        + "\n\nBoth read the same cached pixels, so switching is free."
     )
     return combo
 

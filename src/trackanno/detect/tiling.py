@@ -8,7 +8,6 @@ the mechanism entirely.
 
 from __future__ import annotations
 
-import sys
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
@@ -19,8 +18,8 @@ import numpy as np
 from ..config import Config
 
 __all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
-           "default_node_names", "resolve_device", "describe_devices", "device_label",
-           "describe_auto", "cuda_status", "cuda_devices", "read_model_info"]
+           "default_node_names", "resolve_device", "device_label",
+           "cuda_status", "cuda_devices", "read_model_info"]
 
 
 def cuda_status() -> tuple[bool, str]:
@@ -117,31 +116,6 @@ def _mps_available() -> bool:
         return False
 
 
-def describe_devices() -> list[tuple[str, str]]:
-    """[(value, human label)] for every device this machine can actually use.
-
-    Importing torch takes a second or two, so callers populating a dropdown
-    should do this off the UI thread.
-    """
-    out = [("auto", "auto (pick the best available)")]
-    try:
-        import torch
-    except ImportError:
-        return out + [("cpu", "cpu (torch is not installed)")]
-
-    for i in cuda_devices():
-        try:
-            name = torch.cuda.get_device_name(i)
-            total = torch.cuda.get_device_properties(i).total_memory / 1e9
-            out.append((str(i), f"{i}: {name} ({total:.1f} GB)"))
-        except Exception:
-            out.append((str(i), f"{i}: CUDA device {i}"))
-    if _mps_available():
-        out.append(("mps", "mps (Apple GPU)"))
-    out.append(("cpu", "cpu"))
-    return out
-
-
 def resolve_device(device: str) -> str:
     """Turn ``auto`` into something ultralytics can use, falling back safely.
 
@@ -155,7 +129,6 @@ def resolve_device(device: str) -> str:
     except ImportError:
         return "cpu"
 
-    # The same list the settings page is shown, so the two cannot disagree.
     cuda = cuda_devices()
     mps = _mps_available()
 
@@ -195,36 +168,6 @@ def device_label(device: str) -> str:
     if value == "cpu":
         return "the CPU"
     return value
-
-
-def describe_auto() -> str:
-    """One sentence on what ``auto`` picks here, and - if it is the CPU - why.
-
-    No GPU, a sleeping driver and a CPU-only torch wheel need different answers
-    from the person, so they are told apart rather than all reading as ``cpu``.
-    """
-    resolved = resolve_device("auto")
-    if resolved != "cpu":
-        return f"auto uses {device_label(resolved)} on this machine."
-    usable, why = cuda_status()
-    if usable:  # a CUDA card exists but auto still declined it - say so plainly
-        return "auto uses the CPU here, though CUDA reports itself usable."
-    extra = ""
-    if "CPU-only build" in why:
-        # The fix differs by platform: only Windows ships a CPU-only wheel on
-        # PyPI, so only there is an extra the answer. Elsewhere a CPU-only build
-        # means `[cpu]` was asked for, and the plain install is the way back.
-        extra = (
-            ' Reinstall with the GPU extra - uv tool install "trackanno[cuda]" - '
-            "if this machine has an NVIDIA card."
-            if sys.platform == "win32" else
-            " Reinstall without the [cpu] extra if this machine has an NVIDIA card."
-        )
-    elif "could not initialise" in why or "visible to torch" in why:
-        # The two states a click can change: a card asleep behind hybrid
-        # graphics, and a driver that has just come back.
-        extra = " Re-check once the card is awake."
-    return f"auto uses the CPU here: {why}.{extra}"
 
 
 def default_node_names(n: int) -> list[str]:
@@ -710,7 +653,7 @@ class TiledDetector:
         return merged.take(np.argsort(-merged.conf, kind="stable"))
 
     def detect_untiled(self, frame_rgb: np.ndarray) -> Detections:
-        """Single-shot whole-frame inference. Used by ``prepare.py --self-test``."""
+        """Single-shot whole-frame inference. Used by ``trackanno prepare --self-test``."""
         r = self.model.predict(
             np.ascontiguousarray(frame_rgb), **self._predict_kwargs(self.cfg.detection.imgsz)
         )[0]

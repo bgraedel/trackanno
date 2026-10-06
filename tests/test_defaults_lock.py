@@ -11,11 +11,6 @@ So the claims here are about the SHIPPED TEMPLATE, not about a config a test
 wrote. `project.create_project` is what a new user gets, and these are the values
 it has to keep giving them. Together they say: a project created today behaves
 the way it did before any of this existed.
-
-`predict.coverage` is deliberately NOT asserted to be `manifest`. It ships as
-`dense` and it shipped as `dense` before this branch too, so pinning it here
-would be this suite claiming credit for a default it did not set, and would make
-a future decision about it look like a regression.
 """
 
 from __future__ import annotations
@@ -36,30 +31,17 @@ def _fresh(root: Path, name: str):
     return load_config(create_project(Path(root) / name))
 
 
-def test_a_new_project_predicts_windows_not_bouts(root: Path) -> None:
-    """The dense predictor tiles, and its rows are windows off a grid.
-
-    `window_stride` following `window_frames` is the whole optionality guarantee
-    for the boundary work: it is the difference between the grid every project on
-    disk was built with and an overlapping one, and a silent change there is a
-    silent change of every feature VALUE in the table, not just of how many rows
-    there are.
-    """
+def test_a_new_project_tiles_its_windows(root: Path) -> None:
+    """The dense predictor tiles and keeps every run of the argmax."""
     cfg = _fresh(root, "windows")
 
     check("the dense window stride is not written out by hand",
           cfg.predict.window_stride == "auto", repr(cfg.predict.window_stride))
     check("...and it resolves to the window length, which is a tiling",
-          cfg.predict.resolved_stride(cfg.clips)
-          == cfg.predict.resolved_window(cfg.clips),
-          f"stride {cfg.predict.resolved_stride(cfg.clips)} vs "
-          f"window {cfg.predict.resolved_window(cfg.clips)}")
-    check("no temporal decode runs, so a prediction row stays a window",
-          cfg.predict.decode == "none", repr(cfg.predict.decode))
-    check("...and the decode has no bout length to absorb toward",
+          cfg.predict.resolved_stride(cfg.clips) == cfg.clips.frames,
+          str(cfg.predict.resolved_stride(cfg.clips)))
+    check("the decode has no bout length to absorb toward",
           cfg.predict.min_bout_frames == 0, repr(cfg.predict.min_bout_frames))
-    check("the per-frame posterior is not written",
-          cfg.predict.save_posteriors is False, repr(cfg.predict.save_posteriors))
 
 
 def test_a_new_project_hands_out_clips_in_its_own_order(root: Path) -> None:
@@ -75,8 +57,6 @@ def test_a_new_project_hands_out_clips_in_its_own_order(root: Path) -> None:
 
     check("no rule ranks the queue", cfg.suggest.select_rule == "off",
           repr(cfg.suggest.select_rule))
-    check("...and no class is chased toward a quota",
-          cfg.suggest.select_target_quota == 0, repr(cfg.suggest.select_target_quota))
     check("the holdout still exists to be an unbiased estimate of something",
           0.0 < cfg.suggest.audit_fraction < 1.0, repr(cfg.suggest.audit_fraction))
 

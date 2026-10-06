@@ -529,6 +529,48 @@ def test_the_rewrite_is_backed_up_and_atomic(root: Path) -> None:
           str(csv_path.read_bytes().count(b"\r\n")))
 
 
+def test_the_command_line_relinks_and_keeps_a_backup(root: Path, capsys) -> None:
+    """``trackanno repair-links`` is the only way in, so it has to plan, report,
+    honour --dry-run and leave the old file beside the new one."""
+    from fixtures import make_project
+
+    from trackanno.annotate.clips import ClipStore
+    from trackanno.annotate.reassociate import main, write_labels
+    from trackanno.config import load_config
+
+    config_path = make_project(root)
+    cfg = load_config(config_path)
+    store = ClipStore(cfg.paths.work_dir)
+    try:
+        current = store.manifest.head(2).to_dict("records")
+    finally:
+        store.close()
+    # The same animals under track ids the cache no longer has.
+    orphans = [moved(entry, int(entry["track_id"]) + 900) for entry in current]
+    csv_path = root / "repair-cli.csv"
+    write_labels(csv_path, pd.DataFrame([label_row(o) for o in orphans]))
+    original = csv_path.read_bytes()
+
+    code = main(["--config", str(config_path), "--csv", str(csv_path), "--dry-run"])
+    out = capsys.readouterr().out
+    check("a dry run succeeds", code == 0, str(code))
+    check("...says what it would re-link", "2 can be re-linked" in out, out)
+    check("...and writes nothing", csv_path.read_bytes() == original)
+    check("...not even a backup", not list(root.glob("repair-cli.csv.bak-*")))
+
+    code = main(["--config", str(config_path), "--csv", str(csv_path)])
+    out = capsys.readouterr().out
+    check("the real run succeeds", code == 0, str(code))
+    back = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    check("the labels point at the current clips",
+          list(back["clip_id"]) == [str(e["clip_id"]) for e in current],
+          str(list(back["clip_id"])))
+    backup = root / "repair-cli.csv.bak-1"
+    check("the previous file is kept as a numbered .bak",
+          backup.exists() and backup.read_bytes() == original)
+    check("...and the output says where", backup.name in out, out)
+
+
 def test_the_trainer_says_how_many_it_ignored(root: Path) -> None:
     """The whole point of the exercise. The inner join in ``train_group`` used
     to drop orphaned labels in silence; the count and its per-class breakdown

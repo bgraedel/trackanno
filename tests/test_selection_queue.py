@@ -23,9 +23,8 @@ import pytest
 from harness import check
 from trackanno.annotate.clips import ClipStore
 from trackanno.config import load_config
-from trackanno.learn.select import AUDIT_RULE
 from trackanno.annotate.store import (
-    PROVENANCE_COLUMN, AnnotationStore, decode_provenance, encode_provenance,
+    PROVENANCE_COLUMN, AnnotationStore, decode_provenance,
 )
 
 
@@ -59,7 +58,7 @@ def selection(clip_id: str, rank: int, rule: str = "margin", **extra) -> dict:
     """One ``select.select_batch`` record, in its real shape."""
     out = {
         "clip_id": str(clip_id), "index": rank, "rank": rank, "rule": rule,
-        "score": 0.9 - 0.1 * rank, "target_class": "",
+        "score": 0.9 - 0.1 * rank,
         "predicted_class": "swimming", "predicted_proba": 0.55, "pool_size": 120,
     }
     out.update(extra)
@@ -151,8 +150,6 @@ def test_the_default_config_leaves_the_queue_and_the_csv_exactly_as_they_were(
           widget.order == shuffled_baseline(cfg, store),
           f"{widget.order[:6]} vs {shuffled_baseline(cfg, store)[:6]}")
     check("nothing has been served", widget._served == {})
-    check("nothing is claimed about how a clip was chosen",
-          widget._provenance_for(widget._clip_ids[widget.order[0]]) is None)
 
     clip_id = label(widget, app)
     check("the label was written", annotations.is_done(clip_id))
@@ -219,38 +216,26 @@ def test_a_batch_leads_the_queue_and_leaves_everything_else_in_place(
 def test_the_csv_separates_the_selector_s_picks_from_the_annotator_s_own_detours(
     app, cfg, store, root, monkeypatch
 ) -> None:
-    """The distinction the column exists for, driven through the real GUI path.
-
-    Labelling a pick must record the rule and score that chose it. Labelling a
-    clip the selector never named must record that a human went and got it - the
-    weaker claim, and a true one - because a labelled set that cannot be split
-    into those two groups is a set on which no accuracy can be honestly computed.
-    """
+    """A pick records the rule and score that chose it; any other clip records nothing."""
     monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
     widget, annotations, path = build(cfg, store, root, "provenance")
     app.processEvents()
 
-    from trackanno.gui.app import MANUAL_RULE
-
     baseline = list(widget.order)
     picked = [baseline[-1], baseline[-2]]
     widget.suggester.batch = [
-        selection(widget._clip_ids[picked[0]], 0, rule="margin", score=0.83),
-        # A reserved random draw. `selection_batch` hands its scoreless score
-        # over as None, having already turned `select`'s NaN into the one JSON
-        # value that means the same thing and survives the round trip.
-        selection(widget._clip_ids[picked[1]], 1, rule=AUDIT_RULE,
-                  score=None, target_class=""),
+        selection(widget._clip_ids[picked[0]], 0, score=0.83),
+        selection(widget._clip_ids[picked[1]], 1, score=0.71),
     ]
     widget._apply_filters(initial=True)
     app.processEvents()
 
-    ranked_id = label(widget, app)             # auto-advance moves to the draw
-    drawn_id = label(widget, app)              # and then off the end of the batch
+    ranked_id = label(widget, app)
+    second_id = label(widget, app)
     manual_id = label(widget, app)
 
     check("all three were written", all(annotations.is_done(c) for c in
-                                        (ranked_id, drawn_id, manual_id)))
+                                        (ranked_id, second_id, manual_id)))
     check("the third clip was not one of the picks",
           manual_id not in {widget._clip_ids[i] for i in picked})
 
@@ -261,17 +246,10 @@ def test_the_csv_separates_the_selector_s_picks_from_the_annotator_s_own_detours
     check("and the score that earned it", ranked["score"] == pytest.approx(0.83))
     check("and its rank in the batch", ranked["rank"] == 0)
     check("and the pool it was chosen from", ranked["pool_size"] == 120)
-
-    drawn = decode_provenance(rows[drawn_id][PROVENANCE_COLUMN])
-    check("a random draw records itself as one", drawn["rule"] == AUDIT_RULE)
-    check("with no score rather than an invented zero",
-          drawn["score"] is None, repr(drawn))
-
-    manual = decode_provenance(rows[manual_id][PROVENANCE_COLUMN])
-    check("a clip the annotator navigated to says so",
-          manual["rule"] == MANUAL_RULE, repr(manual))
-    check("and never borrows the selector's reason",
-          manual["rule"] not in {"margin", AUDIT_RULE})
+    check("the second pick records its own rank",
+          decode_provenance(rows[second_id][PROVENANCE_COLUMN])["rank"] == 1)
+    check("a clip the selector did not pick records nothing",
+          rows[manual_id][PROVENANCE_COLUMN] == "", repr(rows[manual_id]))
 
     widget.shutdown()
     path.unlink(missing_ok=True)
@@ -364,8 +342,6 @@ def test_the_clip_already_on_screen_is_never_claimed_by_the_selector(
     widget, annotations, path = build(cfg, store, root, "anchor")
     app.processEvents()
 
-    from trackanno.gui.app import MANUAL_RULE
-
     baseline = list(widget.order)
     anchor = widget.order[widget.position]
     on_screen = widget._clip_ids[anchor]
@@ -390,9 +366,8 @@ def test_the_clip_already_on_screen_is_never_claimed_by_the_selector(
           on_screen not in widget._served)
 
     check("labelling it labels the same clip", label(widget, app) == on_screen)
-    recorded = decode_provenance(rows_of(path)[on_screen][PROVENANCE_COLUMN])
-    check("and records the weaker claim, that a human was already there",
-          recorded["rule"] == MANUAL_RULE, repr(recorded))
+    recorded = rows_of(path)[on_screen][PROVENANCE_COLUMN]
+    check("and records no selector reason", recorded == "", repr(recorded))
 
     widget.shutdown()
     path.unlink(missing_ok=True)
@@ -425,41 +400,7 @@ def test_a_selector_that_raises_is_reported_and_the_shuffle_carries_on(
     check("the queue falls back to the shuffle", widget.order == baseline)
     check("and the annotator is told why",
           any("clip selection is off" in m for m in said), repr(said))
-    check("a clip labelled now claims nothing about its selection",
-          widget._provenance_for(widget._clip_ids[widget.order[0]]) is None)
-
-    # A record the CSV could never hold back is caught HERE, where it costs one
-    # batch, and not at the save of a label somebody has just typed. A NaN score
-    # is not one of those: the codec writes it as `null`, because a clip drawn at
-    # random earned no score and 0.0 would say the model was certain.
-    widget.suggester.selection_batch = StubSuggester.selection_batch.__get__(
-        widget.suggester
-    )
-    for what, bad in (
-        ("a nameless rule", {"clip_id": widget._clip_ids[baseline[0]], "rule": ""}),
-        ("a score json cannot spell", selection(widget._clip_ids[baseline[0]], 0,
-                                                score=object())),
-    ):
-        said.clear()
-        widget.suggester.batch = [bad]
-        widget._apply_filters(initial=True)
-        app.processEvents()
-        check(f"{what} is refused before it can reach the log",
-              widget.order == baseline
-              and any("clip selection is off" in m for m in said), repr(said))
-
-    said.clear()
-    first = widget._clip_ids[baseline[0]]
-    widget.suggester.batch = [selection(first, 0, rule="audit", score=float("nan"))]
-    widget._apply_filters(initial=True)
-    app.processEvents()
-    check("a score nothing measured costs no batch, the cell being able to hold it",
-          not any("clip selection is off" in m for m in said), repr(said))
-    check("...and reaches the log as no value rather than as a score of zero",
-          decode_provenance(
-              encode_provenance(widget._provenance_for(first))
-          )["score"] is None,
-          str(widget._provenance_for(first)))
+    check("nothing was served", widget._served == {})
 
     widget.shutdown()
     path.unlink(missing_ok=True)

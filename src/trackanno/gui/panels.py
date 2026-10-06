@@ -1,20 +1,19 @@
-"""Side-panel widgets: category buttons, source metadata, context minimap."""
+"""Side-panel widgets: category buttons and source metadata."""
 
 from __future__ import annotations
 
 import numpy as np
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from qtpy.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QGroupBox, QLabel,
-    QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QButtonGroup, QGridLayout, QGroupBox, QLabel, QPushButton, QVBoxLayout,
+    QWidget,
 )
 
 from ..config import CategoryGroup, Config
 from .theme import RADIUS, tokens
 from ..annotate.store import AnnotationStore
 
-__all__ = ["CategoryPanel", "MetadataPanel", "MinimapWidget"]
+__all__ = ["CategoryPanel", "MetadataPanel"]
 
 
 def _button_style(color: str, checked: bool) -> str:
@@ -164,11 +163,6 @@ class CategoryPanel(QWidget):
             for option in group.options:
                 self._set_button(group.name, option.name, option.name in selected)
 
-    def restyle(self) -> None:
-        """Rebuild every button's stylesheet from the current theme."""
-        for (group_name, option_name), btn in self._buttons.items():
-            self._set_button(group_name, option_name, bool(btn.property("selected")))
-
     def clear(self) -> None:
         self.set_values(None)
         self.changed.emit()
@@ -219,57 +213,3 @@ class MetadataPanel(QWidget):
             f"{int(meta['n_present'])}/{int(meta['f_end']) - int(meta['f_start'])} frames"
             f"   conf {float(meta['mean_conf']):.2f}"
         )
-
-
-class MinimapWidget(QFrame):
-    """Full-frame thumbnail with the crop rectangle marked."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setFixedHeight(180)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._label = QLabel(alignment=Qt.AlignCenter)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.addWidget(self._label)
-        self._pix: QPixmap | None = None
-
-    def update_from(self, thumbnail: np.ndarray | None, meta, movie_size: tuple[int, int]) -> None:
-        if thumbnail is None:
-            self._label.setText("no thumbnails\n(clips.thumbnails: false)")
-            self._pix = None
-            return
-        thumbnail = np.ascontiguousarray(thumbnail)
-        h, w = thumbnail.shape
-        image = QImage(thumbnail.data, w, h, w, QImage.Format_Grayscale8).copy()
-        pix = QPixmap.fromImage(image)
-
-        height, width = movie_size
-        painter = QPainter(pix)
-        painter.setPen(QPen(QColor(255, 196, 0), 2))
-        painter.drawRect(
-            int(meta["crop_x0"] / max(width, 1) * w),
-            int(meta["crop_y0"] / max(height, 1) * h),
-            max(2, int(meta["crop_w"] / max(width, 1) * w)),
-            max(2, int(meta["crop_h"] / max(height, 1) * h)),
-        )
-        painter.end()
-
-        self._pix = pix
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._pix is None:
-            return
-        size = self._label.size()
-        self._label.setPixmap(
-            self._pix.scaled(
-                max(size.width(), 32), max(size.height(), 32),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation,
-            )
-        )
-
-    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
-        super().resizeEvent(event)
-        self._rescale()

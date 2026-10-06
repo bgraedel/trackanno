@@ -1,6 +1,6 @@
 """How the labels are actually spread, drawn rather than tabulated.
 
-Three things worth seeing on the way to Export: one class swallowing most of the
+Shown on the Model page. Three things worth seeing before training: one class swallowing most of the
 clips, so a classifier that always answers it scores well and means nothing; a
 class below ``suggest.min_per_class``, dropped at training time; a class living
 in a single movie, which grouped cross-validation cannot put in both train and
@@ -13,11 +13,15 @@ from dataclasses import dataclass, field
 
 from qtpy.QtCore import QRectF, QSize, Qt
 from qtpy.QtGui import QColor, QFont, QPainter, QPen
-from qtpy.QtWidgets import QSizePolicy, QWidget
+from qtpy.QtWidgets import (
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
+)
 
 from .theme import tokens
 
-__all__ = ["Tally", "GroupTally", "tally_annotations", "BarChart"]
+__all__ = ["Tally", "GroupTally", "tally_annotations", "BarChart", "DistributionView",
+           "read_annotation_rows"]
 
 MULTI_SEP = "|"
 UNLABELLED = "(not set)"
@@ -278,3 +282,156 @@ def _join(names) -> str:
     if len(names) == 2:
         return f"'{names[0]}' and '{names[1]}'"
     return ", ".join(f"'{n}'" for n in names[:-1]) + f" and '{names[-1]}'"
+
+
+def read_annotation_rows(cfg):
+    """(rows, problem). A broken CSV must report itself, not raise into Qt."""
+    import csv
+
+    path = cfg.paths.csv
+    if not path.exists():
+        return [], f"no annotation file yet at {path}"
+    try:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            return list(csv.DictReader(fh)), ""
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        return [], f"could not read {path.name}: {exc}"
+
+
+class DistributionView(QWidget):
+    """What the labels look like: a coverage line, warnings and one chart per group."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stale = True
+        self._charts: dict[str, BarChart] = {}
+        self._cfg = None
+        self._status = None
+
+        self.coverage = QLabel("")
+        self.coverage.setWordWrap(True)
+        self.coverage.setTextFormat(Qt.RichText)
+
+        self.notes = QLabel("")
+        self.notes.setWordWrap(True)
+        self.notes.setTextFormat(Qt.RichText)
+        self.notes.setVisible(False)
+
+        refresh = QPushButton("Refresh")
+        refresh.setToolTip("Re-read the annotation CSV")
+        refresh.clicked.connect(self.reload)
+
+        head = QHBoxLayout()
+        head.addWidget(self.coverage, 1)
+        head.addWidget(refresh, 0, Qt.AlignTop)
+
+        self.charts_box = QWidget()
+        self.charts_layout = QVBoxLayout(self.charts_box)
+        self.charts_layout.setContentsMargins(0, 0, 0, 0)
+        self.charts_layout.setSpacing(12)
+        self.charts_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(self.charts_box)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(head)
+        layout.addWidget(self.notes)
+        layout.addWidget(scroll, 1)
+
+    def set_project(self, cfg, status) -> None:
+        """Point at a (re)loaded project; charts are rebuilt on the next reload."""
+        self._cfg, self._status = cfg, status
+        self.stale = True
+        # Groups may have been renamed or removed; old charts cannot be reused.
+        self._clear_charts()
+
+    def blocker(self) -> str:
+        if self._cfg is None or self._status is None:
+            return "no project open"
+        if self._status.n_annotated == 0:
+            return "no annotations yet - label some clips first"
+        return ""
+
+    def _clear_charts(self) -> None:
+        for box in list(self._charts.values()):
+            holder = box.parentWidget()
+            while holder is not None and not isinstance(holder, QGroupBox):
+                holder = holder.parentWidget()
+            (holder or box).setParent(None)
+            (holder or box).deleteLater()
+        self._charts.clear()
+
+    def reload(self) -> None:
+        """Re-read the CSV and repaint."""
+        self.stale = False
+        blocker = self.blocker()
+        if blocker:
+            self._clear_charts()
+            self.coverage.setText(f"<span style='color:{tokens()['muted']}'>{blocker}</span>")
+            self.notes.setVisible(False)
+            return
+
+        cfg = self._cfg
+        rows, problem = read_annotation_rows(cfg)
+        if problem:
+            self._clear_charts()
+            self.coverage.setText(
+                f"<span style='color:{tokens()['danger']}'>{problem}</span>"
+            )
+            self.notes.setVisible(False)
+            return
+
+        tallies = tally_annotations(rows, cfg)
+        self._paint_summary(rows)
+
+        minimum = cfg.suggest.min_per_class
+        for tally in tallies:
+            chart = self._charts.get(tally.name)
+            if chart is None:
+                chart = BarChart(tally, minimum)
+                self._charts[tally.name] = chart
+                title = tally.name + ("   (multi-select)" if tally.is_multi else "")
+                box = QGroupBox(title)
+                inner = QVBoxLayout(box)
+                # Zero: the QGroupBox rule already reserves 34px for the title.
+                inner.setContentsMargins(0, 0, 0, 0)
+                inner.addWidget(chart)
+                self.charts_layout.insertWidget(self.charts_layout.count() - 1, box)
+            else:
+                chart.set_tally(tally, minimum)
+
+        lines = summary_lines(tallies, cfg)
+        self.notes.setVisible(bool(lines))
+        if lines:
+            items = "".join(f"<li>{line}</li>" for line in lines)
+            self.notes.setText(
+                f"<div style='color:{tokens()['warning']}'>"
+                f"<ul style='margin-left:-20px;'>{items}</ul></div>"
+            )
+
+    def _paint_summary(self, rows) -> None:
+        status = self._status
+        n = len(rows)
+        total = status.n_clips if status else 0
+        share = f" ({100.0 * n / total:.0f}% of {total} clips)" if total else ""
+        movies = {str(r.get("movie_id", "") or "") for r in rows} - {""}
+        people = {str(r.get("annotator", "") or "") for r in rows} - {""}
+        uncertain = sum(1 for r in rows if str(r.get("uncertain", "")).strip() == "1")
+
+        parts = [f"<b>{n}</b> clip(s) labelled{share}",
+                 f"across <b>{len(movies)}</b> movie(s)"]
+        if len(people) > 1:
+            parts.append(f"by <b>{len(people)}</b> annotators")
+        elif people:
+            parts.append(f"by {sorted(people)[0]}")
+        if uncertain:
+            parts.append(f"<b>{uncertain}</b> marked uncertain")
+        self.coverage.setText(
+            "   |   ".join(parts)
+            + f"<br><span style='color:{tokens()['faint']}'>The dashed line marks "
+            f"suggest.min_per_class ({self._cfg.suggest.min_per_class}); classes "
+            "left of it are dropped when the model is trained.</span>"
+        )

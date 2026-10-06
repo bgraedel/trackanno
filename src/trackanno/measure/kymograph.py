@@ -24,7 +24,7 @@ import numpy as np
 __all__ = ["Kymograph", "curvature_kymograph", "resample_centreline", "chain_from_edges",
            "SignVerdict", "canonical_sign", "SIGN_MODES"]
 
-SIGN_MODES = ("raw", "canonical", "absolute")
+SIGN_MODES = ("raw", "canonical")
 
 # How much static curvature there has to be, relative to the beat, before its
 # sign is worth believing. The split-half test below guards the rest.
@@ -113,27 +113,6 @@ def canonical_sign(kappa, min_ratio: float = SIGN_MIN_RATIO) -> SignVerdict:
     )
 
 
-def _unwrap_in_time(psi):
-    """Finish the unwrap along the time axis, and remove whole-cell rotation.
-
-    Unwrap along arclength first and only then along time, as
-    ``wavespectra.spectral_series`` does: the node where the wave crosses +-pi
-    MOVES as the wave travels, so a fixed arclength position jumps by 2*pi
-    between frames. Subtracting the per-frame mean then removes the cell's
-    absolute heading, which drifts as it swims and would dominate the plot,
-    leaving the shape rotation invariant as curvature already is.
-    """
-    field = np.asarray(psi, dtype=np.float64)
-    usable = np.isfinite(field).all(axis=1)
-    if usable.sum() < 2:
-        return psi
-    block = np.unwrap(field[usable], axis=0)
-    block = block - block.mean(axis=1, keepdims=True)
-    out = np.full(field.shape, np.nan, dtype=np.float32)
-    out[usable] = block.astype(np.float32)
-    return out
-
-
 def chain_from_edges(n_nodes: int, edges) -> list:
     """The keypoint indices along the flagellum, taken from the skeleton.
 
@@ -197,7 +176,6 @@ class Kymograph:
     length_px: np.ndarray      # (T,) float32 arclength of the chain per frame
     n_nodes: int               # tracked points the curve was fitted through
     smooth_px: float
-    psi: np.ndarray | None = None   # (T, S) tangent angle, unwrapped in s and t
 
     @property
     def n_frames(self) -> int:
@@ -227,16 +205,10 @@ class Kymograph:
         """(kymograph, verdict) under one of the sign conventions.
 
         ``raw`` is what was measured. ``canonical`` flips the whole clip so its
-        static curvature is positive, when that is decidable. ``absolute`` drops
-        the sign, merging a leftward bend with a rightward one - fine when only
-        the magnitude matters, bad for reading a travelling wave. The flip is a
+        static curvature is positive, when that is decidable. The flip is a
         single factor for the WHOLE clip; choosing per frame would destroy the
         very thing the plot shows, a pattern whose sign alternates in order.
         """
-        if mode == "absolute":
-            flipped = Kymograph(np.abs(self.kappa), self.length_px, self.n_nodes,
-                                self.smooth_px)
-            return flipped, SignVerdict(1, True, 0.0, "magnitude only, sign discarded")
         if mode != "canonical":
             return self, SignVerdict(1, True, 0.0, "as measured")
 
@@ -261,17 +233,16 @@ class Kymograph:
 def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX):
     """Fit one frame's chain and resample it at equal arclength.
 
-    Returns ``(points, kappa, length, psi)``: points is (n_samples, 2), kappa is
-    (n_samples,) signed curvature in 1/px, length is the arclength in px, and psi
-    is the tangent angle in radians, unwrapped along the arclength. Returns
-    ``(None, None, nan, None)`` when the chain cannot carry a curve.
+    Returns ``(points, kappa, length)``: points is (n_samples, 2), kappa is
+    (n_samples,) signed curvature in 1/px and length is the arclength in px.
+    Returns ``(None, None, nan)`` when the chain cannot carry a curve.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
     good = np.isfinite(x) & np.isfinite(y)
     x, y = x[good], y[good]
     if x.size < MIN_NODES:
-        return None, None, float("nan"), None
+        return None, None, float("nan")
 
     # Duplicate points make the spline parametrisation singular, and a tracker
     # that loses a node often reports it at the previous node's position.
@@ -279,7 +250,7 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     keep = np.concatenate([[True], step > 1e-6])
     x, y = x[keep], y[keep]
     if x.size < MIN_NODES:
-        return None, None, float("nan"), None
+        return None, None, float("nan")
 
     import warnings
 
@@ -297,7 +268,7 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
             warnings.simplefilter("ignore", RuntimeWarning)
             tck, _ = splprep([x, y], s=total, k=3)
     except (TypeError, ValueError):
-        return None, None, float("nan"), None
+        return None, None, float("nan")
 
     # Equal arclength, not equal parameter: splprep parametrises by chord
     # length, which bunches samples exactly where the curve bends and would
@@ -308,7 +279,7 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     arc = np.concatenate([[0.0], np.cumsum((speed[1:] + speed[:-1]) / 2.0 * np.diff(dense))])
     length = float(arc[-1])
     if not np.isfinite(length) or length <= 0:
-        return None, None, float("nan"), None
+        return None, None, float("nan")
 
     wanted = np.linspace(0.0, length, n_samples)
     u = np.interp(wanted, arc, dense)
@@ -321,15 +292,7 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     with np.errstate(invalid="ignore", divide="ignore"):
         kappa = (d1x * d2y - d1y * d2x) / denominator
     kappa[~np.isfinite(kappa)] = np.nan
-
-    # The tangent angle, from the same analytic derivatives, unwrapped ALONG THE
-    # ARCLENGTH: atan2 wraps at +-pi, so a flagellum curling past that shows a
-    # 2*pi cliff at whichever node crosses it. Unwrapping along time is the
-    # caller's job, needing every frame at once. Same quantity as the curvature
-    # above (kappa = dpsi/ds), kept because psi is FIRST-order and reads more
-    # cleanly on a noisy track.
-    psi = np.unwrap(np.arctan2(d1y, d1x))
-    return np.column_stack([px, py]), kappa, length, psi
+    return np.column_stack([px, py]), kappa, length
 
 
 def curvature_kymograph(
@@ -360,20 +323,16 @@ def curvature_kymograph(
     n_samples = max(8, int(n_samples))
 
     kappa = np.full((n_frames, n_samples), np.nan, dtype=np.float32)
-    psi = np.full((n_frames, n_samples), np.nan, dtype=np.float32)
     lengths = np.full(n_frames, np.nan, dtype=np.float32)
     for t in range(n_frames):
-        _, k, length, angle = resample_centreline(
-            chain_x[t], chain_y[t], n_samples, smooth_px)
+        _, k, length = resample_centreline(chain_x[t], chain_y[t], n_samples, smooth_px)
         if k is not None:
             kappa[t] = k.astype(np.float32)
-            psi[t] = angle.astype(np.float32)
             lengths[t] = length
 
     return Kymograph(
         kappa=kappa, length_px=lengths,
         n_nodes=int(chain_x.shape[1]), smooth_px=float(smooth_px),
-        psi=_unwrap_in_time(psi),
     )
 
 

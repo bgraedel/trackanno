@@ -14,12 +14,8 @@ adjacent rows collapse onto an identical measurement window. A window straddling
 a transition is still blurred by it, and a narrow bout is still a single
 measurement.
 
-Two decoders, deliberately both. :func:`decode_min_bout` imposes a hard floor on
-bout length: a constraint rather than a model, but one whose floor is a number a
-biologist can argue about. :func:`decode_viterbi` is the probabilistic version,
-a flat-prior HMM whose self-transition encodes the same expected bout length
-(:func:`self_transition_for`), trading a short bout for a long one on the
-evidence rather than on the length alone.
+:func:`decode_min_bout` imposes a hard floor on bout length: a constraint
+rather than a model, but one whose floor is a number a biologist can argue about.
 
 NaN means "undefined" throughout and is never filled with a value. A frame no
 window could score is a different fact from a frame scored as uniform, and a
@@ -34,16 +30,8 @@ import heapq
 import numpy as np
 
 __all__ = [
-    "frame_posterior", "decode_min_bout", "decode_viterbi", "self_transition_for",
-    "runs_to_bouts",
+    "frame_posterior", "decode_min_bout", "runs_to_bouts",
 ]
-
-# Emission floor for the Viterbi decode. A class given probability exactly 0.0
-# would contribute log(0) = -inf, and two paths both at -inf cannot be compared.
-# The floor forbids the class in practice - log(tiny) is about -708, against a
-# per-step transition cost of order 4 - while keeping every number finite.
-_EMISSION_FLOOR = np.finfo(float).tiny
-
 
 # --------------------------------------------------------------------------- #
 # the posterior
@@ -152,19 +140,6 @@ def _runs(labels: np.ndarray) -> list[tuple[int, int, int]]:
     return [(int(s), int(e), int(labels[s])) for s, e in zip(starts, ends)]
 
 
-def _merge(runs: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
-    """Join neighbouring runs that now carry the same label."""
-    out = [runs[0]]
-    for span in runs[1:]:
-        start, end, label = span
-        prev_start, _, prev_label = out[-1]
-        if label == prev_label:
-            out[-1] = (prev_start, end, label)
-        else:
-            out.append(span)
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # decoding
 # --------------------------------------------------------------------------- #
@@ -190,7 +165,7 @@ def decode_min_bout(posterior: np.ndarray, min_bout_frames: int) -> np.ndarray:
 
     This is a CONSTRAINT, not a model: the result is the argmax made to obey a
     minimum bout length, not the most probable label sequence under any
-    distribution. :func:`decode_viterbi` is the version that is.
+    distribution.
     """
     posterior = np.asarray(posterior, dtype=float)
     if posterior.ndim != 2:
@@ -208,7 +183,7 @@ def decode_min_bout(posterior: np.ndarray, min_bout_frames: int) -> np.ndarray:
     # A doubly-linked list over the runs plus a shortest-first heap. Rescanning
     # every run to find the next target, and rebuilding the list to merge it,
     # makes this quadratic in the run count, and the run count is what an
-    # overlapping stride and several window scales both increase.
+    # overlapping stride increases.
     prev = np.arange(-1, n - 1)
     nxt = np.arange(1, n + 1)
     nxt[n - 1] = -1
@@ -260,116 +235,6 @@ def decode_min_bout(posterior: np.ndarray, min_bout_frames: int) -> np.ndarray:
         if alive[i]:
             out[start[i]:end[i]] = lab[i]
     return out
-
-
-
-def _neighbours(runs: list[tuple[int, int, int]], i: int) -> list[tuple[int, int, int]]:
-    """The defined runs either side of ``runs[i]``, left first."""
-    out = []
-    if i > 0 and runs[i - 1][2] >= 0:
-        out.append(runs[i - 1])
-    if i + 1 < len(runs) and runs[i + 1][2] >= 0:
-        out.append(runs[i + 1])
-    return out
-
-
-
-def decode_viterbi(posterior: np.ndarray, self_transition: float) -> np.ndarray:
-    """Most probable label sequence under a flat-prior, uniform-switch HMM.
-
-    Emissions are ``log(posterior)``; transitions are ``self_transition`` on the
-    diagonal and ``(1 - self_transition) / (n_classes - 1)`` off it, so one number
-    sets how sticky the decode is - see :func:`self_transition_for` for reading it
-    as an expected bout length. The initial state is uniform. Returns
-    ``(n_frames,)`` class indices, ``-1`` where the posterior row is undefined.
-
-    An HMM wants an emission LIKELIHOOD ``p(features | class)`` and a classifier
-    gives a POSTERIOR ``p(class | features)``; the two differ by the class prior,
-    so using the posterior directly is exact only if that prior is flat.
-    ``auto_class_weights="Balanced"`` in :mod:`trackanno.learn.suggest` pushes the
-    fitted model towards a balanced prior without guaranteeing one, and the
-    mismatch is a constant per-class bias in the emissions, showing up as
-    slightly displaced boundaries. A division by the empirical class frequencies
-    is the fix if it matters.
-
-    Undefined frames BREAK THE CHAIN. Each contiguous run of defined frames is
-    decoded on its own and the gaps come back as ``-1``, since carrying a path
-    across frames nobody scored would let a state persist on no evidence.
-
-    ``n_classes == 1`` returns the trivial answer rather than dividing by
-    ``n_classes - 1``. ``self_transition`` outside the open interval ``(0, 1)``
-    is refused: 0 forbids staying and 1 forbids leaving, and both make the log
-    transitions infinite.
-    """
-    posterior = np.asarray(posterior, dtype=float)
-    if posterior.ndim != 2:
-        raise ValueError(f"posterior must be (n_frames, n_classes), got {posterior.shape}")
-    labels = _argmax_labels(posterior)
-    n_classes = posterior.shape[1]
-    if n_classes <= 1 or labels.size == 0:
-        return labels
-
-    stay = float(self_transition)
-    if not 0.0 < stay < 1.0:
-        raise ValueError(
-            f"self_transition must be in (0, 1), got {stay}; 0 forbids a bout from "
-            "continuing and 1 forbids it from ever ending"
-        )
-    transition = np.full((n_classes, n_classes), np.log((1.0 - stay) / (n_classes - 1)))
-    np.fill_diagonal(transition, np.log(stay))
-
-    out = np.full(labels.size, -1, dtype=np.int64)
-    for start, end, label in _runs(labels >= 0):
-        if not label:
-            continue
-        emission = np.log(np.maximum(posterior[start:end], _EMISSION_FLOOR))
-        out[start:end] = _viterbi(emission, transition)
-    return out
-
-
-def _viterbi(emission: np.ndarray, transition: np.ndarray) -> np.ndarray:
-    """Textbook Viterbi in log space over one gap-free segment.
-
-    Emissions need not be normalised: scaling a whole FRAME's row multiplies
-    every path through it by the same constant, leaving the argmax unchanged.
-    Per-CLASS scaling is the prior question the docstring above is about.
-    """
-    n_frames, n_classes = emission.shape
-    score = emission[0].copy()
-    back = np.zeros((n_frames, n_classes), dtype=np.int64)
-    for t in range(1, n_frames):
-        candidates = score[:, None] + transition          # (from, to)
-        best = np.argmax(candidates, axis=0)
-        back[t] = best
-        score = candidates[best, np.arange(n_classes)] + emission[t]
-
-    path = np.empty(n_frames, dtype=np.int64)
-    path[-1] = int(np.argmax(score))
-    for t in range(n_frames - 1, 0, -1):
-        path[t - 1] = back[t, path[t]]
-    return path
-
-
-def self_transition_for(min_bout_frames: int) -> float:
-    """The HMM self-transition whose expected bout length is ``min_bout_frames``.
-
-    Under a constant self-transition ``a`` the holding time is geometric with
-    expectation ``1 / (1 - a)``, so inverting gives ``a = 1 - 1/min_bout_frames``.
-    The same number can therefore be handed to :func:`decode_min_bout` as a hard
-    floor or to :func:`decode_viterbi` as a prior, one being a bound and the
-    other a mean. :meth:`trackanno.config.Predict.resolved_self_transition` is
-    what calls this for ``predict.self_transition: auto``.
-
-    ``min_bout_frames < 2`` is refused: at 1 the identity returns ``a = 0``, a
-    chain forbidden to stay in any state, and below that a negative probability.
-    """
-    frames = int(min_bout_frames)
-    if frames < 2:
-        raise ValueError(
-            f"min_bout_frames must be at least 2, got {frames}; 1 - 1/{frames} is "
-            "not a usable self-transition"
-        )
-    return 1.0 - 1.0 / frames
 
 
 # --------------------------------------------------------------------------- #

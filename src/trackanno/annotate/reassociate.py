@@ -22,6 +22,8 @@ cannot support.
 
 Refuse rather than guess: a mis-link is trained on and never questioned again,
 while an orphan is merely ignored.
+
+    trackanno repair-links --config path/to/config.yaml [--dry-run]
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ import pandas as pd
 
 __all__ = [
     "Match", "Reassociation", "plan_reassociation", "apply_reassociation",
-    "backup_labels", "write_labels",
+    "backup_labels", "write_labels", "main",
     "GEOMETRY_COLUMNS", "REQUIRED_COLUMNS", "DEFAULT_MAX_CENTRE_PX",
     "DEFAULT_MIN_MARGIN_PX",
 ]
@@ -330,3 +332,79 @@ def write_labels(path: Path, frame: pd.DataFrame) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+def _describe(plan: Reassociation) -> list[str]:
+    lines = [
+        f"{plan.already_valid} label(s) already point at clips that exist.",
+        f"{plan.n_orphaned} point at clips that no longer exist:",
+        f"  {len(plan.matched)} can be re-linked by movie, frame range and crop position",
+    ]
+    if plan.conflicted:
+        lines.append(f"  {len(plan.conflicted)} match a clip already labelled since (left alone)")
+    if plan.ambiguous:
+        lines.append(f"  {len(plan.ambiguous)} are ambiguous, two clips fit equally well (left alone)")
+    if plan.unmatched:
+        lines.append(f"  {len(plan.unmatched)} have no candidate at all (left alone)")
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    from ..config import ConfigError, load_config
+    from .clips import ClipStore
+
+    parser = argparse.ArgumentParser(
+        prog="trackanno repair-links",
+        description="Re-link labels whose clip no longer exists onto the current clips.",
+    )
+    parser.add_argument("--config", default="config.yaml",
+                        help="path to config.yaml (default: ./config.yaml)")
+    parser.add_argument("--csv", default=None, help="override paths.csv")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="report what would change and write nothing")
+    args = parser.parse_args(argv)
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    csv_path = Path(args.csv).resolve() if args.csv else Path(cfg.paths.csv)
+    if not csv_path.exists():
+        print(f"error: no annotation file at {csv_path}", file=sys.stderr)
+        return 2
+    try:
+        store = ClipStore(cfg.paths.work_dir)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        manifest = store.manifest.copy()
+    finally:
+        store.close()
+
+    # dtype=str with NA disabled: untouched values must round-trip exactly.
+    labels = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    plan = plan_reassociation(labels, manifest)
+    if not plan.n_orphaned:
+        print(f"All {plan.already_valid} label(s) already point at clips that exist.")
+        return 0
+    print("\n".join(_describe(plan)))
+    if not plan.matched or args.dry_run:
+        return 0
+
+    backup = backup_labels(csv_path)
+    write_labels(csv_path, apply_reassociation(labels, plan))
+    print(f"{len(plan.matched)} label(s) re-linked; the previous file is at {backup}. "
+          "Retrain to fold them in.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

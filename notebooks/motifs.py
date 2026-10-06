@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import hilbert, lfilter
 
-from .transitions import _pyplot
+from trackanno.infer.figures import _pyplot
 
 __all__ = [
     "track_paths",
@@ -319,7 +319,7 @@ def class_posterior(rows: pd.DataFrame, name: str, cfg, group: str) -> np.ndarra
     try:
         import joblib
 
-        from ..learn.suggest import MODEL_FILE
+        from trackanno.learn.suggest import MODEL_FILE
 
         payload = joblib.load(cfg.paths.work_dir / MODEL_FILE)
         model = (payload.get("models") or {}).get(group)
@@ -350,7 +350,7 @@ def elect_medoid(rows: pd.DataFrame, *, space: str = "model",
     if space == "shown":
         wanted = list(shown)
     else:
-        from ..measure.clipfeatures import feature_columns, group_of
+        from trackanno.measure.clipfeatures import feature_columns, group_of
 
         dense_meta = {"f_end", "n_present", "skip_reason", "_behaviour"}
         keep_cnn = space == "model+cnn"

@@ -166,10 +166,16 @@ class UltralyticsTracker(Tracker):
 
     def reset(self) -> None:
         self._impl = self._make()
-        # The construction probe consumes track id 1, and track ids go into clip_ids.
+        # Track ids come from a process-wide counter and go into clip_ids, so every
+        # movie (and the construction probe) must start it from zero.
         reset_id = getattr(self._impl, "reset_id", None)
         if callable(reset_id):
             reset_id()
+        try:
+            from ultralytics.trackers.basetrack import BaseTrack
+        except ImportError:
+            return
+        BaseTrack.reset_id()
 
     def _make(self):
         try:

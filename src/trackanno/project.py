@@ -74,7 +74,7 @@ def create_project(
 ) -> Path:
     """Write a fresh, fully commented ``config.yaml``. Returns its path.
 
-    ``template`` names a set of saved settings to start from
+    ``template`` names a shipped preset or a saved set of settings to start from
     (:mod:`trackanno.templates`); without one, the packaged default is used. The
     paths below are applied on top either way, so a template never carries
     another project's movie folder into this one.
@@ -182,6 +182,9 @@ class ProjectStatus:
     # Movies whose detections are here but whose clips are not: the state a
     # project is in when detection ran on another machine.
     n_detected: int = 0
+    # Movies whose detections or clips no longer match the config. Their clips
+    # still count as prepared; only a forced run replaces them.
+    n_stale: int = 0
     n_clips: int = 0
     n_annotated: int = 0
     model_ok: bool = False
@@ -320,8 +323,17 @@ def project_status(cfg) -> ProjectStatus:
             # Detected but not yet cut: the movie has tracks, from this machine or
             # a GPU box, and still needs its clips. It is deliberately NOT counted
             # as prepared - there is nothing to annotate yet.
-            if _exists(movie_dir / DETECT_FILE):
+            has_handoff = _exists(movie_dir / DETECT_FILE)
+            if has_handoff:
                 status.n_detected += 1
+            if has_handoff or _exists(movie_dir / DONE_FILE):
+                try:
+                    from .detect.prepare import stale_reasons
+
+                    if stale_reasons(cfg, movie_dir.name, check_model=False):
+                        status.n_stale += 1
+                except Exception:
+                    pass
             done = movie_dir / DONE_FILE
             if not _exists(done):
                 continue

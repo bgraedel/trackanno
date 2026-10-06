@@ -87,7 +87,7 @@ def test_feature_figures_draw_and_skip_missing_columns() -> None:
 
 def test_module_plotting_keeps_the_callers_backend() -> None:
     """The first figlib call in a notebook used to switch the whole session
-    to Agg (transitions._pyplot forced it), so every later plt.show() warned
+    to Agg (_pyplot forced it), so every later plt.show() warned
     'FigureCanvasAgg is non-interactive' and nothing displayed. With pyplot
     already imported, drawing must leave the chosen backend alone."""
     import matplotlib

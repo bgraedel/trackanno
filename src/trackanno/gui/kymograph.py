@@ -73,9 +73,6 @@ class KymographView(QWidget):
         super().__init__(parent)
         self.kymo: Kymograph | None = None
         self.frame = 0
-        self.normalised = True
-        self.interpolate = True
-        self.field_kind = "curvature"
         self.sign_mode = "canonical"
         self.verdict = None
         self._verdict_for = None
@@ -94,34 +91,20 @@ class KymographView(QWidget):
 
     # -- what is actually drawn ---------------------------------------------- #
     def field(self):
-        """The (frames, arclength) array to paint, after field and sign choices.
-        Both are applied here rather than baked into the Kymograph, so switching
-        either one repaints without refitting the splines."""
+        """The (frames, arclength) array to paint, after the sign choice.
+        Applied here rather than baked into the Kymograph, so switching it
+        repaints without refitting the splines."""
         if self.kymo is None:
             return None
-        if self.field_kind == "tangent" and self.kymo.psi is not None:
-            data = np.asarray(self.kymo.psi, dtype=np.float32)
-        else:
-            data = self.kymo.normalised() if self.normalised else self.kymo.kappa
-
-        # The sign is judged on the curvature even when the tangent angle is on
-        # screen: the static mode deciding it is a property of the cell, not of
-        # the selected view. Cached against the clip, since field() runs on every
-        # repaint and mouse move.
+        data = self.kymo.normalised()
+        # Cached against the clip, since field() runs on every repaint and
+        # mouse move.
         if self.verdict is None or self._verdict_for is not self.kymo:
             self.verdict = canonical_sign(self.kymo.kappa)
             self._verdict_for = self.kymo
-        if self.sign_mode == "absolute":
-            return np.abs(data)
         if self.sign_mode == "canonical" and self.verdict.confident:
             return data * self.verdict.sign
         return data
-
-    def set_field_kind(self, kind: str) -> None:
-        if kind != self.field_kind:
-            self.field_kind = kind
-            self._image = None
-            self.update()
 
     def set_sign_mode(self, mode: str) -> None:
         if mode != self.sign_mode:
@@ -144,24 +127,8 @@ class KymographView(QWidget):
             self.frame = t
             self.update()
 
-    def set_normalised(self, on: bool) -> None:
-        if bool(on) != self.normalised:
-            self.normalised = bool(on)
-            self._image = None
-            self.update()
-
-    def set_interpolate(self, on: bool) -> None:
-        """Filtered display, or the raw sample grid."""
-        if bool(on) != self.interpolate:
-            self.interpolate = bool(on)
-            self.update()
-
     def clear(self) -> None:
         self.set_kymograph(None)
-
-    def restyle(self) -> None:
-        self._image = None
-        self.update()
 
     # -- geometry ------------------------------------------------------------ #
     def _plot_rect(self) -> QRectF:
@@ -225,8 +192,7 @@ class KymographView(QWidget):
             )
             return
 
-        key = (self.width(), self.height(), current(), self.normalised,
-               self.field_kind, self.sign_mode, id(self.kymo))
+        key = (self.width(), self.height(), current(), self.sign_mode, id(self.kymo))
         if self._image is None or self._image_key != key:
             self._image = self._build_image()
             self._image_key = key
@@ -237,8 +203,8 @@ class KymographView(QWidget):
         painter.setBrush(QColor(t["raised"]))
         painter.drawRect(plot)
         # Filtered: both axes sample a continuous quantity, so smoothing invents
-        # nothing. Switchable, for a noisy track.
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, self.interpolate)
+        # nothing.
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawImage(plot, self._image)
 
         painter.setPen(QPen(QColor(t["border"]), 1))
@@ -305,7 +271,6 @@ class KymographView(QWidget):
         small.setPointSizeF(max(7.0, small.pointSizeF() - 2.5))
         painter.setFont(small)
         painter.setPen(QColor(t["muted"]))
-        unit = "" if self.normalised else " /px"
         for value, y, align in (
             (f"+{self._limit:.2g}", bar.top() - 1, Qt.AlignTop),
             ("0", bar.center().y() - 6, Qt.AlignVCenter),
@@ -313,13 +278,9 @@ class KymographView(QWidget):
         ):
             painter.drawText(QRectF(bar.right() + 3, y, MARGIN_RIGHT - 26, 12),
                              int(Qt.AlignLeft | Qt.AlignVCenter), value)
-        if self.field_kind == "tangent":
-            label = "psi"
-        else:
-            label = "kL" if self.normalised else f"k{unit}"
         painter.drawText(
             QRectF(bar.right() + 3, bar.center().y() + 6, MARGIN_RIGHT - 26, 12),
-            int(Qt.AlignLeft | Qt.AlignVCenter), label,
+            int(Qt.AlignLeft | Qt.AlignVCenter), "kL",
         )
         # Say when the handedness could not be decided, so the colours do not
         # imply a convention the data never established.
@@ -351,9 +312,7 @@ class KymographView(QWidget):
         field = self.field()
         value = field[frame, node]
         arc = node / max(1, s - 1)
-        text = "not tracked" if not np.isfinite(value) else (
-            f"{value:+.3g}" + ("" if self.normalised else " /px")
-        )
+        text = "not tracked" if not np.isfinite(value) else f"{value:+.3g}"
         self.setToolTip(f"frame {frame + 1}   s = {arc:.2f}   {text}")
 
     def mousePressEvent(self, event):  # noqa: N802 (Qt naming)

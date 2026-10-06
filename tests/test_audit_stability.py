@@ -531,6 +531,23 @@ def test_not_recorded_is_not_the_same_fact_as_not_held_out() -> None:
           "not a readable" in _refusal(decode_audit, "2"))
 
 
+def test_every_clip_of_a_track_lands_on_the_same_side(root: Path) -> None:
+    """The holdout is drawn per track, so no track straddles the split."""
+    cfg = _cfg(root, "per_track", CONFIG_TEXT.replace(
+        "ui: {annotator: tester}", "ui: {annotator: tester}\nsuggest: {audit_fraction: 0.5}"))
+    held = cfg.suggest.audit_by_hash
+    sides = {}
+    for movie in ("MOVIE", "OTHER__2024"):
+        for track in range(1, 41):
+            sides[(movie, track)] = {held(_clip_id(track, f, movie)) for f in range(0, 5000, 50)}
+    check("every track's clips share one membership",
+          all(len(s) == 1 for s in sides.values()))
+    check("...and both sides are populated",
+          {next(iter(s)) for s in sides.values()} == {True, False})
+    check("the movie is part of the key",
+          any(sides[("MOVIE", t)] != sides[("OTHER__2024", t)] for t in range(1, 41)))
+
+
 def test_an_unreadable_flag_stops_the_project_opening_rather_than_being_averaged(
     root: Path
 ) -> None:
@@ -688,9 +705,6 @@ def test_the_audit_count_is_never_reported_without_its_population(root: Path) ->
         "macro_f1": 0.71, "accuracy": 0.78, "baseline_accuracy": 0.66,
         "kappa": 0.44, "kappa_lower": 0.21, "n_groups": 4,
         "scope": "leave-movie-out over 4 movies (4-fold)",
-        "cv_pca": "per-fold CNN PCA (saved model uses the global one)",
-        "audit_pca": "global CNN PCA, fitted over every prepared movie INCLUDING "
-                     "these audit clips' own detections - unsupervised leakage",
         "audit_n": 10, "audit_population": 200, "audit_labelled": 10,
         "audit_accuracy": 0.80, "audit_kappa": 0.51,
         "confusion": [], "top_features": [], "reliable": True, "reason": "ok",
@@ -700,8 +714,6 @@ def test_the_audit_count_is_never_reported_without_its_population(root: Path) ->
     check("...next to how many audit clips were scored", "10 scored" in text, text)
     check("...and how much of the holdout that is",
           "10 of 200 audit clips labelled" in text, text)
-    check("the unsupervised leakage is admitted where the number is printed",
-          "leakage" in text and "caveat" in text, text)
 
     # A holdout that exists but has barely been touched must not read as silence.
     thin = dict(base, audit_n=0, audit_labelled=2,
@@ -750,7 +762,7 @@ def test_a_report_older_than_the_population_count_still_prints_its_audit_line(
         "macro_f1": 0.71, "accuracy": 0.78, "baseline_accuracy": 0.66,
         "kappa": 0.44, "kappa_lower": 0.21, "n_groups": 4,
         "scope": "leave-movie-out over 4 movies (4-fold)",
-        # No audit_population, no audit_labelled and no audit_pca: exactly the
+        # No audit_population and no audit_labelled: exactly the
         # keys `train` wrote before this branch, and nothing it did not.
         "audit_n": 10, "audit_accuracy": 0.80, "audit_kappa": 0.51,
         "confusion": [], "top_features": [], "reliable": True, "reason": "ok",
@@ -813,23 +825,16 @@ def test_the_report_counts_the_whole_holdout_not_only_the_labelled_part(
           report.audit_population > report.audit_labelled)
     check("nothing was scored, so audit_n claims nothing",
           report.audit_n == 0, str(report.audit_n))
-    check("the unfitted report still admits how its audit score would be built",
-          isinstance(report.audit_pca, str) and report.audit_pca != "")
 
     text = _printed({"behaviour": asdict(report)})
     check("and the printed report puts the two together",
           f"2 of {len(audit)} audit clips labelled" in text, text)
 
 
-def _fitted_project(root: Path, name: str, columns: list[str], fold_pca: bool = False):
+def _fitted_project(root: Path, name: str, columns: list[str]):
     """A project small enough to fit in a second and complete enough to reach
     the audit score: two movies, two classes present in both, and half the clips
     held out so the holdout is big enough to be scored.
-
-    `fold_pca` supplies the raw CNN aggregate, which is what makes `train_group`
-    refit the basis inside each fold. Without it the CV falls back to the global
-    basis and `cv_pca` says so - a caller asserting the CV/audit CONTRAST has to
-    ask for it, or it is comparing two descriptions of the same global fit.
     """
     text = CONFIG_TEXT + "\nsuggest: {model: hist, audit_fraction: 0.5, " \
                          "min_per_class: 2, iterations: 20}\n"
@@ -852,64 +857,11 @@ def _fitted_project(root: Path, name: str, columns: list[str], fold_pca: bool = 
         # Separable, so the fit has something to find and the audit score is a
         # number rather than noise. Nothing here claims it is a good number.
         "speed_mean": [1.0 if b == "swimming" else 9.0 for b in behaviours],
-        "cnn_00": [0.5 if b == "swimming" else 8.5 for b in behaviours],
     })
     labels = pd.read_csv(cfg.paths.csv)
-    # The positional tag train_group needs before it will use a fold basis at
-    # all; harmless when no aggregate is supplied.
-    features["_row"] = np.arange(len(features))
-    raw_cnn = None
-    if fold_pca:
-        # Three columns because the fold PCA needs n_components >= 2 to run,
-        # separable so the fold fit has something to find.
-        base = np.array([0.5 if b == "swimming" else 8.5 for b in behaviours])
-        raw_cnn = np.column_stack([base, base * 0.5 + 1.0, base * -0.25])
     _, report = train_group(features, labels, "behaviour", cfg,
-                            columns=columns, verbose=False, raw_cnn=raw_cnn)
+                            columns=columns, verbose=False)
     return cfg, features, labels, report
-
-
-def test_the_audit_pca_caveat_is_recorded_on_a_report_that_actually_scored(
-    root: Path
-) -> None:
-    """The audit score is computed on ``columns``, whose ``cnn*`` block comes
-    from a PCA fitted in ``clipfeatures`` over every prepared movie - these
-    clips' own detections included. The CV refits that basis per fold; the audit
-    path does not. Unsupervised only, and probably small, but the size of it is
-    not measured anywhere, and it inflates the one number this tool asks people
-    to trust. ``cv_pca`` documented the cross-validated side and nothing
-    documented this one, so a reader had to find it in the source."""
-    _, _, _, report = _fitted_project(root, "pca-caveat", ["speed_mean", "cnn_00"],
-                                      fold_pca=True)
-
-    check("the fit really reached the audit score", report.audit_n >= 3,
-          f"audit_n={report.audit_n} reason={report.reason}")
-    check("the caveat names the fit it is a caveat about",
-          "global CNN PCA" in report.audit_pca, report.audit_pca)
-    check("...says whose data went into it",
-          "INCLUDING these audit clips" in report.audit_pca, report.audit_pca)
-    check("...says what kind of leakage it is, so it is not overstated",
-          "unsupervised leakage" in report.audit_pca
-          and "labels never enter" in report.audit_pca, report.audit_pca)
-    check("...and contrasts it with the CV path, which does refit",
-          "per audit clip" in report.audit_pca, report.audit_pca)
-    check("the CV side is still documented separately, and differently",
-          report.cv_pca != report.audit_pca and "fold" in report.cv_pca)
-
-    _, _, _, plain = _fitted_project(root, "pca-none", ["speed_mean"])
-    check("a CNN-free model carries no such caveat, because there is none",
-          plain.audit_pca == "no CNN columns", plain.audit_pca)
-    check("...and it still scored an audit set", plain.audit_n >= 3, str(plain.audit_n))
-
-    # The report is written to suggest_report.json, so a field that is not a
-    # plain scalar would break the write rather than the read.
-    import json
-
-    payload = json.loads(json.dumps(asdict(report)))
-    check("the new fields survive the JSON report",
-          payload["audit_pca"] == report.audit_pca
-          and payload["audit_population"] == report.audit_population
-          and payload["audit_labelled"] == report.audit_labelled)
 
 
 def test_a_scored_audit_report_states_how_much_of_the_holdout_it_rests_on(

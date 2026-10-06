@@ -31,8 +31,8 @@ import pandas as pd
 from scipy.signal import ShortTimeFFT
 from harness import check
 from trackanno.measure.wavespectra import (
-    DEFAULT_HOP, DEFAULT_WINDOW, SERIES_COLUMNS, _detrend_coeffs, spectral_series,
-    track_spectral_series, window_values,
+    DEFAULT_FLOW_FRAMES, DEFAULT_HOP, DEFAULT_WINDOW, SERIES_COLUMNS,
+    _detrend_coeffs, spectral_series, track_spectral_series, window_values,
 )
 
 FPS = 100.0
@@ -79,8 +79,8 @@ def travelling_wave(
     k = 2.0 * np.pi / (wavelength_ratio * length_px)
 
     sign = np.full(n_frames, float(k_sign))
-    if flip_at is not None:
-        sign[flip_at:] = -float(k_sign)
+    for i, at in enumerate(np.atleast_1d(flip_at) if flip_at is not None else ()):
+        sign[int(at):] = float(k_sign) * (-1.0) ** (i + 1)
     phase = np.cumsum(np.full(n_frames, 2.0 * np.pi * freq_hz / fps))
     psi = np.pi + amplitude * np.sin(phase[:, None] - sign[:, None] * k * s_mid[None, :])
 
@@ -336,6 +336,141 @@ def test_reversal_is_located() -> None:
     whole = spectral_series(px, py, FPS, 500, 5)
     check("a whole-track window cannot see the reversal",
           len(whole) == 1, f"{len(whole)} rows")
+
+
+def test_flow_direction_needs_no_resolvable_beat() -> None:
+    """Why the flow columns exist at all.
+
+    ``wave_direction`` is read at the dominant STFT bin, so a beat with fewer
+    than ``BEAT_MIN_CYCLES`` cycles in one window is measured at whatever bin
+    the argmax fell into - ``wave_censored`` is the column that says so. The
+    flow columns read a gradient rather than a spectrum, so nothing there has a
+    band to run out of.
+    """
+    for k_sign in (+1, -1):
+        # 2.5 Hz: below the 4 Hz floor a 75-frame window at 100 fps can search.
+        px, py = travelling_wave(400, freq_hz=2.5, k_sign=k_sign)
+        series = spectral_series(px, py, FPS)
+        censored = float(series["wave_censored"].mean())
+        flow = series["wave_flow_direction"].dropna()
+        coherence = float(series["wave_flow_coherence"].median())
+        check(f"a 2.5 Hz beat is below the window's floor (k_sign={k_sign})",
+              censored > 0.5, f"{censored:.2f} of windows censored")
+        check(f"...but the flow direction still reads {k_sign:+d}",
+              len(flow) > 0 and bool((flow == k_sign).all()),
+              f"{(flow == k_sign).mean():.3f} agreed over {len(flow)} windows")
+        check(f"...and calls it one coherent wave (k_sign={k_sign})",
+              coherence > 0.8, f"{coherence:.3f}")
+
+
+def test_the_flow_direction_does_not_depend_on_the_spectral_window() -> None:
+    """Its support is ``flow_frames``, and that is the whole design.
+
+    ``spectral.window`` is set by what the FREQUENCY needs. Anything read at the
+    dominant bin inherits it; this does not, so changing the window must not
+    move a single value.
+    """
+    px, py = travelling_wave(500, flip_at=250, noise_px=0.3, seed=9)
+    reference = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
+    for window in (50, 150, 250):
+        series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
+        shared = reference.index.intersection(series.index)
+        check(f"the two runs share centres to compare (window={window})",
+              len(shared) > 10, f"{len(shared)} shared")
+        for column in ("wave_flow", "wave_flow_coherence", "wave_flow_direction"):
+            same = np.allclose(reference.loc[shared, column],
+                               series.loc[shared, column], equal_nan=True)
+            check(f"{column} is untouched by window={window}", same)
+        # ...while what the spectrum can see does move with it, which is the
+        # contrast. The floor, not the recovered frequency: a clean 8 Hz wave
+        # reads 8 Hz at every window that can resolve it.
+        moved = not np.allclose(reference.loc[shared, "wave_resolvable_hz"],
+                                series.loc[shared, "wave_resolvable_hz"],
+                                equal_nan=True)
+        check(f"...and the band the spectrum searches does move with it ({window})",
+              moved)
+
+
+def test_flow_locates_a_reversal_within_a_hop() -> None:
+    """Both directions turn at the flip; the flow does so at any window."""
+    flip = 250
+    px, py = travelling_wave(500, flip_at=flip, noise_px=0.3, seed=9)
+    for window in (50, 75, 150):
+        series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
+        centres = series.index.to_numpy(int)
+        value = series["wave_flow_direction"].to_numpy(float)
+        finite = np.isfinite(value)
+        negative = np.flatnonzero(finite & (value < 0))
+        located = int(centres[negative[0]]) if negative.size else -1
+        check(f"flow reversal located within one hop (window={window})",
+              abs(located - flip) <= DEFAULT_HOP, f"found at {located}, true {flip}")
+        wrong = finite & (value != np.where(centres < flip, 1.0, -1.0))
+        check(f"...and its error does not grow with the window ({window})",
+              int(wrong.sum()) * DEFAULT_HOP <= 2 * DEFAULT_FLOW_FRAMES,
+              f"{int(wrong.sum()) * DEFAULT_HOP} frames wrong")
+
+    # A 30-frame reversal, well under the spectral window. Both estimators see
+    # it on a clean wave - the Hanning taper concentrates the transform on the
+    # middle of its window, so the spectral one is not simply a boxcar average
+    # over `window` frames. Asserted so that the flow column is not credited
+    # with an advantage it only has on noisy or unresolvable beats.
+    px, py = travelling_wave(500, flip_at=(250, 280), noise_px=0.3, seed=9)
+    series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
+    centres = series.index.to_numpy(int)
+    inside = (centres >= 250 + DEFAULT_FLOW_FRAMES) & (centres < 280 - DEFAULT_FLOW_FRAMES)
+    for column in ("wave_direction", "wave_flow_direction"):
+        value = series[column].to_numpy(float)[inside]
+        check(f"{column} reports a bout shorter than the window",
+              float((value < 0).mean()) > 0.5,
+              f"{(value < 0).mean():.3f} of {int(inside.sum())} rows inside it")
+
+
+def test_a_standing_wave_has_no_direction_to_report() -> None:
+    """``psi = A sin(wt) cos(ks)`` oscillates without travelling.
+
+    The sign of such a thing is noise, so the coherence beside it has to be the
+    column that says "not one travelling wave" - otherwise a direction read off
+    a standing beat is indistinguishable from a real one.
+    """
+    n_frames, n_seg = 400, N_KEYPOINTS - 2
+    ds = 60.0 / n_seg
+    s_mid = (np.arange(n_seg) + 0.5) * ds
+    phase = 2.0 * np.pi * 8.0 * np.arange(n_frames) / FPS
+    psi = np.pi + 0.6 * np.sin(phase)[:, None] * np.cos(
+        (2.0 * np.pi / 60.0) * s_mid)[None, :]
+    x = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
+    y = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
+    px = np.zeros((n_frames, N_KEYPOINTS))
+    py = np.zeros((n_frames, N_KEYPOINTS))
+    px[:, 1:], py[:, 1:] = x, y
+    px[:, 0], py[:, 0] = 20.0, 0.0
+
+    standing = spectral_series(px, py, FPS)["wave_flow_coherence"].median()
+    travelling = spectral_series(*travelling_wave(n_frames), FPS)[
+        "wave_flow_coherence"].median()
+    check("a standing wave reads as barely coherent",
+          float(standing) < 0.2, f"{standing:.3f}")
+    check("...well below a travelling one", float(standing) < 0.5 * float(travelling),
+          f"{standing:.3f} vs {travelling:.3f}")
+
+
+def test_flow_survives_the_readout() -> None:
+    """The clip-level column, and the tie a median of +-1 would produce."""
+    px, py = travelling_wave(300, k_sign=-1)
+    series = spectral_series(px, py, FPS)
+    values = window_values(series, 100, 125)
+    check("the readout carries a flow direction",
+          values["wave_flow_direction"] == -1.0, str(values["wave_flow_direction"]))
+    check("...taken from the signed coefficient, so it never ties at zero",
+          np.sign(values["wave_flow"]) == values["wave_flow_direction"],
+          f"{values['wave_flow']} vs {values['wave_flow_direction']}")
+    check("...with its coherence beside it",
+          0.0 <= values["wave_flow_coherence"] <= 1.0,
+          str(values["wave_flow_coherence"]))
+
+    empty = window_values(series.iloc[0:0], 0, 25)
+    check("an empty series reports no direction rather than zero",
+          np.isnan(empty["wave_flow_direction"]) and np.isnan(empty["wave_flow"]))
 
 
 def test_beat_stability() -> None:

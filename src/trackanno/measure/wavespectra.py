@@ -23,6 +23,9 @@ Rules, applied window by window:
 * ``wave_direction = -sign(slope)``, so **+1 means Base -> Tip**: a Base->Tip
   wave ``psi = A sin(wt - ks)``, k > 0, carries phase ``-ks`` at +f and so a
   NEGATIVE gradient along arclength. Verified against the real labels.
+* ``wave_flow_direction`` is the same thing on the same convention, read from
+  the phase gradient over ``flow_frames`` and needing no frequency, so it
+  survives a beat the window cannot resolve (:func:`flow_series`).
 * The amplitude carries the Hanning coherent-gain factor ``(2/n) * 2``.
 * Nothing is blanked on a significance threshold; ``wave_excess`` and
   ``wave_censored`` are columns standing beside the values, as ``processFile.m``
@@ -47,8 +50,9 @@ from .clipfeatures import (
 )
 
 __all__ = [
-    "spectral_series", "window_values", "track_spectral_series",
-    "SERIES_COLUMNS", "DEFAULT_WINDOW", "DEFAULT_HOP",
+    "spectral_series", "window_values", "WindowSource", "track_spectral_series",
+    "flow_series",
+    "SERIES_COLUMNS", "DEFAULT_WINDOW", "DEFAULT_HOP", "DEFAULT_FLOW_FRAMES",
 ]
 
 # 0.75 s at 100 fps.
@@ -63,6 +67,11 @@ MIN_WINDOW_FRAMES = 8
 # so its "shape" is just interpolation between the points it was given.
 MIN_SEGMENTS = 3
 
+# Frames one flow estimate is read over. Three is the fewest a central
+# difference in time can use; five gives a frame of slack against keypoint
+# jitter without reaching towards a second beat cycle.
+DEFAULT_FLOW_FRAMES = 5
+
 SERIES_COLUMNS = (
     # -- the beat -----------------------------------------------------------
     "wave_freq_hz", "wave_resolvable_hz", "wave_excess", "wave_fundamental_frac",
@@ -73,6 +82,8 @@ SERIES_COLUMNS = (
     "wave_phase_slope", "wave_phase_rsq", "wave_phase_asym", "wave_phase_para",
     "wave_wavelength_px", "wave_wavelength_ratio", "wave_direction",
     "wave_speed_px_s",
+    # -- the same direction, read without a spectrum -------------------------
+    "wave_flow", "wave_flow_coherence", "wave_flow_direction",
     # -- static (time-averaged) shape ---------------------------------------
     "wave_static_cos", "wave_static_sin", "wave_static_asym", "wave_static_para",
     # -- geometry and quality ------------------------------------------------
@@ -149,6 +160,122 @@ def _slice_starts(n: int, m: int, hop: int, mid: int) -> np.ndarray:
     if p_last < p_first:
         return np.empty(0, dtype=int)
     return np.arange(p_first, p_last + 1, dtype=int) * hop - mid
+
+
+def _centred_sum(values: np.ndarray, half: int) -> np.ndarray:
+    """Sliding sum over ``[i - half, i + half]`` along axis 0, clipped at the ends.
+
+    Exact rather than convolved: these sums go into a ratio, and a boxcar that
+    tapers at the edges would bias it there instead of simply narrowing it.
+    """
+    n = values.shape[0]
+    zero = np.zeros((1,) + values.shape[1:], dtype=float)
+    cumulative = np.concatenate([zero, np.cumsum(values, axis=0)], axis=0)
+    idx = np.arange(n)
+    lo = np.clip(idx - half, 0, n)
+    hi = np.clip(idx + half + 1, 0, n)
+    return cumulative[hi] - cumulative[lo]
+
+
+def flow_series(
+    psi: np.ndarray,
+    arc_px: np.ndarray,
+    complete: np.ndarray,
+    frames: int = DEFAULT_FLOW_FRAMES,
+) -> np.ndarray:
+    """Which way the wave travels, per frame, without measuring a frequency.
+
+    For a travelling wave ``psi = A sin(wt - ks)`` with s running Base -> Tip,
+    ``d(psi)/dt = +wA cos(.)`` and ``d(psi)/ds = -kA cos(.)``, so
+    ``-<psi_t psi_s>`` carries the sign of the phase velocity ``w/k``. Divided
+    by the two norms it is a correlation coefficient in ``[-1, 1]``: the SIGN is
+    the direction, on the same convention as ``wave_direction`` (+1 is
+    Base -> Tip), and the MAGNITUDE is how much of the motion is one travelling
+    wave rather than anything else - the local counterpart of
+    ``wave_phase_rsq``.
+
+    Beside ``wave_direction``, not instead of it: that one is read at the
+    dominant STFT bin, which is only the beat where the window holds
+    ``BEAT_MIN_CYCLES`` cycles of it, and below that (``wave_censored``) it is a
+    phase profile at a frequency the cell is not beating at. This needs no
+    frequency, so it has no band to run out of. It is not simply the sharper of
+    the two - the Hanning taper already concentrates the transform on the middle
+    of its window - and the gain is on beats the window cannot resolve.
+
+    ``psi`` is unwrapped along arclength and then time, ``arc_px`` the segment
+    midpoints in pixels, ``complete`` per frame whether the pose was DETECTED
+    rather than filled. Returns ``(n_frames,)``, NaN where the stencil has no
+    gradient to read or leans on interpolation.
+    """
+    psi = np.asarray(psi, dtype=float)
+    n = psi.shape[0]
+    out = np.full(n, np.nan)
+    half = max(1, int(frames) // 2)
+    if psi.ndim != 2 or n < 2 * half + 1 or psi.shape[1] < 2:
+        return out
+
+    # d/dt keeps the static bend: it is constant in time and contributes
+    # nothing. d/ds must NOT - a static bend has an arclength gradient, and it
+    # would sit in the denominator uncorrelated with the motion, dragging every
+    # coefficient towards zero.
+    finite = np.isfinite(psi)
+    filled = np.where(finite, psi, 0.0)
+    seen = _centred_sum(finite.astype(float), half)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        static = np.where(seen > 0, _centred_sum(filled, half) / np.maximum(seen, 1), np.nan)
+
+    psi_t = np.gradient(psi, axis=0)
+    step = np.diff(arc_px, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        psi_s = np.diff(psi - static, axis=1) / np.where(np.abs(step) > 1e-9, step, np.nan)
+    # onto the grid the arclength difference lives on
+    psi_t = 0.5 * (psi_t[:, :-1] + psi_t[:, 1:])
+
+    good = np.isfinite(psi_t) & np.isfinite(psi_s)
+    a, b = np.where(good, psi_t, 0.0), np.where(good, psi_s, 0.0)
+    cross = _centred_sum((a * b).sum(axis=1), half)
+    aa = _centred_sum((a * a).sum(axis=1), half)
+    bb = _centred_sum((b * b).sum(axis=1), half)
+    pairs = _centred_sum(good.sum(axis=1).astype(float), half)
+
+    # Interpolation is judged over the STENCIL, not over the spectral window:
+    # gating a five-frame estimate on how much of a 75-frame window was filled
+    # would hand back exactly the long window this exists to avoid.
+    detected = _centred_sum(np.asarray(complete, dtype=float), half)
+    span = _centred_sum(np.ones(n), half)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        local_fill = 1.0 - detected / np.maximum(span, 1.0)
+        denominator = np.sqrt(aa * bb)
+        out = np.where(
+            (denominator > 1e-12) & (pairs >= 4) & (local_fill <= MAX_INTERP_FRAC),
+            -cross / np.where(denominator > 0, denominator, np.nan),
+            np.nan,
+        )
+    # A correlation coefficient, so clipped to its own range: rounding puts a
+    # perfect wave a few ulp past 1.0, and a caller gating on <= 1 should not
+    # have to know that.
+    out = np.clip(out, -1.0, 1.0)
+    # The ends have a partial stencil, which is a shorter estimate rather than a
+    # wrong one - but its support differs from every other frame's, so it is not
+    # the same measurement and does not go in the same column.
+    out[:half] = np.nan
+    out[n - half:] = np.nan
+    return out
+
+
+def _read_at(values: np.ndarray, centres: np.ndarray, reach: int) -> np.ndarray:
+    """Median of a per-frame series over ``+-reach`` frames of each centre."""
+    out = np.full(centres.size, np.nan)
+    n = values.shape[0]
+    for i, centre in enumerate(centres):
+        lo, hi = max(0, int(centre) - reach), min(n, int(centre) + reach + 1)
+        if hi <= lo:
+            continue
+        block = values[lo:hi]
+        block = block[np.isfinite(block)]
+        if block.size:
+            out[i] = float(np.median(block))
+    return out
 
 
 def _direct_spectrum(
@@ -289,6 +416,7 @@ def spectral_series(
     fps: float,
     window: int = DEFAULT_WINDOW,
     hop: int = DEFAULT_HOP,
+    flow_frames: int = DEFAULT_FLOW_FRAMES,
 ) -> pd.DataFrame:
     """Beat-waveform descriptors for every sliding window of one track.
 
@@ -310,6 +438,10 @@ def spectral_series(
         ``wave_resolvable_hz`` what that costs.
     hop
         Frames between successive window centres.
+    flow_frames
+        Support of the ``wave_flow`` columns, which measure the direction
+        without a spectrum and so are not tied to ``window``. See
+        :func:`flow_series`.
 
     Returns
     -------
@@ -401,6 +533,18 @@ def spectral_series(
 
     out = {c: np.full(n_win, np.nan) for c in SERIES_COLUMNS}
     out["wave_window_frames"] = np.full(n_win, float(m))
+
+    # -- 2b. direction, read without the spectrum ---------------------------- #
+    # Before the band check below, deliberately: a row that can report nothing
+    # else should still report this. Each row speaks for the frames around its
+    # own centre, so a clip's readout stays a median over its OWN frames however
+    # long `window` is.
+    flow = flow_series(psi, arc - seg / 2.0, complete, flow_frames)
+    reach = max(int(flow_frames) // 2, int(hop) // 2)
+    out["wave_flow"] = _read_at(flow, centres, reach)
+    out["wave_flow_coherence"] = _read_at(np.abs(flow), centres, reach)
+    out["wave_flow_direction"] = np.sign(out["wave_flow"])
+    out["wave_flow_direction"][out["wave_flow_direction"] == 0.0] = np.nan
 
     # -- 3. per-window geometry, from sliding sums --------------------------- #
     s = _sliding_mean(node_s, m, starts)                    # (n_win, n_seg)
@@ -543,6 +687,7 @@ def track_spectral_series(
     hop: int = DEFAULT_HOP,
     n_frames: int | None = None,
     f_start: int | None = None,
+    flow_frames: int = DEFAULT_FLOW_FRAMES,
 ) -> pd.DataFrame:
     """:func:`spectral_series` straight off one track's rows in ``tracks.parquet``.
 
@@ -554,7 +699,8 @@ def track_spectral_series(
     sub = sub.sort_values("frame")
     frames = sub["frame"].to_numpy(dtype=int)
     if frames.size == 0:
-        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop)
+        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop,
+                               flow_frames)
     if f_start is None:
         f_start = int(frames.min())
     if n_frames is None:
@@ -563,7 +709,7 @@ def track_spectral_series(
     ky = [f"kp_y_{k}" for k in range(n_keypoints)]
     px = _on_grid(sub, kx, int(n_frames), int(f_start))
     py = _on_grid(sub, ky, int(n_frames), int(f_start))
-    series = spectral_series(px, py, fps, window, hop)
+    series = spectral_series(px, py, fps, window, hop, flow_frames)
     series.index = pd.Index(series.index.to_numpy(dtype=int) + int(f_start), name="frame")
     return series
 
@@ -571,8 +717,28 @@ def track_spectral_series(
 # --------------------------------------------------------------------------- #
 # reading the series out over one annotation window
 # --------------------------------------------------------------------------- #
-def window_values(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, float]:
-    """Collapse the series over one annotation window into a feature row.
+class WindowSource:
+    """:func:`window_values` with the per-track work done once.
+
+    The series columns are taken to numpy on construction; each window is then
+    a row selection on that array.
+    """
+
+    __slots__ = ("centres", "values", "columns", "is_fraction")
+
+    def __init__(self, series: pd.DataFrame | None):
+        present = [] if series is None else [c for c in SERIES_COLUMNS if c in series.columns]
+        self.columns = present
+        if series is None or len(series) == 0:
+            self.centres = np.empty(0, dtype=float)
+            self.values = np.empty((0, len(present)), dtype=float)
+        else:
+            self.centres = series.index.to_numpy(dtype=float)
+            self.values = series[present].to_numpy(dtype=float)
+        self.is_fraction = np.array([c in _FRACTION_COLUMNS for c in present], dtype=bool)
+
+    def at(self, f_start: int, f_end: int) -> dict[str, float]:
+        """Collapse the series over one annotation window into a feature row.
 
     Uses every row whose window CENTRE falls in ``[f_start, f_end)`` - half-open,
     so adjacent clips never both claim the same row. When none do (a clip shorter
@@ -597,40 +763,50 @@ def window_values(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, f
     Returns plain floats, NaN for anything undefined, plus ``n_windows`` and
     ``centre_offset``. Never fills with 0.0.
     """
-    out: dict[str, float] = {c: np.nan for c in SERIES_COLUMNS}
-    out["n_windows"] = 0.0
-    out["centre_offset"] = np.nan
-    if series is None or len(series) == 0:
+        out: dict[str, float] = {c: np.nan for c in SERIES_COLUMNS}
+        out["n_windows"] = 0.0
+        out["centre_offset"] = np.nan
+        if self.centres.size == 0:
+            return out
+
+        target = (float(f_start) + float(f_end)) / 2.0
+        inside = (self.centres >= float(f_start)) & (self.centres < float(f_end))
+        rows = (np.flatnonzero(inside) if inside.any()
+                else np.array([int(np.argmin(np.abs(self.centres - target)))]))
+
+        out["n_windows"] = float(rows.size)
+        out["centre_offset"] = float(np.median(self.centres[rows]) - target)
+        block = self.values[rows]
+        with warnings.catch_warnings():
+            # An all-NaN column is a quantity this window could not measure. Its
+            # answer is the NaN already in `out`.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            pooled = np.where(np.isnan(block).all(axis=0), np.nan,
+                              np.where(self.is_fraction,
+                                       np.nanmean(block, axis=0),
+                                       np.nanmedian(block, axis=0)))
+        for column, value in zip(self.columns, pooled):
+            if np.isfinite(value):
+                out[column] = float(value)
+
+        slope = out.get("wave_phase_slope", np.nan)
+        out["wave_direction"] = _safe(
+            -float(np.sign(slope)) if np.isfinite(slope) and slope != 0.0 else np.nan)
+        # Same reasoning as wave_direction: taken from the median of the SIGNED
+        # coefficient, never as a median of +-1 values, which ties at 0.0 over an
+        # even count and reads as a direction that was never measured.
+        flow = out.get("wave_flow", np.nan)
+        out["wave_flow_direction"] = _safe(
+            float(np.sign(flow)) if np.isfinite(flow) and flow != 0.0 else np.nan
+        )
+        # Recompute the speed from the three aggregated numbers: the median of a
+        # column whose sign flipped partway makes {+400, -400} a speed of 0.
+        freq = out.get("wave_freq_hz", np.nan)
+        wavelength = out.get("wave_wavelength_px", np.nan)
+        out["wave_speed_px_s"] = _safe(out["wave_direction"] * wavelength * freq)
         return out
 
-    centres = series.index.to_numpy(dtype=float)
-    target = (float(f_start) + float(f_end)) / 2.0
-    inside = (centres >= float(f_start)) & (centres < float(f_end))
-    if inside.any():
-        rows = series.loc[inside]
-    else:
-        rows = series.iloc[[int(np.argmin(np.abs(centres - target)))]]
 
-    out["n_windows"] = float(len(rows))
-    used = rows.index.to_numpy(dtype=float)
-    out["centre_offset"] = float(np.median(used) - target)
-    for column in SERIES_COLUMNS:
-        if column not in rows:
-            continue
-        values = rows[column].to_numpy(dtype=float)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            continue
-        if column in _FRACTION_COLUMNS:
-            out[column] = float(values.mean())
-        else:
-            out[column] = float(np.median(values))
-
-    slope = out.get("wave_phase_slope", np.nan)
-    out["wave_direction"] = _safe(-float(np.sign(slope)) if np.isfinite(slope) and slope != 0.0
-                                  else np.nan)
-    # Recompute the speed from the three aggregated numbers: the median of a
-    # column whose sign flipped partway makes {+400, -400} a speed of 0.
-    freq, wavelength = out.get("wave_freq_hz", np.nan), out.get("wave_wavelength_px", np.nan)
-    out["wave_speed_px_s"] = _safe(out["wave_direction"] * wavelength * freq)
-    return out
+def window_values(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, float]:
+    """One window of one track's spectral series. :class:`WindowSource` for many."""
+    return WindowSource(series).at(f_start, f_end)
