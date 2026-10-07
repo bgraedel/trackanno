@@ -365,7 +365,7 @@ def build_dense_features(
                 if n_present < min_present:
                     entry["skip_reason"] = (
                         f"only {n_present} detection(s) in frames {f_start}-{f_end}; "
-                        f"predict.min_frames is {min_present}"
+                        f"a window needs {min_present}"
                     )
                     rows.append(entry)
                     continue
@@ -422,7 +422,7 @@ def _align_to_reference(frame: pd.DataFrame, reference: Path, reporter) -> pd.Da
 
     ``window_features`` fills its whole schema in, so this normally changes
     nothing. It matters where the dense grid produced no row that could compute a
-    family at all - every window under ``min_frames``, or a missing saved
+    family at all - every window under ``predict.min_frames``, or a missing saved
     embedding basis - because then the column is absent rather than NaN.
     """
     if not reference.exists():
@@ -465,7 +465,7 @@ def _summary(
     return (
         f"{len(frame)} dense windows of {span} over "
         f"{frame['movie_id'].nunique()} movie(s); {int((~blank).sum())} of them "
-        f"under predict.min_frames ({min_present}); {usable}/{covered} detected "
+        f"under {min_present} detections; {usable}/{covered} detected "
         f"frames ({share:.1%}) fall in a window that can be featurised"
     )
 

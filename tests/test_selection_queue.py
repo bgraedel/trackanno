@@ -23,6 +23,7 @@ import pytest
 from harness import check
 from trackanno.annotate.clips import ClipStore
 from trackanno.config import load_config
+from trackanno.gui.app import SELECT_BATCH_SIZE
 from trackanno.annotate.store import (
     PROVENANCE_COLUMN, AnnotationStore, decode_provenance,
 )
@@ -98,7 +99,7 @@ def shuffled_baseline(cfg, store) -> list[int]:
     """The order the GUI has always produced: the seeded shuffle of the manifest."""
     order = list(store.manifest.index)
     if cfg.ui.shuffle:
-        random.Random(cfg.ui.shuffle_seed).shuffle(order)
+        random.Random(0).shuffle(order)
     return order
 
 
@@ -206,7 +207,7 @@ def test_a_batch_leads_the_queue_and_leaves_everything_else_in_place(
     check("the selector was offered the reachable clips and only those",
           widget.suggester.pools[-1] == [widget._clip_ids[i] for i in baseline])
     check("and asked for the configured batch size",
-          widget.suggester.sizes[-1] == cfg.suggest.select_batch_size,
+          widget.suggester.sizes[-1] == SELECT_BATCH_SIZE,
           str(widget.suggester.sizes[-1]))
 
     widget.shutdown()

@@ -358,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from ..config import ConfigError, load_config
     from .clips import ClipStore
+    from .store import CsvLockedError, csv_lock
 
     parser = argparse.ArgumentParser(
         prog="trackanno repair-links",
@@ -389,18 +390,23 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         store.close()
 
-    # dtype=str with NA disabled: untouched values must round-trip exactly.
-    labels = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    plan = plan_reassociation(labels, manifest)
-    if not plan.n_orphaned:
-        print(f"All {plan.already_valid} label(s) already point at clips that exist.")
-        return 0
-    print("\n".join(_describe(plan)))
-    if not plan.matched or args.dry_run:
-        return 0
-
-    backup = backup_labels(csv_path)
-    write_labels(csv_path, apply_reassociation(labels, plan))
+    # Held from read to write so an open GUI cannot append in between.
+    try:
+        with csv_lock(csv_path):
+            # dtype=str with NA disabled: untouched values must round-trip exactly.
+            labels = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+            plan = plan_reassociation(labels, manifest)
+            if not plan.n_orphaned:
+                print(f"All {plan.already_valid} label(s) already point at clips that exist.")
+                return 0
+            print("\n".join(_describe(plan)))
+            if not plan.matched or args.dry_run:
+                return 0
+            backup = backup_labels(csv_path)
+            write_labels(csv_path, apply_reassociation(labels, plan))
+    except CsvLockedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(f"{len(plan.matched)} label(s) re-linked; the previous file is at {backup}. "
           "Retrain to fold them in.")
     return 0

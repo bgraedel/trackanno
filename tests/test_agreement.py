@@ -13,8 +13,17 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from harness import check
+
 from trackanno.infer.agreement import differs, find
+
+
+@pytest.fixture(autouse=True)
+def _short_fits(monkeypatch):
+    """A test, not a fit worth keeping."""
+    monkeypatch.setattr("trackanno.learn.suggest._iterations", lambda cfg: 120)
+
 
 GROUP = "behaviour"
 SECOND = "posture"
@@ -172,7 +181,6 @@ def _noisy_project(root, name: str, n_per_movie: int = 24):
 
     cfg = load_config(make_project(root))
     cfg.suggest.min_per_class = 3
-    cfg.suggest.iterations = 120           # a test, not a fit worth keeping
     rng = np.random.default_rng(0)
     rows, feats = [], []
     for movie in ("mov_a", "mov_b", "mov_c"):

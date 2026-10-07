@@ -31,7 +31,29 @@ restructure what is left. One commit per checkbox where practical.
 
 ## Status
 
-Phases 0-3 done (2026-10-06). Phase 4 in progress.
+Phases 0-4 merged (2026-10-07), including the Phase 4 review fixes; master at
+f2e6c4d passes the suite (2584 checks). Real projects' prepared movies still read
+as fresh. Phase 5 and the docs half of Phase 6 in flight; source prose after Phase 5.
+
+Not changed on purpose: loader defaults for omitted keys (`detection.task` etc.)
+match the shipped template; all real projects set them explicitly.
+
+**Known follow-ups, not yet done:**
+- `Suggester(cfg)` load in `AnnotationWidget.__init__` still on the UI thread.
+- Threads outside `run_bg` (retrain, review loader, chunk decoder, TaskPanel) are
+  not joined on close; `joblib.dump(model.joblib)` is not atomic.
+- Commit can wait up to `LOCK_WAIT_S` on the UI thread; stale-lock race between
+  two processes; undo overwrites another writer's later edit of the same clip.
+- Prepare scan list keyed per config path only, so a `video_dir` change shows the
+  old folder until reopen.
+
+**Working method:** parallel agents in git worktrees on disjoint scopes, merged
+into master by the main session; full suite (`uv run pytest -q`, ~5 min, prints
+"N checks passed") plus an independent read-only verifier after each phase.
+Commit messages: short imperative subject, 1-3 sentence body, no trailers.
+Merged worktrees under `.claude/worktrees/` can be removed with
+`git -c core.longpaths=true worktree remove` (`.claude/` is excluded via
+`.git/info/exclude`).
 
 ## Phase 0: baseline
 - [x] Checkpoint commit of the current working tree
@@ -66,18 +88,18 @@ Phases 0-3 done (2026-10-06). Phase 4 in progress.
 - [x] `context_frames`: context feature family over N frames centred on the clip
 
 ## Phase 4: structure
-- [ ] Config rebuild: metadata-driven dataclasses, defaults in one place, test pinning `default_config.yaml`, one-line errors, warn on unknown sections/keys, removed keys load with a warning
-- [ ] Knobs to constants, view toggles to QSettings, Configure form to ~25-30 fields; form writes only changed keys (fixes spin-box rounding rewrites)
-- [ ] yamledit: block lists, 3-level keys, numpy scalars
-- [ ] Explicit Save + Revert; pages marked stale instead of full reload per autosave; remove per-page caches
-- [ ] `Page.run_bg()`: project-tagged jobs, stale results dropped, joined on shutdown (fixes model probe, scan, repair, download races)
-- [ ] Split `gui/hub.py` into one module per page
-- [ ] Split `gui/timeline.py`; footage as a plain chunk LRU with non-blocking stop (fixes right-edge click, track-switch stalls)
-- [ ] Suggester retrain: build off-thread, swap on UI thread, read snapshot not live CSV; cache features on a config/tracks hash
-- [ ] Remaining annotation bugs: suggestion outline in review modes, Ctrl+Z in review, refused commit wiping input at last clip
-- [ ] CSV: lock or re-read before rewrite to avoid two-writer loss
-- [ ] Bouts extend past detections: clip decode to the track's detected span
-- [ ] `recent_projects()` uses the timeout-guarded exists check
+- [x] Config rebuild: metadata-driven dataclasses, defaults in one place, test pinning `default_config.yaml`, one-line errors, warn on unknown sections/keys, removed keys load with a warning
+- [x] Knobs to constants, view toggles to QSettings, Configure form to ~25-30 fields; form writes only changed keys (fixes spin-box rounding rewrites)
+- [x] yamledit: block lists, 3-level keys, numpy scalars
+- [x] Explicit Save + Revert; pages marked stale instead of full reload per autosave; remove per-page caches
+- [x] `Page.run_bg()`: project-tagged jobs, stale results dropped, joined on shutdown (fixes model probe, scan, repair, download races)
+- [x] Split `gui/hub.py` into one module per page
+- [x] Split `gui/timeline.py`; footage as a plain chunk LRU with non-blocking stop (fixes right-edge click, track-switch stalls)
+- [x] Suggester retrain: build off-thread, swap on UI thread, read snapshot not live CSV; cache features on a config/tracks hash
+- [x] Remaining annotation bugs: suggestion outline in review modes, Ctrl+Z in review, refused commit wiping input at last clip
+- [x] CSV: lock or re-read before rewrite to avoid two-writer loss
+- [x] Bouts extend past detections: clip decode to the track's detected span
+- [x] `recent_projects()` uses the timeout-guarded exists check
 
 ## Phase 5: test overhaul
 - [ ] Plain asserts instead of `check()`; split mega-scenarios

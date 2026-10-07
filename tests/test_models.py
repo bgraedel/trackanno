@@ -226,7 +226,7 @@ def test_the_manifest_configures_the_project(registry, root) -> None:
     told = M.apply_manifest(path, entry, DIGEST)
     cfg = load_config(path)
 
-    check("the inference size came from the model", cfg.detection.imgsz == 1280)
+    check("the size it was trained at is applied", cfg.detection.imgsz == 1280, str(told))
     check("so did the confidence it was validated at", abs(cfg.detection.conf - 0.3) < 1e-9)
     check("and a tile size that suits it", cfg.tiling.tile == 512)
     check("the task followed the checkpoint", cfg.detection.task == "pose")
@@ -236,7 +236,7 @@ def test_the_manifest_configures_the_project(registry, root) -> None:
           len(cfg.keypoints.edges) == 3, str(cfg.keypoints.edges))
     check("the digest was pinned into the project", cfg.model.sha256 == DIGEST)
     check("and it reported every change rather than editing silently",
-          any("imgsz" in t for t in told) and any("keypoint" in t for t in told), str(told))
+          any("conf" in t for t in told) and any("keypoint" in t for t in told), str(told))
 
     check("a manifest cannot repoint the project at other movies",
           cfg.paths.video_dir == (root / "manifest" / "videos").resolve(),
@@ -379,7 +379,7 @@ def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch)
     seg = M.ModelEntry(id="leish-seg", url="https://example.org/seg.pt",
                        task="segment", modality="fluorescence",
                        framework="ultralytics",
-                       config={"detection": {"imgsz": 1024}})
+                       config={"detection": {"conf": 0.4}})
     check("a segmentation model parses fine", seg.task == "segment")
     check("but is not runnable here", not seg.runnable)
     check("and says why, naming what this tool does run",
@@ -401,7 +401,7 @@ def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch)
     path = create_project(root / "seg")
     told = M.apply_manifest(path, seg)
     cfg = load_config(path)
-    check("its inference settings still apply", cfg.detection.imgsz == 1024)
+    check("its inference settings still apply", cfg.detection.conf == 0.4)
     check("the task is left alone rather than written and rejected",
           cfg.detection.task in ("detect", "pose"), cfg.detection.task)
     check("and the report says it was not applied",
@@ -473,22 +473,21 @@ def test_a_value_the_loader_rejects_costs_only_that_value(root) -> None:
     """A manifest is written elsewhere, so one bad number must not stop a model
     configuring the rest of the project.
 
-    tiling.overlap is a fraction of the tile; a manifest giving it in pixels used
-    to fail the whole apply with a config error, leaving nothing set.
+    One refused value used to fail the whole apply, leaving nothing set.
     """
     path = create_project(root / "badvalue")
     entry = M.ModelEntry(id="sloppy", url="https://x/s.pt", framework="ultralytics",
                          task="pose",
-                         config={"detection": {"imgsz": 1280},
-                                 "tiling": {"tile": 1280, "overlap": 192}})
+                         config={"detection": {"conf": 0.4},
+                                 "tiling": {"tile": 1280, "enabled": "sometimes"}})
     told = M.apply_manifest(path, entry)
     cfg = load_config(path)
 
-    check("the good values still applied", cfg.detection.imgsz == 1280 and cfg.tiling.tile == 1280,
-          f"imgsz {cfg.detection.imgsz}, tile {cfg.tiling.tile}")
-    check("the bad one did not", cfg.tiling.overlap < 0.9, str(cfg.tiling.overlap))
+    check("the good values still applied", cfg.detection.conf == 0.4 and cfg.tiling.tile == 1280,
+          f"conf {cfg.detection.conf}, tile {cfg.tiling.tile}")
+    check("the bad one did not", cfg.tiling.enabled == "auto", str(cfg.tiling.enabled))
     check("and it is reported with the loader's own complaint",
-          any("NOT applied" in t and "overlap" in t for t in told), str(told))
+          any("NOT applied" in t and "enabled" in t for t in told), str(told))
     check("the project still loads", load_config(path) is not None)
 
 

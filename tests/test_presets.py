@@ -95,7 +95,7 @@ def test_a_preset_keeps_the_comments_of_the_default() -> None:
     check("the file is as long as the one it was made from",
           len(text.splitlines()) == len(DEFAULT_CONFIG.splitlines()))
     check("the comment above the key it changed is still there",
-          "# Trains a classifier on your labels and SUGGESTS a category." in text)
+          "# A classifier trained on your labels suggests a category" in text)
     check("and the key itself changed",
           "suggest:\n  enabled: false" in text)
 
@@ -132,8 +132,7 @@ def test_the_suggester_preset_is_pose_from_the_start(root: Path) -> None:
     check("the pose and waveform groups are asked for alongside the rest",
           set(cfg.suggest.feature_groups) == {"kinematic", "pose", "waveform"},
           str(cfg.suggest.feature_groups))
-    check("the skeleton is drawn on the clip and on the export",
-          cfg.ui.show_skeleton is True and cfg.render.show_skeleton is True)
+    check("the skeleton is drawn on the export", cfg.render.show_skeleton is True)
     check("no shortest bout is imposed", cfg.predict.min_bout_frames == 0)
 
 

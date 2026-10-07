@@ -16,6 +16,14 @@ import pytest
 from harness import check
 
 N_MOVIES, N_TRACKS, N_FRAMES, LENGTH, DIM = 3, 8, 200, 50, 12
+PCA_WIDTH = 4
+
+
+@pytest.fixture(autouse=True)
+def _small_fits(monkeypatch):
+    """A narrow PCA and a short fit keep these tests fast."""
+    monkeypatch.setattr("trackanno.measure.embeddings.PCA_COMPONENTS", PCA_WIDTH)
+    monkeypatch.setattr("trackanno.learn.suggest._iterations", lambda cfg: 20)
 
 
 def synthetic_project(root: Path, name: str, settings: dict | None = None,
@@ -34,9 +42,8 @@ def synthetic_project(root: Path, name: str, settings: dict | None = None,
     path = create_project(Path(root) / name)
     write_config(path, {
         "clips.frames": LENGTH, "clips.stride": LENGTH, "clips.min_clip_frames": 20,
-        "suggest.model": "hist", "suggest.iterations": 20,
+        "suggest.model": "hist",
         "suggest.audit_fraction": 0.0, "suggest.min_per_class": 2,
-        "suggest.pca_components": 4,
         **(settings or {}),
     })
     cfg = load_config(path)
@@ -163,11 +170,11 @@ def test_the_detector_source_matches_the_old_cnn_block(root: Path) -> None:
     stacked = np.concatenate([
         np.load(cfg.movie_dir(f"M{m}") / "instance_features.npy")
         for m in range(N_MOVIES)]).astype(np.float32)
-    n_comp = min(cfg.suggest.pca_components, *stacked.shape)
+    n_comp = min(PCA_WIDTH, *stacked.shape)
     check("the old path's column count", len(columns) == 3 * n_comp,
           f"{len(columns)} vs {3 * n_comp}")
 
-    pca = PCA(n_components=n_comp, random_state=cfg.suggest.seed).fit(stacked)
+    pca = PCA(n_components=n_comp, random_state=0).fit(stacked)
     tracks = pd.read_parquet(cfg.movie_dir("M0") / "tracks.parquet")
     feats = np.load(cfg.movie_dir("M0") / "instance_features.npy")
     sel = (tracks["track_id"] == 3) & (tracks["frame"] >= 50) & (tracks["frame"] < 100)
@@ -263,7 +270,7 @@ def test_prediction_reads_embeddings_in_the_models_own_basis(root: Path) -> None
           not stale.ready and "retrain" in stale.problem.lower(), stale.problem)
 
 
-def test_a_rebuilt_table_the_model_was_not_fitted_on_is_refused(root: Path) -> None:
+def test_a_rebuilt_table_the_model_was_not_fitted_on_is_refused(root: Path, monkeypatch) -> None:
     import hashlib
 
     from trackanno.config import load_config
@@ -288,14 +295,15 @@ def test_a_rebuilt_table_the_model_was_not_fitted_on_is_refused(root: Path) -> N
     check("the same settings rebuild the same basis", Suggester(cfg).ready,
           Suggester(cfg).problem)
 
-    write_config(cfg.path, {"suggest.pca_components": 3})
+    monkeypatch.setattr(emb, "PCA_COMPONENTS", 3)
     build_clip_features(load_config(cfg.path), verbose=False)
     stale = Suggester(load_config(cfg.path))
     check("another basis in the table is refused",
           not stale.ready and "basis" in stale.problem and "Retrain" in stale.problem,
           stale.problem)
 
-    write_config(cfg.path, {"suggest.pca_components": 4, "suggest.context_frames": 80})
+    monkeypatch.setattr(emb, "PCA_COMPONENTS", PCA_WIDTH)
+    write_config(cfg.path, {"suggest.context_frames": 80})
     with pytest.warns(UserWarning, match="context"):
         changed = load_config(cfg.path)
     build_clip_features(changed, verbose=False)

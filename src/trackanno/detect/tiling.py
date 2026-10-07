@@ -15,7 +15,16 @@ from typing import Sequence
 
 import numpy as np
 
+from ..config import FIXED_SETTINGS as _FIXED
 from ..config import Config
+
+NMS_IOU = _FIXED["detection.iou"]                  # per-tile NMS
+MAX_DET = _FIXED["detection.max_det"]              # detections per tile
+DROP_EDGE_TRUNCATED = _FIXED["tiling.drop_edge_truncated"]
+EDGE_MARGIN_PX = _FIXED["tiling.edge_margin_px"]
+FEATURE_LEVELS = _FIXED["features.levels"]
+FEATURE_POOL = _FIXED["features.pool"]
+FEATURE_DTYPE = _FIXED["features.dtype"]
 
 __all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
            "default_node_names", "resolve_device", "device_label",
@@ -472,8 +481,8 @@ class TiledDetector:
             from .features import InstanceFeatures
 
             self.extractor = InstanceFeatures(
-                self.model, levels=cfg.features.levels,
-                pool=cfg.features.pool, dtype=cfg.features.dtype,
+                self.model, levels=FEATURE_LEVELS,
+                pool=FEATURE_POOL, dtype=FEATURE_DTYPE,
             )
 
     # -- grid --------------------------------------------------------------- #
@@ -498,7 +507,7 @@ class TiledDetector:
     def _predict_kwargs(self, imgsz: int) -> dict:
         d = self.cfg.detection
         kwargs = dict(
-            imgsz=imgsz, conf=d.conf, iou=d.iou, max_det=d.max_det,
+            imgsz=imgsz, conf=d.conf, iou=NMS_IOU, max_det=MAX_DET,
             device=self.device, verbose=False,
         )
         if d.half:
@@ -590,7 +599,7 @@ class TiledDetector:
         if len(dets) == 0:
             return dets, Detections.empty(self.n_kpts)
         x0, y0, x1, y1 = tile
-        m = self.cfg.tiling.edge_margin_px
+        m = EDGE_MARGIN_PX
         b = dets.xyxy
         touches = np.zeros(len(dets), bool)
         if x0 > 0:
@@ -610,10 +619,9 @@ class TiledDetector:
         tiled = len(tiles) > 1
 
         crops = [np.ascontiguousarray(frame_rgb[y0:y1, x0:x1]) for x0, y0, x1, y1 in tiles]
-        # Always run at detection.imgsz, tiled or not. `tiling.tile` says how the
-        # frame is CUT; `detection.imgsz` says at what resolution each piece is
-        # SEEN, so the tiled and untiled paths show the model the same scale.
-        imgsz = self.cfg.detection.imgsz
+        # `tiling.tile` says how the frame is cut, `detection.imgsz` the
+        # resolution each piece is seen at, tiled or not.
+        imgsz = int(self.cfg.detection.imgsz)
         if self.extractor is not None:
             results, feat_blocks = self._predict_with_features(crops, imgsz)
         else:
@@ -623,7 +631,7 @@ class TiledDetector:
         kept_parts, suspect_parts = [], []
         for r, tile, feats in zip(results, tiles, feat_blocks):
             dets = self._result_to_dets(r, tile[0], tile[1], feats)
-            if tiled and self.cfg.tiling.drop_edge_truncated:
+            if tiled and DROP_EDGE_TRUNCATED:
                 keep, suspect = self._drop_edge_truncated(dets, tile, height, width)
                 kept_parts.append(keep)
                 suspect_parts.append(suspect)
@@ -655,6 +663,6 @@ class TiledDetector:
     def detect_untiled(self, frame_rgb: np.ndarray) -> Detections:
         """Single-shot whole-frame inference. Used by ``trackanno prepare --self-test``."""
         r = self.model.predict(
-            np.ascontiguousarray(frame_rgb), **self._predict_kwargs(self.cfg.detection.imgsz)
+            np.ascontiguousarray(frame_rgb), **self._predict_kwargs(int(self.cfg.detection.imgsz))
         )[0]
         return self._result_to_dets(r, 0, 0)

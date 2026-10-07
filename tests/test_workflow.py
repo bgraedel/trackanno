@@ -95,7 +95,7 @@ def project_config(root):
     weights.write_bytes(b"")
 
     path = create_project(root / "proj", video_dir=videos, model=weights)
-    write_config(path, {"clips.frames": 25, "clips.min_clip_frames": 20, "ui.follow": "locked"},
+    write_config(path, {"clips.frames": 25, "clips.min_clip_frames": 20, "ui.fps": 12},
                  categories=[{"name": "state", "type": "single", "required": True,
                               "options": [{"name": "a", "key": "1", "color": "#4C9F70"},
                                           {"name": "b", "key": "2", "color": "#D95F02"}]}])
@@ -128,7 +128,7 @@ def test_the_default_config_is_a_shipped_yaml_file(root) -> None:
     check("it parses as a mapping of sections", isinstance(parsed, dict)
           and "paths" in parsed and "clips" in parsed, str(type(parsed)))
     check("and it is commented, which is the point of shipping the text",
-          DEFAULT_CONFIG.count("#") > 100, str(DEFAULT_CONFIG.count("#")))
+          DEFAULT_CONFIG.count("#") > 50, str(DEFAULT_CONFIG.count("#")))
 
     written = Path(create_project(root / "from-the-file")).read_text(encoding="utf-8")
     check("a new project starts from it, comments and all",
@@ -166,7 +166,7 @@ def test_project(root, project_config) -> None:
 
     edited = load_config(path)
     check("edits round-trip through the loader",
-          edited.clips.frames == 25 and edited.ui.follow == "locked")
+          edited.clips.frames == 25 and edited.ui.fps == 12)
     check("category edits round-trip",
           [g.name for g in edited.categories] == ["state"]
           and [o.name for o in edited.categories[0].options] == ["a", "b"])
@@ -368,12 +368,12 @@ def test_progress() -> None:
 PREPARE_CONFIG = """
 paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
 tiff:   {fps: 100}
-detection: {task: detect, imgsz: 640, device: cpu}
+detection: {task: detect, device: cpu}
 features: {enabled: false}
 clips:  {frames: 50, stride: 50, window_mode: first, follow: smooth, pad: 1.6,
          crop_size: 96, min_clip_frames: 40}
 normalize: {mode: fixed}
-tracking: {backend: greedy, min_track_length: 40, greedy_max_dist_px: 30}
+tracking: {backend: greedy, min_track_length: 40}
 categories:
   - name: behaviour
     type: single
@@ -472,8 +472,8 @@ def test_prepare_reports_and_cancels(root: Path) -> None:
 # the two prepare stages
 # --------------------------------------------------------------------------- #
 POSE_PREPARE_CONFIG = PREPARE_CONFIG.replace(
-    "detection: {task: detect, imgsz: 640, device: cpu}",
-    "detection: {task: pose, imgsz: 640, device: cpu}\n"
+    "detection: {task: detect, device: cpu}",
+    "detection: {task: pose, device: cpu}\n"
     "keypoints: {nodes: [head, base], edges: [[head, base]]}",
 )
 
@@ -657,8 +657,8 @@ def test_border_exclusions_are_reported_by_the_planner(root: Path) -> None:
 
     # Track 1 comes within 60px of the left edge; track 2 stays 181px clear.
     config = PREPARE_CONFIG.replace(
-        "tracking: {backend: greedy, min_track_length: 40, greedy_max_dist_px: 30}",
-        "tracking: {backend: greedy, min_track_length: 40, greedy_max_dist_px: 30,\n"
+        "tracking: {backend: greedy, min_track_length: 40}",
+        "tracking: {backend: greedy, min_track_length: 40,\n"
         "           border_margin_px: 70}",
     )
     cfg, movie, frames = _prep_project(root, "border", config)
@@ -1124,35 +1124,35 @@ def test_hub(app, project_config: Path) -> None:
     app.processEvents()
     config_page = hub.pages[1]
     check("basics tab is a short list",
-          5 < len(config_page.form.values()) < 25, str(len(config_page.form.values())))
+          5 < len(config_page.form.current()) < 25, str(len(config_page.form.current())))
     check("advanced tab holds the rest",
-          len(config_page.advanced.values()) > len(config_page.form.values()))
+          len(config_page.advanced.current()) > len(config_page.form.current()))
     check("no setting appears on both tabs",
-          not (set(config_page.form.values()) & set(config_page.advanced.values())))
+          not (set(config_page.form.current()) & set(config_page.advanced.current())))
 
     config_page.form._widgets["clips.pad"].setValue(2.75)
     # ...and one from the OTHER tab, which an earlier version silently dropped.
     config_page.advanced._widgets["detection.conf"].setValue(0.4)
     app.processEvents()
-    check("editing schedules an autosave",
-          config_page._dirty and config_page._save_timer.isActive())
-    check("the autosave fires", pump(app, lambda: not config_page._dirty, timeout=10))
+    check("editing marks the page unsaved",
+          config_page._dirty and config_page.save_button.isEnabled()
+          and config_page.heading.title.text().endswith("*"))
+    check("Save writes it", config_page.save() and not config_page._dirty)
     check("the edit reached the file", abs(hub.cfg.clips.pad - 2.75) < 1e-9, str(hub.cfg.clips.pad))
     check("an advanced-tab edit is saved too",
           abs(hub.cfg.detection.conf - 0.4) < 1e-9, str(hub.cfg.detection.conf))
     check("saving keeps the comments",
           project_config.read_text(encoding="utf-8").count("#") > 40)
-    check("saving does not wipe the form", config_page.form.values()["clips.pad"] == 2.75)
+    check("saving does not wipe the form", config_page.form.current()["clips.pad"] == 2.75)
 
-    # Reloading after a save must not re-arm the timer, or autosave loops.
-    check("a save does not schedule another save", not config_page._save_timer.isActive())
+    check("a save leaves nothing unsaved", not config_page.save_button.isEnabled())
 
     # An unusable label set must fail LOUDLY and leave the file alone.
     good_text = project_config.read_text(encoding="utf-8")
     name_field = config_page.categories._groups[0].name
     name_field.setText("")
     app.processEvents()
-    check("the autosave refuses an unusable label set",
+    check("Save refuses an unusable label set",
           not config_page.save() and config_page.banner.isVisible())
     check("the refusal says why",
           "no name" in config_page.banner.text(), config_page.banner.text()[:120])
@@ -1160,23 +1160,27 @@ def test_hub(app, project_config: Path) -> None:
           project_config.read_text(encoding="utf-8") == good_text)
     name_field.setText("state")
     app.processEvents()
-    check("fixing it saves again", pump(app, lambda: not config_page._dirty, timeout=10))
+    check("fixing it saves again", config_page.save() and not config_page._dirty)
     check("the error banner clears", not config_page.banner.isVisible())
 
     # A path that points at nothing is a WARNING, not a blocked save: a model on
     # an offline share must not stop you editing anything else.
     config_page.form._widgets["paths.model"].set_value(str(project_config.parent / "nope.pt"))
     app.processEvents()
-    check("a missing path still saves", pump(app, lambda: not config_page._dirty, timeout=10))
+    check("a missing path still saves", config_page.save() and not config_page._dirty)
     check("but it is flagged", "paths.model" in config_page._show_warnings())
     check("and it is not an error banner", not config_page.banner.isVisible())
 
-    # Leaving the page must never prompt - it just flushes.
+    # Leaving the page with unsaved edits asks; Save writes them on the way out.
     config_page.form._widgets["clips.pad"].setValue(3.0)
+    asked: list[str] = []
+    config_page._ask_unsaved = lambda: (asked.append("asked"), "save")[1]
     hub.go_to(0)
     app.processEvents()
-    check("navigating away flushes instead of prompting",
-          not config_page._dirty and abs(hub.cfg.clips.pad - 3.0) < 1e-9)
+    del config_page._ask_unsaved
+    check("navigating away asks, and Save writes",
+          asked == ["asked"] and not config_page._dirty
+          and abs(hub.cfg.clips.pad - 3.0) < 1e-9)
 
     # Downloading a shared model is the usual way to get one, so its button sits
     # in the detection model row rather than off in a corner.
@@ -1370,7 +1374,7 @@ def test_a_template_carries_settings_but_not_paths(root) -> None:
     source = create_project(root / "tpl-a", video_dir=videos, model=weights)
     write_config(source, {
         "clips.frames": 33, "clips.min_clip_frames": 25, "clips.crop_size": 128,
-        "detection.imgsz": 1280, "detection.conf": 0.4,
+        "tiling.tile": 1280, "detection.conf": 0.4,
         "tracking.backend": "botsort", "ui.annotator": "someone",
     }, categories=[{"name": "state", "type": "single", "required": True,
                     "options": [{"name": "swimming", "key": "1", "color": "#4C9F70"},
@@ -1391,9 +1395,9 @@ def test_a_template_carries_settings_but_not_paths(root) -> None:
     cfg = load_config(made)
 
     check("the tuning came across",
-          (cfg.clips.frames, cfg.detection.imgsz, cfg.tracking.backend)
+          (cfg.clips.frames, cfg.tiling.tile, cfg.tracking.backend)
           == (33, 1280, "botsort"),
-          f"{cfg.clips.frames}, {cfg.detection.imgsz}, {cfg.tracking.backend}")
+          f"{cfg.clips.frames}, {cfg.tiling.tile}, {cfg.tracking.backend}")
     check("so did the category buttons",
           [g.name for g in cfg.categories] == ["state"]
           and [o.name for o in cfg.categories[0].options] == ["swimming", "stuck"])
@@ -1513,8 +1517,8 @@ def test_export_can_open_the_project_folder(app, root, monkeypatch) -> None:
         check("the button is on the Export page", page.open_folder.text() == "Open project folder")
 
         opened: list = []
-        monkeypatch.setattr(H.os, "startfile", opened.append, raising=False)
-        monkeypatch.setattr(H.sys, "platform", "win32")
+        monkeypatch.setattr(H.export.os, "startfile", opened.append, raising=False)
+        monkeypatch.setattr("sys.platform", "win32")
         page._open_project_folder()
         check("it opens the folder the config lives in",
               opened == [str(project.parent)], str(opened))
@@ -1552,7 +1556,9 @@ def test_browsing_to_a_file_stops_using_the_shared_model(app, root) -> None:
         # Exactly what the Browse dialog does once a file has been chosen.
         field.edit.setText(str(local).replace("\\", "/"))
         field.picked.emit(str(local).replace("\\", "/"))
-        check("the save lands", pump(app, lambda: not page._dirty, timeout=10))
+        check("the page waits for Save", page._dirty and "Save" in field.status.text(),
+              field.status.text())
+        check("the save lands", page.save() and not page._dirty)
 
         after = load_config(project)
         check("the shared model is dropped", not after.model.is_remote,
@@ -1595,7 +1601,7 @@ def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> 
         def chosen(self):
             return entry
 
-    monkeypatch.setattr(H, "ModelRegistryDialog", StubRegistry)
+    monkeypatch.setattr(H.project, "ModelRegistryDialog", StubRegistry)
     dialog = H.NewProjectDialog()
     try:
         dialog.name.setText("from-registry")
@@ -1614,8 +1620,8 @@ def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> 
 
         asked: list[str] = []
         monkeypatch.setattr(
-            H.QMessageBox, "question",
-            lambda *a, **k: (asked.append(str(a[2])), H.QMessageBox.No)[1],
+            H.project.QMessageBox, "question",
+            lambda *a, **k: (asked.append(str(a[2])), H.project.QMessageBox.No)[1],
         )
         dialog._accept()
         check("creating is not held up over a model that HAS been chosen",
@@ -1666,8 +1672,8 @@ def test_the_shared_model_is_fetched_after_the_project_is_written(app, root, mon
             return entry
 
     installed: list = []
-    monkeypatch.setattr(H, "NewProjectDialog", StubDialog)
-    monkeypatch.setattr(H, "_install_shared_model",
+    monkeypatch.setattr(H.project, "NewProjectDialog", StubDialog)
+    monkeypatch.setattr(H.project, "_install_shared_model",
                         lambda page, e, path: installed.append((e, Path(path))))
 
     window = H.Hub(str(make_project(root / "host")))

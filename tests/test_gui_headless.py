@@ -191,11 +191,12 @@ def test_the_window_labels_advances_and_resumes(app, cfg, store) -> None:
 
     window.overlay_box.setChecked(False)
     app.processEvents()
+    started = window.follow
     for _ in FOLLOW_MODES:
         window.cycle_follow()
         app.processEvents()
     check("cycling the view mode returns to where it started",
-          window.follow == cfg.ui.follow, window.follow)
+          window.follow == started, window.follow)
     window.step_zoom(+1)
     window.step_zoom(+1)
     app.processEvents()

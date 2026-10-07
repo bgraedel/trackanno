@@ -198,7 +198,7 @@ def test_the_default_config_selects_nothing(root: Path) -> None:
           all(suggester.selection_batch(manifest, set(), n) == []
               for n in (1, 2, 5, 20, 100)))
     check("the GUI's shuffle is still the order, untouched",
-          cfg.ui.shuffle is True and cfg.ui.shuffle_seed == 0)
+          cfg.ui.shuffle is True)
 
     # The same project with the rule set, and nothing else changed.
     write_config(cfg.path, {"suggest.select_rule": "margin"})
@@ -464,10 +464,8 @@ def test_the_choice_settings_refuse_a_value_they_do_not_know(root: Path) -> None
     text = config_path.read_text(encoding="utf-8").replace(
         'select_rule: "off"', "select_rule: off")
     config_path.write_text(text, encoding="utf-8")
-    boolean = refusal(_load, config_path)
-    check("an unquoted `off`, which YAML makes a boolean, is refused by name",
-          boolean != "" and "boolean" in boolean, boolean)
-    check("and the message says to quote it", '"off"' in boolean, boolean)
+    check("an unquoted `off`, which YAML makes a boolean, still reads as 'off'",
+          _load(config_path).suggest.select_rule == "off")
 
 
 def _load(path):
@@ -485,14 +483,14 @@ def test_every_new_key_is_registered(root: Path) -> None:
 
     new_keys = {
         "select_rule": "margin",
-        "select_batch_size": 12,
+        "retrain_every": 12,
     }
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         parsed = Suggest.parse(dict(new_keys))
     check("every new key parses without being ignored",
-          parsed.select_rule == "margin" and parsed.select_batch_size == 12)
+          parsed.select_rule == "margin" and parsed.retrain_every == 12)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -520,9 +518,8 @@ def test_the_numeric_settings_refuse_a_value_that_cannot_mean_anything(
     selector do something other than what the number says."""
     from trackanno.config import Suggest
 
-    check("a batch of no clips is refused",
-          "at least 1" in refusal(Suggest.parse, {"select_rule": "margin",
-                                                  "select_batch_size": 0}))
+    check("a refit after no labels is refused",
+          "at least 1" in refusal(Suggest.parse, {"retrain_every": 0}))
 
 
 # --------------------------------------------------------------------------- #

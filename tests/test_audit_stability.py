@@ -35,7 +35,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from harness import check
+
 from trackanno.config import RESERVED_GROUP_NAMES, load_config
 from trackanno.annotate.reassociate import apply_reassociation, plan_reassociation, write_labels
 from trackanno.annotate.store import (
@@ -43,6 +45,13 @@ from trackanno.annotate.store import (
     AnnotationStore, decode_audit, encode_audit, read_audit_records,
 )
 from trackanno.learn.suggest import AuditHoldout, _print_report, train_group
+
+
+@pytest.fixture(autouse=True)
+def _short_fits(monkeypatch):
+    """A test, not a fit worth keeping."""
+    monkeypatch.setattr("trackanno.learn.suggest._iterations", lambda cfg: 20)
+
 
 CONFIG_TEXT = """
 paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
@@ -837,7 +846,7 @@ def _fitted_project(root: Path, name: str, columns: list[str]):
     held out so the holdout is big enough to be scored.
     """
     text = CONFIG_TEXT + "\nsuggest: {model: hist, audit_fraction: 0.5, " \
-                         "min_per_class: 2, iterations: 20}\n"
+                         "min_per_class: 2}\n"
     cfg = _cfg(root, name, text)
     metas, behaviours = [], []
     for movie in ("MOVIE_A", "MOVIE_B"):

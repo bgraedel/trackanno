@@ -146,7 +146,7 @@ always names the current set while each entry points at one immutable asset:
   "notes": "8-point flagellum, 20x",
   "config": {
     "detection": {"imgsz": 1280, "conf": 0.25},
-    "tiling": {"tile": 640, "overlap": 96},
+    "tiling": {"tile": 640, "overlap": 0.25},
     "keypoints": {"nodes": ["Head", "Base", "Flag1", "..."],
                   "edges": [["Head", "Base"], ["Base", "Flag1"]]}},
   "preprocess": {},

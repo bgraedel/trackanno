@@ -41,6 +41,19 @@ def painted(widget) -> np.ndarray:
     )[..., :3]
 
 
+def loaded(app, panel, tries: int = 5000) -> None:
+    """Spin the loop until the panel has read its predictions off-thread."""
+    import time
+
+    for _ in range(tries):
+        app.processEvents()
+        if panel.loaded:
+            app.processEvents()
+            return
+        time.sleep(0.002)
+    raise AssertionError("the predictions never finished loading")
+
+
 def ink(frame: np.ndarray) -> int:
     """Pixels that are not the commonest colour in the image - i.e. not the
     background it was cleared to."""
@@ -109,7 +122,7 @@ def first_movie_bouts(cfg) -> list[dict]:
 def test_the_reader_maps_every_column_a_bout_carries(synthetic) -> None:
     """One row per (group, bout), and each of its columns means something
     different: getting one of them wrong produces a plausible picture."""
-    from trackanno.gui.timeline import PredictionReader
+    from trackanno.gui.review import PredictionReader
 
     reader = PredictionReader(synthetic)
     check("the file opens", reader.problem == "", reader.problem)
@@ -147,13 +160,15 @@ def test_a_track_with_no_predictions_is_a_normal_state(app, synthetic) -> None:
     one question a reviewer would ask ("is this the tool or the data?") could
     not be answered from the screen.
     """
-    from trackanno.gui.timeline import BoutReviewPanel, PredictionReader
+    from trackanno.gui.review import BoutReviewPanel, PredictionReader
 
     reader = PredictionReader(synthetic)
     track = reader.track("m", 4242)
     check("the reader answers with an empty track rather than raising", track.empty)
 
     panel = BoutReviewPanel(synthetic)
+
+    loaded(app, panel)
     panel.resize(900, 320)
     panel.show()
     app.processEvents()
@@ -185,7 +200,7 @@ def decoded(root):
 
 def test_a_real_decode_reaches_the_timeline_intact(decoded) -> None:
     """The decoded bouts tile the track and keep the planted transition."""
-    from trackanno.gui.timeline import PredictionReader
+    from trackanno.gui.review import PredictionReader
 
     cfg, movie = decoded
     reader = PredictionReader(cfg)
@@ -205,10 +220,13 @@ def test_a_real_decode_reaches_the_timeline_intact(decoded) -> None:
 
 def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
     """The panel opens on the real file and puts pixels on the screen."""
-    from trackanno.gui.timeline import BoutReviewPanel
+    from qtpy.QtCore import QPointF
+
+    from trackanno.gui.review import BoutReviewPanel
 
     cfg, movie = decoded
     panel = BoutReviewPanel(cfg)
+    loaded(app, panel)
     panel.resize(1000, 400)
     panel.show()
     app.processEvents()
@@ -224,13 +242,20 @@ def test_the_timeline_draws_a_decoded_track(app, decoded) -> None:
     app.processEvents()
     check("the timeline actually paints", ink(painted(panel.timeline)) > 500,
           str(ink(painted(panel.timeline))))
-    hits = panel.timeline._hits
+    timeline = panel.timeline
+    gutter, scale = timeline._geom
+    hits = []
+    for lane, (group, segments) in enumerate(timeline.track.lanes.items()):
+        y = timeline.TOP + lane * timeline.LANE + timeline.LANE / 2
+        for segment in segments:
+            x = timeline._x((segment.f_start + segment.f_end) / 2, gutter, scale)
+            hits.append(timeline._at(QPointF(x, y)))
     check("every drawn span is hit-testable, so the detail has somewhere "
           "to live",
-          len(hits) == panel.timeline.track.n_segments,
-          f"{len(hits)} rects for {panel.timeline.track.n_segments} segments")
+          len(hits) == timeline.track.n_segments and all(hits),
+          f"{sum(map(bool, hits))} hits for {timeline.track.n_segments} segments")
 
-    group, segment = hits[0][1], hits[0][2]
+    group, segment = hits[0]
     tip = panel.timeline._describe(group, segment)
     check("the tooltip says confidence is a mean and not a peak",
           "MEAN posterior" in tip and "not its peak" in tip, tip)
@@ -245,7 +270,7 @@ def test_a_track_the_predictions_never_mention_is_still_selectable(decoded) -> N
     and then the reviewer cannot ask the one question a silent track raises.
     """
     from trackanno.annotate.clips import TRACKS_FILE
-    from trackanno.gui.timeline import PredictionReader
+    from trackanno.gui.review import PredictionReader
 
     cfg, movie = decoded
     path = cfg.movie_dir(movie) / TRACKS_FILE
@@ -271,7 +296,7 @@ def test_a_windows_file_is_refused_with_a_sentence(app, root) -> None:
     """Only decoded bouts are reviewed; a file of fixed windows says so."""
     from test_predict import build_case
 
-    from trackanno.gui.timeline import BoutReviewPanel, PredictionReader
+    from trackanno.gui.review import BoutReviewPanel, PredictionReader
 
     cfg, _ = build_case(root, "review-windows")
     rows = [{k: v for k, v in bout_row(0, 50, "swimming", 0.9).items()
@@ -283,6 +308,8 @@ def test_a_windows_file_is_refused_with_a_sentence(app, root) -> None:
           "not decoded bouts" in reader.problem, reader.problem)
 
     panel = BoutReviewPanel(cfg)
+
+    loaded(app, panel)
     panel.resize(1000, 400)
     panel.show()
     app.processEvents()
@@ -297,7 +324,7 @@ def test_a_project_with_no_predictions_says_so_instead_of_raising(app, root) -> 
     down; the sentence carries the same information without the crash."""
     from test_predict import build_case
 
-    from trackanno.gui.timeline import BoutReviewPanel, PredictionReader
+    from trackanno.gui.review import BoutReviewPanel, PredictionReader
 
     cfg, _ = build_case(root, "review-none")
     reader = PredictionReader(cfg)
@@ -307,6 +334,8 @@ def test_a_project_with_no_predictions_says_so_instead_of_raising(app, root) -> 
           "Label all clips with the model" in reader.problem, reader.problem)
 
     panel = BoutReviewPanel(cfg)
+
+    loaded(app, panel)
     panel.resize(800, 300)
     panel.show()
     app.processEvents()
@@ -330,11 +359,12 @@ def test_the_timeline_takes_the_width_the_window_gives_it(app, root) -> None:
     """
     from test_predict import build_case
 
-    from trackanno.gui.timeline import BoutReviewPanel
+    from trackanno.gui.review import BoutReviewPanel
 
     cfg, _ = build_case(root, "review-resize", labels=2)
     write_bouts(cfg, first_movie_bouts(cfg))
     panel = BoutReviewPanel(cfg)
+    loaded(app, panel)
     panel.show()
     app.processEvents()
     scroll = panel.timeline.parentWidget().parentWidget()
@@ -410,6 +440,7 @@ def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
 
         hub.go_to(PAGES.index("Review"))
         app.processEvents()
+        loaded(app, review.panel)
         check("going there shows the page in the window",
               hub.sidebar.currentRow() == PAGES.index("Review")
               and hub.stack.currentWidget() is review)
@@ -427,7 +458,7 @@ def test_reviewing_is_a_page_and_is_gated_on_the_file(app, root) -> None:
         hub.go_to(PAGES.index("Model"))
         app.processEvents()
         check("leaving the page lets go of the movie",
-              panel.footage._movie is None)
+              panel.footage._decoder is None)
         hub.go_to(PAGES.index("Review"))
         app.processEvents()
         check("coming back reuses the one panel rather than stacking them",

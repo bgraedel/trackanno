@@ -18,13 +18,19 @@ import numpy as np
 import pandas as pd
 
 from ..annotate.clips import MANIFEST_FILE, TRACKS_FILE
-from ..config import Config
+from ..config import FIXED_SETTINGS, Config
 from . import embeddings as emb
 
-__all__ = ["build_clip_features", "grid_delta", "window_features",
-           "CLIP_FEATURES_FILE", "CONTEXT_PREFIX"]
+# Frames between spectral estimates, and the support of the wave_flow columns.
+SPECTRAL_HOP = FIXED_SETTINGS["spectral.hop"]
+FLOW_FRAMES = FIXED_SETTINGS["spectral.flow_frames"]
+
+__all__ = ["build_clip_features", "cached_clip_features", "feature_cache_key",
+           "grid_delta", "window_features", "CLIP_FEATURES_FILE", "CONTEXT_PREFIX"]
 
 CLIP_FEATURES_FILE = "clip_features.parquet"
+# The cache key the table on disk was built under, beside the table.
+CLIP_FEATURES_KEY_FILE = "clip_features.key"
 CONTEXT_PREFIX = "ctx_"
 
 # Rates are per SECOND everywhere, so movies acquired at different frame rates
@@ -453,8 +459,8 @@ def window_features(
     if cfg.is_pose:
         spectra = wavespectra.track_spectral_series(
             tdf, cfg.n_keypoints, fps,
-            window=cfg.spectral.window, hop=cfg.spectral.hop,
-            flow_frames=cfg.spectral.flow_frames,
+            window=cfg.spectral.window, hop=SPECTRAL_HOP,
+            flow_frames=FLOW_FRAMES,
         )
 
     # Both hold the per-track work; the loop below only slices them.
@@ -511,9 +517,11 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir
-    movie_dirs = sorted(p for p in work.iterdir() if p.is_dir() and (p / MANIFEST_FILE).exists())
+    movie_dirs = _movie_dirs(work)
     if not movie_dirs:
         raise FileNotFoundError(f"no prepared movies under {work}; run `trackanno prepare` first")
+    # Before any input is read, so a file changing mid-build leaves a stale key.
+    key = feature_cache_key(cfg)
 
     manifests, tracks_by_movie = [], {}
     for d in movie_dirs:
@@ -587,8 +595,11 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
     out["_embedding_basis"] = json.dumps(
         {n: emb.basis_hash(p) for n, p in bases.items()}, sort_keys=True)
     if write:
+        key_path = work / CLIP_FEATURES_KEY_FILE
+        key_path.unlink(missing_ok=True)
         out.to_parquet(work / CLIP_FEATURES_FILE, index=False)
         emb.save_bases(work / emb.BASES_FILE, bases)
+        key_path.write_text(key, encoding="utf-8")
 
     n_emb = len([c for c in out.columns if c.startswith("emb_")])
     n_ctx = len([c for c in out.columns if c.startswith(CONTEXT_PREFIX)])
@@ -599,6 +610,98 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
     if verbose:
         print(f"  {summary}")
     return out
+
+
+def _movie_dirs(work: Path) -> list[Path]:
+    return sorted(p for p in work.iterdir() if p.is_dir() and (p / MANIFEST_FILE).exists())
+
+
+def _plain(value):
+    """``value`` as JSON-ready data, for hashing config sections."""
+    import dataclasses
+
+    if dataclasses.is_dataclass(value):
+        return _plain(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _stat(path: Path) -> list | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return [st.st_size, st.st_mtime_ns]
+
+
+def feature_cache_key(cfg: Config) -> str:
+    """Digest of everything the clip feature table depends on.
+
+    The feature-relevant config, the schema and PCA constants, and the size and
+    mtime of each movie's manifest, tracks, metadata and embedding inputs.
+    Labels are not part of it.
+    """
+    import hashlib
+
+    work = cfg.paths.work_dir
+    specs = cfg.suggest.embeddings
+    movies = {}
+    for d in _movie_dirs(work):
+        files = {name: _stat(d / name) for name in
+                 (MANIFEST_FILE, TRACKS_FILE, "cache.json", emb.DETECTOR_FILE)}
+        for spec in specs:
+            if spec.source == "file":
+                files[f"emb:{spec.name}"] = _stat(emb._file_path(cfg, spec, d.name))
+        movies[d.name] = files
+    state = {
+        "feature_version": FEATURE_VERSION,
+        "pca_max_rows": emb.PCA_MAX_ROWS,
+        "clips": _plain(cfg.clips),
+        "spectral": [_plain(cfg.spectral), SPECTRAL_HOP, FLOW_FRAMES],
+        "fixed": {k: v for k, v in FIXED_SETTINGS.items() if k.startswith("clips.")},
+        "pose": [bool(cfg.is_pose), int(cfg.n_keypoints)],
+        "detector_features": bool(cfg.features.enabled),
+        "suggest": {
+            "pca_components": int(emb.PCA_COMPONENTS),
+            "seed": int(emb.SEED),
+            "context_frames": int(cfg.suggest.context_frames),
+            "embeddings": _plain(specs),
+        },
+        "movies": movies,
+    }
+    text = json.dumps(state, sort_keys=True, default=str)
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def cached_clip_features(cfg: Config) -> pd.DataFrame | None:
+    """The table on disk if it was built under the current key, else None.
+
+    Also None when the saved embedding bases no longer match the table's basis
+    stamp, since a model fitted on the table would carry the wrong bases.
+    """
+    work = cfg.paths.work_dir
+    table, key_path = work / CLIP_FEATURES_FILE, work / CLIP_FEATURES_KEY_FILE
+    if not table.exists() or not key_path.exists():
+        return None
+    try:
+        if key_path.read_text(encoding="utf-8").strip() != feature_cache_key(cfg):
+            return None
+        features = pd.read_parquet(table)
+        stamped = {}
+        if len(features) and "_embedding_basis" in features.columns:
+            stamped = json.loads(str(features["_embedding_basis"].iloc[0]))
+        saved = {n: emb.basis_hash(p)
+                 for n, p in emb.load_bases(work / emb.BASES_FILE).items()}
+    except Exception:                                # noqa: BLE001
+        return None
+    if stamped != saved:
+        return None
+    return features
 
 
 # Bump whenever a feature's MEANING changes, not just when one is added or
@@ -613,7 +716,7 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
 # 3  censored windows excluded from wave_freq_drift_hz / wave_freq_track_sd_hz;
 #    tip_angular_speed no longer bridges gaps
 # 4  wave_flow, wave_flow_coherence, wave_flow_direction: the wave direction
-#    from the phase gradient over `spectral.flow_frames`, needing no resolvable
+#    from the phase gradient over FLOW_FRAMES, needing no resolvable
 #    beat. Added beside the spectral direction, which is unchanged
 # 5  cnn* replaced by emb_<name>_* from one project-wide PCA per embedding;
 #    optional ctx_* context family
@@ -705,14 +808,14 @@ def known_columns(cfg: Config | None = None) -> list[str]:
     """Every column a built feature table could hold, without reading one.
 
     Without ``cfg`` the context family is included. Embedding columns are an
-    upper bound: the PCA may keep fewer than ``suggest.pca_components``.
+    upper bound: the PCA may keep fewer than ``embeddings.PCA_COMPONENTS``.
     """
     columns = list(feature_schema())
     if cfg is None or int(cfg.suggest.context_frames) > 0:
         columns += context_names()
     if cfg is not None:
         for spec in cfg.suggest.embeddings:
-            columns += emb.column_names(spec.name, cfg.suggest.pca_components)
+            columns += emb.column_names(spec.name, emb.PCA_COMPONENTS)
     return columns
 
 

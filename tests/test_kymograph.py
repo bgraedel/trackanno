@@ -486,27 +486,6 @@ def test_the_panel_shows_it_only_for_pose(app, root: Path) -> None:
     check("scrubbing the chart moves the clip", panel.viewer._frame == 3,
           str(panel.viewer._frame))
 
-    # Display-only settings must reach the LIVE panel. They are deliberately
-    # absent from the rebuild fingerprint (none of them is worth discarding the
-    # clip you are on), which meant changing them did nothing until the project
-    # was reopened and read as the setting being ignored.
-    from trackanno.config import load_config as _load
-    from trackanno.project import write_config as _write
-
-    before_position = panel.position
-    _write(cfg.path, {"ui.kymo_sign": "raw"})
-    panel.apply_view_settings(_load(cfg.path))
-    app.processEvents()
-    check("the sign convention switches without a reload",
-          panel.kymo_view.sign_mode == "raw", panel.kymo_view.sign_mode)
-    check("...without losing your place", panel.position == before_position)
-    check("...and the panel adopted the new config",
-          panel.cfg.ui.kymo_sign == "raw")
-    check("the raw view actually paints", not panel.kymo_view.grab().isNull())
-    _write(cfg.path, {"ui.kymo_sign": "canonical"})
-    panel.apply_view_settings(_load(cfg.path))
-    app.processEvents()
-
     first = panel.kymo_view.kymo
     panel.next_clip()
     app.processEvents()

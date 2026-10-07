@@ -446,7 +446,7 @@ def test_bouts_cover_every_detected_frame_once(root: Path) -> None:
               for m in manifest["movie_id"].unique()))
 
 
-def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path) -> None:
+def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path, monkeypatch) -> None:
     """A dropped row and a row the model declined to label look identical once
     the file is read back, so a window that cannot be featurised has to survive
     into the output carrying the reason."""
@@ -458,14 +458,13 @@ def test_a_window_too_thin_to_measure_is_a_row_not_a_hole(root: Path) -> None:
     cfg, _ = build_case(root, "thin")
     # min_frames above anything the fixture's tracks can supply, so every window
     # is skipped and the answer must still be a full table.
-    write_config(cfg.path, {"predict.min_frames": 999})
-    cfg = load_config(cfg.path)
+    cfg.predict.min_frames = 999
 
     dense = build_dense_features(cfg)
     check("no window survives the bar", (dense["skip_reason"] != "").all())
     check("...and every one of them is still a row", len(dense) > 0)
-    check("the reason names the setting that stopped it",
-          dense["skip_reason"].str.contains("predict.min_frames").all(),
+    check("the reason names the bar that stopped it",
+          dense["skip_reason"].str.contains("a window needs 999").all(),
           str(dense["skip_reason"].iloc[0]))
 
     out = predict_all(cfg)
@@ -967,9 +966,6 @@ def test_the_exported_pixels_show_which_is_which(root: Path) -> None:
     from trackanno.view.render import render_movie
 
     cfg, _ = build_case(root, "pixels")
-    # Captions off, so the comparison below is about the box and nothing else.
-    cfg.render.show_category = False
-    cfg.render.show_track_id = False
 
     movie = SyntheticMovie()
     tracks = movie.tracks()
@@ -997,6 +993,9 @@ def test_the_exported_pixels_show_which_is_which(root: Path) -> None:
     out = Path(root) / "pixels"
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(imageio, "get_writer", Capture)
+        # Captions off, so the comparison below is about the box and nothing else.
+        patch.setattr("trackanno.view.render.SHOW_CATEGORY", False)
+        patch.setattr("trackanno.view.render.SHOW_TRACK_ID", False)
         render_movie(cfg, movie, tracks, annotations, GROUP, out / "labels.mp4",
                      max_frames=4, source="labels")
         render_movie(cfg, movie, tracks, annotations, GROUP, out / "predicted.mp4",
@@ -1192,3 +1191,17 @@ def test_a_movie_with_no_detector_embeddings_is_refused_not_filled_with_nan(
               emb.DETECTOR_FILE in message, message)
         check("...and names which movie to re-prepare",
               any(d.name in message for d in work.iterdir() if d.is_dir()), message)
+
+
+def test_bouts_stop_at_the_first_and_last_detection(root: Path) -> None:
+    """Windows reach past a track's ends; its bouts do not."""
+    from trackanno.infer.predict import predict_all
+
+    cfg, movie = planted_case(root, "clipped", stride=LENGTH)
+    path = cfg.paths.work_dir / movie / "tracks.parquet"
+    tracks = pd.read_parquet(path)
+    tracks[(tracks["frame"] >= 7) & (tracks["frame"] <= 262)].to_parquet(path, index=False)
+    bouts = predict_all(cfg)
+    assert int(bouts["f_start"].min()) == 7
+    assert int(bouts["f_end"].max()) == 263
+    assert (bouts["n_frames"] == bouts["f_end"] - bouts["f_start"]).all()

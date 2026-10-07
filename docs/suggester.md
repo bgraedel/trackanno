@@ -102,7 +102,9 @@ Dense prediction reads each embedding the model uses from that source in that
 basis, whatever the config now declares, and refuses if the data is gone. The
 clip table is stamped with its bases and `context_frames`; a model whose table
 was rebuilt differently (`--features-only`) refuses to load until retrained.
-`--ablate` builds its table in memory. Each clip and dense window gets the mean, std
+`--ablate` builds its table in memory. Training reuses the clip table until the
+feature config or a movie's tracks or embedding files change
+(`clip_features.key`); `--train --rebuild-features` forces a rebuild. Each clip and dense window gets the mean, std
 and frame-to-frame delta of the codes, `emb_<name>_<i>_{mean,std,delta}`.
 Cross-validation and the saved model use the same columns. Embeddings can
 re-identify individuals, so judge them by the leave-movie-out score.

@@ -375,9 +375,11 @@ def test_an_unreachable_path_cannot_freeze_the_window(root: Path) -> None:
 
     # Every settings path the window probes has to go through the guard. A bare
     # is_dir() anywhere on this path is the bug, so it is checked at the source.
-    for name in ("gui/hub.py", "gui/configform.py"):
-        text = (Path(__file__).resolve().parents[1] / "src" / "trackanno" / name
-                ).read_text(encoding="utf-8")
+    package = Path(__file__).resolve().parents[1] / "src" / "trackanno"
+    names = [p.relative_to(package).as_posix()
+             for p in sorted((package / "gui" / "hub").glob("*.py"))]
+    for name in names + ["gui/configform.py"]:
+        text = (package / name).read_text(encoding="utf-8")
         for call in (".is_dir()", ".is_file()"):
             offenders = [
                 line.strip() for line in text.splitlines()
@@ -393,6 +395,7 @@ def test_a_held_out_clip_can_say_so(app, root: Path) -> None:
     on screen said why, which reads as a broken suggester."""
     from fixtures import make_project
 
+    import trackanno.gui.app as app_module
     from trackanno.annotate.clips import ClipStore
     from trackanno.config import load_config
     from trackanno.gui.app import AnnotationWidget
@@ -408,9 +411,8 @@ def test_a_held_out_clip_can_say_so(app, root: Path) -> None:
         panel.suggester = _AlwaysAudit()
         panel._current_suggestion = {}
 
-        cfg.suggest.audit_visible = False
         check("silent by default", panel._why_no_suggestion("c0") == "")
-        cfg.suggest.audit_visible = True
+        app_module.AUDIT_VISIBLE = True
         note = panel._why_no_suggestion("c0")
         check("...and explains itself when asked to", "held out" in note, note)
         check("...naming the reason it shows nothing", "confidence" in note, note)
@@ -432,6 +434,7 @@ def test_a_held_out_clip_can_say_so(app, root: Path) -> None:
         panel.shutdown()
         panel.close()
     finally:
+        app_module.AUDIT_VISIBLE = False
         store.close()
 
 
@@ -657,6 +660,7 @@ def test_the_group_picker_never_empties_itself(app, root: Path) -> None:
           not picker.note.isHidden())
     check("and the reason is named", "detection.task" in picker.note.text(),
           picker.note.text())
+    page.revert()
     hub.close()
 
 
@@ -761,6 +765,10 @@ def test_model_probe_saves_task_and_keypoints_together(app, root: Path) -> None:
     page._on_model_info({"task": "pose", "n_keypoints": 17, "classes": ["cell"],
                          "imgsz": 640, "name": "yolo11n-pose.pt"})
     app.processEvents()
+    check("the probe only offers the change", not page._dirty
+          and page.form._widgets["detection.task"].currentText() == "detect")
+    page.model_apply.click()
+    app.processEvents()
     check("the task followed the checkpoint",
           page.form._widgets["detection.task"].currentText() == "pose")
     check("the names table was sized to match", page.keypoints.count.value() == 17)
@@ -777,6 +785,8 @@ def test_model_probe_saves_task_and_keypoints_together(app, root: Path) -> None:
     # lose them for briefly pointing at a plain detector.
     page._on_model_info({"task": "detect", "n_keypoints": 0, "classes": ["cell"],
                          "imgsz": 640, "name": "yolo11n.pt"})
+    app.processEvents()
+    page.model_apply.click()
     app.processEvents()
     check("the task followed it back",
           page.form._widgets["detection.task"].currentText() == "detect")

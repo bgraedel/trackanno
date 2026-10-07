@@ -24,12 +24,20 @@ import numpy as np
 import pandas as pd
 
 from ..annotate.clips import NORM_FILE, TRACKS_FILE
-from ..config import Config, load_config
+from ..config import FIXED_SETTINGS, Config, load_config
 from ..video.movies import MovieSource, Normalizer, open_movie
 from .overlay import draw_detections, gray_to_rgb, hex_to_rgb
 from ..annotate.store import MULTI_SEP
 
 SOURCES = ("labels", "predictions", "both")
+
+THICKNESS = FIXED_SETTINGS["render.thickness"]
+FONT_SCALE = FIXED_SETTINGS["render.font_scale"]
+SHOW_TRACK_ID = FIXED_SETTINGS["render.show_track_id"]
+SHOW_CATEGORY = FIXED_SETTINGS["render.show_category"]
+UNLABELLED_COLOR = FIXED_SETTINGS["render.unlabelled_color"]
+CODEC = FIXED_SETTINGS["render.codec"]
+QUALITY = FIXED_SETTINGS["render.quality"]
 
 
 def _pad_even(img: np.ndarray) -> np.ndarray:
@@ -235,15 +243,15 @@ def render_movie(
         )
 
     marks_by_frame = build_frame_marks(annotations, predictions, cfg, group_name, source)
-    unlabelled_rgb = hex_to_rgb(cfg.render.unlabelled_color)
+    unlabelled_rgb = hex_to_rgb(UNLABELLED_COLOR)
     tracks_by_frame = {f: df for f, df in tracks.groupby("frame", sort=False)}
 
     fps = movie.fps if cfg.render.fps == "auto" else float(cfg.render.fps)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     writer = imageio.get_writer(
-        str(out_path), fps=fps, codec=cfg.render.codec,
-        quality=cfg.render.quality, macro_block_size=1,
+        str(out_path), fps=fps, codec=CODEC,
+        quality=QUALITY, macro_block_size=1,
     )
 
     try:
@@ -264,21 +272,21 @@ def render_movie(
                         if hide_unlabelled:
                             continue
                         colors[track_id] = unlabelled_rgb
-                        text[track_id] = f"t{track_id}" if cfg.render.show_track_id else ""
+                        text[track_id] = f"t{track_id}" if SHOW_TRACK_ID else ""
                     else:
                         colors[track_id] = entry.color
                         if entry.predicted:
                             dashed.add(track_id)
                         parts = []
-                        if cfg.render.show_track_id:
+                        if SHOW_TRACK_ID:
                             parts.append(f"t{track_id}")
-                        if cfg.render.show_category:
+                        if SHOW_CATEGORY:
                             parts.append(entry.text)
                         text[track_id] = " ".join(parts)
                 draw_detections(
                     rgb, records, cfg, colors, text,
-                    thickness=cfg.render.thickness,
-                    font_scale=cfg.render.font_scale,
+                    thickness=THICKNESS,
+                    font_scale=FONT_SCALE,
                     show_skeleton=cfg.render.show_skeleton,
                     dashed=dashed,
                 )

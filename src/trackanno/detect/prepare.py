@@ -50,7 +50,7 @@ from ..annotate.clips import (
     finalise_geometry, plan_clips,
     specs_to_frame, write_clip_cache,
 )
-from ..config import Config, load_config
+from ..config import FIXED_SETTINGS, Config, load_config
 from ..video.movies import MovieSource, Normalizer, discover_movies
 from ..progress import Cancelled, ConsoleReporter, NullReporter, Reporter
 from .tiling import TiledDetector
@@ -128,23 +128,18 @@ def run_tracking(
 # Settings that change what detection writes, fps included. Clip-stage keys
 # (min_track_length, border_*) and where it runs (device, batch) are left out.
 _DETECT_KEYS = (
-    "detection.task", "detection.conf", "detection.iou", "detection.imgsz",
-    "detection.max_det", "detection.half",
+    "detection.task", "detection.conf", "detection.imgsz", "detection.half",
     "tiling.enabled", "tiling.tile", "tiling.overlap", "tiling.merge_iou",
-    "tiling.drop_edge_truncated", "tiling.edge_margin_px",
-    "tracking.backend", "tracking.tracker_cfg", "tracking.greedy_max_dist_px",
-    "tracking.overrides",
-    "features.enabled", "features.levels", "features.pool", "features.dtype",
-    "normalize.mode", "normalize.percentiles", "normalize.subsample",
+    "tracking.backend", "tracking.overrides",
+    "features.enabled",
+    "normalize.mode", "normalize.percentiles",
     "nd2.channel", "nd2.z", "tiff.channel",
     "nd2.fps", "tiff.fps",   # scale the tracker's track_buffer
 )
 # Settings that change what the clip stage cuts from the same tracks.
 _CLIP_KEYS = (
     "clips.frames", "clips.stride", "clips.window_mode", "clips.follow",
-    "clips.crop_from", "clips.smooth_window", "clips.pad", "clips.crop_size",
-    "clips.max_size", "clips.min_clip_frames", "clips.max_clips_per_track",
-    "clips.context_tracks",
+    "clips.pad", "clips.crop_size", "clips.min_clip_frames",
     "tracking.min_track_length", "tracking.border_margin_px",
     "tracking.border_max_frac",
 )
@@ -227,8 +222,12 @@ def _legacy_sections(cfg: Config) -> dict[str, dict]:
         if section is None:
             continue
         values = asdict(section) if is_dataclass(section) else dict(section)
+        # Keys that are now fixed, at the values older handoffs were hashed with.
+        for dotted, fixed in FIXED_SETTINGS.items():
+            section_name, _, key = dotted.partition(".")
+            if section_name == name:
+                values.setdefault(key, fixed)
         if name == "normalize":
-            # Removed keys, at the defaults older handoffs were hashed with.
             values.setdefault("sample_every", "auto")
             values.setdefault("smooth_window", 9)
         if name == "detection":
@@ -345,6 +344,10 @@ def _changed(cfg: Config, was: dict, now: dict) -> list[str]:
             default = _default(cfg, key)
             if default is MISSING or default != value:
                 changed.append(key)
+    # A recorded key that is now fixed compares against the fixed value.
+    for key in set(was) - set(now):
+        if key in FIXED_SETTINGS and was[key] != _plain(FIXED_SETTINGS[key]):
+            changed.append(key)
     return sorted(changed)
 
 

@@ -12,7 +12,7 @@ Design constraints that matter more than the model choice:
   columns the saved model is fitted on.
 * **The reported number is always the grouped-CV score, never the training score.**
 * **The model stays silent unless it clears a bar** (`suggest.min_per_class` and
-  `suggest.min_macro_f1`): a confidently wrong suggester is worse than none,
+  MIN_MACRO_F1): a confidently wrong suggester is worse than none,
   because the annotator's corrections train the next one.
 """
 
@@ -31,9 +31,10 @@ import numpy as np
 import pandas as pd
 
 from ..measure.clipfeatures import (
-    CLIP_FEATURES_FILE, FEATURE_VERSION, build_clip_features, feature_columns,
+    CLIP_FEATURES_FILE, FEATURE_VERSION, build_clip_features, cached_clip_features,
+    feature_columns,
 )
-from ..config import Config, load_config
+from ..config import FIXED_SETTINGS, Config, load_config
 from .select import select_batch
 from ..annotate.store import AUDIT_COLUMN, decode_audit, read_audit_records
 
@@ -45,6 +46,14 @@ REPORT_FILE = "suggest_report.json"
 # fitted on every label, so its opinion of one is an opinion of a row it has
 # memorised.
 CV_PREDICTIONS_FILE = "cv_predictions.parquet"
+
+# Boosting hyperparameters shared by both backends; iterations, learning rate
+# and l2_leaf_reg come from ``suggest.*``.
+DEPTH = FIXED_SETTINGS["suggest.depth"]
+BALANCE_CLASSES = FIXED_SETTINGS["suggest.balance_classes"]
+SEED = FIXED_SETTINGS["suggest.seed"]
+# The model stays silent below this cross-validated macro-F1.
+MIN_MACRO_F1 = FIXED_SETTINGS["suggest.min_macro_f1"]
 
 # Columns whose VALUE depends on how many frames the window spans, named in the
 # mismatch message because "the features mean something else now" is not
@@ -192,13 +201,13 @@ class GroupReport:
     cv_predictions: list = field(default_factory=list)
 
 
-def _learning_rate(cfg: Config) -> dict:
-    """``learning_rate=...``, or nothing at all where it is left to the estimator.
+def _iterations(cfg: Config) -> int:
+    """Boosting rounds per fit."""
+    return int(cfg.suggest.iterations)
 
-    Omitted rather than filled in with a number: CatBoost's own default is not
-    a constant but a rate derived from the row count and the iteration count,
-    and passing anything at all is what turns that off.
-    """
+
+def _learning_rate(cfg: Config) -> dict:
+    """``{"learning_rate": x}``, or empty for ``auto``."""
     rate = cfg.suggest.learning_rate
     return {} if isinstance(rate, str) else {"learning_rate": float(rate)}
 
@@ -206,11 +215,8 @@ def _learning_rate(cfg: Config) -> dict:
 def _build_model(cfg: Config, n_classes: int):
     """The classifier behind the suggestions.
 
-    CatBoost is the default because the label distribution is lopsided: one
-    state dominates and an unweighted model answers by predicting it, while
-    ``auto_class_weights="Balanced"`` reweights the loss by inverse class
-    frequency. It also takes NaN natively, which the kinematic features use to
-    mean "undefined".
+    CatBoost by default: balanced class weights handle the lopsided labels, and
+    it takes NaN natively. The learning rate is left to the estimator.
     """
     if cfg.suggest.model == "catboost":
         try:
@@ -218,20 +224,13 @@ def _build_model(cfg: Config, n_classes: int):
 
             return CatBoostClassifier(
                 **_task_type(cfg),
-                iterations=cfg.suggest.iterations,
-                # CatBoost grows SYMMETRIC trees, so depth alone sets the width:
-                # 2**depth leaves, no separate knob, and 64 at the default 6.
-                depth=cfg.suggest.depth,
-                l2_leaf_reg=cfg.suggest.l2_leaf_reg,
+                iterations=_iterations(cfg), depth=DEPTH,
+                l2_leaf_reg=float(cfg.suggest.l2_leaf_reg), **_learning_rate(cfg),
                 loss_function="MultiClass" if n_classes > 2 else "Logloss",
-                auto_class_weights="Balanced" if cfg.suggest.balance_classes else None,
-                verbose=False, random_seed=cfg.suggest.seed, allow_writing_files=False,
-                **_learning_rate(cfg),
+                auto_class_weights="Balanced" if BALANCE_CLASSES else None,
+                verbose=False, random_seed=SEED, allow_writing_files=False,
             )
         except ImportError:
-            # catboost is an ordinary dependency, so this means a broken
-            # environment rather than a missing extra. Say so and carry on with
-            # sklearn instead of failing the whole run.
             print(
                 "suggest.model is 'catboost' but catboost will not import; "
                 "using sklearn instead. Reinstall to get the default estimator.",
@@ -240,14 +239,10 @@ def _build_model(cfg: Config, n_classes: int):
     from sklearn.ensemble import HistGradientBoostingClassifier
 
     return HistGradientBoostingClassifier(
-        max_iter=cfg.suggest.iterations,
-        max_depth=cfg.suggest.depth,
-        l2_regularization=cfg.suggest.l2_leaf_reg,
-        # sklearn's equivalent of auto_class_weights; it has no "Balanced"
-        # string for this estimator until 1.4, hence the guard.
-        class_weight="balanced" if cfg.suggest.balance_classes else None,
-        early_stopping=False, random_state=cfg.suggest.seed,
-        **_learning_rate(cfg),
+        max_iter=_iterations(cfg), max_depth=DEPTH,
+        l2_regularization=float(cfg.suggest.l2_leaf_reg), **_learning_rate(cfg),
+        class_weight="balanced" if BALANCE_CLASSES else None,
+        early_stopping=False, random_state=SEED,
     )
 
 
@@ -286,39 +281,28 @@ def _task_type(cfg: Config) -> dict:
     return {} if resolved_device(cfg) == "cpu" else {"task_type": "GPU", "devices": "0"}
 
 
-def _rate_text(s) -> str:
-    """The learning rate, or what 'auto' will do instead of one."""
-    return ("auto (the estimator picks it from the rows and iterations)"
-            if isinstance(s.learning_rate, str) else f"{s.learning_rate}")
-
-
 def describe_model(cfg: Config, n_classes: int, n_rows: int, n_cols: int) -> str:
-    """One line naming the estimator and every hyperparameter that shapes the fit.
-
-    Written to the reporter, so it lands in the GUI's log beside the score.
-    """
-    s = cfg.suggest
-    if s.model == "catboost":
+    """One line naming the estimator and its hyperparameters, for the log."""
+    weights = "balanced" if BALANCE_CLASSES else "none"
+    iterations, l2 = _iterations(cfg), cfg.suggest.l2_leaf_reg
+    lr = cfg.suggest.learning_rate
+    if cfg.suggest.model == "catboost":
         try:
-            import catboost  # noqa: F401
+            import catboost
             backend = f"CatBoost {catboost.__version__}"
-            shape = (f"depth {s.depth} (symmetric, {2 ** s.depth} leaves), "
-                     f"iterations {s.iterations}, lr {_rate_text(s)}, "
-                     f"l2_leaf_reg {s.l2_leaf_reg}")
+            shape = (f"depth {DEPTH} ({2 ** DEPTH} leaves), iterations {iterations}, "
+                     f"lr {lr}, l2_leaf_reg {l2}")
             loss = "MultiClass" if n_classes > 2 else "Logloss"
-            weights = "Balanced" if s.balance_classes else "none"
             extra = f", loss {loss}, class weights {weights}"
         except ImportError:
             backend = "sklearn HistGradientBoosting (catboost not installed)"
-            shape = (f"max_depth {s.depth}, max_iter {s.iterations}, "
-                     f"lr {_rate_text(s)}, l2 {s.l2_leaf_reg}")
-            extra = f", class weights {'balanced' if s.balance_classes else 'none'}"
+            shape = f"max_depth {DEPTH}, max_iter {iterations}, lr {lr}, l2 {l2}"
+            extra = f", class weights {weights}"
     else:
         backend = "sklearn HistGradientBoosting"
-        shape = (f"max_depth {s.depth}, max_iter {s.iterations}, "
-                 f"lr {_rate_text(s)}, l2 {s.l2_leaf_reg}")
-        extra = f", class weights {'balanced' if s.balance_classes else 'none'}"
-    return (f"{backend}: {shape}{extra}, seed {s.seed} | "
+        shape = f"max_depth {DEPTH}, max_iter {iterations}, lr {lr}, l2 {l2}"
+        extra = f", class weights {weights}"
+    return (f"{backend}: {shape}{extra}, seed {SEED} | "
             f"{n_rows} clips x {n_cols} features, {n_classes} classes")
 
 
@@ -344,7 +328,7 @@ class _IterationTicker:
 def _fit(model, X, y, cfg: Config, reporter, label: str):
     """Fit with a live progress stage where the backend supports one."""
     reporter.raise_if_cancelled()
-    reporter.stage(label, cfg.suggest.iterations)
+    reporter.stage(label, _iterations(cfg))
     if cfg.suggest.model == "catboost" and hasattr(model, "get_feature_importance"):
         try:
             model.fit(X, y, callbacks=[_IterationTicker(reporter)])
@@ -354,7 +338,7 @@ def _fit(model, X, y, cfg: Config, reporter, label: str):
             # The GPU backend rejects `callbacks`; fit without the ticker.
             pass
     model.fit(X, y)
-    reporter.advance(cfg.suggest.iterations)
+    reporter.advance(_iterations(cfg))
     reporter.raise_if_cancelled()
     return model
 
@@ -372,7 +356,7 @@ def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int,
     reporter = reporter or NullReporter()
     pred = np.empty(len(y), dtype=object)
     conf = np.full(len(y), np.nan, dtype=float)
-    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=cfg.suggest.seed)
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     for fold, (train_idx, test_idx) in enumerate(splitter.split(X, y, groups=groups), start=1):
         held_out = sorted(set(np.asarray(groups)[test_idx]))
         reporter.log(
@@ -590,7 +574,7 @@ def train_group(
     # Bootstrap the lower bound over GROUPS (movies), the unit the folds were
     # split on; resampling clips would understate the uncertainty that matters,
     # and a single point estimate opens the gate on many pure-noise runs.
-    rng = np.random.default_rng(cfg.suggest.seed)
+    rng = np.random.default_rng(SEED)
     unique_groups = np.unique(groups)
     kappas = []
     for _ in range(400):
@@ -606,17 +590,16 @@ def train_group(
     # the majority rate, and accepts a near-degenerate one that clears it by
     # luck. Kappa is chance-corrected against the marginals; the bootstrap lower
     # bound stops one lucky split.
-    reliable = kappa_lo > 0.0 and macro_f1 >= cfg.suggest.min_macro_f1
+    reliable = kappa_lo > 0.0 and macro_f1 >= MIN_MACRO_F1
     if kappa_lo <= 0.0:
         reason = (
             f"agreement is not distinguishable from chance "
             f"(kappa {kappa:.2f}, 5th-percentile bound {kappa_lo:.2f} <= 0 "
             f"over {n_movies} movie(s))"
         )
-    elif macro_f1 < cfg.suggest.min_macro_f1:
+    elif macro_f1 < MIN_MACRO_F1:
         reason = (
-            f"grouped-CV macro-F1 {macro_f1:.2f} below suggest.min_macro_f1 "
-            f"{cfg.suggest.min_macro_f1:.2f}"
+            f"grouped-CV macro-F1 {macro_f1:.2f} below {MIN_MACRO_F1:.2f}"
         )
     else:
         reason = "ok"
@@ -663,7 +646,7 @@ def train_group(
             for clip_id, answer, c in zip(
                 merged["clip_id"].astype(str).to_numpy(), pred, pred_conf)
         ],
-        top_features=_feature_importance(model, X, y, columns, cfg.suggest.seed),
+        top_features=_feature_importance(model, X, y, columns, SEED),
         reliable=reliable,
         reason=reason,
     )
@@ -691,21 +674,24 @@ def train_group(
     return (model if report.reliable else None), report
 
 
-def train(cfg: Config, rebuild_features: bool = True, verbose: bool = True,
+def train(cfg: Config, rebuild_features: bool = False, verbose: bool = True,
           reporter=None) -> dict:
-    """Build features, fit every category group, persist models + report."""
+    """Fit every category group and persist models + report.
+
+    Clip features are reused while their cache key holds; ``rebuild_features``
+    forces a rebuild.
+    """
     import joblib
 
     from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     work = cfg.paths.work_dir
-    path = work / CLIP_FEATURES_FILE
-    features = (
-        build_clip_features(cfg, verbose=verbose, reporter=reporter)
-        if rebuild_features or not path.exists()
-        else pd.read_parquet(path)
-    )
+    features = None if rebuild_features else cached_clip_features(cfg)
+    if features is None:
+        features = build_clip_features(cfg, verbose=verbose, reporter=reporter)
+    else:
+        reporter.log(f"clip features unchanged, reusing {CLIP_FEATURES_FILE}")
     if not cfg.paths.csv.exists():
         raise FileNotFoundError(f"no annotations yet at {cfg.paths.csv}")
     labels = pd.read_csv(cfg.paths.csv)
@@ -888,8 +874,10 @@ class Suggester:
     # turn.
     audit: AuditHoldout
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, labels_csv: str | Path | None = None):
+        """``labels_csv`` is read for audit membership instead of the live CSV."""
         self.cfg = cfg
+        self.labels_csv = Path(labels_csv) if labels_csv is not None else None
         self.columns: list[str] = []
         self.models: dict = {}
         self.reports: dict = {}
@@ -906,6 +894,11 @@ class Suggester:
         # {name: EmbeddingSpec} the model's embeddings were read from.
         self.embedding_specs: dict = {}
         self._by_clip: dict[str, np.ndarray] = {}
+        # Feature row per clip id, and per-group class probabilities over every
+        # row, computed once per model so selection does not rescore the pool.
+        self._row_of: dict[str, int] = {}
+        self._matrix: np.ndarray | None = None
+        self._proba: dict[str, np.ndarray] = {}
         # Bumped by every `load`, and all a caller needs to know that a batch
         # from `selection_batch` is out of date.
         self.model_epoch: int = 0
@@ -921,6 +914,7 @@ class Suggester:
         self.problem = ""
         self.columns, self.models, self.reports = [], {}, {}
         self.features, self._by_clip = None, {}
+        self._row_of, self._matrix, self._proba = {}, None, {}
         self.trained_window = None
         self.context_frames = 0
         self.embedding_bases = {}
@@ -930,7 +924,7 @@ class Suggester:
         # clips whether or not a model exists. Resolved HERE and not per
         # question, so turning a page does not read the CSV. An unreadable flag
         # is allowed to raise: nobody could then say which clips are held out.
-        self.audit = AuditHoldout.from_csv(self.cfg, self.cfg.paths.csv)
+        self.audit = AuditHoldout.from_csv(self.cfg, self.labels_csv or self.cfg.paths.csv)
 
         work = self.cfg.paths.work_dir
         model_path, feat_path = work / MODEL_FILE, work / CLIP_FEATURES_FILE
@@ -1030,6 +1024,8 @@ class Suggester:
         matrix = features[columns].to_numpy(dtype=np.float32, copy=False)
         ids = features["clip_id"].astype(str).to_numpy()
         self._by_clip = {clip_id: matrix[i] for i, clip_id in enumerate(ids)}
+        self._row_of = {clip_id: i for i, clip_id in enumerate(ids)}
+        self._matrix = matrix
 
         report_path = work / REPORT_FILE
         if report_path.exists():
@@ -1044,6 +1040,23 @@ class Suggester:
     @property
     def ready(self) -> bool:
         return bool(self.models) and bool(self._by_clip)
+
+    def _group_proba(self, group: str) -> np.ndarray:
+        """Class probabilities of every feature row under ``group``'s model, cached."""
+        proba = self._proba.get(group)
+        if proba is None:
+            proba = np.asarray(self.models[group].predict_proba(self._matrix), dtype=float)
+            self._proba[group] = proba
+        return proba
+
+    def warm(self) -> None:
+        """Score the pool for selection now, so the first batch is a lookup."""
+        cfg = self.cfg
+        if not (cfg.suggest.enabled and cfg.suggest.selection_on and self.ready):
+            return
+        group = self.selection_group()
+        if group:
+            self._group_proba(group)
 
     def window_problem(self, length: int) -> str:
         """'' if a feature table built at `length` is safe for this model, else why not.
@@ -1219,7 +1232,7 @@ class Suggester:
         # imputed: an imputed row still ranks, on numbers the clip does not
         # have. The ordinary state after re-running detection rebuilds the
         # manifest and not the feature table, so it is a filter, not an error.
-        rows = [self._by_clip.get(clip_id) for clip_id in ids]
+        rows = [self._row_of.get(clip_id) for clip_id in ids]
         keep = np.array([row is not None for row in rows], dtype=bool)
         if not keep.any():
             return []
@@ -1235,10 +1248,8 @@ class Suggester:
         if not candidates.any():
             return []
 
-        model = self.models[group]
-        matrix = np.vstack([rows[i] for i in pool])
-        proba = np.asarray(model.predict_proba(matrix), dtype=float)
-        classes = [str(c) for c in model.classes_]
+        proba = self._group_proba(group)[[rows[i] for i in pool]]
+        classes = [str(c) for c in self.models[group].classes_]
 
         records = select_batch(proba, pool_ids, classes, int(n),
                                candidates=candidates)
@@ -1464,6 +1475,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--config", default=None)
     p.add_argument("--train", action="store_true", help="build features, fit, cross-validate")
+    p.add_argument("--rebuild-features", action="store_true",
+                   help="rebuild clip features even if their inputs are unchanged")
     p.add_argument("--report", action="store_true", help="print the last saved report")
     p.add_argument("--ablate", action="store_true",
                    help="compare what each feature group is worth")
@@ -1490,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(json.loads(path.read_text(encoding="utf-8")))
         return 0
 
-    reports = train(cfg)
+    reports = train(cfg, rebuild_features=args.rebuild_features)
     _print_report(reports)
     usable = [g for g, r in reports.items() if r["reliable"]]
     print(

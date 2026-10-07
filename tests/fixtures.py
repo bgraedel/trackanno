@@ -52,10 +52,8 @@ def _settings(pose: bool) -> dict:
         "clips.stride": 50,
         "clips.window_mode": "all",
         "clips.follow": "fixed",
-        "clips.crop_from": "union",
         "clips.pad": 1.6,
         "clips.crop_size": 96,
-        "clips.max_size": 256,
         "clips.min_clip_frames": 40,
         "ui.annotator": "tester",
     }

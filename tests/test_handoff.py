@@ -82,12 +82,34 @@ def test_what_makes_a_handoff_stale(root: Path) -> None:
 
     # A key added in a later version is absent from older records.
     record = dict(info["config_fingerprint"])
-    record.pop("normalize.subsample")
+    record.pop("tiling.tile")
     path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
     check("a key the record lacks is fine at its default", handoff_is_fresh(cfg, movie.id))
-    cfg.normalize.subsample = 9
+    cfg.tiling.tile = 320
     check("but not away from it", not handoff_is_fresh(cfg, movie.id))
-    cfg.normalize.subsample = 4
+    cfg.tiling.tile = 640
+
+    # A recorded key that is no longer configurable compares against its constant.
+    for value, fresh in ((0.5, True), (0.7, False)):
+        path.write_text(json.dumps({**info, "config_fingerprint": {
+            **info["config_fingerprint"], "detection.iou": value}}), encoding="utf-8")
+        check(f"a recorded detection.iou of {value} is {'fresh' if fresh else 'stale'}",
+              handoff_is_fresh(cfg, movie.id) is fresh)
+
+    # Inference size: records without it were detected at the default.
+    check("the inference keys are fingerprinted",
+          {"detection.imgsz", "detection.half", "tiling.overlap", "tiling.merge_iou"}
+          <= set(info["config_fingerprint"]))
+    record = dict(info["config_fingerprint"])
+    record.pop("detection.imgsz")
+    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
+    check("no recorded imgsz is fresh at the default", handoff_is_fresh(cfg, movie.id))
+    cfg.detection.imgsz = 1280
+    check("...and stale at another size", not handoff_is_fresh(cfg, movie.id))
+    record["detection.imgsz"] = 1280
+    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
+    check("a record made at that size is fresh", handoff_is_fresh(cfg, movie.id))
+    cfg.detection.imgsz = 640
 
     path.write_text(json.dumps({**info, "config_fingerprint": _legacy_fingerprint(cfg)}),
                     encoding="utf-8")
@@ -269,18 +291,18 @@ def test_a_legacy_handoff_survives_clip_stage_changes(root: Path) -> None:
     cfg.tracking.min_track_length = 40
     cfg.tracking.border_margin_px = 0
 
-    tracking = asdict(cfg.tracking)
+    tracking = {**asdict(cfg.tracking), "tracker_cfg": "", "greedy_max_dist_px": 25.0}
     tracking.pop("border_margin_px")
     tracking.pop("border_max_frac")
     write({**_legacy_fingerprint(cfg), "tracking": _legacy_digest(tracking)})
     check("a digest from before the border keys existed is fresh",
           handoff_is_fresh(cfg, movie.id), str(detection_changes(cfg, movie.id)))
 
-    cfg.tracking.greedy_max_dist_px = 99
+    cfg.tracking.overrides = {"gmc_method": "sparseOptFlow"}
     check("a detect-stage change in the same section is not",
           detection_changes(cfg, movie.id) == ["tracking.*"],
           str(detection_changes(cfg, movie.id)))
-    cfg.tracking.greedy_max_dist_px = 30
+    cfg.tracking.overrides = {"gmc_method": "none"}
 
     write({**_legacy_fingerprint(cfg), "tracking": "0" * 12})
     stub = StubDetector(frames, movie.n_frames)

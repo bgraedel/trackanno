@@ -586,10 +586,11 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     Returned rather than logged, so the Configure page can report what a model
     decided in the same breath as applying it.
     """
-    from ..config import load_config
+    from ..config import load_config, schema_keys
     from ..project import write_config
 
     before = load_config(config_path)
+    configurable = set(schema_keys())
     updates: dict[str, object] = {}
     told: list[str] = []
 
@@ -601,6 +602,9 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
         if not isinstance(values, dict):
             continue
         for key, value in values.items():
+            if f"{section}.{key}" not in configurable:
+                told.append(f"NOT applied: {section}.{key} is not configurable")
+                continue
             current = getattr(getattr(before, section, None), key, None)
             if isinstance(current, Path):
                 continue
@@ -736,7 +740,7 @@ def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
         elif pixel_size_um is None and bounds[0] == bounds[1]:
             out.append(
                 f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels "
-                "only. At a different magnification, scale detection.imgsz and "
-                "tiling.tile with it, or retrain."
+                "only. At a different magnification, scale tiling.tile with it, "
+                "or retrain."
             )
     return out

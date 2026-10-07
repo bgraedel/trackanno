@@ -24,7 +24,10 @@ from typing import Iterator
 
 import numpy as np
 
-from ..config import Config
+from ..config import FIXED_SETTINGS, Config
+
+# Every Nth pixel along each axis feeds the percentiles.
+SUBSAMPLE = FIXED_SETTINGS["normalize.subsample"]
 
 __all__ = [
     "MovieSource",
@@ -116,7 +119,7 @@ class Normalizer:
 
         opt = options or Normalize()
         n = min(movie.n_frames, n_frames) if n_frames else movie.n_frames
-        step = max(1, opt.subsample)
+        step = max(1, SUBSAMPLE)
         pcts = opt.percentiles
 
         if opt.mode == "fixed":

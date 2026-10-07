@@ -25,7 +25,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..config import Config
+from ..config import FIXED_SETTINGS, Config
+
+CROP_FROM = FIXED_SETTINGS["clips.crop_from"]            # bbox: p95 box extent
+SMOOTH_WINDOW = FIXED_SETTINGS["clips.smooth_window"]    # frames, follow: smooth
+MAX_SIZE = FIXED_SETTINGS["clips.max_size"]              # cap on an auto crop size
+CONTEXT_TRACKS = FIXED_SETTINGS["clips.context_tracks"]  # record neighbours in the crop
+MAX_CLIPS_PER_TRACK = FIXED_SETTINGS["clips.max_clips_per_track"]  # 0 is unlimited
 
 __all__ = [
     "ClipSpec", "clip_id_for", "plan_clips", "border_flags", "drop_border_rows",
@@ -279,9 +285,9 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
             elif cfg.clips.follow == "fixed":
                 path = np.repeat(centres.mean(axis=0, keepdims=True), span, axis=0)
             else:
-                path = _moving_average(centres, cfg.clips.smooth_window)
+                path = _moving_average(centres, SMOOTH_WINDOW)
 
-            if cfg.clips.crop_from == "union":
+            if CROP_FROM == "union":
                 base = float(np.nanmax(
                     [boxes[:, 2].max() - boxes[:, 0].min(), boxes[:, 3].max() - boxes[:, 1].min()]
                 ))
@@ -319,7 +325,7 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
             made += 1
             if cfg.clips.window_mode == "first_per_track":
                 break
-            if cfg.clips.max_clips_per_track and made >= cfg.clips.max_clips_per_track:
+            if MAX_CLIPS_PER_TRACK and made >= MAX_CLIPS_PER_TRACK:
                 break
 
     return specs
@@ -333,7 +339,7 @@ def choose_crop_size(specs: list[ClipSpec], cfg: Config) -> int:
         return 64
     needed = np.array([s.crop_w for s in specs], dtype=float)
     size = int(np.ceil(np.percentile(needed, 99) / 16.0) * 16)
-    return int(np.clip(size, 32, cfg.clips.max_size))
+    return int(np.clip(size, 32, MAX_SIZE))
 
 
 def finalise_geometry(specs: list[ClipSpec], size: int, n_frames: int) -> np.ndarray:
@@ -416,7 +422,7 @@ def build_box_table(
         x0 = origins[row, t, 0].astype(np.float64)
         y0 = origins[row, t, 1].astype(np.float64)
         window, target = boxes[lo:hi], ids[lo:hi]
-        if cfg.clips.context_tracks:
+        if CONTEXT_TRACKS:
             keep = (
                 (window[:, 2] > x0) & (window[:, 0] < x0 + s.crop_w)
                 & (window[:, 3] > y0) & (window[:, 1] < y0 + s.crop_h)

@@ -20,7 +20,6 @@ from harness import check
 # Prediction keys the form has to offer and round-trip.
 NEW_KEYS = {
     "predict.window_stride": 25,
-    "predict.min_frames": 7,
     "predict.min_bout_frames": 10,
 }
 
@@ -39,6 +38,8 @@ def test_every_field_reaches_exactly_one_tab(app) -> None:
     from trackanno.gui.configform import FIELDS, GROUPS, ConfigForm
 
     defined = [f"{section}.{key}" for section, key, *_ in FIELDS]
+    check("the form stays short", 25 <= len(defined) <= 32, str(len(defined)))
+    check("every field has help from the schema", all(tip for *_, tip, _e in FIELDS))
     check("no field is defined twice", len(defined) == len(set(defined)),
           str(sorted({d for d in defined if defined.count(d) > 1})))
 
@@ -48,9 +49,7 @@ def test_every_field_reaches_exactly_one_tab(app) -> None:
           str(sorted(set(defined) ^ set(rendered))))
     check("...and none reaches both", len(rendered) == len(set(rendered)))
     check("the basics tab is still the short list",
-          5 < len(basic._widgets) < 25, str(len(basic._widgets)))
-    check("the advanced tab holds the rest",
-          len(advanced._widgets) > len(basic._widgets))
+          5 < len(basic._widgets) < 20, str(len(basic._widgets)))
     check("scope 'all' is both", len(ConfigForm("all")._widgets) == len(defined))
 
     # Every group is a heading plus one sentence about what the settings under
@@ -65,8 +64,7 @@ def test_every_field_reaches_exactly_one_tab(app) -> None:
     # The point of the regrouping: the keys load_config refuses OVER EACH OTHER
     # are shown together, with one sentence about the combination, rather than
     # as adjacent rows each explaining only itself.
-    group_of = {f"{section}.{key}": title
-                for title, _b, fields in GROUPS for section, key, *_ in fields}
+    group_of = {dotted: title for title, _b, rows in GROUPS for dotted, *_ in rows}
     coupled = ["predict.window_stride", "predict.min_bout_frames"]
     check("the keys that are refused over each other are one group",
           len({group_of[k] for k in coupled}) == 1,
@@ -86,7 +84,7 @@ def test_the_prediction_keys_the_gui_can_break_are_on_it(app, root: Path) -> Non
 
     form = ConfigForm("all")
     form.load(_raw(NEW_KEYS))
-    values = form.values()
+    values = form.current()
     for dotted, value in NEW_KEYS.items():
         check(f"{dotted} round-trips through the form",
               values[dotted] == value, repr(values.get(dotted)))
@@ -96,7 +94,6 @@ def test_the_prediction_keys_the_gui_can_break_are_on_it(app, root: Path) -> Non
     coherent = {
         "clips.frames": 50, "clips.stride": 50,
         "predict.window_stride": 25, "predict.min_bout_frames": 25,
-        "predict.min_frames": 4,
     }
     write_config(path, coherent)
     cfg = load_config(path)
@@ -104,19 +101,19 @@ def test_the_prediction_keys_the_gui_can_break_are_on_it(app, root: Path) -> Non
           cfg.predict.resolved_stride(cfg.clips) == 25,
           str(cfg.predict.resolved_stride(cfg.clips)))
     check("...and every value survived the round trip",
-          cfg.predict.min_frames == 4 and cfg.predict.min_bout_frames == 25)
+          cfg.predict.min_bout_frames == 25)
 
     form = ConfigForm("all")
     form.load(yaml.safe_load(path.read_text(encoding="utf-8")))
-    written = form.values()
+    written = form.current()
     check("...and the form reads back what it wrote",
           all(written[k] == v for k, v in coherent.items()),
           str({k: written[k] for k, v in coherent.items() if written[k] != v}))
 
 
 def test_a_refused_field_never_reaches_the_file(app, root: Path) -> None:
-    """The autosave writes every tab at once, so one unusable field must stop
-    the whole save rather than being dropped out of it."""
+    """Save writes every tab at once, so one unusable field must stop the whole
+    save rather than being dropped out of it."""
     from trackanno.gui.hub import ConfigPage, Hub
     from trackanno.project import create_project
 
@@ -154,7 +151,7 @@ def test_auto_says_what_it_stands_for(app) -> None:
 
     form = ConfigForm("all")
     form.load(yaml.safe_load(DEFAULT_CONFIG))
-    values = form.values()
+    values = form.current()
     form.show_resolved(values)
 
     window = form._widgets["predict.window_stride"]
@@ -185,265 +182,176 @@ def test_auto_says_what_it_stands_for(app) -> None:
     check("leaving 'auto' starts from the number it stood for", window.edit.value() == 50)
     window.auto.setChecked(False)
     check("...and only then is the number editable", window.edit.isEnabled())
-    check("...and the form offers the number", form.values()["predict.window_stride"] == 50)
+    check("...and the form offers the number", form.current()["predict.window_stride"] == 50)
     window.edit.setValue(37)
     check("an explicit number is written as one",
-          form.values()["predict.window_stride"] == 37)
+          form.current()["predict.window_stride"] == 37)
     window.auto.setChecked(True)
-    check("ticking it back writes the word", form.values()["predict.window_stride"] == "auto")
+    check("ticking it back writes the word", form.current()["predict.window_stride"] == "auto")
 
 
 def test_a_fixed_set_of_values_is_never_free_text(app) -> None:
-    """Every setting whose valid values are a fixed set is offered as that set."""
+    """Every setting with a fixed set of values is a combo of exactly that set."""
+    from trackanno.config import meta_for
     from trackanno.gui.configform import FIELDS, ConfigForm, _options
 
-    kinds = {f"{section}.{key}": kind for section, key, kind, *_ in FIELDS}
-    check("nothing is left as an untyped scalar box",
-          not [k for k, kind in kinds.items() if kind == "scalar"],
-          str([k for k, kind in kinds.items() if kind == "scalar"]))
-    for dotted, expected in (("tiling.enabled", "tristate"),
-                             ("clips.crop_size", "autonum")):
-        check(f"{dotted} is not free text any more", kinds[dotted] == expected,
-              kinds[dotted])
-
     form = ConfigForm("all")
-    tiling = form._widgets["tiling.enabled"]
-    check("tiling offers exactly its three values", tiling.count() == 3)
-    # The item carries what it writes, not what it reads: `off` typed into a
-    # text box arrives downstream as the string "off", which is TRUE.
-    tiling.set_value(False)
-    check("'off' writes a boolean, not the word",
-          form.values()["tiling.enabled"] is False)
-    tiling.set_value(True)
-    check("'on' too", form.values()["tiling.enabled"] is True)
-    tiling.set_value("auto")
-    check("...and 'auto' stays the word it is compared against",
-          form.values()["tiling.enabled"] == "auto")
+    for section, key, kind, _label, _tip, extra in FIELDS:
+        dotted = f"{section}.{key}"
+        choices = meta_for(dotted).get("choices")
+        if choices:
+            check(f"{dotted} is a combo", kind == "choice", kind)
+            check(f"{dotted} offers the schema's choices",
+                  _options(dotted, extra) == [str(c) for c in choices])
+            check(f"{dotted} cannot be typed into", not form._widgets[dotted].isEditable())
+    check("every combo has options to offer",
+          all(_options(f"{f[0]}.{f[1]}", f[5]) for f in FIELDS if f[2] == "choice"))
 
-    # A name is a name. `_parse_scalar` used to type these, so an annotator
-    # called 2024 was written as an integer and an empty box as null - which
-    # reaches ui.annotator as the string "None" and signs every CSV row with it.
+    # A name is a name: an annotator called 2024 stays text, an empty box is "".
     annotator = form._widgets["ui.annotator"]
     annotator.setText("2024")
-    check("an annotator called 2024 stays a name",
-          form.values()["ui.annotator"] == "2024")
+    check("an annotator called 2024 stays a name", form.current()["ui.annotator"] == "2024")
     annotator.setText("")
-    check("an empty name is the empty name, not null",
-          form.values()["ui.annotator"] == "")
-
-    check("every combo has options to offer",
-          all(_options(field[5]) for field in FIELDS if field[2] == "choice"),
-          str([f"{f[0]}.{f[1]}" for f in FIELDS
-               if f[2] == "choice" and not _options(f[5])]))
+    check("an empty name is the empty name, not null", form.current()["ui.annotator"] == "")
 
 
 def test_no_combo_offers_a_value_the_loader_refuses(app, root: Path) -> None:
-    """A list of allowed values copied into the form rots silently in either
-    direction. Where the module that defines them exports a registry, the form
-    reads it; where it does not, this pins the direction that can be pinned."""
+    """Every option every combo offers is accepted by the real loader."""
     from trackanno.config import ConfigError
+    from trackanno.detect.tracking import TRACKERS
     from trackanno.gui.configform import FIELDS, _options
     from trackanno.project import create_project, write_config
-    from trackanno.detect.tracking import TRACKERS
 
-    extras = {f"{section}.{key}": extra for section, key, _kind, _l, _t, extra in FIELDS}
     check("the trackers are the registry itself",
-          _options(extras["tracking.backend"]) == sorted(TRACKERS) + ["greedy"])
-    check("...and are read, not written down",
-          "options_from" in extras["tracking.backend"]
-          and "options" not in extras["tracking.backend"])
+          _options("tracking.backend", {}) == sorted(TRACKERS) + ["greedy"])
 
-    # Everything else has its allowed values written out inside config.py's own
-    # parse functions, with nothing importable to read. Every option is put
-    # through the real loader instead, so a list that goes stale fails here.
     path = create_project(root / "combos")
     base = path.read_text(encoding="utf-8")
-    companions: dict = {}
     offered = 0
     for section, key, kind, _label, _tip, extra in FIELDS:
         if kind != "choice":
             continue
         dotted = f"{section}.{key}"
-        for option in _options(extra):
+        for option in _options(dotted, extra):
             path.write_text(base, encoding="utf-8")
             try:
-                write_config(path, {dotted: option, **companions.get(dotted, {})})
+                write_config(path, {dotted: option})
             except ConfigError as exc:
                 check(f"{dotted} offers only values the loader takes", False,
                       f"{option!r}: {exc}")
             offered += 1
-        if dotted == "detection.device":
-            continue  # any CUDA index is valid, so there is no value to refuse
-        path.write_text(base, encoding="utf-8")
-        try:
-            write_config(path, {dotted: "not-a-real-option"})
-        except ConfigError:
-            pass
-        else:
-            check(f"{dotted} refuses a value it does not offer", False)
-    check("every value every combo offers is one the loader accepts",
-          offered >= 30, str(offered))
+    path.write_text(base, encoding="utf-8")
+    check("every value every combo offers is one the loader accepts", offered >= 15,
+          str(offered))
 
 
-def test_an_autonum_widget_takes_the_shape_its_setting_does(app) -> None:
-    """A field has to be able to represent what its setting accepts.
+def test_tooltips_come_from_the_schema(app) -> None:
+    """One help string per key, shown as the field's tooltip."""
+    from trackanno.config import help_for
+    from trackanno.gui.configform import ConfigForm
 
-    `_AutoField` builds an integer spin box unless the row says
-    `numeric: "float"`, so a setting declared `float | str` with that missing
-    loads 0.05 as 0. The next autosave writes the 0, the loader refuses it, and
-    the Configure page cannot save anything at all until the file is edited by
-    hand - which is how `suggest.learning_rate` shipped.
-
-    Read off the dataclass annotation rather than probed with a value, because
-    the value that exposes it differs per setting and a probe that suits one
-    is nonsense for the next.
-    """
-    from trackanno import config as config_module
-    from trackanno.gui.configform import FIELDS, ConfigForm
-
-    sections = {
-        "detection": "Detection", "tiling": "Tiling", "tracking": "Tracking",
-        "clips": "Clips", "suggest": "Suggest", "predict": "Predict",
-        "ui": "UI", "normalize": "Normalize", "features": "Features",
-        "paths": "Paths", "keypoints": "Keypoints",
-    }
     form = ConfigForm("all")
-    checked = 0
-    for section, key, kind, *_ in FIELDS:
-        if kind != "autonum":
-            continue
-        holder = getattr(config_module, sections.get(section, ""), None)
-        annotation = str((getattr(holder, "__annotations__", {}) or {}).get(key, ""))
-        check(f"{section}.{key} is a real setting on a real section",
-              bool(annotation), f"no annotation for {section}.{key}")
-        wants_float = "float" in annotation
-        widget = form._widgets[f"{section}.{key}"]
-        check(f"{section}.{key} takes {'a rate' if wants_float else 'a whole number'}, "
-              f"and its box does too",
-              bool(widget._float) == wants_float,
-              f"declared {annotation!r}, widget float={widget._float}")
-        checked += 1
-    check("there were autonum fields to check", checked >= 3, str(checked))
+    for dotted, widget in form._widgets.items():
+        check(f"{dotted} shows its schema help", help_for(dotted) in widget.toolTip(),
+              widget.toolTip())
 
 
-def test_a_key_the_file_never_mentions_is_not_invented(app, root: Path) -> None:
-    """The generated config.yaml documents most settings and leaves the rest to
-    their defaults. Writing every widget back turned each of those into whatever
-    its spin box range starts at - `suggest.iterations` 1000 -> 10, `depth` 6 -> 1,
-    `balance_classes` on -> off - on the first autosave of a new project, which
-    is a different model with nothing on screen to say so."""
+def test_reprepare_keys_follow_the_fingerprint() -> None:
+    """The '*' marks are the keys the detect and clip stages record."""
+    from trackanno.detect.prepare import _CLIP_KEYS, _DETECT_KEYS
+    from trackanno.gui.configform import NEEDS_REPREPARE
+
+    check("every fingerprinted key is marked",
+          set(_DETECT_KEYS) | set(_CLIP_KEYS) <= NEEDS_REPREPARE)
+    check("clip length is one of them", "clips.frames" in NEEDS_REPREPARE)
+    check("playback speed is not", "ui.fps" not in NEEDS_REPREPARE)
+
+
+def test_only_changed_keys_are_written(app, root: Path) -> None:
+    """An untouched field is never rewritten, even where its widget rounds it."""
     from trackanno.config import load_config
     from trackanno.gui.configform import ConfigForm
     from trackanno.project import create_project, write_config
 
     path = create_project(root / "untouched")
-    before = path.read_text(encoding="utf-8")
-    raw = yaml.safe_load(before)
-    check("the generated project really does leave these out",
-          "iterations" not in (raw.get("suggest") or {}))
-
-    form = ConfigForm("all")
-    form.load(raw)
-    check("a key the file does not mention is not offered for writing",
-          "suggest.iterations" not in form.values())
-    check("...while one it does mention is",
-          form.values()["clips.frames"] == raw["clips"]["frames"])
-
-    write_config(path, form.values())
-    cfg = load_config(path)
-    check("saving the form keeps the default the loader would have used",
-          cfg.suggest.iterations == 1000 and cfg.suggest.depth == 6
-          and cfg.suggest.learning_rate == "auto"
-          and cfg.suggest.balance_classes,
-          f"{cfg.suggest.iterations}, {cfg.suggest.depth}, {cfg.suggest.balance_classes}")
-    check("...and the comments survive a save of every field",
-          path.read_text(encoding="utf-8").count("#") == before.count("#"),
-          f"{path.read_text(encoding='utf-8').count('#')} vs {before.count('#')}")
-
-    # Touching one is what makes it real, and only that one.
-    form.load(yaml.safe_load(path.read_text(encoding="utf-8")))
-    form._widgets["suggest.iterations"].setValue(1200)
-    offered = form.values()
-    check("touching an absent key writes it", offered.get("suggest.iterations") == 1200)
-    check("...and its untouched neighbours stay absent",
-          "suggest.depth" not in offered and "suggest.balance_classes" not in offered)
-    write_config(path, offered)
-    written = load_config(path)
-    check("the touched key reached the file", written.suggest.iterations == 1200)
-    check("...and the untouched one kept its default", written.suggest.depth == 6)
-
-
-def test_a_key_the_file_never_mentions_is_shown_at_the_value_that_runs(app, root: Path) -> None:
-    """Absent is not blank. The test above is the write half of this rule; this
-    is the read half, and it was the half that was wrong: with the key missing,
-    every one of those widgets displayed whatever its range began at, so the
-    Suggestions tab reported 10 boosting iterations, depth 1 and unbalanced
-    classes while the model being fitted was 1000, 6 and balanced. Reading it was
-    misleading and acting on it was worse - raising the iterations from what the
-    page showed would have cut the model to a hundredth of its size."""
-    from trackanno.config import load_config, section_defaults
-    from trackanno.gui.configform import ConfigForm
-    from trackanno.project import create_project
-
-    path = create_project(root / "shown")
+    write_config(path, {"detection.conf": 0.125})
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    cfg = load_config(path)
 
     form = ConfigForm("all")
     form.load(raw)
-    shown = form._raw_values()
+    check("the spin box shows a rounded value",
+          form.current()["detection.conf"] == 0.13, str(form.current()["detection.conf"]))
+    check("nothing is offered for writing straight after loading", form.values() == {},
+          str(form.values()))
+    before = path.read_text(encoding="utf-8")
 
-    check("the generated file really does leave the boosting knobs out",
-          "iterations" not in (raw.get("suggest") or {}))
-    check("the page shows the iterations that will actually be fitted",
-          shown["suggest.iterations"] == cfg.suggest.iterations == 1000,
-          f"{shown['suggest.iterations']} shown, {cfg.suggest.iterations} fitted")
-    check("...the depth those trees will have",
-          shown["suggest.depth"] == cfg.suggest.depth == 6,
-          f"{shown['suggest.depth']} vs {cfg.suggest.depth}")
-    check("...the L2 penalty they will carry",
-          shown["suggest.l2_leaf_reg"] == cfg.suggest.l2_leaf_reg == 3.0,
-          f"{shown['suggest.l2_leaf_reg']} vs {cfg.suggest.l2_leaf_reg}")
-    check("...and that the classes will be balanced",
-          shown["suggest.balance_classes"] == cfg.suggest.balance_classes is True,
-          f"{shown['suggest.balance_classes']} vs {cfg.suggest.balance_classes}")
-    check("the rate is still the estimator's to choose",
-          shown["suggest.learning_rate"] == cfg.suggest.learning_rate == "auto",
-          f"{shown['suggest.learning_rate']!r}")
+    form._widgets["clips.frames"].setValue(40)
+    form._widgets["clips.stride"].setValue(40)
+    offered = form.values()
+    check("only the touched keys are offered", set(offered) == {"clips.frames", "clips.stride"},
+          str(offered))
+    write_config(path, offered)
+    cfg = load_config(path)
+    check("the untouched value keeps its precision", cfg.detection.conf == 0.125,
+          str(cfg.detection.conf))
+    check("the touched one changed", cfg.clips.frames == 40)
+    check("the comments survive", path.read_text(encoding="utf-8").count("#")
+          == before.count("#"))
 
-    # The general rule, so a knob added later cannot quietly go back to showing
-    # the corner of its own range.
-    checked = 0
-    for dotted in sorted(form._absent):
-        section, _, key = dotted.partition(".")
-        default = section_defaults(section)
-        if key not in default:
-            continue
-        check(f"{dotted} is shown at the value the loader would use",
-              shown[dotted] == default[key],
-              f"shows {shown[dotted]!r}, loader uses {default[key]!r}")
-        checked += 1
-    check("there were absent keys to check", checked >= 5, str(checked))
-
-    check("and showing them is still not offering them for writing",
-          not (set(form._absent) & set(form.values())),
-          str(sorted(set(form._absent) & set(form.values()))))
+    form.saved()
+    check("after a save nothing is pending", form.values() == {})
+    form._widgets["clips.frames"].setValue(50)
+    check("changing back after a save is a change", form.values().get("clips.frames") == 50)
 
 
-def test_a_half_typed_pair_is_left_out_not_raised(app) -> None:
-    """``0.5, -`` is a normal state mid-keystroke; the changed slot must not raise."""
+def test_an_absent_key_is_shown_at_its_default(app) -> None:
+    """A key the file does not mention shows the value the loader uses."""
+    from trackanno.config import section_defaults
     from trackanno.gui.configform import ConfigForm
 
-    form = next(f for f in (ConfigForm("basic"), ConfigForm("advanced"))
-                if "normalize.percentiles" in f._widgets)
-    widget = form._widgets["normalize.percentiles"]
-    for text in ("0.5, -", "0.5, 99.5, 1", "x, y"):
-        widget.setText(text)
-        check(f"{text!r} is left out of the values",
-              "normalize.percentiles" not in form._raw_values())
-        check("...and is warned about", "normalize.percentiles" in form.warnings())
-    widget.setText("0.5, 99.5")
-    check("a complete pair parses", form.values()["normalize.percentiles"] == [0.5, 99.5])
+    form = ConfigForm("all")
+    form.load({})
+    shown = form.current()
+    checked = 0
+    for dotted, kind in form._kinds.items():
+        section, _, key = dotted.partition(".")
+        default = section_defaults(section).get(key)
+        if default is None or kind in ("dir", "file"):
+            continue
+        check(f"{dotted} is shown at its default", shown[dotted] == default,
+              f"{shown[dotted]!r} vs {default!r}")
+        checked += 1
+    check("there were defaults to check", checked >= 15, str(checked))
+    check("and none of them is offered for writing", form.values() == {})
+
+
+def test_the_form_shows_what_the_loader_uses(app) -> None:
+    """Project B omits or retires what project A set; the form shows B's effective values."""
+    from trackanno.gui.configform import ConfigForm
+
+    form = ConfigForm("all")
+    form.load({
+        "paths": {"work_dir": "./elsewhere", "csv": "./a.csv"},
+        "clips": {"frames": 40, "stride": 10, "min_clip_frames": 10},
+        "suggest": {"select_rule": "margin", "feature_groups": ["kinematic"]},
+        "detection": {"imgsz": 1280},
+    })
+    form.load({
+        "clips": {"frames": 25, "min_clip_frames": 10},
+        "suggest": {"select_rule": "entropy", "context_frames": 5},
+    })
+    shown = form.current()
+    check("an omitted path shows its default", shown["paths.work_dir"] == "./work"
+          and shown["paths.csv"] == "./annotations.csv", str(shown["paths.work_dir"]))
+    check("an omitted stride shows clips.frames", shown["clips.stride"] == 25,
+          str(shown["clips.stride"]))
+    check("a retired value shows its replacement", shown["suggest.select_rule"] == "margin",
+          shown["suggest.select_rule"])
+    check("omitted feature groups show the effective set",
+          shown["suggest.feature_groups"] == ["kinematic", "pose", "waveform", "context"],
+          str(shown["suggest.feature_groups"]))
+    check("an omitted number shows its default", shown["detection.imgsz"] == 640)
+    check("nothing is offered for writing", form.values() == {})
 
 
 def test_a_cleared_warning_gives_the_tooltip_back(app) -> None:
@@ -474,6 +382,7 @@ def test_refused_edits_survive_reloads_and_guard_navigation(app, root: Path) -> 
     index = hub.pages.index(page)
     hub.go_to(index)
     app.processEvents()
+    good = path.read_text(encoding="utf-8")
 
     stride = page.advanced._widgets["predict.window_stride"]
     stride.auto.setChecked(False)
@@ -487,20 +396,26 @@ def test_refused_edits_survive_reloads_and_guard_navigation(app, root: Path) -> 
           not stride.auto.isChecked() and stride.edit.value() == 999,
           str(stride.edit.value()))
 
-    answers: list[bool] = []
-    page._ask_discard = lambda: answers.pop(0)
-    answers.append(False)
+    answers: list[str] = []
+    page._ask_unsaved = lambda: answers.pop(0)
+    answers.append("save")
     hub.go_to(0)
     app.processEvents()
-    check("Stay keeps the Configure page", hub.stack.currentWidget() is page)
+    check("a refused Save keeps the Configure page", hub.stack.currentWidget() is page)
     check("...and the edit", stride.edit.value() == 999)
+    check("...and the file", path.read_text(encoding="utf-8") == good)
 
-    answers.append(True)
+    answers.append("cancel")
+    hub.go_to(0)
+    app.processEvents()
+    check("Cancel keeps the Configure page", hub.stack.currentWidget() is page)
+
+    answers.append("discard")
     hub.go_to(0)
     app.processEvents()
     check("Discard leaves the page", hub.stack.currentWidget() is not page)
     check("...and reverts the field to the file", stride.auto.isChecked())
-    check("...and nothing is pending", not page._dirty and page.maybe_save())
+    check("...and nothing is pending", not page._dirty and page.confirm_leave())
 
     hub.close()
     app.processEvents()

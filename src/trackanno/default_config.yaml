@@ -1,265 +1,134 @@
 # =============================================================================
 # trackanno project configuration
-#
-# Created by the New Project screen. Every value here is editable from the
-# Configure tab, which rewrites this file in place and keeps these comments.
-# Paths are resolved relative to THIS file.
+# Edited by the Configure page, which keeps these comments. Paths are relative
+# to this file.
 # =============================================================================
 
 paths:
-  # Folder containing the movies. .tif/.tiff and .nd2 are both read natively.
-  video_dir: "./videos"
-  # YOLO weights used for detection (and pose, if detection.task is 'pose').
-  model: "./best.pt"
-  # Clip cache + per-movie tables. KEEP THIS ON A LOCAL DISK: the GUI does
-  # ~1 MB random reads per clip and over a network share that latency is what
-  # you feel.
-  work_dir: "./work"
-  # The annotation log. One row per annotated clip; this file IS the state.
-  csv: "./annotations.csv"
+  video_dir: "./videos"       # folder holding the movies (.tif, .tiff, .nd2)
+  model: "./best.pt"          # YOLO weights used for detection
+  work_dir: "./work"          # clip cache and per-movie tables; keep it on a local disk
+  csv: "./annotations.csv"    # the annotation log, one row per labelled clip
   patterns: ["*.tif", "*.tiff", "*.nd2"]
 
 
-# --- ND2-specific reading ----------------------------------------------------
-# ND2 files can carry P (multipoint), T, C and Z axes. We need a single 2D
-# grayscale time series, so choose how to collapse the extra axes.
+# --- ND2 reading: collapse the extra axes to one 2D time series --------------
 nd2:
-  channel: 0          # channel index, or its name as a string (e.g. "BF")
-  z: 0                # z index, or "max" / "mean" / "min" for a projection
-  positions: all      # "all", or a list like [0, 2, 5]. Each P becomes a movie.
-  fps: auto           # "auto" reads the frame interval from the ND2 metadata
+  channel: 0          # index, or the channel name as a string (e.g. "BF")
+  z: 0                # index, or "max" / "mean" / "min" for a projection
+  positions: all      # "all", or a list like [0, 2, 5]; each position is a movie
+  fps: auto           # auto reads the frame interval from the file
 
 
-# --- TIFF-specific reading ---------------------------------------------------
+# --- TIFF reading -------------------------------------------------------------
 tiff:
   fps: 100            # TIFF carries no frame rate; set the acquisition rate
   channel: 0
 
 
-# --- Raw -> uint8 intensity mapping ------------------------------------------
-#   per_frame -> own mapping per frame (default; flattest)
-#   fixed     -> one mapping for the whole movie (faithful, including flicker)
+# --- Raw to 8-bit intensity ---------------------------------------------------
 normalize:
-  mode: per_frame
+  mode: per_frame     # per_frame: a mapping per frame | fixed: one per movie
   percentiles: [0.5, 99.5]
-  subsample: 4
 
 
 # --- Detection ---------------------------------------------------------------
 detection:
-  task: detect        # "pose" (model predicts keypoints) or "detect" (boxes)
-  conf: 0.25
-  iou: 0.5            # per-tile NMS
-  imgsz: 640          # inference size - match what the model was trained at
-  max_det: 300
-  device: auto        # auto = first CUDA GPU, else Apple MPS, else the CPU.
-                      # "0" pins the first CUDA device, "mps", or "cpu".
-  batch: 8            # tiles per forward pass (lower if the GPU runs out of memory)
-  half: false
+  task: detect        # pose (keypoints) | detect (boxes only)
+  conf: 0.25          # minimum detection confidence
+  device: auto        # auto | cpu | mps | a CUDA index such as "0"
+  batch: 8            # tiles per forward pass; lower it if the GPU runs out of memory
+  imgsz: 640          # resolution each tile is seen at; match the model's training size
+  half: false         # fp16 inference on a GPU
 
 
-# --- Detection model ---------------------------------------------------------
-# Leave `source` empty to use paths.model, a .pt file on this machine. Otherwise
-# name a model from the registry (Configure -> "From registry...") or give an
-# https URL to a .pt, and it is downloaded once into a shared cache. `sha256` is
-# filled in on the first fetch and pins the weights from then on, so a release
-# that later moves is a loud mismatch rather than a different model under the
-# same name.
+# --- Detection model ----------------------------------------------------------
+# Empty source uses paths.model. Otherwise a registry id or an https URL to a
+# .pt; sha256 is filled in on the first fetch and pins the weights.
 model:
   source: ""
   version: ""
   sha256: ""
 
 
-# --- Tiled inference ---------------------------------------------------------
-# Movies larger than one model input get cut into overlapping tiles, run as a
-# batch, mapped back to full-frame coordinates and merged with a global NMS.
-# Frames that already fit in one tile skip all of this automatically.
+# --- Tiled inference ----------------------------------------------------------
 tiling:
-  enabled: auto       # auto | true | false
-  tile: 640           # how the frame is CUT; detection.imgsz is the resolution
-                      # each tile is SEEN at
-  overlap: 0.25
-  merge_iou: 0.6
-  drop_edge_truncated: true
-  edge_margin_px: 2
+  enabled: auto       # auto tiles only frames larger than one tile | true | false
+  tile: 640           # tile size cut from the frame, in pixels
+  overlap: 0.25       # share of a tile shared with its neighbour
+  merge_iou: 0.6      # boxes from two tiles overlapping more than this are one animal
 
 
 # --- Tracking ----------------------------------------------------------------
 tracking:
   backend: tracktrack       # tracktrack | bytetrack | botsort | ocsort | greedy
-  tracker_cfg: ""           # "" = the backend's bundled ultralytics yaml
-  overrides:
-    # Compensates for CAMERA motion. On a static stage everything that moves is
-    # an animal, so leave this off or a global transform gets fitted to them.
-    gmc_method: none
   min_track_length: 40      # drop tracks seen in fewer frames than this
-  # Exclude the frames where a track reaches the edge of the picture, where the
-  # animal is partly outside it: the box is cut off by the frame rather than by
-  # the animal ending, and a pose model places its keypoints against a shape
-  # that is not all there. Nothing reports that - the detector is confident
-  # about the part it can see - so it has to be excluded rather than detected.
-  # The track itself survives; only its time at the edge does not.
-  border_margin_px: 0       # how near the edge counts as at it; 0 = keep every frame
-  border_max_frac: 0.0      # share of ONE CLIP's frames allowed there before it goes
-  greedy_max_dist_px: 25
+  border_margin_px: 0       # how near the frame edge counts as at it; 0 is off
+  border_max_frac: 0.0      # share of one clip's frames allowed at the edge
+  overrides:                # parameters passed to the tracker
+    gmc_method: none        # camera-motion compensation; off on a static stage
 
 
-# --- Keypoints (only used when detection.task is 'pose') ---------------------
-# The order MUST match the trained model.
+# --- Keypoints (detection.task: pose); the order must match the model ---------
 keypoints:
   nodes: []
   edges: []
 
 
-# --- Clip extraction ---------------------------------------------------------
+# --- Clips -------------------------------------------------------------------
 clips:
-  frames: 50          # clip length -> "50 frames of a single track"
-  stride: 50          # == frames means non-overlapping windows. Below frames
-                      # the clips OVERLAP.
-
-  # How much of each movie becomes clips:
-  #   first           -> ONLY the movie's first `frames` frames
-  #   first_per_track -> the first full window of each track
-  #   all             -> every non-overlapping window of every track
-  window_mode: all
-
-  # The crop follows the animal; `follow` sets how closely:
-  #   track  -> re-centred every frame. Smallest crop, translation invisible.
-  #   smooth -> centre follows a moving average.  (default)
-  #   fixed  -> one crop for the window. All motion visible, biggest crop.
-  follow: smooth
-  crop_from: bbox     # bbox | union
-  smooth_window: 25
-
-  pad: 1.6            # crop = per-frame box extent x this
-  crop_size: auto     # "auto" = p99 of the required sizes, rounded to /16
-  max_size: 256
-  min_clip_frames: 40
-  max_clips_per_track: 0   # 0 = unlimited
-  context_tracks: true     # record neighbouring tracks that fall in the crop
+  frames: 50          # frames per clip; also the window the model is fitted at
+  stride: 50          # frames between clip starts; equal to frames tiles
+  window_mode: all    # first | first_per_track | all
+  follow: smooth      # how the crop follows the animal: smooth | fixed | track
+  pad: 1.6            # crop side = box extent x this
+  crop_size: auto     # cache crop size; auto is the p99 of what is needed
+  min_clip_frames: 40 # detected frames a window needs to become a clip
 
 
-# --- Per-detection detector embeddings ----------------------------------------
-# Pooled from the SAME forward pass as detection - no second pass. Used by the
-# suggestion model only through a `detector` entry in suggest.embeddings.
+# --- Detector embeddings, saved during detection ------------------------------
 features:
   enabled: true
-  levels: [P3, P4, P5]
-  pool: 1
-  dtype: float16
+
+
+# --- Beat spectrum ------------------------------------------------------------
+spectral:
+  window: 75          # frames the beat spectrum is measured over, centred on the clip
 
 
 # --- Annotation suggestions ---------------------------------------------------
-# Trains a classifier on your labels and SUGGESTS a category. The suggestion is
-# displayed only - never pre-selected - so your labels stay independent of the
-# model trained on them. It stays silent until it clears a chance-corrected bar.
+# A classifier trained on your labels suggests a category; it never pre-selects.
 suggest:
   enabled: true
-  model: catboost       # catboost | hist (sklearn HistGradientBoosting)
-  # Which processor fits the trees: cpu | gpu | auto. CatBoost only; 'gpu' with
-  # model 'hist' is refused. CatBoost's GPU uses 128 feature borders against the
-  # CPU's 254, so the two fit different models, and it is slower below roughly
-  # 50 000 rows. 'auto' takes a GPU where CatBoost sees one; 'gpu' raises where
-  # there is none.
-  device: cpu
-  # Which families of measurement the model may use. 'pose'/'waveform' are
-  # skipped automatically when detection.task is 'detect'.
-  #   kinematic  trajectory and box shape   (always available)
-  #   pose       body/flagellum, beat       (needs task: pose)
-  #   waveform   beat shape after Geyer, Howard & Sartori 2022 (needs task: pose)
-  #   context    kinematic features over context_frames (needs context_frames > 0)
-  #   emb_<name> an embedding declared below
+  model: catboost       # catboost | hist (scikit-learn HistGradientBoosting)
+  device: cpu           # cpu | gpu | auto (CatBoost only)
+  # kinematic | pose | waveform | context | emb_<name>
   feature_groups: [kinematic, pose, waveform]
-  # Per-detection embedding inputs, off by default. Each becomes the group
-  # emb_<name> (add it to feature_groups) with columns emb_<name>_<i>_{mean,std,delta}.
-  # A file source is one table per movie with track_id, frame and numeric columns.
-  # embeddings:
-  #   - {name: det, source: detector}          # needs features.enabled
-  #   - {name: ae, source: file, path: embeddings/{movie_id}.parquet}
+  # Embedding inputs, e.g. {name: det, source: detector} or
+  # {name: ae, source: file, path: embeddings/{movie_id}.parquet}
   embeddings: []
-  # Kinematic features again over this many frames centred on each window,
-  # as the 'context' group (ctx_* columns). 0 is off.
-  context_frames: 0
-  # The finest cut: the columns themselves, by name. null means "do not cut
-  # here", which is every column the groups above selected. A list NARROWS that
-  # set rather than replacing it, so every name has to belong to a group that is
-  # still ticked. The Model page's feature table is what makes a column worth
-  # dropping.
-  feature_columns: null
-  pca_components: 32   # PCA width of each embedding
-  retrain_every: 10     # retrain in the background after this many new labels
-  min_per_class: 5
-  min_macro_f1: 0.45
-  audit_fraction: 0.10
-  # Held-out clips show NO suggestion at any confidence. Set audit_fraction
-  # to 0 to suggest on every clip and give up the agreement measure; set
-  # audit_visible to true to be told which clips those are.
-  #
-  # Which clips these are is decided by a hash of the clip_id ONLY while a clip
-  # is unlabelled. The moment you label one, whether it was held out is written
-  # into the `audit_holdout` column of annotations.csv and that recording is what
-  # counts from then on. It has to be: clip_id embeds the track id, so re-running
-  # detection would otherwise redraw the holdout from scratch and clips the model
-  # was kept away from would end up in its training set. Raising or lowering
-  # audit_fraction therefore changes which of your UNLABELLED clips are held out
-  # and leaves the ones you have already judged where they are.
-  audit_visible: false  # share of clips that never show a suggestion, so
-                        # human-vs-model agreement stays measurable
-  seed: 0
-
-  # -- Which clip you are asked about next -------------------------------------
-  # Off out of the box: clips arrive in the GUI's seeded shuffle, so the labelled
-  # set is a random sample of the project and every number computed over it - the
-  # class balance, the cross-validated F1 - is a statement about your data.
-  #
-  # Turn it on and the model ranks the unlabelled clips by how unsure it is and
-  # hands you the ones a label would teach it most. That saves your time and
-  # costs something specific: the labelled set is now assembled to be HARD, so
-  # accuracy measured on it reads lower than the truth by an amount nobody can
-  # work out afterwards. Every row records why it was shown (the `selected_by`
-  # column of annotations.csv), and audit-holdout clips are never ranked, which
-  # is why audit_fraction: 0 with a rule set is refused rather than warned about.
-  #   off     -> manifest/shuffle order, exactly as before  (default)
-  #   margin  -> smallest gap between the model's top two answers.
-  select_rule: "off"    # quote it: an unquoted `off` is a YAML boolean
-  # Clips per batch. Twice retrain_every, so a batch outlasts the model that
-  # produced it.
-  select_batch_size: 20
+  context_frames: 0     # frames of kinematic context around each window; 0 is off
+  feature_columns: null # narrow the groups to these columns; null keeps every column
+  retrain_every: 10     # refit in the background after this many new labels
+  min_per_class: 5      # a class with fewer labels is not modelled
+  audit_fraction: 0.10  # share of tracks held out, so agreement stays measurable
+  min_confidence: 0.0   # hide suggestions below this confidence
+  select_rule: "off"    # off: shuffled order | margin: least certain first
+  iterations: 1000      # boosting rounds per fit
+  learning_rate: auto   # boosting step size; auto lets the estimator choose
+  l2_leaf_reg: 3.0      # L2 regularisation of the leaf values
 
 
-# --- Bulk labelling ----------------------------------------------------------
-# What `trackanno predict` writes to predictions.parquet: decoded
-# bouts over every frame of every track. Windows of clips.frames (the length the
-# model was fitted at) are laid over each track, their class probabilities are
-# averaged per frame, and the per-frame argmax is cut into bouts. No pixels are
-# read: features come from tracks.parquet and instance_features.npy.
+# --- Bulk labelling (trackanno predict) ---------------------------------------
 predict:
-  # Frames from one window's start to the next.
-  #   auto (= clips.frames) -> the windows tile; a change of behaviour is
-  #              reported to within one window.  (default)
-  #   below clips.frames -> the windows overlap, and a transition is pinned to
-  #              within one stride. Costs proportionally more windows.
-  #   above clips.frames -> refused: it leaves frames no window scores.
-  window_stride: auto
-
-  # Detections a dense window needs before it is featurised. NOT
-  # clips.min_clip_frames - that guarantees a watchable video clip, and nothing
-  # here is watched. 2 is the floor at which any motion feature can exist.
-  # Windows below it still get a ROW, with an empty prediction and a
-  # skip_reason saying why.
-  min_frames: 2
-
-  # The shortest bout worth believing, in frames: a claim about the ANIMAL, not
-  # the model. Shorter runs are absorbed into whichever neighbour their own
-  # frames score higher. 0 keeps every run of the per-frame argmax.
-  min_bout_frames: 0
+  window_stride: auto   # frames between window starts; auto is clips.frames
+  min_bout_frames: 0    # shorter bouts join a neighbour; 0 keeps every run
+  min_frames: 2         # detections a window needs to be featurised
 
 
-# --- Annotation categories ---------------------------------------------------
-# Each group becomes a block of buttons. `key` is the keyboard shortcut and
-# `color` is used for the buttons AND the rendered overlay movie.
-# EDIT THESE - the ones below are placeholders.
+# --- Annotation categories ----------------------------------------------------
+# Each group is a block of buttons; `key` is its shortcut, `color` is used on
+# screen and in rendered movies. Replace these placeholders.
 categories:
   - name: behaviour
     type: single          # single = one choice | multi = checkboxes
@@ -278,42 +147,16 @@ categories:
       - {name: track_switch, key: "e", color: "#BB2222"}
 
 
-# --- GUI ---------------------------------------------------------------------
+# --- Annotation window --------------------------------------------------------
 ui:
-  theme: dark          # dark | light | system (follow the desktop)
-  fps: 20               # playback rate in the GUI (not the acquisition rate)
-  autoplay: true
-  loop: true
-  auto_advance: true    # one keypress labels and jumps to the next clip
+  theme: dark           # dark | light | system; applies on next start
+  fps: 20               # playback rate in the annotation window
+  auto_advance: true    # one keypress labels the clip and moves on
+  shuffle: true         # annotate in a seeded random order
+  annotator: ""         # written into every row of the CSV
+  kymo_sign: canonical  # canonical: flip each kymograph to its dominant sign | raw
 
-  # Annotate in a seeded random order. Going movie-by-movie invites order
-  # effects - you calibrate on the first movie and drift.
-  shuffle: true
-  shuffle_seed: 0
-
-  show_overlay: true          # mark the animal this clip is about (key: o)
-  show_skeleton: false        # pose keypoints on top of the marker
-  show_context_tracks: false  # ALSO outline other tracks in the crop (key: c).
-                              # Off by default: the marker's job is to say which
-                              # animal is being judged.
-
-  # What the view follows (key: s cycles):
-  #   centred -> one view on the track's median position; all motion visible
-  #   locked  -> re-centred every frame; translation invisible by construction
-  follow: centred
-  view_zoom: 1.0        # magnification into the crop (keys: + / - / 0)
-  # Curvature of the flagellum along its length against time, drawn under
-  # the clip. Only appears when detection.task is 'pose'.
-  show_kymograph: true
-  kymo_smooth_px: 0.6      # how far the fitted centreline may leave a keypoint
-  # A 2D image cannot tell a cell from its mirror, so the same beat can come
-  # out blue in one clip and red in the next. canonical | raw
-  kymo_sign: canonical
-  prefetch: 8           # clips read ahead in the background
-  resume: first_unannotated   # first_unannotated | last_position
-  annotator: ""
-
-# Keyboard shortcuts. Category keys are defined per option above.
+# Keyboard shortcuts. Category keys are set per option above.
 keys:
   next: ["Right", "Return"]
   prev: ["Left"]
@@ -331,16 +174,9 @@ keys:
   undo: ["Ctrl+Z"]
 
 
-# --- Overlay movie rendering -------------------------------------------------
+# --- Overlay movies -----------------------------------------------------------
 render:
-  fps: auto             # auto = the movie's own frame rate
+  fps: auto             # auto is the movie's own frame rate
   out_dir: "./renders"
-  thickness: 2
-  font_scale: 0.4
-  show_track_id: true
-  show_category: true
-  show_skeleton: false
   hide_unlabelled: false
-  unlabelled_color: "#555555"
-  codec: libx264
-  quality: 8
+  show_skeleton: false

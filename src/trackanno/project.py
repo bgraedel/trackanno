@@ -150,7 +150,7 @@ def write_config(path: str | Path, updates: dict, categories: list[dict] | None 
 
     With ``validate`` the candidate is parsed by the real loader *before* it
     replaces anything, so an edit that would not load is refused outright rather
-    than written and rolled back. That is what lets the GUI autosave.
+    than written and rolled back.
     """
     path = Path(path)
     text = candidate_config(path, updates, categories, keypoints)
@@ -177,7 +177,8 @@ def write_config(path: str | Path, updates: dict, categories: list[dict] | None 
 @dataclass
 class ProjectStatus:
     config_path: Path
-    n_videos: int = 0
+    # None when the folder answered but listing it timed out.
+    n_videos: int | None = 0
     n_prepared: int = 0
     # Movies whose detections are here but whose clips are not: the state a
     # project is in when detection ran on another machine.
@@ -190,10 +191,17 @@ class ProjectStatus:
     model_ok: bool = False
     video_dir_ok: bool = False
     suggester: str = ""
+    # False when the work-dir scan timed out: the counts above are unknown, not 0.
+    work_known: bool = True
+
+    @property
+    def videos_text(self) -> str:
+        """``n_videos`` for display; "?" when the listing timed out."""
+        return "? (share slow, not counted)" if self.n_videos is None else str(self.n_videos)
 
     @property
     def can_prepare(self) -> bool:
-        return self.video_dir_ok and self.model_ok and self.n_videos > 0
+        return self.video_dir_ok and self.model_ok and self.n_videos != 0
 
     @property
     def can_annotate(self) -> bool:
@@ -286,82 +294,138 @@ def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
     return False
 
 
+_LIST_TIMEOUT = 3.0          # seconds a directory listing on a share may take
+
+
+def _bounded(fn, default, timeout: float | None = None):
+    """``fn()``, or ``default`` if it raises or outlasts ``timeout``."""
+    import threading
+
+    result: list = []
+
+    def work():
+        try:
+            result.append(fn())
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(_LIST_TIMEOUT if timeout is None else timeout)
+    return result[0] if result else default
+
+
+def _count_videos(video_dir: Path, patterns) -> int:
+    seen = set()
+    for pattern in patterns:
+        seen.update(p for p in video_dir.glob(pattern) if p.is_file())
+    return len(seen)
+
+
+def _count_rows(path: Path) -> int:
+    """Distinct clip ids in the annotation CSV, parsed so quoted newlines count once."""
+    import csv
+
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, [])
+        if "clip_id" not in header:
+            return 0
+        col = header.index("clip_id")
+        return len({row[col] for row in reader if len(row) > col and row[col]})
+
+
+def _scan_work(cfg, work: Path) -> dict:
+    """Counts and suggester state from the work dir, from markers and small JSON."""
+    from .annotate.clips import DETECT_FILE, DONE_FILE
+
+    out = {"n_detected": 0, "n_stale": 0, "n_prepared": 0, "n_clips": 0, "suggester": ""}
+    try:
+        movie_dirs = sorted(work.iterdir())
+    except OSError:
+        movie_dirs = []
+    for movie_dir in movie_dirs:
+        if not _exists(movie_dir, "dir"):
+            continue
+        # Detected but not yet cut: the movie has tracks, from this machine or
+        # a GPU box, and still needs its clips. It is deliberately NOT counted
+        # as prepared - there is nothing to annotate yet.
+        has_handoff = _exists(movie_dir / DETECT_FILE)
+        if has_handoff:
+            out["n_detected"] += 1
+        if has_handoff or _exists(movie_dir / DONE_FILE):
+            try:
+                from .detect.prepare import stale_reasons
+
+                if stale_reasons(cfg, movie_dir.name, check_model=False):
+                    out["n_stale"] += 1
+            except Exception:
+                pass
+        done = movie_dir / DONE_FILE
+        if not _exists(done):
+            continue
+        out["n_prepared"] += 1
+        try:
+            out["n_clips"] += int(json.loads(done.read_text(encoding="utf-8"))["n_clips"])
+        except (OSError, KeyError, ValueError):
+            pass
+
+    report = work / "suggest_report.json"
+    if _exists(report):
+        try:
+            reports = json.loads(report.read_text(encoding="utf-8"))
+            live = [g for g, r in reports.items() if r.get("reliable")]
+            out["suggester"] = (
+                "suggesting: " + ", ".join(live) if live
+                else "trained, staying silent"
+            )
+        except (OSError, ValueError):
+            out["suggester"] = "unreadable report"
+    return out
+
+
+def scan_work(cfg) -> dict:
+    """The work-dir counts of :class:`ProjectStatus`, with no time limit."""
+    return _scan_work(cfg, cfg.paths.work_dir)
+
+
 def project_status(cfg) -> ProjectStatus:
     """Summarise a project without opening a movie or a clip cache.
 
-    Directory listings and small JSON reads only: this runs every time the
-    workflow window is shown, where one ND2 open on a share is a visible stall.
+    Directory listings and small JSON reads only, each bounded in time: this
+    runs every time the workflow window is shown, and any path may be a share.
     """
     status = ProjectStatus(config_path=cfg.path)
     video_dir = cfg.paths.video_dir
-    # A path on a disconnected share does not answer "no", it RAISES: Windows
-    # reports WinError 64 out of is_dir(), glob() and is_file() alike. The clip
-    # cache is local, so annotating needs no share and that must not propagate.
+    # A path on a disconnected share does not answer "no", it RAISES or hangs:
+    # Windows reports WinError 64 out of is_dir(), glob() and is_file() alike.
     status.video_dir_ok = _exists(video_dir, "dir")
     if status.video_dir_ok:
-        seen = set()
-        try:
-            for pattern in cfg.paths.patterns:
-                seen.update(p for p in video_dir.glob(pattern) if p.is_file())
-        except OSError:
-            status.video_dir_ok = False
-        status.n_videos = len(seen)
-    from .annotate.clips import DETECT_FILE, DONE_FILE
+        def count() -> int:
+            try:
+                return _count_videos(video_dir, cfg.paths.patterns)
+            except OSError:
+                return -1
+
+        n_videos = _bounded(count, None)
+        if n_videos == -1:
+            status.video_dir_ok, status.n_videos = False, 0
+        else:
+            status.n_videos = n_videos
     from .video.models import local_model_path
 
     status.model_ok = _exists(local_model_path(cfg), "file")
 
     work = cfg.paths.work_dir
     if _exists(work, "dir"):
-        try:
-            movie_dirs = sorted(work.iterdir())
-        except OSError:
-            movie_dirs = []
-        for movie_dir in movie_dirs:
-            if not _exists(movie_dir, "dir"):
-                continue
-            # Detected but not yet cut: the movie has tracks, from this machine or
-            # a GPU box, and still needs its clips. It is deliberately NOT counted
-            # as prepared - there is nothing to annotate yet.
-            has_handoff = _exists(movie_dir / DETECT_FILE)
-            if has_handoff:
-                status.n_detected += 1
-            if has_handoff or _exists(movie_dir / DONE_FILE):
-                try:
-                    from .detect.prepare import stale_reasons
-
-                    if stale_reasons(cfg, movie_dir.name, check_model=False):
-                        status.n_stale += 1
-                except Exception:
-                    pass
-            done = movie_dir / DONE_FILE
-            if not _exists(done):
-                continue
-            status.n_prepared += 1
-            try:
-                status.n_clips += int(json.loads(done.read_text(encoding="utf-8"))["n_clips"])
-            except (OSError, KeyError, ValueError):
-                pass
-
-        report = work / "suggest_report.json"
-        if _exists(report):
-            try:
-                reports = json.loads(report.read_text(encoding="utf-8"))
-                live = [g for g, r in reports.items() if r.get("reliable")]
-                status.suggester = (
-                    "suggesting: " + ", ".join(live) if live
-                    else "trained, staying silent"
-                )
-            except (OSError, ValueError):
-                status.suggester = "unreadable report"
+        scanned = _bounded(lambda: _scan_work(cfg, work), None)
+        status.work_known = scanned is not None
+        for name, value in (scanned or {}).items():
+            setattr(status, name, value)
 
     csv = cfg.paths.csv
     if _exists(csv):
-        try:
-            with open(csv, "r", encoding="utf-8") as fh:
-                status.n_annotated = max(0, sum(1 for _ in fh) - 1)
-        except OSError:
-            pass
+        status.n_annotated = _bounded(lambda: _count_rows(csv), 0)
     return status
 
 
@@ -378,33 +442,32 @@ def _state_dir() -> Path:
     return Path(base) / "trackanno"
 
 
-def recent_projects() -> list[Path]:
-    """Most recently opened first. Paths that have vanished are dropped."""
+def _recent_entries() -> list[Path]:
+    """The recent list as stored, without touching the paths in it."""
     path = _state_dir() / RECENT_FILE
-    if not path.exists():
-        return []
     try:
         entries = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    out, seen = [], set()
-    for entry in entries:
-        candidate = Path(str(entry))
-        if candidate.exists() and candidate not in seen:
-            seen.add(candidate)
-            out.append(candidate)
-    return out[:MAX_RECENT]
+    if not isinstance(entries, list):
+        return []
+    return list(dict.fromkeys(Path(str(entry)) for entry in entries))
+
+
+def recent_projects() -> list[Path]:
+    """Most recently opened first. Paths that are gone or unreachable are dropped."""
+    return [p for p in _recent_entries() if _exists(p)][:MAX_RECENT]
 
 
 def remember_project(config_path: str | Path) -> None:
     path = Path(config_path).resolve()
-    entries = [str(path)] + [str(p) for p in recent_projects() if p != path]
+    entries = [str(path)] + [str(p) for p in _recent_entries() if p != path]
     _write_recent(entries[:MAX_RECENT])
 
 
 def forget_project(config_path: str | Path) -> None:
     path = Path(config_path).resolve()
-    _write_recent([str(p) for p in recent_projects() if p != path])
+    _write_recent([str(p) for p in _recent_entries() if p != path])
 
 
 def _write_recent(entries: list[str]) -> None:

@@ -23,7 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import Config
+from ..config import FIXED_SETTINGS, Config
+
+# Distance gate of the greedy fallback tracker, in pixels.
+GREEDY_MAX_DIST_PX = FIXED_SETTINGS["tracking.greedy_max_dist_px"]
 from .tiling import Detections
 
 __all__ = ["Tracker", "build_tracker"]
@@ -97,8 +100,7 @@ def _tracker_args(cfg: Config, fps: float):
     from types import SimpleNamespace
 
     backend = cfg.tracking.backend
-    default_yaml = TRACKERS.get(backend, ("", "bytetrack.yaml"))[1]
-    wanted = cfg.tracking.tracker_cfg or default_yaml
+    wanted = TRACKERS.get(backend, ("", "bytetrack.yaml"))[1]
 
     params: dict = {}
     try:
@@ -214,7 +216,7 @@ class GreedyTracker(Tracker):
     """Nearest-centroid matching with a hard distance gate."""
 
     def __init__(self, cfg: Config, fps: float):
-        self.max_dist = float(cfg.tracking.greedy_max_dist_px)
+        self.max_dist = float(GREEDY_MAX_DIST_PX)
         self.max_age = max(1, int(round(fps / 30.0 * 30)))
         self.reset()
 

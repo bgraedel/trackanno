@@ -27,9 +27,9 @@ N_FRAMES, HEIGHT, WIDTH = 120, 512, 512
 CONFIG_TEXT = """
 paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
 tiff:   {fps: 100}
-detection: {task: detect, imgsz: 640}
-clips:  {frames: 50, stride: 50, window_mode: all, follow: fixed, crop_from: union,
-         pad: 1.6, crop_size: 96, max_size: 256, min_clip_frames: 40}
+detection: {task: detect}
+clips:  {frames: 50, stride: 50, window_mode: all, follow: fixed,
+         pad: 1.6, crop_size: 96, min_clip_frames: 40}
 normalize: {mode: fixed}
 tracking: {min_track_length: 50}
 categories:
@@ -125,7 +125,6 @@ def test_frames_at_the_frame_edge_are_excluded_but_the_track_survives(cfg, movie
     cfg.clips.min_clip_frames = 1
     cfg.clips.stride = length
     cfg.clips.window_mode = "all"
-    cfg.clips.max_clips_per_track = 0
 
     check("off by default, so an existing project plans what it always did",
           cfg.tracking.border_margin_px == 0
@@ -458,14 +457,17 @@ def test_pipeline(root, cfg, movie, tracks) -> None:
     per_track = plan_clips(tracks, movie.id, movie.n_frames, cfg)
     check("window_mode=first_per_track yields one clip per track", len(per_track) == 2)
 
-def test_follow_modes(cfg, movie, tracks) -> None:
+def test_follow_modes(cfg, movie, tracks, monkeypatch) -> None:
     """Crop sizing by per-frame bbox must be much smaller than by union."""
     import cv2
+
+    import trackanno.annotate.clips as clips_module
 
     cfg.clips.window_mode = "all"
     sizes = {}
     for follow, crop_from in [("fixed", "union"), ("smooth", "bbox"), ("track", "bbox")]:
-        cfg.clips.follow, cfg.clips.crop_from = follow, crop_from
+        cfg.clips.follow = follow
+        monkeypatch.setattr(clips_module, "CROP_FROM", crop_from)
         cfg.clips.crop_size = "auto"
         specs = plan_clips(tracks, movie.id, movie.n_frames, cfg)
         sizes[follow] = choose_crop_size(specs, cfg)
@@ -478,7 +480,7 @@ def test_follow_modes(cfg, movie, tracks) -> None:
           sizes["track"] <= sizes["smooth"] <= sizes["fixed"], str(sizes))
 
     # A moving crop must still map back to the original pixels exactly.
-    cfg.clips.follow, cfg.clips.crop_from = "track", "bbox"
+    cfg.clips.follow = "track"
     specs = plan_clips(tracks, movie.id, movie.n_frames, cfg)
     size = choose_crop_size(specs, cfg)
     origins = finalise_geometry(specs, size, cfg.clips.frames)

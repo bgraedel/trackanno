@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..config import FIXED_SETTINGS
+
 __all__ = [
     "active", "basis_hash", "BASES_FILE", "DETECTOR_FILE", "column_names",
     "detection_vectors",
@@ -29,8 +31,10 @@ __all__ = [
 
 BASES_FILE = "embedding_pca.joblib"
 DETECTOR_FILE = "instance_features.npy"
-# Rows the PCA is fitted on at most, drawn with the suggest seed.
+# Rows the PCA is fitted on at most, drawn with SEED.
 PCA_MAX_ROWS = 200_000
+PCA_COMPONENTS = FIXED_SETTINGS["suggest.pca_components"]   # width of each embedding
+SEED = FIXED_SETTINGS["suggest.seed"]
 STATS = ("mean", "std", "delta")
 EMBEDDING_COLUMN = re.compile(r"^emb_(?P<name>[A-Za-z0-9]+)_(?P<i>\d+)_(?P<stat>mean|std|delta)$")
 
@@ -155,7 +159,7 @@ def fit_bases(cfg, vectors: dict, reporter=None) -> dict:
     """
     from sklearn.decomposition import PCA
 
-    rng = np.random.default_rng(cfg.suggest.seed)
+    rng = np.random.default_rng(SEED)
     bases = {}
     for name, by_movie in vectors.items():
         sources = {m: v if isinstance(v, tuple) else (len(v), lambda v=v: v)
@@ -182,8 +186,8 @@ def fit_bases(cfg, vectors: dict, reporter=None) -> dict:
         stacked = np.concatenate(parts, axis=0)
         if not len(stacked):
             raise RuntimeError(f"embedding {name!r} has no complete vector in any movie")
-        n_comp = int(min(cfg.suggest.pca_components, stacked.shape[0], stacked.shape[1]))
-        pca = PCA(n_components=n_comp, random_state=cfg.suggest.seed).fit(stacked)
+        n_comp = int(min(PCA_COMPONENTS, stacked.shape[0], stacked.shape[1]))
+        pca = PCA(n_components=n_comp, random_state=SEED).fit(stacked)
         bases[name] = pca
         if reporter is not None:
             reporter.log(

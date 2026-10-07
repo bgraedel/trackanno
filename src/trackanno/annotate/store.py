@@ -18,10 +18,13 @@ import json
 import math
 import os
 import shutil
+import socket
 import tempfile
 import threading
+import time
 import warnings
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +36,7 @@ __all__ = [
     "encode_provenance", "decode_provenance",
     "encode_audit", "decode_audit", "read_audit_records",
     "IDENTITY_COLUMNS", "TRAILING_COLUMNS",
+    "CsvLockedError", "csv_lock",
 ]
 
 MULTI_SEP = "|"
@@ -297,6 +301,129 @@ def read_audit_records(path: str | Path) -> dict[str, bool]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# cross-process lock
+# --------------------------------------------------------------------------- #
+LOCK_STALE_S = 600.0
+LOCK_WAIT_S = 15.0
+
+
+class CsvLockedError(OSError):
+    """Another process is writing the annotation CSV."""
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists on this machine."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.GetLastError() == 5  # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_holder(lock: Path) -> dict:
+    try:
+        return json.loads(lock.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return {}
+
+
+def _lock_is_stale(lock: Path) -> bool:
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return False
+    if age > LOCK_STALE_S:
+        return True
+    holder = _lock_holder(lock)
+    pid = holder.get("pid")
+    return (holder.get("host") == socket.gethostname() and isinstance(pid, int)
+            and not _pid_alive(pid))
+
+
+def _try_lock(path: Path) -> bool:
+    """Create the lock file once, breaking a stale one. True if acquired."""
+    lock = _lock_path(path)
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not _lock_is_stale(lock):
+                return False
+            lock.unlink(missing_ok=True)
+            continue
+        except OSError as exc:
+            # Windows denies access to a lock file whose deletion is pending;
+            # that file still answers stat with an error other than not-found.
+            try:
+                os.stat(lock)
+            except FileNotFoundError:
+                raise OSError(
+                    exc.errno, f"cannot create {lock} ({exc.strerror}); "
+                    "the annotation folder must be writable"
+                ) from exc
+            except OSError:
+                pass
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "host": socket.gethostname(),
+                       "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}, fh)
+        return True
+    return False
+
+
+def _unlock(path: Path) -> None:
+    _lock_path(path).unlink(missing_ok=True)
+
+
+@contextmanager
+def csv_lock(path: str | Path, wait: float | None = None):
+    """Hold ``<csv>.lock`` for the duration; raise `CsvLockedError` after ``wait`` s."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + (LOCK_WAIT_S if wait is None else wait)
+    while not _try_lock(path):
+        if time.monotonic() >= deadline:
+            holder = _lock_holder(_lock_path(path))
+            who = f"pid {holder.get('pid')} on {holder.get('host')}" if holder else "another process"
+            raise CsvLockedError(
+                f"{path.name} is being written by {who}; try again, or delete "
+                f"{_lock_path(path).name} if that process is gone"
+            )
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
+        _unlock(path)
+
+
+def _norm(row: dict | None) -> dict | None:
+    """A row as comparable text, ignoring empty cells."""
+    if row is None:
+        return None
+    return {k: str(v) for k, v in row.items() if k is not None and v not in ("", None)}
+
+
 class AnnotationStore:
     def __init__(self, path: str | Path, cfg: Config):
         self.path = Path(path)
@@ -321,6 +448,11 @@ class AnnotationStore:
         # All CSV access is serialised: the GUI retrains on a background thread,
         # and on Windows os.replace() fails outright if another handle is open.
         self._lock = threading.RLock()
+        # Disk state at our last read or write, for detecting other writers.
+        self._base: dict[str, dict] = {}
+        self._stat: tuple[int, int] | None = None
+        self._held = False
+        self._needs_rewrite = False
         self._load()
 
     # -- io ----------------------------------------------------------------- #
@@ -350,22 +482,30 @@ class AnnotationStore:
         except OSError:
             pass
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        self._repair_torn_append()
+    def _disk_stat(self) -> tuple[int, int] | None:
+        try:
+            st = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
 
+    def _read_disk(self) -> tuple[list[str], dict[str, dict], list[str]]:
+        """Header, rows by clip_id and first-seen order, straight off the file."""
+        rows: dict[str, dict] = {}
+        order: list[str] = []
         with open(self.path, "r", encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh)
-            disk_columns = list(reader.fieldnames or [])
+            columns = list(reader.fieldnames or [])
             for row in reader:
                 clip_id = row.get("clip_id")
                 if not clip_id:
                     continue
-                if clip_id not in self.rows:
-                    self._order.append(clip_id)
-                self.rows[clip_id] = row
+                if clip_id not in rows:
+                    order.append(clip_id)
+                rows[clip_id] = row
+        return columns, rows, order
 
+    def _widen(self, disk_columns: list[str]) -> None:
         # Category groups can change between sessions. Never append against a
         # stale header (it shifts every later column), and never rewrite with
         # only the new columns (it drops historical ones): take the union.
@@ -377,21 +517,19 @@ class AnnotationStore:
             warnings.warn(
                 f"{self.path.name} has column(s) not in the current config: {extra}. "
                 "They are preserved but no longer written to.",
-                stacklevel=2,
+                stacklevel=3,
             )
             self.columns = self.columns + extra
-        for row in self.rows.values():
+
+    def _stamp(self, rows: dict[str, dict]) -> tuple[int, int]:
+        """Fill missing columns and freeze audit membership, in place.
+
+        Returns ``(stamped, held_by_record)``.
+        """
+        stamped, by_record = 0, 0
+        for clip_id, row in rows.items():
             for col in self.columns:
                 row.setdefault(col, "")
-
-        # FREEZE the audit membership of every labelled clip that has not
-        # recorded one, at whatever the hash says TODAY, so the holdout an
-        # existing project has now is the holdout it keeps, clip for clip.
-        # Here rather than at train time because this module owns the file: a
-        # fit must be able to READ the membership without deciding it, or two
-        # fits of the same project could disagree.
-        stamped, by_record = 0, 0
-        for clip_id, row in self.rows.items():
             try:
                 member = decode_audit(row.get(AUDIT_COLUMN))
             except ValueError as exc:
@@ -402,6 +540,24 @@ class AnnotationStore:
                 stamped += 1
             elif member != hashed:
                 by_record += 1
+        return stamped, by_record
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        self._repair_torn_append()
+        self._stat = self._disk_stat()
+        disk_columns, self.rows, self._order = self._read_disk()
+        self._widen(disk_columns)
+
+        # FREEZE the audit membership of every labelled clip that has not
+        # recorded one, at whatever the hash says TODAY, so the holdout an
+        # existing project has now is the holdout it keeps, clip for clip.
+        # Here rather than at train time because this module owns the file: a
+        # fit must be able to READ the membership without deciding it, or two
+        # fits of the same project could disagree.
+        stamped, by_record = self._stamp(self.rows)
+        self._base = {cid: _norm(row) for cid, row in self.rows.items()}
 
         if stamped and AUDIT_COLUMN not in disk_columns:
             warnings.warn(
@@ -441,8 +597,68 @@ class AnnotationStore:
         # appending to an upgraded file writes a row one field SHORT, which
         # reads back as unrecorded while the header on disk already matches, so
         # a stamp left in memory would be recomputed on the next open.
-        if stamped or (disk_columns and disk_columns != self.columns):
-            self.rewrite()
+        self._needs_rewrite = bool(stamped or (disk_columns and disk_columns != self.columns))
+        # Deferred to the next write while another process holds the lock.
+        try:
+            locked = self._needs_rewrite and _try_lock(self.path)
+        except OSError:
+            locked = False  # read-only: open anyway, writes will say why
+        if locked:
+            self._held = True
+            try:
+                self._sync()
+                self.rewrite()
+            finally:
+                self._held = False
+                _unlock(self.path)
+
+    @contextmanager
+    def _writing(self):
+        """Hold the thread and file locks, with memory synced to disk."""
+        with self._lock:
+            if self._held:
+                yield
+                return
+            with csv_lock(self.path):
+                self._held = True
+                try:
+                    self._sync()
+                    yield
+                finally:
+                    self._held = False
+
+    def _sync(self) -> None:
+        """Merge rows another process wrote since our last read or write.
+
+        Three-way by clip_id against the disk state last seen: a row changed
+        here keeps this version, any other row takes the disk's.
+        """
+        stat = self._disk_stat()
+        if stat == self._stat:
+            return
+        if stat is None:
+            self._needs_rewrite = True
+            return
+        self._repair_torn_append()
+        disk_columns, theirs, their_order = self._read_disk()
+        self._widen(disk_columns)
+        stamped, _ = self._stamp(theirs)
+        merged: dict[str, dict] = {}
+        for clip_id in dict.fromkeys([*self._order, *their_order, *self._base]):
+            ours = self.rows.get(clip_id)
+            changed_here = _norm(ours) != self._base.get(clip_id)
+            pick = ours if changed_here else theirs.get(clip_id)
+            if pick is not None:
+                merged[clip_id] = pick
+        seen = set(self._order)
+        self._order = [c for c in self._order if c in merged] + [
+            c for c in their_order if c in merged and c not in seen
+        ]
+        self.rows = merged
+        self._stamp(self.rows)
+        self._base = {cid: _norm(row) for cid, row in theirs.items()}
+        self._stat = self._disk_stat()
+        self._needs_rewrite = bool(stamped or disk_columns != self.columns)
 
     def _write_header_if_needed(self) -> None:
         if self.path.exists() and self.path.stat().st_size > 0:
@@ -454,16 +670,21 @@ class AnnotationStore:
             os.fsync(fh.fileno())
 
     def _append(self, row: dict) -> None:
-        with self._lock:
+        with self._writing():
+            if self._needs_rewrite:
+                self.rewrite()
+                return
             self._write_header_if_needed()
             with open(self.path, "a", encoding="utf-8", newline="") as fh:
                 csv.DictWriter(fh, fieldnames=self.columns, extrasaction="ignore").writerow(row)
                 fh.flush()
                 os.fsync(fh.fileno())
+            self._base[str(row["clip_id"])] = _norm(row)
+            self._stat = self._disk_stat()
 
     def rewrite(self) -> None:
         """Atomically rewrite the whole file (used when an existing row is edited)."""
-        with self._lock:
+        with self._writing():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".csv.tmp")
             try:
@@ -479,6 +700,9 @@ class AnnotationStore:
             except BaseException:
                 Path(tmp).unlink(missing_ok=True)
                 raise
+            self._base = {cid: _norm(self.rows[cid]) for cid in self._order if cid in self.rows}
+            self._stat = self._disk_stat()
+            self._needs_rewrite = False
 
     def snapshot(self, destination: Path) -> Path:
         """Copy the CSV under the lock, for a reader on another thread: reading
@@ -545,6 +769,12 @@ class AnnotationStore:
         forget it. See :meth:`_audit_membership`.
         """
         clip_id = str(meta["clip_id"])
+        with self._writing():
+            return self._record(clip_id, meta, values, uncertain, notes, dwell_s,
+                                suggestion, suggestion_shown, selected_by)
+
+    def _record(self, clip_id, meta, values, uncertain, notes, dwell_s,
+                suggestion, suggestion_shown, selected_by) -> dict:
         previous = self.rows.get(clip_id)
 
         row = {
@@ -643,7 +873,7 @@ class AnnotationStore:
 
     def undo(self) -> str | None:
         """Revert the most recent record(). Returns the affected clip_id."""
-        with self._lock:
+        with self._writing():
             if not self._undo_stack:
                 return None
             clip_id, previous, position = self._undo_stack.pop()
@@ -661,7 +891,7 @@ class AnnotationStore:
             return clip_id
 
     def clear(self, clip_id: str) -> None:
-        with self._lock:
+        with self._writing():
             if clip_id not in self.rows:
                 return
             position = self._order.index(clip_id) if clip_id in self._order else len(self._order)

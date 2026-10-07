@@ -17,9 +17,12 @@ from __future__ import annotations
 import os
 import contextlib
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Per-user state (recent list, view toggles) never touches the real profile.
+os.environ.setdefault("TRACKANNO_STATE_DIR", tempfile.mkdtemp(prefix="trackanno-state-"))
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -85,3 +88,12 @@ def root(tmp_path_factory, request):
         os.environ.pop("TRACKANNO_STATE_DIR", None)
     else:
         os.environ["TRACKANNO_STATE_DIR"] = previous
+
+
+@pytest.fixture(autouse=True)
+def _no_unsaved_prompt(request, monkeypatch):
+    """Unsaved Configure edits are discarded instead of opening a modal box."""
+    if "app" in request.fixturenames:
+        monkeypatch.setattr("trackanno.gui.hub.ConfigPage._ask_unsaved",
+                            lambda self: "discard")
+    yield

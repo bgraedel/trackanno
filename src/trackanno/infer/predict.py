@@ -28,7 +28,7 @@ import pandas as pd
 
 from .bouts import decode_min_bout, frame_posterior, runs_to_bouts
 from ..measure.clipfeatures import CLIP_FEATURES_FILE
-from ..annotate.clips import StagedWrite
+from ..annotate.clips import TRACKS_FILE, StagedWrite
 from ..config import Config, load_config
 from ..learn.suggest import MODEL_FILE, REPORT_FILE, Suggester
 
@@ -174,6 +174,21 @@ def _labelled_mask(spans, f_lo: int, f_hi: int) -> np.ndarray:
     return mask
 
 
+def _detected_spans(cfg: Config, movie_ids) -> dict[tuple[str, int], tuple[int, int]]:
+    """``{(movie_id, track_id): (first, last + 1)}`` detected frame per track."""
+    out: dict[tuple[str, int], tuple[int, int]] = {}
+    for movie_id in sorted(set(movie_ids)):
+        path = cfg.paths.work_dir / str(movie_id) / TRACKS_FILE
+        try:
+            tracks = pd.read_parquet(path, columns=["track_id", "frame"])
+        except (OSError, ValueError, KeyError):
+            continue
+        span = tracks.groupby("track_id")["frame"].agg(["min", "max"])
+        for track_id, lo, hi in zip(span.index, span["min"], span["max"]):
+            out[(str(movie_id), int(track_id))] = (int(lo), int(hi) + 1)
+    return out
+
+
 def _bout_id(movie_id: str, track_id: int, f_start: int, f_end: int) -> str:
     """The identity of one decoded bout, and deliberately NOT a ``clip_id``.
 
@@ -263,9 +278,10 @@ def _bout_predictions(
     back as an all-NaN posterior row, decodes to ``-1``, and leaves the span as a
     bout with an empty label and a ``skip_reason``.
 
-    The span decoded for a track is the union of ITS OWN WINDOWS, not the range
-    of its detections: a window legitimately reaches past the first and last
-    detection, and those frames carry real evidence.
+    The posterior is built over the union of a track's windows, then cut to its
+    first and last detection before decoding, so no bout covers frames before
+    the track appears or after it ends. Gaps inside the track are left to the
+    windows: one too thin to featurise yields an unlabelled bout.
     """
     movie_ids = features["movie_id"].astype(str).to_numpy()
     track_ids = features["track_id"].to_numpy(dtype=np.int64)
@@ -339,6 +355,7 @@ def _bout_predictions(
     del matrix
 
     labelled = _human_spans(cfg, groups)
+    detected = _detected_spans(cfg, movie_ids)
     by_track = pd.DataFrame(
         {"movie_id": movie_ids, "track_id": track_ids}
     ).groupby(["movie_id", "track_id"], sort=True).indices
@@ -356,17 +373,23 @@ def _bout_predictions(
         spans = np.column_stack(
             [starts[usable], stops[usable]]
         ) if usable.size else np.zeros((0, 2), dtype=np.int64)
+        first, last = detected.get((str(movie_id), int(track_id)), (f_lo, f_hi))
+        d_lo, d_hi = max(f_lo, first), min(f_hi, last)
+        if d_hi <= d_lo:
+            d_lo, d_hi = f_lo, f_hi
+        cut = slice(d_lo - f_lo, d_hi - f_lo)
         human = _labelled_mask(
-            labelled.get((str(movie_id), int(track_id)), ()), f_lo, f_hi
+            labelled.get((str(movie_id), int(track_id)), ()), d_lo, d_hi
         )
 
         for group in groups:
             posterior, covering = frame_posterior(
                 spans, proba_by_group[group][rank[usable]], f_lo, f_hi
             )
+            posterior, covering = posterior[cut], covering[cut]
             labels = decode_min_bout(posterior, min_bout)
-            for bout in runs_to_bouts(labels, posterior, classes_by_group[group], f_lo):
-                lo, hi = bout["f_start"] - f_lo, bout["f_end"] - f_lo
+            for bout in runs_to_bouts(labels, posterior, classes_by_group[group], d_lo):
+                lo, hi = bout["f_start"] - d_lo, bout["f_end"] - d_lo
                 row = {
                     "bout_id": _bout_id(
                         movie_id, track_id, bout["f_start"], bout["f_end"]
@@ -385,7 +408,7 @@ def _bout_predictions(
                     "skip_reason": "" if bout["label"] else (
                         f"no window over frames {bout['f_start']}-{bout['f_end']} "
                         f"could be featurised, so those frames have no posterior "
-                        f"to decode; predict.min_frames is {min_frames}"
+                        f"to decode; a window needs {min_frames} detections"
                     ),
                     "human_overlap_frac": float(human[lo:hi].mean()),
                 }

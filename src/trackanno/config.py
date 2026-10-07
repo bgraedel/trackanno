@@ -1,30 +1,32 @@
 """Typed configuration loaded from ``config.yaml``.
 
-Plain dataclasses rather than pydantic: the schema is small, and validation
-errors here should read like advice, not like a stack trace.
+One dataclass per section. Each field carries its default, a one-line help
+string and its allowed values; :func:`_parse_section` reads any section from
+that metadata. Hand-written code is kept for rules that span fields.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from dataclasses import fields as dataclasses_fields
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, ClassVar
 
 import yaml
 
-__all__ = ["Config", "load_config", "CategoryGroup", "CategoryOption",
-           "ModelSource", "RESERVED_GROUP_NAMES", "section_defaults"]
+__all__ = ["Config", "ConfigError", "load_config", "CategoryGroup", "CategoryOption",
+           "ModelSource", "RESERVED_GROUP_NAMES", "FIXED_SETTINGS", "VIEW_SETTINGS",
+           "SECTIONS", "section_defaults", "effective_values", "schema_keys", "help_for",
+           "meta_for"]
 
 # A category group becomes a CSV column, so a group named like a built-in column
-# silently overwrites it. Hand-maintained mirror of ``store.IDENTITY_COLUMNS``
-# and ``store.TRAILING_COLUMNS``, kept here rather than imported to avoid the
-# import cycle. Nothing in the language holds the two together;
-# ``tests/test_store_provenance.py`` asserts they are equal. Add to both, or to
-# neither.
+# would overwrite it. Mirrors ``store.IDENTITY_COLUMNS`` and
+# ``store.TRAILING_COLUMNS`` (not imported, to avoid a cycle);
+# ``tests/test_store_provenance.py`` asserts they are equal.
 RESERVED_GROUP_NAMES = frozenset({
     "clip_id", "movie_id", "source_file", "series", "channel",
     "track_id", "f_start", "f_end",
@@ -36,393 +38,482 @@ RESERVED_GROUP_NAMES = frozenset({
 
 
 class ConfigError(ValueError):
-    """Raised for a malformed config.yaml, with a message aimed at a human."""
+    """A malformed config.yaml, with a one-line message."""
 
 
 # --------------------------------------------------------------------------- #
-# helpers
+# migration tables
 # --------------------------------------------------------------------------- #
+# Settings that are no longer configurable, with the value now used. Modules
+# read their constants from here, so the warning and the code cannot disagree.
+FIXED_SETTINGS: dict[str, Any] = {
+    "normalize.subsample": 4,
+    "detection.iou": 0.5,
+    "detection.max_det": 300,
+    "tiling.drop_edge_truncated": True,
+    "tiling.edge_margin_px": 2,
+    "tracking.greedy_max_dist_px": 25.0,
+    "tracking.tracker_cfg": "",
+    "features.levels": ["P3", "P4", "P5"],
+    "features.pool": 1,
+    "features.dtype": "float16",
+    "spectral.hop": 5,
+    "spectral.flow_frames": 5,
+    "suggest.pca_components": 32,
+    "suggest.min_macro_f1": 0.45,
+    "suggest.seed": 0,
+    "suggest.audit_seed": 12345,
+    "suggest.depth": 6,
+    "suggest.balance_classes": True,
+    "suggest.select_batch_size": 20,
+    "suggest.audit_visible": False,
+    "clips.crop_from": "bbox",
+    "clips.smooth_window": 25,
+    "clips.max_size": 256,
+    "clips.context_tracks": True,
+    "clips.max_clips_per_track": 0,
+    "ui.autoplay": True,
+    "ui.loop": True,
+    "ui.prefetch": 8,
+    "ui.resume": "first_unannotated",
+    "ui.shuffle_seed": 0,
+    "ui.show_kymograph": True,
+    "ui.kymo_smooth_px": 0.6,
+    "render.thickness": 2,
+    "render.font_scale": 0.4,
+    "render.show_track_id": True,
+    "render.show_category": True,
+    "render.unlabelled_color": "#555555",
+    "render.codec": "libx264",
+    "render.quality": 8,
+}
 
-def _section(data: dict, name: str) -> dict:
-    value = data.get(name, {})
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ConfigError(f"config section '{name}' must be a mapping, got {type(value).__name__}")
-    return value
+# Extra advice for a fixed setting whose old value had a replacement.
+_FIXED_HINTS = {
+    "tracking.tracker_cfg": "set tracker parameters under tracking.overrides",
+}
+
+# Display toggles that moved to per-user settings in the annotation window,
+# with the default each starts at.
+VIEW_SETTINGS: dict[str, Any] = {
+    "ui.show_overlay": True,
+    "ui.show_skeleton": False,
+    "ui.show_context_tracks": False,
+    "ui.follow": "centred",
+    "ui.view_zoom": 1.0,
+}
+
+# Keys removed outright, with the one-line reason.
+_REMOVED_KEYS = {
+    "predict.decode": "Viterbi decoding was removed; predict.min_bout_frames is the hard floor",
+    "predict.self_transition": "Viterbi decoding was removed; predict.min_bout_frames is the hard floor",
+}
+
+# Removed values of settings that remain, and what an old config now gets.
+REMOVED_VALUES: dict[str, dict[str, str]] = {
+    "normalize.mode": {"smooth": "per_frame", "none": "fixed"},
+    "suggest.select_rule": {"least_confidence": "margin", "entropy": "margin"},
+    "ui.kymo_sign": {"absolute": "canonical"},
+}
+REMOVED_NORMALIZE_MODES = REMOVED_VALUES["normalize.mode"]
 
 
-def _known(section: str, given: dict, allowed: Sequence[str]) -> None:
-    unknown = set(given) - set(allowed)
-    if unknown:
-        warnings.warn(
-            f"ignoring unknown key(s) in config section '{section}': {sorted(unknown)}",
-            stacklevel=3,
-        )
+def _warn(message: str) -> None:
+    warnings.warn(message, stacklevel=4)
 
 
-def _optional_auto(value, where: str, expected: str):
-    """A setting that may say ``auto``: ``None`` for auto, the value otherwise.
+# Old values that already meant the fixed one.
+_FIXED_ALIASES = {"tracking.tracker_cfg": (None,)}
 
-    ``None`` rather than the resolved number: what ``auto`` stands for is a fact
-    about another section (``clips.frames``, ``audit_fraction``) this parse
-    cannot see yet, and a config that says ``auto`` should keep saying it when
-    the GUI writes the file back.
+
+def _same(value, fixed) -> bool:
+    """Whether an old config's ``value`` is the fixed one, loosely typed."""
+    if isinstance(fixed, list):
+        return isinstance(value, (list, tuple)) and             [str(x).upper() for x in value] == [str(x).upper() for x in fixed]
+    converter = {bool: _to_bool, int: _to_float, float: _to_float}.get(type(fixed), _to_str)
+    try:
+        return converter(value) == fixed
+    except _Bad:
+        return False
+
+
+def _migrate_key(dotted: str, value) -> bool:
+    """Warn about a key the schema no longer has. True when it was handled."""
+    if dotted in FIXED_SETTINGS:
+        fixed = FIXED_SETTINGS[dotted]
+        hint = _FIXED_HINTS.get(dotted)
+        if _same(value, fixed) or value in _FIXED_ALIASES.get(dotted, ()):
+            _warn(f"{dotted} is no longer configurable; using {fixed!r}")
+        else:
+            _warn(f"{dotted} is no longer configurable; using {fixed!r}, NOT the "
+                  f"{value!r} this config sets" + (f" ({hint})" if hint else ""))
+        return True
+    if dotted in VIEW_SETTINGS:
+        _warn(f"{dotted} is now a per-user view setting in the annotation window; "
+              "ignoring it here")
+        return True
+    if dotted in _REMOVED_KEYS:
+        _warn(f"ignoring {dotted}: {_REMOVED_KEYS[dotted]}")
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# field metadata and the generic parse
+# --------------------------------------------------------------------------- #
+def knob(default, help: str = "", *, choices=None, min=None, max=None, below=None,
+         special: tuple = (), parse: Callable | None = None):
+    """A setting: its default, one line of help and what it accepts.
+
+    ``choices`` limits string values (a callable is read lazily), ``min``/``max``
+    bound numbers inclusively and ``below`` exclusively, ``special`` lists words
+    a numeric setting also takes (``auto``), ``parse`` replaces the coercion.
     """
-    if isinstance(value, str):
-        if value != "auto":
-            raise ConfigError(f"{where} must be {expected}, got {value!r}")
+    meta = {"help": help, "choices": choices, "min": min, "max": max, "below": below,
+            "special": tuple(special), "parse": parse}
+    if isinstance(default, (list, dict)):
+        return field(default_factory=lambda: copy.deepcopy(default), metadata=meta)
+    return field(default=default, metadata=meta)
+
+
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0"}
+
+
+class _Bad(Exception):
+    """A value that does not fit one type in a union."""
+
+
+def _to_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in _TRUE | _FALSE:
+        return v.strip().lower() in _TRUE
+    raise _Bad
+
+
+def _to_int(v):
+    if isinstance(v, bool):
+        raise _Bad
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str):
+        try:
+            number = float(v)
+        except ValueError:
+            raise _Bad from None
+        if number.is_integer():
+            return int(number)
+    raise _Bad
+
+
+def _to_float(v):
+    if isinstance(v, bool):
+        raise _Bad
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            raise _Bad from None
+    raise _Bad
+
+
+def _to_str(v):
+    if isinstance(v, (dict, list, tuple)):
+        raise _Bad
+    return str(v)
+
+
+def _to_str_list(v):
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v]
+    raise _Bad
+
+
+def _to_int_list(v):
+    items = v if isinstance(v, (list, tuple)) else [v]
+    return [_to_int(x) for x in items]
+
+
+def _to_dict(v):
+    if isinstance(v, dict):
+        return dict(v)
+    raise _Bad
+
+
+_CONVERT = {
+    "bool": (_to_bool, "true or false"), "int": (_to_int, "a whole number"),
+    "float": (_to_float, "a number"), "str": (_to_str, "text"),
+    "Path": (_to_str, "a path"), "list[str]": (_to_str_list, "a list of names"),
+    "list[int]": (_to_int_list, "a list of whole numbers"),
+    "dict": (_to_dict, "a mapping"),
+}
+
+
+def _choices(meta: dict) -> list | None:
+    c = meta.get("choices")
+    if c is None:
         return None
-    return value
+    return list(c() if callable(c) else c)
 
 
-def _selection_rule(d: dict) -> str:
-    """``select_rule`` as ``off`` or ``margin``, or a refusal."""
-    raw = d.get("select_rule", "off")
-    if isinstance(raw, bool):
-        # YAML reads a bare `off` as a boolean.
-        raise ConfigError(
-            "suggest.select_rule came through as a YAML boolean, which is what an "
-            "unquoted `off`/`on` becomes. Quote it: select_rule: \"off\"."
-        )
-    rule = str(raw)
-    if rule in ("least_confidence", "entropy"):
-        warnings.warn(
-            f"suggest.select_rule {rule!r} is no longer available; using 'margin'",
-            stacklevel=3,
-        )
-        return "margin"
-    if rule not in ("off", "margin"):
-        raise ConfigError(
-            f"suggest.select_rule must be \"off\" or \"margin\", got {rule!r}"
-        )
-    return rule
-
-
-def _feature_columns(value, groups: list[str]) -> list[str] | None:
-    """``suggest.feature_columns``, checked against the vocabulary and the groups.
-
-    ``None`` (and an absent key) means "do not cut here"; a list narrows what
-    ``feature_groups`` selected. The names are checked against
-    :func:`trackanno.measure.clipfeatures.known_columns`, which is the full set a
-    built table can hold, so a typo is refused here rather than silently changing
-    the feature space the model was fitted in. Only when the key is given: the
-    schema pulls the measurement modules in, and the default path must not pay
-    for that.
-
-    A name whose family is not in ``feature_groups`` is refused rather than
-    turning that family back on, because the two keys would then disagree about
-    what the model may see and only one of them would be on screen.
-    """
-    if value is None:
+def _coerce(where: str, value, type_text: str, meta: dict):
+    """``value`` as the field's type, checked against its choices and range."""
+    special = meta["special"]
+    if isinstance(value, str) and value in special:
+        return value
+    kinds = [k.strip() for k in type_text.split("|")]
+    if value is None and "None" in kinds:
         return None
-    if isinstance(value, str):
-        raise ConfigError(
-            f"suggest.feature_columns must be a list of column names, got the "
-            f"string {value!r}. One name is still a list: [{value}]."
-        )
-    names = [str(c).strip() for c in value]
-    if not names:
-        raise ConfigError(
-            "suggest.feature_columns is an empty list, so the model would have no "
-            "inputs at all. 'every column the feature groups selected' is written "
-            "as null, not as []."
-        )
-    repeated = sorted({n for n in names if names.count(n) > 1})
-    if repeated:
-        raise ConfigError(
-            f"suggest.feature_columns names {repeated} more than once. A column "
-            "listed twice is not weighted twice, so the repeat says something the "
-            "model cannot do; drop it."
-        )
-
-    import difflib
-
-    from .measure.clipfeatures import group_of, known_columns
-    from .measure.embeddings import EMBEDDING_COLUMN
-
-    # Embedding names are matched by shape: their width follows the PCA, and
-    # training refuses the ones the table actually lacks.
-    vocabulary = known_columns()
-    unknown = [n for n in names
-               if n not in set(vocabulary) and not EMBEDDING_COLUMN.match(n)]
-    if unknown:
-        near = difflib.get_close_matches(unknown[0], vocabulary, n=4, cutoff=0.6)
-        raise ConfigError(
-            f"suggest.feature_columns names {len(unknown)} column(s) no feature "
-            f"table has: {unknown[:6]}"
-            + (f". Did you mean {', '.join(near)}?" if near else ".")
-            + " Pick them on the Configure page, which lists what this project can "
-            "actually compute, or set the key to null to use every column the "
-            "feature groups selected."
-        )
-    outside = sorted({n for n in names if group_of(n) not in groups})
-    if outside:
-        families = sorted({str(group_of(n)) for n in outside})
-        raise ConfigError(
-            f"suggest.feature_columns names {outside[:6]} from the feature "
-            f"group(s) {families}, which suggest.feature_groups does not include "
-            f"({groups}). The two keys would then disagree about what the model may "
-            "see. Either add the group to suggest.feature_groups, or drop those "
-            "columns from suggest.feature_columns."
-        )
-    return names
+    if special:
+        kinds = [k for k in kinds if k != "str"]
+    choices = _choices(meta)
+    if choices is not None and isinstance(value, bool) and "bool" not in kinds:
+        # An unquoted on/off arrives as a YAML boolean.
+        word = "on" if value else "off"
+        value = word if word in choices else value
+    out = _NOTHING = object()
+    for kind in kinds:
+        convert = _CONVERT.get(kind)
+        if convert is None:
+            continue
+        try:
+            out = convert[0](value)
+            break
+        except _Bad:
+            continue
+    if out is _NOTHING:
+        shapes = [_CONVERT[k][1] for k in kinds if k in _CONVERT]
+        shapes += [repr(s) for s in special]
+        raise ConfigError(f"{where} must be {' or '.join(shapes)}, got {value!r}")
+    if isinstance(out, str) and choices is not None and out not in choices:
+        raise ConfigError(f"{where} must be one of {choices}, got {out!r}")
+    if isinstance(out, (int, float)) and not isinstance(out, bool):
+        lo, hi, below = meta["min"], meta["max"], meta["below"]
+        if (lo is not None and out < lo) or (hi is not None and out > hi) \
+                or (below is not None and out >= below):
+            span = (f"at least {lo}" if hi is None and below is None
+                    else f"in [{lo if lo is not None else '-inf'}, "
+                         f"{below if below is not None else hi}"
+                         f"{')' if below is not None else ']'}")
+            raise ConfigError(f"{where} must be {span}, got {out!r}")
+    return out
 
 
-_CLIP_ID = re.compile(r"^(?P<movie>.+)__t(?P<track>\d+)__f\d+$")
+def _parse_section(cls, d: dict, root: Path | None = None, name: str | None = None):
+    """Build section ``cls`` from mapping ``d`` using its field metadata."""
+    name = name or cls.NAME
+    d = dict(d or {})
+    known = {f.name for f in dataclasses_fields(cls)}
+    for key in [k for k in d if k not in known]:
+        if not _migrate_key(f"{name}.{key}", d[key]):
+            _warn(f"ignoring unknown key {name}.{key}")
+        d.pop(key)
+    values = {}
+    for f in dataclasses_fields(cls):
+        where = f"{name}.{f.name}"
+        given = f.name in d and (d[f.name] is not None or "None" in str(f.type))
+        if given:
+            raw = d[f.name]
+            old = REMOVED_VALUES.get(where, {})
+            if isinstance(raw, str) and raw in old:
+                _warn(f"{where}: {raw!r} was removed; using {old[raw]!r}")
+                raw = old[raw]
+            parse = f.metadata.get("parse")
+            values[f.name] = (parse(raw, where) if parse
+                              else _coerce(where, raw, str(f.type), f.metadata))
+        if str(f.type) == "Path":
+            value = values.get(f.name, _default_of(f))
+            values[f.name] = _resolve(root, value) if root is not None else Path(str(value))
+    obj = cls(**values)
+    obj._check(d)
+    return obj
 
 
-def audit_track_key(clip_id: str) -> str:
-    """``movie_id::track_id`` for a clip_id, the unit the audit holdout is drawn
-    over. An id not in ``clip_id_for`` form is its own key."""
-    m = _CLIP_ID.match(str(clip_id))
-    if m is None:
-        return str(clip_id)
-    return f"{m['movie']}::{int(m['track'])}"
+class _Section:
+    """Shared parse for every section dataclass."""
+
+    NAME: ClassVar[str] = ""
+
+    @classmethod
+    def parse(cls, d: dict | None = None, root: Path | None = None):
+        return _parse_section(cls, d or {}, root)
+
+    def _check(self, raw: dict) -> None:
+        """Rules that span fields. ``raw`` is the mapping as given."""
+
+
+def _resolve(root: Path, value) -> Path:
+    p = Path(str(value).replace("\\", "/"))
+    return p if p.is_absolute() or str(p).startswith("//") else (root / p).resolve()
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
-    """'#4C9F70' -> (76, 159, 112). Everything downstream works in RGB."""
+    """'#4C9F70' -> (76, 159, 112)."""
     s = color.lstrip("#")
     if len(s) == 3:
         s = "".join(c * 2 for c in s)
     if len(s) != 6:
         raise ConfigError(f"colour {color!r} is not a #rrggbb hex string")
-    return tuple(int(s[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    try:
+        return tuple(int(s[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        raise ConfigError(f"colour {color!r} is not a #rrggbb hex string") from None
 
 
 # --------------------------------------------------------------------------- #
 # sections
 # --------------------------------------------------------------------------- #
 @dataclass
-class Paths:
-    video_dir: Path
-    model: Path
-    work_dir: Path
-    csv: Path
-    patterns: list[str] = field(default_factory=lambda: ["*.tif", "*.tiff", "*.nd2"])
+class Paths(_Section):
+    NAME: ClassVar[str] = "paths"
 
-    @classmethod
-    def parse(cls, d: dict, root: Path) -> "Paths":
-        _known("paths", d, ["video_dir", "model", "work_dir", "csv", "patterns"])
-        return cls(
-            video_dir=_resolve(root, d.get("video_dir", "./videos")),
-            model=_resolve(root, d.get("model", "./best.pt")),
-            work_dir=_resolve(root, d.get("work_dir", "./work")),
-            csv=_resolve(root, d.get("csv", "./annotations.csv")),
-            patterns=list(d.get("patterns", ["*.tif", "*.tiff", "*.nd2"])),
-        )
-
-
-def _resolve(root: Path, value: str | Path) -> Path:
-    p = Path(str(value).replace("\\", "/"))
-    return p if p.is_absolute() or str(p).startswith("//") else (root / p).resolve()
+    video_dir: Path = knob("./videos", "Folder holding the movies (.tif, .tiff, .nd2).")
+    model: Path = knob("./best.pt", "YOLO weights used for detection.")
+    work_dir: Path = knob("./work", "Clip cache and per-movie tables; keep it on a local disk.")
+    csv: Path = knob("./annotations.csv", "The annotation log, one row per labelled clip.")
+    patterns: list[str] = knob(["*.tif", "*.tiff", "*.nd2"],
+                               "Which files in the video folder are movies.")
 
 
 @dataclass
-class ND2Options:
-    channel: int | str = 0
-    z: int | str = 0
-    positions: str | list[int] = "all"
-    fps: float | str = "auto"
+class ND2Options(_Section):
+    NAME: ClassVar[str] = "nd2"
 
-    @classmethod
-    def parse(cls, d: dict) -> "ND2Options":
-        _known("nd2", d, ["channel", "z", "positions", "fps"])
-        z = d.get("z", 0)
-        if isinstance(z, str) and z not in ("max", "mean", "min"):
-            raise ConfigError("nd2.z must be an integer index or one of 'max', 'mean', 'min'")
-        return cls(
-            channel=d.get("channel", 0),
-            z=z,
-            positions=d.get("positions", "all"),
-            fps=d.get("fps", "auto"),
-        )
-
-
-# Removed normalize.mode values and the mode an old config now gets instead.
-REMOVED_NORMALIZE_MODES = {"smooth": "per_frame", "none": "fixed"}
+    channel: int | str = knob(0, "Channel index, or its name.")
+    z: int | str = knob(0, "Z index, or max / mean / min for a projection.",
+                        choices=("max", "mean", "min"))
+    positions: str | list[int] = knob("all", "'all', or a list of positions; each is a movie.",
+                                      special=("all",))
+    fps: float | str = knob("auto", "Frame rate; auto reads it from the file.",
+                            special=("auto",), min=0)
 
 
 @dataclass
-class Normalize:
-    """How raw frames become uint8: ``per_frame`` or ``fixed`` percentiles."""
+class TiffOptions(_Section):
+    NAME: ClassVar[str] = "tiff"
 
-    mode: str = "per_frame"
-    percentiles: tuple[float, float] = (0.5, 99.5)
-    subsample: int = 4
+    fps: float = knob(100.0, "Acquisition frame rate; TIFF does not record it.", min=0)
+    channel: int = knob(0, "Channel index.", min=0)
 
-    @classmethod
-    def parse(cls, d: dict) -> "Normalize":
-        _known("normalize", d, ["mode", "percentiles", "subsample"])
-        mode = str(d.get("mode", "per_frame"))
-        if mode in REMOVED_NORMALIZE_MODES:
-            fallback = REMOVED_NORMALIZE_MODES[mode]
-            warnings.warn(f"normalize.mode: {mode!r} was removed; using {fallback!r}",
-                          stacklevel=3)
-            mode = fallback
-        if mode not in ("fixed", "per_frame"):
-            raise ConfigError(
-                "normalize.mode must be 'per_frame' (default) or 'fixed' (one mapping "
-                "for the whole movie - faithful to real intensity changes, including "
-                "flicker)"
-            )
-        pcts = d.get("percentiles", [0.5, 99.5])
-        if len(pcts) != 2 or not 0 <= float(pcts[0]) < float(pcts[1]) <= 100:
-            raise ConfigError("normalize.percentiles must be [low, high] within 0..100")
-        return cls(
-            mode=mode,
-            percentiles=(float(pcts[0]), float(pcts[1])),
-            subsample=max(1, int(d.get("subsample", 4))),
-        )
+
+def _percentiles(value, where: str) -> tuple[float, float]:
+    try:
+        lo, hi = (float(v) for v in value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where} must be [low, high], got {value!r}") from None
+    if not 0 <= lo < hi <= 100:
+        raise ConfigError(f"{where} must be [low, high] within 0..100, got {value!r}")
+    return (lo, hi)
 
 
 @dataclass
-class TiffOptions:
-    fps: float = 100.0
-    channel: int = 0
+class Normalize(_Section):
+    """How raw frames become uint8."""
 
-    @classmethod
-    def parse(cls, d: dict) -> "TiffOptions":
-        _known("tiff", d, ["fps", "channel"])
-        return cls(fps=float(d.get("fps", 100.0)), channel=int(d.get("channel", 0)))
+    NAME: ClassVar[str] = "normalize"
 
-
-@dataclass
-class Detection:
-    task: str = "pose"
-    conf: float = 0.25
-    iou: float = 0.5
-    imgsz: int = 640
-    max_det: int = 300
-    device: str = "auto"
-    batch: int = 8
-    half: bool = False
-
-    @classmethod
-    def parse(cls, d: dict) -> "Detection":
-        _known("detection", d, ["task", "conf", "iou", "imgsz", "max_det", "device", "batch", "half"])
-        task = str(d.get("task", "pose"))
-        if task not in ("pose", "detect"):
-            raise ConfigError("detection.task must be 'pose' or 'detect'")
-        return cls(
-            task=task,
-            conf=float(d.get("conf", 0.25)),
-            iou=float(d.get("iou", 0.5)),
-            imgsz=int(d.get("imgsz", 640)),
-            max_det=int(d.get("max_det", 300)),
-            device=str(d.get("device", "auto")),
-            batch=max(1, int(d.get("batch", 8))),
-            half=bool(d.get("half", False)),
-        )
+    mode: str = knob("per_frame", "per_frame: a mapping per frame; fixed: one per movie.",
+                     choices=("per_frame", "fixed"))
+    percentiles: tuple[float, float] = knob((0.5, 99.5), "Percentiles mapped to 0 and 255.",
+                                            parse=_percentiles)
 
 
 @dataclass
-class Tiling:
-    enabled: str | bool = "auto"
-    tile: int = 640
-    overlap: float = 0.25
-    merge_iou: float = 0.6
-    drop_edge_truncated: bool = True
-    edge_margin_px: int = 2
+class Detection(_Section):
+    NAME: ClassVar[str] = "detection"
 
-    @classmethod
-    def parse(cls, d: dict) -> "Tiling":
-        _known(
-            "tiling", d,
-            ["enabled", "tile", "overlap", "merge_iou", "drop_edge_truncated", "edge_margin_px"],
-        )
-        overlap = float(d.get("overlap", 0.25))
-        if not 0.0 <= overlap < 0.9:
-            raise ConfigError("tiling.overlap must be in [0, 0.9)")
-        return cls(
-            enabled=d.get("enabled", "auto"),
-            tile=int(d.get("tile", 640)),
-            overlap=overlap,
-            merge_iou=float(d.get("merge_iou", 0.6)),
-            drop_edge_truncated=bool(d.get("drop_edge_truncated", True)),
-            edge_margin_px=int(d.get("edge_margin_px", 2)),
-        )
+    task: str = knob("detect", "pose if the model predicts keypoints, detect for boxes only.",
+                     choices=("pose", "detect"))
+    conf: float = knob(0.25, "Minimum detection confidence.", min=0.0, max=1.0)
+    device: str = knob("auto", "auto, cpu, mps, or a CUDA index such as 0.")
+    batch: int = knob(8, "Tiles per forward pass; lower it if the GPU runs out of memory.",
+                      min=1)
+    imgsz: int = knob(640, "Resolution each tile is seen at; match the model's training size.",
+                      min=32)
+    half: bool = knob(False, "fp16 inference on a GPU.")
+
+
+def _trackers() -> list[str]:
+    from .detect.tracking import TRACKERS
+
+    return sorted(TRACKERS) + ["greedy"]
 
 
 @dataclass
-class Tracking:
-    backend: str = "tracktrack"
-    tracker_cfg: str = ""            # "" -> the backend's bundled yaml
-    min_track_length: int = 50
-    greedy_max_dist_px: float = 25.0
-    # How close to the frame edge counts as being at it, and how much of one
-    # clip may be spent there before that clip goes. 0 px is off.
-    border_margin_px: int = 0
-    border_max_frac: float = 0.0
-    overrides: dict = field(default_factory=dict)
+class Tiling(_Section):
+    NAME: ClassVar[str] = "tiling"
 
-    @classmethod
-    def parse(cls, d: dict) -> "Tracking":
-        from .detect.tracking import TRACKERS
-
-        _known("tracking", d,
-               ["backend", "tracker_cfg", "min_track_length", "greedy_max_dist_px",
-                "border_margin_px", "border_max_frac", "overrides"])
-        backend = str(d.get("backend", "tracktrack"))
-        allowed = sorted(TRACKERS) + ["greedy"]
-        if backend not in allowed:
-            raise ConfigError(f"tracking.backend must be one of {allowed}")
-        overrides = d.get("overrides") or {}
-        if not isinstance(overrides, dict):
-            raise ConfigError("tracking.overrides must be a mapping of tracker parameters")
-        margin = int(d.get("border_margin_px", 0))
-        if margin < 0:
-            raise ConfigError(
-                f"tracking.border_margin_px must be 0 or more (got {margin}); it is "
-                "how far from the frame edge still counts as being at it, and "
-                "'do not exclude border detections at all' is written as 0"
-            )
-        border_frac = float(d.get("border_max_frac", 0.0))
-        if not 0.0 <= border_frac <= 1.0:
-            raise ConfigError(
-                f"tracking.border_max_frac must be in [0, 1] (got {border_frac}); it "
-                "is the share of ONE CLIP's detections allowed within "
-                "tracking.border_margin_px of the edge, so 0 discards a clip that "
-                "reaches the edge at all and 1 discards none. The track carries on "
-                "either way: it is clips that go, not tracks"
-            )
-        return cls(
-            backend=backend,
-            tracker_cfg=str(d.get("tracker_cfg", "") or ""),
-            min_track_length=int(d.get("min_track_length", 50)),
-            greedy_max_dist_px=float(d.get("greedy_max_dist_px", 25.0)),
-            border_margin_px=margin,
-            border_max_frac=border_frac,
-            overrides=dict(overrides),
-        )
+    enabled: bool | str = knob("auto", "auto tiles only frames larger than one tile.",
+                               special=("auto",))
+    tile: int = knob(640, "Tile size cut from the frame, in pixels.", min=32)
+    overlap: float = knob(0.25, "Share of a tile shared with its neighbour.", min=0.0, below=1.0)
+    merge_iou: float = knob(0.6, "Overlap above which boxes from two tiles are one animal.",
+                            min=0.0, max=1.0)
 
 
 @dataclass
-class Features:
+class Tracking(_Section):
+    NAME: ClassVar[str] = "tracking"
+
+    backend: str = knob("tracktrack", "Which tracker links detections across frames.",
+                        choices=_trackers)
+    min_track_length: int = knob(40, "Drop tracks seen in fewer frames than this.", min=1)
+    border_margin_px: int = knob(0, "How near the frame edge counts as at it; 0 is off.",
+                                 min=0)
+    border_max_frac: float = knob(0.0, "Share of one clip's frames allowed at the edge.",
+                                  min=0.0, max=1.0)
+    overrides: dict = knob({"gmc_method": "none"}, "Parameters passed to the tracker.")
+
+
+def _edges(value, where: str) -> list[tuple[str, str]]:
+    out = []
+    for e in value or []:
+        if not isinstance(e, (list, tuple)) or len(e) != 2:
+            raise ConfigError(f"{where} entry {e!r} must have exactly two node names")
+        out.append((str(e[0]), str(e[1])))
+    return out
+
+
+@dataclass
+class Keypoints(_Section):
+    NAME: ClassVar[str] = "keypoints"
+
+    nodes: list[str] = knob([], "Keypoint names, in the model's order.")
+    edges: list[tuple[str, str]] = knob([], "Skeleton links, drawn on screen only.",
+                                        parse=_edges)
+
+    @property
+    def n(self) -> int:
+        return len(self.nodes)
+
+    @property
+    def edge_idx(self) -> list[tuple[int, int]]:
+        idx = {n: i for i, n in enumerate(self.nodes)}
+        return [(idx[a], idx[b]) for a, b in self.edges]
+
+    def _check(self, raw: dict) -> None:
+        for a, b in self.edges:
+            for name in (a, b):
+                if name not in self.nodes:
+                    raise ConfigError(f"keypoints.edges references unknown node {name!r}")
+
+
+@dataclass
+class Features(_Section):
     """Per-detection detector embeddings, pooled from the same forward pass."""
 
-    enabled: bool = True
-    levels: list[str] = field(default_factory=lambda: ["P3", "P4", "P5"])
-    pool: int = 1
-    dtype: str = "float16"
+    NAME: ClassVar[str] = "features"
 
-    @classmethod
-    def parse(cls, d: dict) -> "Features":
-        _known("features", d, ["enabled", "levels", "pool", "dtype"])
-        levels = [str(l).upper() for l in d.get("levels", ["P3", "P4", "P5"])]
-        bad = [l for l in levels if l not in ("P3", "P4", "P5")]
-        if bad:
-            raise ConfigError(f"features.levels entries must be P3/P4/P5, got {bad}")
-        dtype = str(d.get("dtype", "float16"))
-        if dtype not in ("float16", "float32"):
-            raise ConfigError("features.dtype must be float16 or float32")
-        return cls(
-            enabled=bool(d.get("enabled", True)),
-            levels=levels,
-            pool=max(1, int(d.get("pool", 1))),
-            dtype=dtype,
-        )
+    enabled: bool = knob(True, "Save detector embeddings during detection.")
 
 
 @dataclass
@@ -439,113 +530,122 @@ class EmbeddingSpec:
         return f"emb_{self.name}"
 
 
-def _embeddings(value) -> list[EmbeddingSpec]:
-    """``suggest.embeddings``: a list of ``{name, source, path}`` mappings."""
+def _embeddings(value, where: str = "suggest.embeddings") -> list[EmbeddingSpec]:
+    """A list of ``{name, source, path}`` mappings."""
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ConfigError("suggest.embeddings must be a list of {name, source, path}")
+        raise ConfigError(f"{where} must be a list of {{name, source, path}}")
     out: list[EmbeddingSpec] = []
     for entry in value:
         if not isinstance(entry, dict):
-            raise ConfigError(f"suggest.embeddings entry {entry!r} is not a mapping")
-        _known("suggest.embeddings", entry, ["name", "source", "path"])
+            raise ConfigError(f"{where} entry {entry!r} is not a mapping")
+        for key in set(entry) - {"name", "source", "path"}:
+            _warn(f"ignoring unknown key {where}.{key}")
         name = str(entry.get("name", "")).strip()
         if not re.fullmatch(r"[A-Za-z0-9]+", name):
-            raise ConfigError(
-                f"suggest.embeddings name {name!r} must be letters and digits only"
-            )
+            raise ConfigError(f"{where} name {name!r} must be letters and digits only")
         source = str(entry.get("source", "detector"))
         if source not in ("detector", "file"):
-            raise ConfigError(
-                f"suggest.embeddings {name}: source must be 'detector' or 'file', "
-                f"got {source!r}"
-            )
+            raise ConfigError(f"{where} {name}: source must be 'detector' or 'file', "
+                              f"got {source!r}")
         path = entry.get("path")
         if source == "file" and (not path or "{movie_id}" not in str(path)):
-            raise ConfigError(
-                f"suggest.embeddings {name}: a file source needs a path containing "
-                "{movie_id}, e.g. embeddings/{movie_id}.parquet"
-            )
+            raise ConfigError(f"{where} {name}: a file source needs a path containing "
+                              "{movie_id}, e.g. embeddings/{movie_id}.parquet")
         if any(e.name == name for e in out):
-            raise ConfigError(f"suggest.embeddings names {name!r} twice")
+            raise ConfigError(f"{where} names {name!r} twice")
         out.append(EmbeddingSpec(name, source, str(path) if path else None))
     return out
+
+
+def _feature_columns(value, where: str = "suggest.feature_columns") -> list[str] | None:
+    """The column list as given; checked against the groups in ``Suggest._check``."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raise ConfigError(f"{where} must be a list of column names, got {value!r}")
+    names = [str(c).strip() for c in value]
+    if not names:
+        raise ConfigError(f"{where} is an empty list; use null for every column the groups select")
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise ConfigError(f"{where} names {repeated} more than once")
+    return names
+
+
+def _check_columns(names: list[str], groups: list[str]) -> None:
+    """Refuse names no feature table has, or from a group that is not selected."""
+    import difflib
+
+    from .measure.clipfeatures import group_of, known_columns
+    from .measure.embeddings import EMBEDDING_COLUMN
+
+    vocabulary = known_columns()
+    unknown = [n for n in names
+               if n not in set(vocabulary) and not EMBEDDING_COLUMN.match(n)]
+    if unknown:
+        near = difflib.get_close_matches(unknown[0], vocabulary, n=4, cutoff=0.6)
+        raise ConfigError(
+            f"suggest.feature_columns names unknown column(s) {unknown[:6]}"
+            + (f"; did you mean {', '.join(near)}?" if near else "")
+        )
+    outside = sorted({n for n in names if group_of(n) not in groups})
+    if outside:
+        families = sorted({str(group_of(n)) for n in outside})
+        raise ConfigError(
+            f"suggest.feature_columns names {outside[:6]} from group(s) {families}, "
+            f"which suggest.feature_groups ({groups}) does not include; add the group "
+            "or drop those columns"
+        )
 
 
 _OLD_CNN = re.compile(r"^cnn(\d+)_(mean|std|delta)$")
 
 
-def _migrate_cnn(groups: list[str], embeddings: list[EmbeddingSpec],
-                 columns) -> tuple[list[str], object]:
-    """Map the retired ``cnn`` group onto a ``detector`` embedding named ``det``."""
-    if "cnn" not in groups:
-        return groups, columns
-    warnings.warn(
-        "suggest.feature_groups 'cnn' is now the detector embedding 'det'; "
-        "reading it as suggest.embeddings [{name: det, source: detector}] and "
-        "group emb_det. Retrain models fitted on cnn columns.",
-        stacklevel=4,
-    )
-    if not any(e.name == "det" for e in embeddings):
-        embeddings.append(EmbeddingSpec("det", "detector"))
-    groups = list(dict.fromkeys("emb_det" if g == "cnn" else g for g in groups))
-    if columns is not None and not isinstance(columns, str):
-        columns = [_OLD_CNN.sub(r"emb_det_\1_\2", str(c)) for c in columns]
-    return groups, columns
+_CLIP_ID = re.compile(r"^(?P<movie>.+)__t(?P<track>\d+)__f\d+$")
+
+
+def audit_track_key(clip_id: str) -> str:
+    """``movie_id::track_id`` for a clip_id, the unit the audit holdout is drawn
+    over. An id not in ``clip_id_for`` form is its own key."""
+    m = _CLIP_ID.match(str(clip_id))
+    if m is None:
+        return str(clip_id)
+    return f"{m['movie']}::{int(m['track'])}"
 
 
 @dataclass
-class Suggest:
-    enabled: bool = True
-    model: str = "catboost"
-    pca_components: int = 32
-    retrain_every: int = 10
-    min_per_class: int = 5
-    min_macro_f1: float = 0.45
-    audit_fraction: float = 0.10
-    audit_visible: bool = False
-    seed: int = 0
-    audit_seed: int = 12345
-    min_confidence: float = 0.0
-    # Hyperparameters, shared by both backends so switching model does not
-    # silently change the fit as well. The values are CatBoost's own defaults,
-    # which are tuned against far more datasets than this project has, and
-    # `learning_rate: auto` is the one that cannot be written as a number:
-    # CatBoost derives it from the row count and the iteration count, and the
-    # right rate for 200 labelled clips is not the right rate for 5000.
-    iterations: int = 1000
-    depth: int = 6
-    learning_rate: float | str = "auto"
-    l2_leaf_reg: float = 3.0
-    # NOT a CatBoost default, and deliberately so: it describes this data
-    # rather than the estimator. One behaviour dominates a behaviour log, and
-    # an unweighted model scores well by answering with it.
-    balance_classes: bool = True
-    # Which processor fits the trees: cpu, gpu or auto. CatBoost only.
-    # CatBoost's GPU uses 128 feature borders against the CPU's 254, so the two
-    # fit different models. It is also slower below roughly 50 000 rows.
-    device: str = "cpu"
-    # Which feature families the model may use. Absent, every static family
-    # plus every declared embedding.
-    feature_groups: list[str] = field(
-        default_factory=lambda: ["kinematic", "pose", "waveform"])
-    # Per-detection embedding inputs, each a feature group ``emb_<name>``.
-    embeddings: list[EmbeddingSpec] = field(default_factory=list)
-    # Frames of kinematic context centred on each window; 0 is off.
-    context_frames: int = 0
-    # The finest of the three cuts: the columns themselves, by name. None is not
-    # "no columns" but "do not cut here", which is what keeps the default the
-    # behaviour every project on disk was fitted under. It NARROWS what the
-    # groups selected rather than replacing it, so a name whose family is not in
-    # `feature_groups` is a contradiction and is refused rather than quietly
-    # turning that family back on.
-    feature_columns: list[str] | None = None
-    # -- which clips the annotator is handed next (:mod:`trackanno.learn.select`) --- #
-    # 'off' keeps the GUI's seeded shuffle; 'margin' puts the clips the model is
-    # least sure about first, in batches re-ranked after each refit.
-    select_rule: str = "off"
-    select_batch_size: int = 20
+class Suggest(_Section):
+    NAME: ClassVar[str] = "suggest"
+
+    enabled: bool = knob(True, "Show what a classifier trained on your labels predicts.")
+    model: str = knob("catboost", "catboost, or hist (scikit-learn HistGradientBoosting).",
+                      choices=("catboost", "hist"))
+    device: str = knob("cpu", "Where CatBoost fits: cpu, gpu or auto.",
+                       choices=("cpu", "gpu", "auto"))
+    feature_groups: list[str] = knob(["kinematic", "pose", "waveform"],
+                                     "Feature families the model may use.")
+    embeddings: list[EmbeddingSpec] = knob([], "Per-detection embedding inputs.",
+                                           parse=_embeddings)
+    context_frames: int = knob(0, "Frames of kinematic context around each window; 0 is off.",
+                               min=0)
+    feature_columns: list[str] | None = knob(None, "Narrow the groups to these columns; "
+                                             "null keeps every column.",
+                                             parse=_feature_columns)
+    retrain_every: int = knob(10, "Refit in the background after this many new labels.",
+                              min=1)
+    min_per_class: int = knob(5, "A class with fewer labels is not modelled.", min=1)
+    audit_fraction: float = knob(0.10, "Share of tracks held out from the suggester.",
+                                 min=0.0, below=1.0)
+    min_confidence: float = knob(0.0, "Hide suggestions below this confidence.",
+                                 min=0.0, max=1.0)
+    select_rule: str = knob("off", "off keeps the shuffle; margin asks about the least "
+                            "certain clips first.", choices=("off", "margin"))
+    iterations: int = knob(1000, "Boosting rounds per fit.", min=1)
+    learning_rate: float | str = knob("auto", "Boosting step size; auto lets the estimator "
+                                      "choose.", special=("auto",), min=0.0)
+    l2_leaf_reg: float = knob(3.0, "L2 regularisation of the leaf values.", min=0.0)
 
     @property
     def selection_on(self) -> bool:
@@ -555,230 +655,85 @@ class Suggest:
         """Whether ``clip_id``'s track hashes into the audit holdout (fallback).
 
         Hashed on ``movie_id::track_id`` so every clip of a track lands on the
-        same side. Track ids change on re-detection, so a labelled clip's
-        recorded membership (``store.AUDIT_COLUMN``) wins over this. Uses its
-        own seed so varying ``seed`` does not redraw the holdout.
+        same side. A labelled clip's recorded membership wins over this.
         """
         frac = float(self.audit_fraction)
         if frac <= 0:
             return False
+        seed = FIXED_SETTINGS["suggest.audit_seed"]
         digest = hashlib.blake2b(
-            f"{self.audit_seed}:{audit_track_key(clip_id)}".encode(), digest_size=8
+            f"{seed}:{audit_track_key(clip_id)}".encode(), digest_size=8
         ).digest()
         return (int.from_bytes(digest, "big") % 10_000) < frac * 10_000
 
-    @classmethod
-    def parse(cls, d: dict) -> "Suggest":
-        _known(
-            "suggest", d,
-            ["enabled", "model", "pca_components", "retrain_every", "min_per_class",
-             "min_macro_f1", "audit_fraction", "audit_visible", "seed", "audit_seed",
-             "min_confidence",
-             "iterations", "depth", "learning_rate", "l2_leaf_reg", "balance_classes",
-             "device",
-             "feature_groups", "feature_columns", "embeddings", "context_frames",
-             "select_rule", "select_batch_size"],
-        )
-        model = str(d.get("model", "catboost"))
-        if model not in ("hist", "catboost"):
-            raise ConfigError("suggest.model must be 'hist' or 'catboost'")
-        depth = int(d.get("depth", 6))
-        if not 1 <= depth <= 10:
-            raise ConfigError(
-                "suggest.depth must be 1-10. CatBoost trees are symmetric, so depth "
-                "alone sets the width: 2**depth leaves, 64 at the default 6. Past "
-                "that a few hundred hand-labelled clips are memorised rather than "
-                "learned, which the reliability gate then refuses to suggest from."
-            )
+    def _check(self, raw: dict) -> None:
         from .measure.clipfeatures import FEATURE_GROUPS
 
-        embeddings = _embeddings(d.get("embeddings"))
-        context_frames = int(d.get("context_frames", 0) or 0)
-        if context_frames < 0:
-            raise ConfigError("suggest.context_frames must be 0 (off) or a frame count")
-        groups = d.get("feature_groups")
-        explicit = groups is not None
-        if groups is None:
-            groups = [g for g in FEATURE_GROUPS if g != "context" or context_frames > 0]
-            groups += [e.group for e in embeddings]
-        else:
-            groups = [str(g) for g in groups]
-        groups, columns = _migrate_cnn(groups, embeddings, d.get("feature_columns"))
-        allowed = list(FEATURE_GROUPS) + [e.group for e in embeddings]
+        groups = list(self.feature_groups)
+        if "feature_groups" not in raw:
+            groups = [g for g in FEATURE_GROUPS if g != "context" or self.context_frames > 0]
+            groups += [e.group for e in self.embeddings]
+        if "cnn" in groups:
+            _warn("suggest.feature_groups 'cnn' is now the detector embedding 'det' "
+                  "(group emb_det); retrain models fitted on cnn columns")
+            if not any(e.name == "det" for e in self.embeddings):
+                self.embeddings.append(EmbeddingSpec("det", "detector"))
+            groups = list(dict.fromkeys("emb_det" if g == "cnn" else g for g in groups))
+            if self.feature_columns is not None:
+                self.feature_columns = [_OLD_CNN.sub(r"emb_det_\1_\2", c)
+                                        for c in self.feature_columns]
+        allowed = list(FEATURE_GROUPS) + [e.group for e in self.embeddings]
         unknown = [g for g in groups if g not in allowed]
         if unknown:
-            raise ConfigError(
-                f"suggest.feature_groups has unknown entries {unknown}; "
-                f"choose from {allowed} (emb_<name> needs a suggest.embeddings entry)"
-            )
+            raise ConfigError(f"suggest.feature_groups has unknown entries {unknown}; "
+                              f"choose from {allowed}")
         if not groups:
-            raise ConfigError(
-                "suggest.feature_groups is empty, so the model would have no "
-                f"inputs at all; choose at least one of {allowed}"
-            )
-        unused = [e.group for e in embeddings if e.group not in groups]
-        if context_frames > 0 and "context" not in groups:
+            raise ConfigError("suggest.feature_groups is empty, so the model has no inputs "
+                              f"at all; choose from {allowed}")
+        unused = [e.group for e in self.embeddings if e.group not in groups]
+        if self.context_frames > 0 and "context" not in groups:
             unused.append("context")
-        if explicit and unused:
-            warnings.warn(
-                f"{unused} are configured (suggest.embeddings, suggest.context_frames) "
-                "but suggest.feature_groups does not list them, so the model will "
-                "not use them",
-                stacklevel=3,
-            )
-        chosen = _feature_columns(columns, groups)
-        device = str(d.get("device", "cpu")).lower()
-        if device not in ("cpu", "gpu", "auto"):
-            raise ConfigError(
-                f"suggest.device must be 'cpu', 'gpu' or 'auto', got {device!r}. "
-                "'auto' uses a GPU where CatBoost sees one, so the same project "
-                "can be fitted two ways on two machines; 'gpu' raises instead."
-            )
-        if device == "gpu" and model != "catboost":
-            raise ConfigError(
-                f"suggest.device is 'gpu' but suggest.model is {model!r}. "
-                "scikit-learn's HistGradientBoosting is CPU-only, so the setting "
-                "would do nothing. Use suggest.model 'catboost', or device 'cpu'."
-            )
-        audit = float(d.get("audit_fraction", 0.10))
-        if not 0.0 <= audit < 1.0:
-            raise ConfigError("suggest.audit_fraction must be in [0, 1)")
-        enabled = bool(d.get("enabled", True))
-        rule = _selection_rule(d)
-        batch = int(d.get("select_batch_size", 20))
-        if batch < 1:
-            raise ConfigError(
-                f"suggest.select_batch_size must be at least 1 (got {batch}); it is "
-                "how many clips one batch hands the annotator, and a batch of none "
-                "is spelled by setting suggest.select_rule to 'off'"
-            )
-        rate = _optional_auto(
-            d.get("learning_rate", "auto"), "suggest.learning_rate",
-            "a rate or 'auto' (the estimator's own, which CatBoost derives from "
-            "the number of rows and iterations rather than fixing in advance)",
-        )
-        if rate is not None and not 0.0 < float(rate) <= 1.0:
-            raise ConfigError(
-                f"suggest.learning_rate must be in (0, 1], got {float(rate)}; it is "
-                "the share of each tree's correction that is kept, and 'let the "
-                "estimator choose' is written as 'auto'"
-            )
-        if rule != "off" and audit <= 0.0:
-            raise ConfigError(
-                f"suggest.select_rule is {rule!r} but suggest.audit_fraction is "
-                f"{audit:g}, so this project has no audit holdout. Selection hands "
-                "the annotator whichever clips the model is least sure about, which "
-                "makes the labelled set a sample assembled to be hard: every "
-                "accuracy computed over it afterwards is lower than the truth by an "
-                "amount nobody can estimate without knowing how the set was "
-                "assembled. The holdout is what keeps one unbiased estimate alive - "
-                "clips drawn by a coin, never ranked - and at audit_fraction 0 there "
-                "is no such clip to draw. Set suggest.audit_fraction above 0 (0.10 "
-                "holds out a tenth), or set suggest.select_rule to 'off'."
-            )
-        if rule != "off" and not enabled:
-            raise ConfigError(
-                f"suggest.select_rule is {rule!r} but suggest.enabled is false, so "
-                "no model is ever loaded and there is nothing to rank the clips "
-                "with. The order would silently stay the GUI's shuffle, which is "
-                "the setting quietly not applying. Set suggest.enabled to true, or "
-                "suggest.select_rule to 'off'."
-            )
-        return cls(
-            enabled=enabled,
-            model=model,
-            pca_components=max(2, int(d.get("pca_components", 32))),
-            retrain_every=max(1, int(d.get("retrain_every", 10))),
-            min_per_class=max(1, int(d.get("min_per_class", 5))),
-            min_macro_f1=float(d.get("min_macro_f1", 0.45)),
-            audit_fraction=audit,
-            audit_visible=bool(d.get("audit_visible", False)),
-            seed=int(d.get("seed", 0)),
-            # Deliberately independent of `seed`: changing the CV seed must not
-            # silently redraw the audit set and invalidate it retroactively.
-            audit_seed=int(d.get("audit_seed", 12345)),
-            min_confidence=float(d.get("min_confidence", 0.0)),
-            iterations=max(10, int(d.get("iterations", 1000))),
-            depth=depth,
-            learning_rate="auto" if rate is None else float(rate),
-            l2_leaf_reg=float(d.get("l2_leaf_reg", 3.0)),
-            balance_classes=bool(d.get("balance_classes", True)),
-            device=device,
-            feature_groups=groups,
-            embeddings=embeddings,
-            context_frames=context_frames,
-            feature_columns=chosen,
-            select_rule=rule,
-            select_batch_size=batch,
-        )
+        if "feature_groups" in raw and unused:
+            _warn(f"{unused} are configured (suggest.embeddings, suggest.context_frames) "
+                  "but suggest.feature_groups does not list them, so the model will "
+                  "not use them")
+        self.feature_groups = groups
+        if self.feature_columns is not None:
+            _check_columns(self.feature_columns, groups)
+        if self.learning_rate == 0:
+            raise ConfigError("suggest.learning_rate must be above 0, or 'auto'")
+        if self.device == "gpu" and self.model != "catboost":
+            raise ConfigError(f"suggest.device 'gpu' needs suggest.model 'catboost', "
+                              f"not {self.model!r}")
+        if self.select_rule != "off" and self.audit_fraction <= 0.0:
+            raise ConfigError(f"suggest.select_rule {self.select_rule!r} needs "
+                              "suggest.audit_fraction above 0 (e.g. 0.10) to keep an "
+                              "unbiased holdout, or select_rule 'off'")
+        if self.select_rule != "off" and not self.enabled:
+            raise ConfigError(f"suggest.select_rule {self.select_rule!r} needs "
+                              "suggest.enabled: true")
 
 
 @dataclass
-class Spectral:
-    """The window a BEAT is measured over, which is not the window it is labelled over.
+class Spectral(_Section):
+    """The window a beat is measured over, centred on the clip."""
 
-    A clip's length is chosen so a person can judge one behaviour, not for a
-    Fourier transform: at 25 frames and 100 fps one FFT bin is 4 Hz and the
-    resolvability floor lands at 12 Hz, above most of these cells' beats, so the
-    window is longer than the clip and CENTRED on it. Past about 75 frames
-    accuracy falls again, because behaviour changes inside a track and a long
-    window averages over the reversal. Raise it if your cells hold a direction
-    longer, lower it if they switch faster than ~0.75 s.
-    """
+    NAME: ClassVar[str] = "spectral"
 
-    window: int = 75
-    # Frames between successive spectral estimates. The series is computed once
-    # per track, so a small hop is cheap and localises a reversal to within one
-    # hop.
-    hop: int = 5
-    # Support of the wave_flow columns, which read the direction from the phase
-    # GRADIENT and so need no cycles - the window above is what the FREQUENCY
-    # needs. Keep it well under a beat period: it is the shortest stretch over
-    # which a direction is claimed, so it sets how sharply a reversal lands.
-    flow_frames: int = 5
-
-    @classmethod
-    def parse(cls, d: dict) -> "Spectral":
-        _known("spectral", d, ["window", "hop", "flow_frames"])
-        window = int(d.get("window", 75))
-        hop = int(d.get("hop", 5))
-        flow_frames = int(d.get("flow_frames", 5))
-        if window < 8:
-            raise ConfigError(
-                "spectral.window must be at least 8 frames; below that there is no "
-                "band left to search once the resolvability floor is applied"
-            )
-        if not 1 <= hop <= window:
-            raise ConfigError("spectral.hop must be between 1 and spectral.window")
-        if flow_frames < 3:
-            raise ConfigError(
-                f"spectral.flow_frames must be at least 3 (got {flow_frames}); it is "
-                "the stretch a direction is read over, and a centred difference in "
-                "time needs three frames to exist"
-            )
-        return cls(window=window, hop=hop, flow_frames=flow_frames)
+    window: int = knob(75, "Frames the beat spectrum is measured over.", min=8)
 
 
 @dataclass
-class Predict:
-    """How the labelling pass scores every frame and cuts it into bouts.
+class Predict(_Section):
+    """How ``trackanno predict`` scores every frame and cuts it into bouts."""
 
-    Windows of ``clips.frames`` start every ``window_stride`` frames over every
-    track; their class probabilities are averaged per frame and cut into bouts.
-    See :mod:`trackanno.infer.densepredict`.
-    """
+    NAME: ClassVar[str] = "predict"
 
-    # Frames between one window's start and the next. 'auto' is clips.frames,
-    # an exact tiling; smaller overlaps the windows and pins a transition to
-    # within one stride.
-    window_stride: int | str = "auto"
-    # Detections a dense window needs before its features mean anything. Two is
-    # the floor at which ANY motion feature can exist. Deliberately NOT
-    # clips.min_clip_frames, which exists so an annotator gets a watchable video.
-    min_frames: int = 2
-    # The shortest bout worth believing, in frames: shorter runs are absorbed
-    # into their neighbours. 0 keeps the plain per-frame argmax runs.
-    min_bout_frames: int = 0
+    window_stride: int | str = knob("auto", "Frames between window starts; auto is "
+                                    "clips.frames.", special=("auto",), min=1)
+    min_bout_frames: int = knob(0, "Shorter bouts join a neighbour; 0 keeps every run.",
+                                min=0)
+    min_frames: int = knob(2, "Detections a window needs to be featurised.", min=1)
 
     def resolved_stride(self, clips: "Clips") -> int:
         """``window_stride`` with ``auto`` filled in: ``clips.frames``."""
@@ -786,63 +741,20 @@ class Predict:
             return max(1, int(clips.frames))
         return max(1, int(self.window_stride))
 
-    @classmethod
-    def parse(cls, d: dict) -> "Predict":
-        removed = sorted(k for k in ("decode", "self_transition") if k in d)
-        if removed:
-            warnings.warn(
-                f"ignoring predict.{', predict.'.join(removed)}: Viterbi decoding was "
-                "removed, and predict.min_bout_frames is now a hard floor on bout length",
-                stacklevel=3,
-            )
-            d = {k: v for k, v in d.items() if k not in removed}
-        _known("predict", d, ["window_stride", "min_frames", "min_bout_frames"])
-        stride = d.get("window_stride", "auto")
-        if isinstance(stride, str):
-            if stride != "auto":
-                raise ConfigError(
-                    "predict.window_stride must be a frame count or 'auto' "
-                    "(clips.frames, so the windows tile exactly)"
-                )
-        elif int(stride) < 1:
-            raise ConfigError(
-                f"predict.window_stride must be at least 1 (got {int(stride)})"
-            )
-        min_frames = int(d.get("min_frames", 2))
-        if min_frames < 1:
-            raise ConfigError(
-                f"predict.min_frames must be at least 1 (got {min_frames}); a window "
-                "with no detections in it has nothing to measure"
-            )
-        min_bout = int(d.get("min_bout_frames", 0))
-        if min_bout < 0:
-            raise ConfigError(
-                f"predict.min_bout_frames must be 0 or more (got {min_bout})"
-            )
-        return cls(
-            window_stride=stride if isinstance(stride, str) else int(stride),
-            min_frames=min_frames,
-            min_bout_frames=min_bout,
-        )
-
 
 @dataclass
-class ModelSource:
-    """Where the detection weights come from, when not a file on this disk.
+class ModelSource(_Section):
+    """Where the detection weights come from, when not ``paths.model``.
 
-    ``source`` is a model id from the registry (see :mod:`trackanno.video.models`) or
-    an ``https://`` URL to a ``.pt``. Empty means ``paths.model``, which is what
-    a project made from a local file uses.
-
-    ``sha256`` is written back on the first successful fetch and pins the
-    weights from then on. A registry that later moves a tag to different weights
-    is then a loud mismatch rather than a silent change of model under an
-    unchanged name.
+    ``source`` is a registry id or an ``https://`` URL; ``sha256`` is written on
+    the first fetch and pins the weights from then on.
     """
 
-    source: str = ""
-    version: str = ""
-    sha256: str = ""
+    NAME: ClassVar[str] = "model"
+
+    source: str = knob("", "Registry id or https URL; empty uses paths.model.")
+    version: str = knob("", "Registry version.")
+    sha256: str = knob("", "Pinned digest, filled in on the first fetch.")
 
     @property
     def is_remote(self) -> bool:
@@ -852,125 +764,43 @@ class ModelSource:
     def is_url(self) -> bool:
         return self.source.strip().lower().startswith(("http://", "https://"))
 
-    @classmethod
-    def parse(cls, d: dict) -> "ModelSource":
-        _known("model", d, ["source", "version", "sha256"])
-        source = str(d.get("source", "") or "").strip()
-        if source.lower().startswith("http://"):
+    def _check(self, raw: dict) -> None:
+        self.source = self.source.strip()
+        self.version = self.version.strip()
+        self.sha256 = self.sha256.strip().lower()
+        if self.source.lower().startswith("http://"):
             from .video.models import is_trusted_url
 
-            if not is_trusted_url(source):
-                raise ConfigError(
-                    "model.source must be https, not http: weights are executed "
-                    "when they are loaded, so they may not be fetched over a "
-                    "channel that can be rewritten in transit"
-                )
-        digest = str(d.get("sha256", "") or "").strip().lower()
+            if not is_trusted_url(self.source):
+                raise ConfigError("model.source must be https, not http")
+        digest = self.sha256
         if digest and (len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest)):
             raise ConfigError("model.sha256 must be a 64-character hex digest, or empty")
-        return cls(
-            source=source,
-            version=str(d.get("version", "") or "").strip(),
-            sha256=digest,
-        )
 
 
 @dataclass
-class Keypoints:
-    nodes: list[str] = field(default_factory=list)
-    edges: list[tuple[str, str]] = field(default_factory=list)
+class Clips(_Section):
+    NAME: ClassVar[str] = "clips"
 
-    @property
-    def n(self) -> int:
-        return len(self.nodes)
+    frames: int = knob(50, "Frames per clip; also the window the model is fitted at.",
+                       min=1)
+    stride: int = knob(50, "Frames between clip starts; equal to frames tiles.", min=1)
+    window_mode: str = knob("all", "first, first_per_track, or all windows.",
+                            choices=("first", "first_per_track", "all"))
+    follow: str = knob("smooth", "How the crop follows the animal: smooth, fixed or track.",
+                       choices=("smooth", "fixed", "track"))
+    pad: float = knob(1.6, "Crop side is the box extent times this.", min=0.0)
+    crop_size: int | str = knob("auto", "Cache crop size; auto is the p99 of what is "
+                                "needed.", special=("auto",), min=1)
+    min_clip_frames: int = knob(40, "Detected frames a window needs to become a clip.",
+                                min=1)
 
-    @property
-    def edge_idx(self) -> list[tuple[int, int]]:
-        idx = {n: i for i, n in enumerate(self.nodes)}
-        return [(idx[a], idx[b]) for a, b in self.edges]
-
-    @classmethod
-    def parse(cls, d: dict) -> "Keypoints":
-        _known("keypoints", d, ["nodes", "edges"])
-        nodes = [str(n) for n in d.get("nodes", [])]
-        edges: list[tuple[str, str]] = []
-        for e in d.get("edges", []):
-            if len(e) != 2:
-                raise ConfigError(f"keypoints.edges entry {e!r} must have exactly two node names")
-            a, b = str(e[0]), str(e[1])
-            for name in (a, b):
-                if name not in nodes:
-                    raise ConfigError(f"keypoints.edges references unknown node {name!r}")
-            edges.append((a, b))
-        return cls(nodes=nodes, edges=edges)
-
-
-@dataclass
-class Clips:
-    frames: int = 50
-    stride: int = 50
-    window_mode: str = "all"
-    follow: str = "smooth"
-    crop_from: str = "bbox"
-    smooth_window: int = 25
-    pad: float = 2.0
-    crop_size: int | str = "auto"
-    max_size: int = 256
-    min_clip_frames: int = 40
-    max_clips_per_track: int = 0
-    context_tracks: bool = True
-
-    @classmethod
-    def parse(cls, d: dict) -> "Clips":
-        _known(
-            "clips", d,
-            ["frames", "stride", "window_mode", "follow", "crop_from", "smooth_window", "pad",
-             "crop_size", "max_size", "min_clip_frames", "max_clips_per_track", "context_tracks"],
-        )
-        follow = str(d.get("follow", "smooth"))
-        if follow not in ("smooth", "fixed", "track"):
-            raise ConfigError(
-                "clips.follow must be 'smooth' (crop follows a smoothed trajectory - small crop, "
-                "local motion still visible), 'fixed' (one crop for the window - shows all motion "
-                "but needs a big crop) or 'track' (re-centred every frame - smallest crop, but "
-                "translation becomes invisible)"
-            )
-        crop_from = str(d.get("crop_from", "bbox"))
-        if crop_from not in ("bbox", "union"):
-            raise ConfigError("clips.crop_from must be 'bbox' or 'union'")
-        mode = str(d.get("window_mode", "all"))
-        if mode not in ("first", "first_per_track", "all"):
-            raise ConfigError(
-                "clips.window_mode must be 'first' (only the movie's first window), "
-                "'first_per_track' (first window of each track) or 'all' (every window)"
-            )
-        frames = int(d.get("frames", 50))
-        min_present = int(d.get("min_clip_frames", 40))
-        if min_present > frames:
-            raise ConfigError(
-                f"clips.min_clip_frames ({min_present}) cannot exceed clips.frames ({frames}); "
-                "no window could ever qualify"
-            )
-        stride = int(d.get("stride", frames))
-        if stride < 1:
-            raise ConfigError(
-                f"clips.stride must be at least 1 (got {stride}); it is the step "
-                "the window grid advances by, so 0 or less never terminates"
-            )
-        return cls(
-            frames=frames,
-            stride=stride,
-            window_mode=mode,
-            follow=follow,
-            crop_from=crop_from,
-            smooth_window=max(1, int(d.get("smooth_window", 25))),
-            pad=float(d.get("pad", 2.0)),
-            crop_size=d.get("crop_size", "auto"),
-            max_size=int(d.get("max_size", 256)),
-            min_clip_frames=min_present,
-            max_clips_per_track=int(d.get("max_clips_per_track", 0)),
-            context_tracks=bool(d.get("context_tracks", True)),
-        )
+    def _check(self, raw: dict) -> None:
+        if "stride" not in raw:
+            self.stride = self.frames
+        if self.min_clip_frames > self.frames:
+            raise ConfigError(f"clips.min_clip_frames ({self.min_clip_frames}) exceeds "
+                              f"clips.frames ({self.frames}); no window could ever qualify")
 
 
 @dataclass
@@ -999,149 +829,73 @@ class CategoryGroup:
         return next((o for o in self.options if o.name == name), None)
 
 
+def _unknown(where: str, given: dict, allowed) -> None:
+    for key in sorted(set(given) - set(allowed)):
+        _warn(f"ignoring unknown key {where}.{key}")
+
+
 def _parse_categories(raw: Any) -> list[CategoryGroup]:
     if not raw:
         raise ConfigError("config must define at least one entry under 'categories'")
+    if not isinstance(raw, list):
+        raise ConfigError("categories must be a list of groups")
     groups: list[CategoryGroup] = []
     seen_keys: dict[str, str] = {}
     seen_names: set[str] = set()
     for g in raw:
+        if not isinstance(g, dict):
+            raise ConfigError(f"category group {g!r} is not a mapping")
         name = str(g.get("name", "")).strip()
         if not name:
             raise ConfigError("every category group needs a 'name'")
         if name in RESERVED_GROUP_NAMES:
-            raise ConfigError(
-                f"category group {name!r} collides with a built-in column of the "
-                f"annotation CSV, which would overwrite it. Reserved names: "
-                f"{', '.join(sorted(RESERVED_GROUP_NAMES))}"
-            )
+            raise ConfigError(f"category group {name!r} collides with a built-in CSV column")
         if name in seen_names:
-            raise ConfigError(
-                f"two category groups are both named {name!r}; they would share "
-                "one CSV column"
-            )
+            raise ConfigError(f"two category groups are both named {name!r}")
         seen_names.add(name)
-        _known(f"categories[{g.get('name')}]", g, ["name", "type", "required", "options"])
+        _unknown(f"categories[{name}]", g, ["name", "type", "required", "options"])
         gtype = str(g.get("type", "single"))
         if gtype not in ("single", "multi"):
-            raise ConfigError(f"category group {g.get('name')!r}: type must be 'single' or 'multi'")
+            raise ConfigError(f"category group {name!r}: type must be 'single' or 'multi'")
         options: list[CategoryOption] = []
-        for o in g.get("options", []):
-            _known("category option", o, ["name", "key", "color"])
+        for o in g.get("options", []) or []:
+            _unknown(f"categories[{name}] option", o, ["name", "key", "color"])
             key = str(o.get("key", ""))
             if not key:
                 raise ConfigError(f"category option {o.get('name')!r} needs a 'key' shortcut")
-            label = f"{g.get('name')}.{o.get('name')}"
+            label = f"{name}.{o.get('name')}"
             if key.lower() in seen_keys:
-                raise ConfigError(
-                    f"keyboard shortcut {key!r} is used by both {seen_keys[key.lower()]} "
-                    f"and {label} - shortcuts must be unique"
-                )
+                raise ConfigError(f"shortcut {key!r} is used by both "
+                                  f"{seen_keys[key.lower()]} and {label}")
             seen_keys[key.lower()] = label
             color = str(o.get("color", "#CCCCCC"))
-            _hex_to_rgb(color)  # validate early
+            _hex_to_rgb(color)
             options.append(CategoryOption(name=str(o["name"]), key=key, color=color))
         if not options:
-            raise ConfigError(f"category group {g.get('name')!r} has no options")
-        groups.append(
-            CategoryGroup(
-                name=str(g["name"]),
-                type=gtype,
-                required=bool(g.get("required", False)),
-                options=options,
-            )
-        )
+            raise ConfigError(f"category group {name!r} has no options")
+        required = _coerce(f"categories[{name}].required", g.get("required", False), "bool",
+                           {"special": (), "choices": None, "min": None, "max": None,
+                            "below": None})
+        groups.append(CategoryGroup(name=name, type=gtype, required=required,
+                                    options=options))
     return groups
 
 
-def _one_of(value, allowed, where: str) -> str:
-    """A choice setting, refused loudly rather than silently falling back.
-
-    A typo that quietly reverts to the default looks applied and is not.
-    """
-    text = str(value)
-    if text not in allowed:
-        raise ConfigError(f"{where} must be one of {list(allowed)}, got {text!r}")
-    return text
-
-
 @dataclass
-class UI:
-    theme: str = "dark"
-    fps: int = 30
-    autoplay: bool = True
-    loop: bool = True
-    auto_advance: bool = True
-    show_overlay: bool = True
-    show_skeleton: bool = False
-    show_context_tracks: bool = False
-    show_kymograph: bool = True
-    kymo_smooth_px: float = 0.6
-    kymo_sign: str = "canonical"
-    follow: str = "centred"
-    view_zoom: float = 1.0
-    prefetch: int = 8
-    resume: str = "first_unannotated"
-    annotator: str = ""
-    shuffle: bool = True
-    shuffle_seed: int = 0
+class UI(_Section):
+    NAME: ClassVar[str] = "ui"
 
-    @classmethod
-    def parse(cls, d: dict) -> "UI":
-        _known(
-            "ui", d,
-            ["theme", "fps", "autoplay", "loop", "auto_advance", "show_overlay",
-             "show_skeleton",
-             "show_context_tracks", "show_kymograph",
-             "kymo_smooth_px", "kymo_sign",
-             "follow",
-             "view_zoom",
-             "prefetch", "resume", "annotator", "shuffle", "shuffle_seed"],
-        )
-        resume = str(d.get("resume", "first_unannotated"))
-        if resume not in ("first_unannotated", "last_position"):
-            raise ConfigError("ui.resume must be 'first_unannotated' or 'last_position'")
-        theme = str(d.get("theme", "dark"))
-        if theme not in ("dark", "light", "system"):
-            raise ConfigError("ui.theme must be 'dark', 'light' or 'system'")
-
-        kymo_sign = str(d.get("kymo_sign", "canonical"))
-        if kymo_sign == "absolute":
-            warnings.warn("ui.kymo_sign: 'absolute' was removed; using 'canonical'",
-                          stacklevel=3)
-            kymo_sign = "canonical"
-        follow = str(d.get("follow", "centred"))
-        if follow == "smooth":
-            warnings.warn("ui.follow: 'smooth' was removed; using 'centred'", stacklevel=3)
-            follow = "centred"
-        if follow not in ("centred", "locked"):
-            raise ConfigError(
-                "ui.follow must be 'centred' (one view on the track's median position - all "
-                "motion visible) or 'locked' (re-centred every frame - translation invisible)"
-            )
-        return cls(
-            theme=theme,
-            fps=int(d.get("fps", 30)),
-            autoplay=bool(d.get("autoplay", True)),
-            loop=bool(d.get("loop", True)),
-            auto_advance=bool(d.get("auto_advance", True)),
-            show_overlay=bool(d.get("show_overlay", True)),
-            show_skeleton=bool(d.get("show_skeleton", False)),
-            show_context_tracks=bool(d.get("show_context_tracks", False)),
-            show_kymograph=bool(d.get("show_kymograph", True)),
-            kymo_smooth_px=max(0.0, float(d.get("kymo_smooth_px", 0.6))),
-            kymo_sign=_one_of(kymo_sign, ("raw", "canonical"), "ui.kymo_sign"),
-            follow=follow,
-            view_zoom=max(1.0, float(d.get("view_zoom", 1.0))),
-            prefetch=max(0, int(d.get("prefetch", 8))),
-            resume=resume,
-            annotator=str(d.get("annotator", "")),
-            shuffle=bool(d.get("shuffle", True)),
-            shuffle_seed=int(d.get("shuffle_seed", 0)),
-        )
+    theme: str = knob("dark", "dark, light, or system. Applies on next start.",
+                      choices=("dark", "light", "system"))
+    fps: int = knob(20, "Playback rate in the annotation window.", min=1)
+    auto_advance: bool = knob(True, "One keypress labels the clip and moves on.")
+    shuffle: bool = knob(True, "Annotate in a seeded random order.")
+    annotator: str = knob("", "Written into every row of the CSV.")
+    kymo_sign: str = knob("canonical", "canonical flips each kymograph to its dominant "
+                          "sign; raw keeps it as measured.", choices=("canonical", "raw"))
 
 
-_DEFAULT_KEYS = {
+DEFAULT_KEYS = {
     "next": ["Right", "Return"],
     "prev": ["Left"],
     "next_unannotated": ["Tab"],
@@ -1153,51 +907,37 @@ _DEFAULT_KEYS = {
     "zoom_out": ["-"],
     "zoom_reset": ["0"],
     "uncertain": ["u"],
+    "notes": ["n"],
     "clear": ["Backspace"],
     "undo": ["Ctrl+Z"],
-    "notes": ["n"],
 }
+_DEFAULT_KEYS = DEFAULT_KEYS
 
 
 @dataclass
-class Render:
-    fps: float | str = "auto"
-    out_dir: Path = Path("./renders")
-    thickness: int = 2
-    font_scale: float = 0.4
-    show_track_id: bool = True
-    show_category: bool = True
-    show_skeleton: bool = False
-    hide_unlabelled: bool = False
-    unlabelled_color: str = "#555555"
-    codec: str = "libx264"
-    quality: int = 8
+class Render(_Section):
+    NAME: ClassVar[str] = "render"
 
-    @classmethod
-    def parse(cls, d: dict, root: Path) -> "Render":
-        _known(
-            "render", d,
-            ["fps", "out_dir", "thickness", "font_scale", "show_track_id", "show_category",
-             "show_skeleton", "hide_unlabelled", "unlabelled_color", "codec", "quality"],
-        )
-        return cls(
-            fps=d.get("fps", "auto"),
-            out_dir=_resolve(root, d.get("out_dir", "./renders")),
-            thickness=int(d.get("thickness", 2)),
-            font_scale=float(d.get("font_scale", 0.4)),
-            show_track_id=bool(d.get("show_track_id", True)),
-            show_category=bool(d.get("show_category", True)),
-            show_skeleton=bool(d.get("show_skeleton", False)),
-            hide_unlabelled=bool(d.get("hide_unlabelled", False)),
-            unlabelled_color=str(d.get("unlabelled_color", "#555555")),
-            codec=str(d.get("codec", "libx264")),
-            quality=int(d.get("quality", 8)),
-        )
+    fps: float | str = knob("auto", "Frame rate of the movie; auto is the source rate.",
+                            special=("auto",), min=0)
+    out_dir: Path = knob("./renders", "Where overlay movies are written.")
+    hide_unlabelled: bool = knob(False, "Draw only tracks that carry a label.")
+    show_skeleton: bool = knob(False, "Draw pose keypoints.")
 
 
 # --------------------------------------------------------------------------- #
 # top level
 # --------------------------------------------------------------------------- #
+SECTIONS: dict[str, type] = {
+    "paths": Paths, "nd2": ND2Options, "tiff": TiffOptions, "normalize": Normalize,
+    "detection": Detection, "model": ModelSource, "tiling": Tiling,
+    "tracking": Tracking, "keypoints": Keypoints, "features": Features,
+    "spectral": Spectral, "suggest": Suggest, "predict": Predict, "clips": Clips,
+    "ui": UI, "render": Render,
+}
+_TOP_LEVEL = set(SECTIONS) | {"categories", "keys"}
+
+
 @dataclass
 class Config:
     path: Path
@@ -1220,7 +960,6 @@ class Config:
     keys: dict[str, list[str]]
     render: Render
 
-    # -- convenience ------------------------------------------------------- #
     @property
     def is_pose(self) -> bool:
         return self.detection.task == "pose"
@@ -1231,11 +970,7 @@ class Config:
 
     @property
     def needs_keypoints(self) -> bool:
-        """``task: pose`` but nothing says how many keypoints the model has.
-
-        Resolvable, not fatal: the count lives in the checkpoint's ``kpt_shape``;
-        the names do not, so they are generated and can be renamed afterwards.
-        """
+        """``task: pose`` with no keypoint names; the checkpoint supplies the count."""
         return self.is_pose and not self.keypoints.nodes
 
     def movie_dir(self, movie_id: str) -> Path:
@@ -1252,6 +987,26 @@ class Config:
         return opt.color if opt else None
 
 
+def _section(data: dict, name: str) -> dict:
+    value = data.get(name, {})
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"config section '{name}' must be a mapping, "
+                          f"got {type(value).__name__}")
+    return value
+
+
+def _parse_keys(data: dict) -> dict[str, list[str]]:
+    keys = {k: list(v) for k, v in DEFAULT_KEYS.items()}
+    for action, binding in _section(data, "keys").items():
+        if action not in DEFAULT_KEYS:
+            _warn(f"ignoring unknown key binding keys.{action}")
+            continue
+        keys[action] = [binding] if isinstance(binding, str) else [str(b) for b in binding]
+    return keys
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load and validate config.yaml. Relative paths resolve against its folder."""
     if path is None:
@@ -1259,116 +1014,109 @@ def load_config(path: str | Path | None = None) -> Config:
     path = Path(path).resolve()
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
-
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
     if not isinstance(data, dict):
         raise ConfigError(f"{path} does not contain a YAML mapping")
 
+    for name in sorted(set(data) - _TOP_LEVEL):
+        _warn(f"ignoring unknown config section '{name}'")
     root = path.parent
-    keys = dict(_DEFAULT_KEYS)
-    for action, binding in _section(data, "keys").items():
-        if action not in _DEFAULT_KEYS:
-            warnings.warn(f"ignoring unknown key binding action 'keys.{action}'", stacklevel=2)
-            continue
-        keys[action] = [binding] if isinstance(binding, str) else [str(b) for b in binding]
-
-    cfg = Config(
-        path=path,
-        paths=Paths.parse(_section(data, "paths"), root),
-        nd2=ND2Options.parse(_section(data, "nd2")),
-        tiff=TiffOptions.parse(_section(data, "tiff")),
-        normalize=Normalize.parse(_section(data, "normalize")),
-        detection=Detection.parse(_section(data, "detection")),
-        model=ModelSource.parse(_section(data, "model")),
-        tiling=Tiling.parse(_section(data, "tiling")),
-        tracking=Tracking.parse(_section(data, "tracking")),
-        keypoints=Keypoints.parse(_section(data, "keypoints")),
-        features=Features.parse(_section(data, "features")),
-        spectral=Spectral.parse(_section(data, "spectral")),
-        suggest=Suggest.parse(_section(data, "suggest")),
-        predict=Predict.parse(_section(data, "predict")),
-        clips=Clips.parse(_section(data, "clips")),
-        categories=_parse_categories(data.get("categories")),
-        ui=UI.parse(_section(data, "ui")),
-        keys=keys,
-        render=Render.parse(_section(data, "render"), root),
-    )
+    sections = {name: cls.parse(_section(data, name), root) for name, cls in SECTIONS.items()}
+    keys = _parse_keys(data)
+    cfg = Config(path=path, categories=_parse_categories(data.get("categories")),
+                 keys=keys, **sections)
 
     # Before embeddings, an unset feature_groups meant the detector's cnn group.
     old = data.get("suggest")
     if (isinstance(old, dict) and "feature_groups" not in old
             and "embeddings" not in old and cfg.features.enabled):
-        warnings.warn(
-            "detector embeddings are now opt-in; add suggest.embeddings "
-            "[{name: det, source: detector}] and emb_det to feature_groups to use them",
-            stacklevel=2,
-        )
+        _warn("detector embeddings are now opt-in; add suggest.embeddings "
+              "[{name: det, source: detector}] and emb_det to feature_groups to use them")
 
-    # `task: pose` with no keypoints listed is INCOMPLETE, not invalid, and must
-    # not raise here: the count is readable from the checkpoint.
-    # `Config.needs_keypoints` carries the state and TiledDetector fills it in.
-
-    # The dense window is clips.frames, so the stride check spans two sections.
     stride = cfg.predict.resolved_stride(cfg.clips)
     if stride > int(cfg.clips.frames):
-        raise ConfigError(
-            f"predict.window_stride ({stride}) is longer than the window "
-            f"(clips.frames, {cfg.clips.frames}), which would leave frames no "
-            "window scores. Leave it at 'auto' to tile, or go below to overlap"
-        )
-
-    # Category keys must not collide with the navigation shortcuts.
+        raise ConfigError(f"predict.window_stride ({stride}) cannot exceed clips.frames "
+                          f"({cfg.clips.frames}); frames would go unscored")
     nav = {k.lower() for binds in keys.values() for k in binds}
     for g in cfg.categories:
         for o in g.options:
             if o.key.lower() in nav:
-                raise ConfigError(
-                    f"category shortcut {o.key!r} ({g.name}.{o.name}) collides with a "
-                    f"navigation shortcut in the 'keys' section"
-                )
+                raise ConfigError(f"category shortcut {o.key!r} ({g.name}.{o.name}) "
+                                  "collides with a navigation shortcut")
     return cfg
 
 
 # --------------------------------------------------------------------------- #
-# defaults, for a form that has to show a key the file does not mention
+# schema queries, for the form, the template and the tests
 # --------------------------------------------------------------------------- #
-_SECTION_TYPES = {
-    "nd2": "ND2Options", "tiff": "TiffOptions", "normalize": "Normalize",
-    "detection": "Detection", "model": "ModelSource", "tiling": "Tiling",
-    "tracking": "Tracking", "keypoints": "Keypoints", "features": "Features",
-    "spectral": "Spectral", "suggest": "Suggest", "predict": "Predict",
-    "clips": "Clips", "ui": "UI", "render": "Render", "paths": "Paths",
-}
+def _field(dotted: str):
+    name, _, key = dotted.partition(".")
+    cls = SECTIONS.get(name)
+    if cls is None:
+        return None
+    return next((f for f in dataclasses_fields(cls) if f.name == key), None)
 
-_DEFAULTS_CACHE: dict[str, dict] = {}
+
+def _default_of(f):
+    if f.default is not MISSING:
+        return f.default
+    return f.default_factory()
+
+
+def schema_keys() -> list[str]:
+    """Every configurable dotted key, in section order."""
+    return [f"{name}.{f.name}" for name, cls in SECTIONS.items()
+            for f in dataclasses_fields(cls)]
+
+
+def help_for(dotted: str) -> str:
+    """The one-line help for a key, or ""."""
+    f = _field(dotted)
+    return f.metadata.get("help", "") if f is not None else ""
+
+
+def meta_for(dotted: str) -> dict:
+    """A key's metadata with ``choices`` resolved: help, choices, min, max, below, special."""
+    f = _field(dotted)
+    if f is None:
+        return {}
+    meta = dict(f.metadata)
+    meta["choices"] = _choices(meta)
+    meta["type"] = str(f.type)
+    return meta
+
+
+def effective_values(data: dict) -> dict[str, Any]:
+    """Every schema key as the loader sets it from the raw mapping ``data``.
+
+    Paths keep the file's text. A section that does not load shows its raw
+    values over the defaults.
+    """
+    out: dict[str, Any] = {}
+    for name, cls in SECTIONS.items():
+        raw = data.get(name) if isinstance(data.get(name), dict) else {}
+        fields = dataclasses_fields(cls)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                section = cls.parse(copy.deepcopy(raw))
+            values = {f.name: getattr(section, f.name) for f in fields}
+        except Exception:                                   # noqa: BLE001
+            values = {f.name: raw.get(f.name, _default_of(f)) for f in fields}
+        for f in fields:
+            value = values[f.name]
+            if str(f.type) == "Path":
+                given = raw.get(f.name)
+                value = str(given if given is not None else _default_of(f))
+            out[f"{name}.{f.name}"] = value
+    return out
 
 
 def section_defaults(name: str) -> dict:
-    """What the loader uses for the keys ``config.yaml`` does not mention.
-
-    Read by running the section's own ``parse`` over an empty mapping, so it
-    cannot drift from what a project actually loads with. That matters because
-    the generated file documents most settings and leaves the rest out entirely:
-    ``suggest.iterations`` is not in it, and 1000 is still what gets fitted.
-
-    Path-valued defaults are dropped. A path only means something relative to a
-    project folder, and this has no project.
-    """
-    if name in _DEFAULTS_CACHE:
-        return _DEFAULTS_CACHE[name]
-    cls = globals().get(_SECTION_TYPES.get(name, ""))
-    values: dict[str, Any] = {}
-    if cls is not None:
-        try:
-            parsed = cls.parse({}, Path(".")) if name in ("paths", "render") else cls.parse({})
-        except Exception:
-            parsed = None
-        if parsed is not None:
-            values = {
-                f.name: getattr(parsed, f.name)
-                for f in dataclasses_fields(parsed)
-                if not isinstance(getattr(parsed, f.name), Path)
-            }
-    _DEFAULTS_CACHE[name] = values
-    return values
+    """Field defaults of one section, without path-valued ones."""
+    cls = SECTIONS.get(name)
+    if cls is None:
+        return {}
+    return {f.name: _default_of(f) for f in dataclasses_fields(cls)
+            if not str(f.type).startswith("Path")}

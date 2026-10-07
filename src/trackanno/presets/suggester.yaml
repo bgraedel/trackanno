@@ -16,6 +16,4 @@ set:
   detection.task: pose
   suggest.enabled: true
   suggest.feature_groups: [kinematic, pose, waveform]
-  ui.show_skeleton: true
-  ui.show_kymograph: true
   render.show_skeleton: true
