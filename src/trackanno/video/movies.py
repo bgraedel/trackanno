@@ -1,18 +1,4 @@
-"""Format-agnostic movie access.
-
-Everything downstream (detection, clip extraction, the GUI, the renderer) sees
-one abstraction: a *MovieSource* is a 2-D grayscale time series with a stable id
-whose ``frame(i)`` returns the raw i-th frame.
-
-``TiffMovie``
-    Multi-page / stacked TIFF. Uncompressed contiguous files open as a true
-    ``np.memmap``; anything else falls back to per-page decoding.
-
-``ND2Movie``
-    Nikon ND2 via the ``nd2`` package. ND2 carries P (multipoint), T, C and Z
-    axes, so **each P position becomes its own MovieSource**, with channel / z
-    from the config and the frame interval read out of the ND2 metadata.
-"""
+"""Movie access: a ``MovieSource`` is a 2-D grayscale time series (TIFF, or one ND2 position)."""
 
 from __future__ import annotations
 
@@ -44,13 +30,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 @dataclass
 class Normalizer:
-    """Percentile -> uint8 mapping for one movie, optionally per frame.
-
-    ``fixed`` is one mapping for the whole movie, faithful to real intensity
-    changes; ``per_frame`` gives every frame its own percentiles, removing drift
-    and flicker. The curve is persisted so prepare, the GUI and the renderer
-    agree pixel-for-pixel.
-    """
+    """Percentile to uint8 mapping for a movie: one for all frames (``fixed``) or one per frame."""
 
     lo: float | list[float]
     hi: float | list[float]
@@ -110,11 +90,7 @@ class Normalizer:
     def from_movie(
         cls, movie: "MovieSource", options=None, progress=None, n_frames: int | None = None
     ) -> "Normalizer":
-        """Measure the intensity mapping for a movie.
-
-        Percentiles come from a strided pixel subsample: ample for a percentile,
-        and cheap even on very large frames.
-        """
+        """Measure the intensity mapping from a strided pixel subsample."""
         from ..config import Normalize
 
         opt = options or Normalize()
@@ -125,8 +101,6 @@ class Normalizer:
         if opt.mode == "fixed":
             idx = np.unique(np.linspace(0, n - 1, min(20, n)).astype(int))
         else:
-            # Every frame gets its own mapping: illumination here swings frame to
-            # frame, so anything coarser leaves visible pulsing.
             idx = np.arange(n)
 
         iterator = progress(idx) if progress else idx
@@ -248,18 +222,16 @@ class TiffMovie(MovieSource):
                 f"{self._n_channels} channel(s)"
             )
 
-        # Every axis that is not Y/X/C is time (multiple such axes get flattened).
+        # Every axis other than Y/X/C is time, flattened.
         self._time_axes = [i for i in range(len(axes)) if i not in (yi, xi, self._chan_axis)]
         self._time_shape = [int(shape[i]) for i in self._time_axes]
         self.n_frames = int(np.prod(self._time_shape)) if self._time_shape else 1
 
-        # Pages are laid out by every non-YX axis in the series' own order, so
-        # derive the layout rather than assuming channel-fastest
-        # (`t * n_channels + c`), which reads the wrong plane for a CTYX stack.
+        # Pages follow the series' own non-YX axis order.
         self._page_axes = [i for i in range(len(axes)) if i not in (yi, xi)]
         self._page_shape = [int(shape[i]) for i in self._page_axes]
 
-        # Fast path: uncompressed + contiguous -> real memmap, zero-copy reads.
+        # Uncompressed contiguous files open as a memmap.
         self._mm: np.ndarray | None = None
         self._cache: np.ndarray | None = None
         try:
@@ -290,8 +262,7 @@ class TiffMovie(MovieSource):
         if src is not None:
             return np.asarray(src[self._index_tuple(index)])
 
-        # Page-wise fallback (compressed / non-contiguous files). Map the frame
-        # and channel onto a page using the series' real axis order.
+        # Page-wise fallback for compressed or non-contiguous files.
         if not self._page_shape:
             page = 0
         else:
@@ -308,9 +279,8 @@ class TiffMovie(MovieSource):
             arr = arr[..., min(self.channel, arr.shape[-1] - 1)]
         if arr.ndim != 2:
             raise ValueError(
-                f"{self.path.name}: page {page} decoded to shape {arr.shape}, expected a 2-D "
-                f"plane (series axes {self._axes!r}). Re-save the file uncompressed, or "
-                "report this layout."
+                f"{self.path.name}: page {page} has shape {arr.shape}, not a 2-D plane "
+                f"(axes {self._axes!r}); re-save the file uncompressed"
             )
         return arr
 
@@ -407,8 +377,7 @@ class ND2Movie(MovieSource):
 
         self.n_frames = int(sizes.get("T", 1))
 
-        # Axes that index a *sequence* entry (everything except channel and YX);
-        # nd2's read_frame() takes a flat index over exactly these, in file order.
+        # read_frame() takes a flat index over these axes, in file order.
         self._seq_axes = [a for a in self._axes if a not in ("C", "Y", "X", "S")]
         self._seq_shape = [int(sizes[a]) for a in self._seq_axes]
 
@@ -417,8 +386,8 @@ class ND2Movie(MovieSource):
             detected = _nd2_fps(f)
             if detected is None:
                 warnings.warn(
-                    f"{self.path.name}: could not read a frame rate from the ND2 metadata; "
-                    "falling back to 100 fps. Set nd2.fps explicitly to silence this.",
+                    f"{self.path.name}: no frame rate in the ND2 metadata; using 100 fps "
+                    "(set nd2.fps)",
                     stacklevel=2,
                 )
             self.fps = float(detected or 100.0)
@@ -430,7 +399,7 @@ class ND2Movie(MovieSource):
         except Exception:
             self.pixel_size_um = None
 
-        self._dask = None  # lazily built fallback
+        self._dask = None  # lazy fallback reader
 
     # -- indexing ---------------------------------------------------------- #
     def _seq_index(self, t: int, z: int) -> int:
@@ -451,8 +420,7 @@ class ND2Movie(MovieSource):
             raw = np.asarray(self._f.read_frame(self._seq_index(t, z)))
         except Exception:
             raw = self._read_plane_dask(t, z)
-        # read_frame returns (C, Y, X) when the file is multi-channel, else (Y, X);
-        # RGB files come back as (Y, X, S).
+        # (C, Y, X) for multi-channel files, (Y, X, S) for RGB, else (Y, X).
         if raw.ndim == 3:
             if raw.shape[-1] in (3, 4) and "S" in self._axes:
                 raw = raw[..., min(self.channel, raw.shape[-1] - 1)]
@@ -517,12 +485,7 @@ def _nd2_positions(path: Path, cfg: Config) -> list[int]:
 
 
 def _may_hold(path: Path, wanted: set[str]) -> bool:
-    """Whether this file could hold one of the wanted movies, by name alone.
-
-    A movie id is the file's stem, plus an ND2 position suffix where the file
-    holds several. So this answers without opening anything, and opening every
-    ND2 on a share to find out is the slowest thing discovery does.
-    """
+    """Whether this file could hold one of the wanted movie ids, judged by name alone."""
     return any(w == path.stem or w.startswith(f"{path.stem}__P") for w in wanted)
 
 
@@ -554,12 +517,7 @@ def _pick(sources: list[MovieSource], wanted: set[str]):
 
 
 def discover_movies(cfg: Config, only: list[str] | None = None) -> list[MovieSource]:
-    """Open every movie under ``paths.video_dir``. ND2 positions become separate movies.
-
-    With ``only``, files whose name cannot hold one of those ids are not opened
-    at all: the GUI asks for one movie at a time, and opening the whole folder
-    to hand back one of it is minutes on a share.
-    """
+    """Open every movie under ``paths.video_dir`` (one per ND2 position), or only the ids in ``only``."""
     video_dir = cfg.paths.video_dir
     if not video_dir.exists():
         raise FileNotFoundError(f"paths.video_dir does not exist: {video_dir}")
@@ -578,8 +536,7 @@ def discover_movies(cfg: Config, only: list[str] | None = None) -> list[MovieSou
     shortlist = [p for p in files if _may_hold(p, wanted)]
     selected, seen = _pick(_open_movies(shortlist, cfg), wanted)
     if wanted - seen and len(shortlist) != len(files):
-        # Only a shortcut, so anything it did not find is looked for properly
-        # rather than reported missing on the strength of a file name.
+        # The name shortlist missed some; search every file.
         for source in selected:
             source.close()
         selected, seen = _pick(_open_movies(files, cfg), wanted)
@@ -588,12 +545,12 @@ def discover_movies(cfg: Config, only: list[str] | None = None) -> list[MovieSou
         for source in selected:
             source.close()
         raise ValueError(
-            f"unknown movie id(s): {sorted(missing)}. Available: {', '.join(sorted(seen))}"
+            f"unknown movie id(s) {sorted(missing)}; available: {', '.join(sorted(seen))}"
         )
     return selected
 
 
 def open_movie(cfg: Config, movie_id: str) -> MovieSource:
-    """Reopen a single movie by its id (used by the renderer)."""
+    """Open one movie by its id."""
     sources = discover_movies(cfg, only=[movie_id])
     return sources[0]

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from fixtures import FILE_SETTINGS, synthetic_project
 
-from test_embeddings import FILE_SETTINGS, synthetic_project
 
 
 @pytest.fixture

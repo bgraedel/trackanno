@@ -1,10 +1,4 @@
-"""Edits to config.yaml that keep its comments.
-
-A ``safe_load`` + ``safe_dump`` round trip drops every comment, so the text is
-edited line by line. Dotted keys of any depth are found by indentation; a value
-written over a block (a block list or mapping) replaces the whole block.
-Structural blocks (``categories``) go through :func:`replace_section`.
-"""
+"""Line-based edits to config.yaml that keep its comments."""
 
 from __future__ import annotations
 
@@ -81,11 +75,7 @@ def _indent(line: str) -> int:
 
 
 def _block_end(lines: list[str], i: int) -> int:
-    """One past the last line belonging to the value of the key on line ``i``.
-
-    Children are more indented, or ``- `` items at the key's own indent.
-    Blank and comment lines count only when more content follows.
-    """
+    """One past the last line of the value of the key on line ``i``."""
     own = _indent(lines[i])
     end = i + 1
     for j in range(i + 1, len(lines)):
@@ -211,12 +201,7 @@ def _current(lines: list[str], path: list[str]):
 
 
 def set_values(text: str, updates: dict[str, Any]) -> str:
-    """Apply ``{"section.key": value}`` (any depth) to YAML text.
-
-    Existing keys are rewritten in place, keeping indentation and the trailing
-    comment; missing keys are added under their parent, missing sections at the
-    end of the file.
-    """
+    """Apply ``{"section.key": value}`` to YAML text in place; missing keys are added."""
     lines = text.splitlines()
     for dotted, value in updates.items():
         _set_one(lines, dotted.split("."), _native(value))
@@ -224,11 +209,7 @@ def set_values(text: str, updates: dict[str, Any]) -> str:
 
 
 def replace_section(text: str, section: str, value: Any, header: str = "") -> str:
-    """Replace a whole top-level block with freshly dumped YAML.
-
-    For ``categories`` and ``keypoints``. Comments inside the block are lost,
-    hence ``header``.
-    """
+    """Replace a top-level block with dumped YAML under ``header``; its comments are lost."""
     body = yaml.safe_dump(
         {section: value}, sort_keys=False, default_flow_style=False, allow_unicode=True
     ).rstrip("\n")

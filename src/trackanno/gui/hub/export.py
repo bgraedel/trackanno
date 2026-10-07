@@ -46,7 +46,6 @@ class ExportPage(Page):
         self._list_stale = True
 
         self.group = QComboBox()
-        # The combo carries the machine-readable value behind each plain label.
         self.source = QComboBox()
         for label, value in (("my labels", "labels"),
                              ("model predictions", "predictions"),
@@ -78,8 +77,7 @@ class ExportPage(Page):
 
         self.open_folder = QPushButton("Open project folder")
         self.open_folder.setToolTip(
-            "Show the project in the file manager. The rendered movies land in "
-            "render.out_dir inside it."
+            "Show the project in the file manager (movies go to render.out_dir)."
         )
         self.open_folder.clicked.connect(self._open_project_folder)
         folder_bar = QHBoxLayout()
@@ -106,15 +104,13 @@ class ExportPage(Page):
             "Export",
             "Put the labels back onto the original movies.",
             help="""
-<p>Burns the labels onto a copy of the original movie, colouring each track by
-its category. Works at any time, including on a half-finished CSV.</p>
+<p>Draws the labels onto a copy of each movie, one colour per category. Works on
+a half-finished CSV too.</p>
 
-<p>Colour by <b>your own labels</b>, by the <b>model's predictions</b>, or by
-both. A predicted box is <b>dashed and carries its confidence</b>, which is what
-lets the two be shown together.</p>
+<p>Colour by <b>your labels</b>, the <b>model's predictions</b>, or both.
+Predicted boxes are <b>dashed and show their confidence</b>.</p>
 
-<p>Frames no label or prediction covers are left as they were. A coloured box is
-a claim, and there is none to make there.</p>
+<p>Frames without a label or prediction are left unchanged.</p>
 """,
         ))
         layout.addWidget(splitter, 1)
@@ -134,11 +130,10 @@ a claim, and there is none to make there.</p>
         if self.cfg is None or self.hub.status is None:
             return "no project open"
         if self.source_value() == "predictions":
-            # A prediction-only export needs no hand labels, but it needs the file.
             from ...infer.predict import predictions_path
 
             if not predictions_path(self.cfg).exists():
-                return ("no predictions yet - run 'Label all clips with the model' "
+                return ("no predictions yet: run 'Label all clips with the model' "
                         "on the Model page")
             return ""
         if self.hub.status.n_annotated == 0:
@@ -161,8 +156,7 @@ a claim, and there is none to make there.</p>
         for group in self.cfg.categories:
             if not group.is_multi:
                 self.group.addItem(group.name)
-        # Follow render.hide_unlabelled when it or the project changes, and
-        # leave a ticked or cleared box alone otherwise.
+        # Reseed the box only when render.hide_unlabelled or the project changes.
         seed = (self.cfg.path, bool(self.cfg.render.hide_unlabelled))
         if seed != self._hide_seed:
             self._hide_seed = seed
@@ -172,7 +166,7 @@ a claim, and there is none to make there.</p>
         self.reload_movies()
 
     def _on_source_changed(self) -> None:
-        """The source decides both what the button may do and which movies exist."""
+        """Update the note, gate and movie list for the new source."""
         self._paint_source_note()
         self.refresh_gate()
         self.reload_movies()
@@ -183,8 +177,7 @@ a claim, and there is none to make there.</p>
             self.source_note.setText("")
             return
         note = (
-            "predicted values are drawn as dashed boxes with their confidence, "
-            "so they cannot be mistaken for your labels"
+            "predictions are drawn as dashed boxes with their confidence"
         )
         if self.cfg is not None:
             from ...infer.predict import predictions_path, staleness
@@ -198,7 +191,7 @@ a claim, and there is none to make there.</p>
         self.source_note.setText(note)
 
     def reload_movies(self) -> None:
-        """Re-read the CSV. Called when the page is shown, not per annotation."""
+        """Re-read the movie list (on show, not per annotation)."""
         if self.cfg is None:
             return
         self._list_stale = False
@@ -227,9 +220,7 @@ a claim, and there is none to make there.</p>
             self.movies.addItem(item)
 
     def _predicted_movies(self) -> tuple[dict, str]:
-        """({movie_id: row count}, what one row is). Never raises, like annotated_movies.
-
-        """
+        """({movie_id: row count}, what one row is). Never raises."""
         from ...infer.predict import load_predictions
 
         try:
@@ -248,7 +239,7 @@ a claim, and there is none to make there.</p>
         source = self.source_value()
         group_name = self.group.currentText() or None
         if source != "labels":
-            # Refuse before starting: an empty export looks like "nothing to say".
+            # Refuse up front rather than render an empty export.
             from ...infer.predict import load_predictions
 
             try:

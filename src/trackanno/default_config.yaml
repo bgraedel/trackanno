@@ -1,7 +1,6 @@
 # =============================================================================
 # trackanno project configuration
-# Edited by the Configure page, which keeps these comments. Paths are relative
-# to this file.
+# The Configure page keeps these comments. Paths are relative to this file.
 # =============================================================================
 
 paths:
@@ -9,27 +8,27 @@ paths:
   model: "./best.pt"          # YOLO weights used for detection
   work_dir: "./work"          # clip cache and per-movie tables; keep it on a local disk
   csv: "./annotations.csv"    # the annotation log, one row per labelled clip
-  patterns: ["*.tif", "*.tiff", "*.nd2"]
+  patterns: ["*.tif", "*.tiff", "*.nd2"]  # which files in the video folder are movies
 
 
-# --- ND2 reading: collapse the extra axes to one 2D time series --------------
+# --- ND2 reading: one 2D time series per position ----------------------------
 nd2:
-  channel: 0          # index, or the channel name as a string (e.g. "BF")
-  z: 0                # index, or "max" / "mean" / "min" for a projection
-  positions: all      # "all", or a list like [0, 2, 5]; each position is a movie
-  fps: auto           # auto reads the frame interval from the file
+  channel: 0          # channel index, or its name (e.g. "BF")
+  z: 0                # z index, or max | mean | min for a projection
+  positions: all      # all, or a list like [0, 2, 5]; each is a movie
+  fps: auto           # frame rate; auto reads it from the file
 
 
 # --- TIFF reading -------------------------------------------------------------
 tiff:
-  fps: 100            # TIFF carries no frame rate; set the acquisition rate
-  channel: 0
+  fps: 100            # acquisition frame rate; TIFF does not record it
+  channel: 0          # channel index
 
 
 # --- Raw to 8-bit intensity ---------------------------------------------------
 normalize:
   mode: per_frame     # per_frame: a mapping per frame | fixed: one per movie
-  percentiles: [0.5, 99.5]
+  percentiles: [0.5, 99.5]  # percentiles mapped to 0 and 255
 
 
 # --- Detection ---------------------------------------------------------------
@@ -55,24 +54,24 @@ model:
 tiling:
   enabled: auto       # auto tiles only frames larger than one tile | true | false
   tile: 640           # tile size cut from the frame, in pixels
-  overlap: 0.25       # share of a tile shared with its neighbour
+  overlap: 0.25       # fraction of a tile that overlaps its neighbour
   merge_iou: 0.6      # boxes from two tiles overlapping more than this are one animal
 
 
 # --- Tracking ----------------------------------------------------------------
 tracking:
-  backend: tracktrack       # tracktrack | bytetrack | botsort | ocsort | greedy
+  backend: tracktrack       # tracktrack | bytetrack | botsort | ocsort | deepocsort | fasttrack | greedy
   min_track_length: 40      # drop tracks seen in fewer frames than this
-  border_margin_px: 0       # how near the frame edge counts as at it; 0 is off
-  border_max_frac: 0.0      # share of one clip's frames allowed at the edge
+  border_margin_px: 0       # pixels from the edge that count as at it; 0 is off
+  border_max_frac: 0.0      # fraction of a clip's frames allowed at the edge
   overrides:                # parameters passed to the tracker
-    gmc_method: none        # camera-motion compensation; off on a static stage
+    gmc_method: none        # camera-motion compensation; off for a static stage
 
 
 # --- Keypoints (detection.task: pose); the order must match the model ---------
 keypoints:
-  nodes: []
-  edges: []
+  nodes: []           # keypoint names, in the model's order
+  edges: []           # skeleton links, drawn on screen only
 
 
 # --- Clips -------------------------------------------------------------------
@@ -81,14 +80,14 @@ clips:
   stride: 50          # frames between clip starts; equal to frames tiles
   window_mode: all    # first | first_per_track | all
   follow: smooth      # how the crop follows the animal: smooth | fixed | track
-  pad: 1.6            # crop side = box extent x this
+  pad: 1.6            # crop side is the box extent times this
   crop_size: auto     # cache crop size; auto is the p99 of what is needed
   min_clip_frames: 40 # detected frames a window needs to become a clip
 
 
 # --- Detector embeddings, saved during detection ------------------------------
 features:
-  enabled: true
+  enabled: true       # save detector embeddings during detection
 
 
 # --- Beat spectrum ------------------------------------------------------------
@@ -99,10 +98,10 @@ spectral:
 # --- Annotation suggestions ---------------------------------------------------
 # A classifier trained on your labels suggests a category; it never pre-selects.
 suggest:
-  enabled: true
+  enabled: true         # show what a classifier trained on your labels predicts
   model: catboost       # catboost | hist (scikit-learn HistGradientBoosting)
-  device: cpu           # cpu | gpu | auto (CatBoost only)
-  # kinematic | pose | waveform | context | emb_<name>
+  device: cpu           # where CatBoost fits: cpu | gpu | auto
+  # Feature families the model may use: kinematic | pose | waveform | context | emb_<name>
   feature_groups: [kinematic, pose, waveform]
   # Embedding inputs, e.g. {name: det, source: detector} or
   # {name: ae, source: file, path: embeddings/{movie_id}.parquet}
@@ -111,9 +110,9 @@ suggest:
   feature_columns: null # narrow the groups to these columns; null keeps every column
   retrain_every: 10     # refit in the background after this many new labels
   min_per_class: 5      # a class with fewer labels is not modelled
-  audit_fraction: 0.10  # share of tracks held out, so agreement stays measurable
+  audit_fraction: 0.10  # fraction of tracks held out to measure agreement
   min_confidence: 0.0   # hide suggestions below this confidence
-  select_rule: "off"    # off: shuffled order | margin: least certain first
+  select_rule: "off"    # off keeps the shuffle | margin: least certain clips first
   iterations: 1000      # boosting rounds per fit
   learning_rate: auto   # boosting step size; auto lets the estimator choose
   l2_leaf_reg: 3.0      # L2 regularisation of the leaf values
@@ -176,7 +175,7 @@ keys:
 
 # --- Overlay movies -----------------------------------------------------------
 render:
-  fps: auto             # auto is the movie's own frame rate
-  out_dir: "./renders"
-  hide_unlabelled: false
-  show_skeleton: false
+  fps: auto             # frame rate of the movie; auto is the source rate
+  out_dir: "./renders"  # where overlay movies are written
+  hide_unlabelled: false  # draw only tracks that carry a label
+  show_skeleton: false  # draw pose keypoints

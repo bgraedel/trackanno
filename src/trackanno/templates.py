@@ -1,24 +1,4 @@
-"""Reusable project settings: the presets that ship, and the ones you save.
-
-A template is a whole ``config.yaml``, comments included, stored outside any
-project so it survives the project it came from.
-
-It does NOT carry the three paths that describe one project on one disk:
-``video_dir``, ``work_dir`` and ``csv`` are reset to what a new project uses.
-``paths.model`` IS kept, and the New Project form overrides it when a model is
-chosen. ``ui.annotator`` is cleared: a template is a protocol, not a person.
-
-Saving copies the project's own file rather than re-serialising it, so the
-comments come along unchanged, and parses the result with the real loader, so a
-template that would not load cannot be saved.
-
-A *preset* is a template that ships with trackanno: a file under ``presets/``
-naming only the keys it changes, applied to the packaged default. They form a
-ladder, from hand annotation to a dense pose predictor, so a new project starts
-from one working set of settings rather than from every knob at once. Naming the
-changes rather than copying the whole file is what keeps a preset from drifting
-away from the defaults it was written against.
-"""
+"""Project templates: shipped presets (overrides on the default) and saved config.yaml copies."""
 
 from __future__ import annotations
 
@@ -39,16 +19,14 @@ __all__ = [
 ]
 
 BUILTIN_NAME = "default"
-BUILTIN_SUMMARY = "The packaged config.yaml as it ships: boxes, the suggester on, no decode."
+BUILTIN_SUMMARY = "The packaged default: boxes, suggester on."
 TEMPLATES_DIRNAME = "templates"
 PRESETS_DIRNAME = "presets"
 
-# The typed name lives in the file, not only in the file name, so a template
-# keeps the name it was given ("trypanosome 100 fps", not "trypanosome-100-fps")
-# and still describes itself if it is copied to somebody else.
+# First line of a saved template; keeps the typed name, not just the file slug.
 _HEADER = "# trackanno template: "
 
-# Reset on save: these describe one project on one disk, not a way of working.
+# Project-specific keys reset on save.
 _PROJECT_PATHS = {
     "paths.video_dir": "./videos",
     "paths.work_dir": "./work",
@@ -59,11 +37,7 @@ _PROJECT_PATHS = {
 
 @dataclass(frozen=True)
 class Preset:
-    """A set of overrides on the packaged default, shipped in ``presets/``.
-
-    ``id`` is the file name; ``overrides`` maps ``section.key`` to the value the
-    preset wants there.
-    """
+    """Overrides on the packaged default, shipped in ``presets/``; ``id`` is the file name."""
 
     id: str
     name: str
@@ -75,12 +49,7 @@ class Preset:
 
 @dataclass(frozen=True)
 class Template:
-    """A named set of settings.
-
-    Three kinds, told apart by which field is filled: the built-in default
-    (neither), a shipped preset (``preset``, its id) and one saved from a project
-    (``path``). Only the last can be deleted.
-    """
+    """A named set of settings: the built-in default, a ``preset``, or a saved file at ``path``."""
 
     name: str
     path: Path | None = None
@@ -90,7 +59,7 @@ class Template:
 
     @property
     def builtin(self) -> bool:
-        """Shipped with trackanno, so it is not ours to delete."""
+        """Shipped with trackanno, so not deletable."""
         return self.path is None
 
     @property
@@ -107,7 +76,7 @@ def templates_dir() -> Path:
 
 
 def _slug(name: str) -> str:
-    """A file name that survives every filesystem, from a name a person typed."""
+    """A filesystem-safe file name for a typed name."""
     out = re.sub(r"[^A-Za-z0-9._ -]+", "-", str(name)).strip(" .-")
     out = re.sub(r"[\s-]+", "-", out)
     return out.lower() or "template"
@@ -126,7 +95,7 @@ def _stored_name(path: Path) -> str:
 
 
 def _preset_files() -> list:
-    """The shipped preset files, read through the package rather than the disk."""
+    """The shipped preset files."""
     try:
         directory = resources.files(__package__).joinpath(PRESETS_DIRNAME)
         return sorted(
@@ -160,12 +129,7 @@ def _read_preset(file) -> Preset | None:
 
 
 def list_presets() -> list[Preset]:
-    """The shipped presets, in ladder order.
-
-    Read on every call, so editing one in a checkout shows up without a
-    reinstall. A preset that will not parse is skipped rather than raised: a bad
-    file in the package must not stop a project being created.
-    """
+    """The shipped presets in ladder order; unreadable ones are skipped."""
     found = [p for p in (_read_preset(f) for f in _preset_files()) if p is not None]
     return sorted(found, key=lambda p: (p.order, p.name.lower()))
 
@@ -186,11 +150,7 @@ def find_preset(name: str | None) -> Preset | None:
 
 
 def preset_text(preset: Preset | str | None) -> str:
-    """The ``config.yaml`` text a preset stands for: the default, overridden.
-
-    Every comment in the default survives, because the values are rewritten in
-    place rather than dumped afresh.
-    """
+    """The default ``config.yaml`` text with the preset's values set in place."""
     from .project import DEFAULT_CONFIG
 
     if isinstance(preset, str) or preset is None:
@@ -217,11 +177,7 @@ def list_templates() -> list[Template]:
 
 
 def find_template(name: str | None) -> Template | None:
-    """Match a typed name, its slug, or the file name. None if unknown.
-
-    All three, because the typed name, the name shown in the picker and the name
-    on disk can differ by punctuation.
-    """
+    """Match a typed name, its slug, or the file name. None if unknown."""
     if name is None:
         return None
     wanted = str(name).strip().lower()
@@ -242,12 +198,7 @@ def find_template(name: str | None) -> Template | None:
 
 
 def template_text(template: Template | str | None) -> str:
-    """The ``config.yaml`` text a template stands for.
-
-    Accepts a name for convenience. An unknown name, or the built-in, gives the
-    packaged default, so a project is always creatable even if the state
-    directory has been wiped between sessions.
-    """
+    """The ``config.yaml`` text for a template or name; unknown names give the default."""
     from .project import DEFAULT_CONFIG
 
     if isinstance(template, str) or template is None:
@@ -259,20 +210,13 @@ def template_text(template: Template | str | None) -> str:
     if template.builtin or template.path is None:
         return DEFAULT_CONFIG
     text = template.path.read_text(encoding="utf-8")
-    # The header names the template, not the project; a config.yaml written from
-    # it should read as an ordinary project file.
     if text.startswith(_HEADER):
         _, _, text = text.partition("\n")
     return text
 
 
 def save_template(name: str, config_path: str | Path, overwrite: bool = False) -> Template:
-    """Store the settings in ``config_path`` under ``name``. Returns the Template.
-
-    Raises ``FileExistsError`` unless ``overwrite``, ``ValueError`` on a name
-    that collides with the built-in, and whatever the loader raises if the
-    result would not load.
-    """
+    """Save ``config_path``'s settings as template ``name``; refuses clashes and bad configs."""
     from .config import load_config
 
     name = str(name).strip()
@@ -287,8 +231,6 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
     source = Path(config_path)
     text = set_values(source.read_text(encoding="utf-8"), dict(_PROJECT_PATHS))
 
-    # Parse it as a project before storing it: the error reads far better here
-    # than three steps later, when the project is created.
     with tempfile.TemporaryDirectory() as tmp:
         probe = Path(tmp) / "config.yaml"
         probe.write_text(text, encoding="utf-8")
@@ -300,8 +242,6 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
     if target.exists() and not overwrite:
         raise FileExistsError(f"a template named {target.stem!r} already exists")
 
-    # Written beside its real name and moved into place, so an interrupted save
-    # cannot leave a half-written template to be picked up later.
     staged = target.with_suffix(".yaml.part")
     staged.write_text(f"{_HEADER}{name}\n{text}", encoding="utf-8")
     staged.replace(target)

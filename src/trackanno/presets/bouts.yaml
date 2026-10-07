@@ -1,28 +1,18 @@
-# trackanno preset. The keys under `set` are applied to the packaged
-# default_config.yaml, so a key not named here keeps its shipped value and the
-# comment that documents it.
+# trackanno preset: the keys under `set` override the packaged default_config.yaml.
 name: dense bouts
 order: 3
 summary: Every frame scored on 25-frame windows stepped by 5, decoded into bouts.
 about: >
-  Keypoints and the classifier as in the suggester preset, with dense prediction
-  turned into behaviour. The dense grid measures 25 frames and steps 5, so a change
-  of behaviour is pinned to five frames rather than to a window, and bouts
-  shorter than ten frames are absorbed into their neighbours. Review then shows where each
-  boundary landed. The dense window length is not a setting of
-  its own: a model is fitted at clips.frames and refuses to score a grid of any
-  other length, so the annotation clips are 25 frames here as well, and
-  min_clip_frames comes down with them. Change clips.frames and the
-  dense window follows it; the stride stays where it is put.
+  The suggester preset plus dense prediction: 25-frame windows every 5 frames,
+  with bouts shorter than 10 frames merged into a neighbour. The window length is
+  clips.frames, so clips are 25 frames too.
 set:
-  # The window every measurement is made over, for the annotator and the dense
-  # grid alike.
-  clips.frames: 25
+  clips.frames: 25             # the window for annotation and dense prediction
   clips.stride: 25
-  clips.min_clip_frames: 20    # the same 80% of the window the default asks for
+  clips.min_clip_frames: 20    # 80% of the window, as in the default
   detection.task: pose
   suggest.enabled: true
   suggest.feature_groups: [kinematic, pose, waveform]
   render.show_skeleton: true
-  predict.window_stride: 5     # five frames between window starts, so they overlap
+  predict.window_stride: 5     # overlapping windows, 5 frames apart
   predict.min_bout_frames: 10

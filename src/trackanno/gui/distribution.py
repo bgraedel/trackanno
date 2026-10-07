@@ -1,10 +1,6 @@
-"""How the labels are actually spread, drawn rather than tabulated.
+"""Label distribution charts and warnings for the Model page.
 
-Shown on the Model page. Three things worth seeing before training: one class swallowing most of the
-clips, so a classifier that always answers it scores well and means nothing; a
-class below ``suggest.min_per_class``, dropped at training time; a class living
-in a single movie, which grouped cross-validation cannot put in both train and
-test.
+Flags a dominant class, classes below ``suggest.min_per_class`` and classes in one movie.
 """
 
 from __future__ import annotations
@@ -61,10 +57,7 @@ class GroupTally:
 
 
 def tally_annotations(rows, cfg) -> list:
-    """[GroupTally] from CSV rows, in the order the config declares them.
-
-    Every configured option gets a bar even at zero, and a value in the CSV the
-    config no longer declares gets one marked unknown."""
+    """[GroupTally] from CSV rows in config order; unknown CSV values get a bar marked unknown."""
     out = []
     for group in cfg.categories:
         tally = GroupTally(name=group.name, is_multi=group.is_multi)
@@ -95,7 +88,6 @@ def tally_annotations(rows, cfg) -> list:
                 bar.count += 1
                 bar.movies.add(movie)
 
-        # Only when non-zero, so a fully filled group carries no empty row.
         if blank.count:
             tally.bars.append(blank)
         out.append(tally)
@@ -148,7 +140,6 @@ class BarChart(QWidget):
         value_font.setWeight(QFont.DemiBold)
         metrics = painter.fontMetrics()
 
-        # Column widths measured from the actual strings, not a fixed fraction.
         label_w = min(
             max(140, max(metrics.horizontalAdvance(b.name) for b in bars) + 26),
             max(150, int(self.width() * 0.42)),
@@ -191,7 +182,7 @@ class BarChart(QWidget):
                 painter.setBrush(colour)
                 painter.drawRoundedRect(fill, 4, 4)
 
-            # The line the Model page applies: left of it is dropped at training.
+            # suggest.min_per_class threshold.
             if self.min_per_class > 1 and self.min_per_class < scale:
                 x = track_x + track_w * self.min_per_class / scale
                 pen = QPen(QColor(t["border_hi"]), 1, Qt.DashLine)
@@ -213,8 +204,7 @@ class BarChart(QWidget):
     def _value_text(self, bar: Tally) -> str:
         total = self.tally.n_rows or 1
         text = f"{bar.count}   {100.0 * bar.count / total:.0f}%"
-        # Only when it is a problem: a class in one movie cannot be scored by
-        # grouped-by-movie cross-validation.
+        # Flag classes in a single movie.
         if bar.count and bar.n_movies == 1 and bar.name != UNLABELLED:
             text += "   1 movie"
         return text
@@ -239,7 +229,7 @@ def summary_lines(tallies, cfg) -> list:
         if thin:
             out.append(
                 f"{tally.name}: {_join(thin)} below the {minimum}-label minimum, "
-                "so they are dropped at training time."
+                "dropped at training."
             )
         if single:
             one = len(single) == 1
@@ -251,15 +241,14 @@ def summary_lines(tallies, cfg) -> list:
         if unknown:
             out.append(
                 f"{tally.name}: {_join(unknown)} {_is(unknown)} in the CSV but not "
-                "in the config - an option was renamed or removed after labelling."
+                "in the config (renamed or removed after labelling)."
             )
         if blank is not None and blank.count and not tally.is_multi:
             out.append(
                 f"{tally.name}: {blank.count} annotated clip(s) have no value for "
                 "this group."
             )
-        # Imbalance, judged on the labels themselves: counting the "(not set)"
-        # bar would make an unlabelled group report a nonsense percentage.
+        # Imbalance over real labels only, excluding "(not set)".
         labelled = sum(b.count for b in real)
         top = max(real, key=lambda b: b.count, default=None)
         if labelled >= 20 and top is not None and top.count / labelled > 0.9:
@@ -285,7 +274,7 @@ def _join(names) -> str:
 
 
 def read_annotation_rows(cfg):
-    """(rows, problem). A broken CSV must report itself, not raise into Qt."""
+    """(rows, problem); never raises."""
     import csv
 
     path = cfg.paths.csv
@@ -345,14 +334,13 @@ class DistributionView(QWidget):
         """Point at a (re)loaded project; charts are rebuilt on the next reload."""
         self._cfg, self._status = cfg, status
         self.stale = True
-        # Groups may have been renamed or removed; old charts cannot be reused.
         self._clear_charts()
 
     def blocker(self) -> str:
         if self._cfg is None or self._status is None:
             return "no project open"
         if self._status.n_annotated == 0:
-            return "no annotations yet - label some clips first"
+            return "no annotations yet: label some clips first"
         return ""
 
     def _clear_charts(self) -> None:
@@ -396,7 +384,7 @@ class DistributionView(QWidget):
                 title = tally.name + ("   (multi-select)" if tally.is_multi else "")
                 box = QGroupBox(title)
                 inner = QVBoxLayout(box)
-                # Zero: the QGroupBox rule already reserves 34px for the title.
+                # The QGroupBox style already reserves room for the title.
                 inner.setContentsMargins(0, 0, 0, 0)
                 inner.addWidget(chart)
                 self.charts_layout.insertWidget(self.charts_layout.count() - 1, box)
@@ -431,7 +419,7 @@ class DistributionView(QWidget):
             parts.append(f"<b>{uncertain}</b> marked uncertain")
         self.coverage.setText(
             "   |   ".join(parts)
-            + f"<br><span style='color:{tokens()['faint']}'>The dashed line marks "
+            + f"<br><span style='color:{tokens()['faint']}'>Dashed line: "
             f"suggest.min_per_class ({self._cfg.suggest.min_per_class}); classes "
-            "left of it are dropped when the model is trained.</span>"
+            "left of it are dropped at training.</span>"
         )

@@ -1,10 +1,4 @@
-"""Tiled YOLO inference.
-
-Movies are much larger than the model's input, so each frame is cut into
-overlapping tiles, run as a batch, mapped back to full-frame coordinates and
-merged with one class-agnostic NMS. Frames that fit inside a single tile skip
-the mechanism entirely.
-"""
+"""Tiled YOLO inference: overlapping tiles per frame, mapped back and merged by NMS."""
 
 from __future__ import annotations
 
@@ -32,13 +26,7 @@ __all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
 
 
 def cuda_status() -> tuple[bool, str]:
-    """``(usable, why not)`` for CUDA on this machine, with the reason kept.
-
-    ``torch.cuda.is_available()`` answers False for a CPU-only wheel, an absent
-    driver, a card asleep behind hybrid graphics and a driver that has fallen
-    over alike, and says which only in a warning it raises on the way past. That
-    warning is caught here so the reason can be put on screen.
-    """
+    """``(usable, reason)`` for CUDA on this machine, keeping torch's warning as the reason."""
     try:
         import torch
     except ImportError:
@@ -54,9 +42,6 @@ def cuda_status() -> tuple[bool, str]:
     if usable and count > 0:
         return True, ""
     if usable:
-        # The two ask different layers and are allowed to disagree; only one of
-        # them reads CUDA_VISIBLE_DEVICES. Nothing can run on a device that
-        # cannot be enumerated, so this counts as no GPU.
         return False, ("torch reports CUDA available but can enumerate no device "
                        "(CUDA_VISIBLE_DEVICES is the usual cause)")
 
@@ -67,10 +52,7 @@ def cuda_status() -> tuple[bool, str]:
         return False, said
     if not getattr(torch.version, "cuda", None):
         return False, f"torch {torch.__version__} is a CPU-only build"
-    # The default check inside torch never raises - a missing or unresponsive
-    # driver is simply a device count of zero. So the interesting question is
-    # whether the driver disagrees, which is the difference between "no card
-    # here" and "the card is there and torch could not reach it".
+    # Ask the driver, to tell "no card" from "torch could not reach it".
     cards = _driver_sees()
     if cards:
         return False, (
@@ -81,11 +63,7 @@ def cuda_status() -> tuple[bool, str]:
 
 
 def _driver_sees() -> str:
-    """What ``nvidia-smi`` lists, or "" if it is absent or says nothing.
-
-    Only called once torch has already said no, so the happy path spawns
-    nothing. Bounded and fully guarded, a diagnosis being no use if it can hang.
-    """
+    """The GPU names ``nvidia-smi`` lists, or "" if it is absent or silent."""
     import subprocess
 
     try:
@@ -100,11 +78,7 @@ def _driver_sees() -> str:
 
 
 def cuda_devices() -> list[int]:
-    """The CUDA indices this machine can actually be told to use.
-
-    The one place either half of the app asks, so the settings list and
-    ``resolve_device`` cannot disagree about what is on offer.
-    """
+    """The usable CUDA device indices on this machine."""
     usable, _why = cuda_status()
     if not usable:
         return []
@@ -126,12 +100,7 @@ def _mps_available() -> bool:
 
 
 def resolve_device(device: str) -> str:
-    """Turn ``auto`` into something ultralytics can use, falling back safely.
-
-    A config that names a GPU is a promise about the machine it was written on;
-    on a machine without that device this says so and continues on the CPU
-    rather than dying inside ultralytics.
-    """
+    """Resolve ``auto`` or a device name for ultralytics; a missing GPU falls back to the CPU."""
     requested = str(device).strip()
     try:
         import torch  # noqa: F401 - the probes below need it importable
@@ -153,16 +122,13 @@ def resolve_device(device: str) -> str:
         index = int(requested.replace("cuda:", ""))
         if index in cuda:
             return str(index)
-        print(
-            f"[trackanno] detection.device is {requested!r} but no such CUDA device "
-            "is available here; using the CPU instead."
-        )
+        print(f"[trackanno] detection.device {requested!r} is not available here; using the CPU")
         return "cpu"
     return requested
 
 
 def device_label(device: str) -> str:
-    """Name a resolved device the way a log line should read it."""
+    """A readable name for a resolved device."""
     value = str(device).strip()
     index = value.replace("cuda:", "")
     if index.isdigit():
@@ -180,22 +146,12 @@ def device_label(device: str) -> str:
 
 
 def default_node_names(n: int) -> list[str]:
-    """Placeholder keypoint names for a model that reports ``n`` of them.
-
-    No ultralytics checkpoint stores keypoint *names*, only ``kpt_shape``. Order
-    is what has to match the model, so generated names are correct by
-    construction and can be renamed for readability afterwards.
-    """
+    """Placeholder keypoint names ``kp0..``; checkpoints store only the count."""
     return [f"kp{i}" for i in range(int(n))]
 
 
 def read_model_info(model_path) -> dict:
-    """What a checkpoint says about itself: task, keypoint count, class names.
-
-    Read from the file rather than through ``YOLO(...)`` so the GUI can answer
-    "what is this model?" the moment you pick one, without building a detector
-    or touching the GPU.
-    """
+    """Task, keypoint count, class names and imgsz read from a checkpoint file, on the CPU."""
     import torch
 
     try:
@@ -204,10 +160,7 @@ def read_model_info(model_path) -> dict:
         raise RuntimeError(f"could not read {model_path}: {exc}") from exc
 
     if isinstance(checkpoint, dict):
-        # EMA first, then "model": a checkpoint written mid-training keeps the
-        # averaged weights under "ema" and leaves "model" set to None, so
-        # reading "model" alone finds nothing on a user's own best.pt.
-        # Ultralytics resolves it the same way round.
+        # EMA first: mid-training checkpoints leave "model" as None.
         model = checkpoint.get("ema") or checkpoint.get("model")
         args = checkpoint.get("train_args") or {}
     else:
@@ -219,8 +172,7 @@ def read_model_info(model_path) -> dict:
     except TypeError:
         head = None
 
-    # kpt_shape is (n_keypoints, n_dims). It lives on the model, in the yaml it
-    # was built from, or - on a checkpoint carrying neither - on the head module.
+    # kpt_shape is (n_keypoints, n_dims), on the model, its yaml, or the head.
     shape = getattr(model, "kpt_shape", None)
     if shape is None:
         shape = (getattr(model, "yaml", None) or {}).get("kpt_shape")
@@ -235,9 +187,7 @@ def read_model_info(model_path) -> dict:
 
     task = args.get("task") or getattr(model, "task", None)
     if not task and head is not None:
-        # Same rule ultralytics uses: the head module names the task. A segment
-        # or classify checkpoint reported as a detector would fail much later
-        # and much less clearly.
+        # As in ultralytics, the head module's class names the task.
         kind = type(head).__name__.lower()
         for candidate in ("pose", "segment", "classify", "obb", "detect"):
             if candidate in kind:
@@ -265,11 +215,7 @@ _PRECISION_KWARG: dict | None = None
 
 
 def _precision_kwarg() -> dict:
-    """FP16 inference, spelled the way the installed ultralytics wants it.
-
-    `quantize=16` where it exists, `half=True` otherwise. Resolved once: this is
-    called per frame.
-    """
+    """The FP16 predict kwarg the installed ultralytics takes (``quantize`` or ``half``)."""
     global _PRECISION_KWARG
     if _PRECISION_KWARG is None:
         try:
@@ -322,8 +268,7 @@ class Detections:
         kpts = None
         if all(p.kpts is not None for p in parts):
             kpts = np.concatenate([p.kpts for p in parts], axis=0)
-        # Features are dropped unless every part has them: a partial failure must
-        # never silently misalign rows against boxes.
+        # Keep features only if every part has them, so rows stay aligned.
         feats = None
         if all(p.feats is not None for p in parts):
             feats = np.concatenate([p.feats for p in parts], axis=0)
@@ -340,11 +285,7 @@ class Detections:
 # geometry
 # --------------------------------------------------------------------------- #
 def tile_grid(height: int, width: int, tile: int, overlap: float) -> list[tuple[int, int, int, int]]:
-    """Overlapping (x0, y0, x1, y1) tiles covering the frame.
-
-    Tiles are ``tile`` px square where possible; the last row/column is snapped
-    back inside the frame instead of padded, so every tile holds real pixels.
-    """
+    """Overlapping (x0, y0, x1, y1) tiles covering the frame, the last ones snapped inside."""
     if tile <= 0:
         raise ValueError("tiling.tile must be positive")
     step = max(1, int(round(tile * (1.0 - overlap))))
@@ -425,18 +366,14 @@ class TiledDetector:
         from ultralytics import YOLO
 
         self.cfg = cfg
-        # Resolved once, here, so every predict call and every log line agree,
-        # and logged every time: "auto" on its own never tells you whether a slow
-        # run is on the GPU or the CPU.
+        # Resolve once and always log which device runs.
         self.device = resolve_device(cfg.detection.device)
         wanted = str(cfg.detection.device).strip()
         told = f"detection.device {wanted!r} -> {device_label(self.device)}"
         level = "info"
-        # Asking for a GPU and silently getting the CPU is the failure that
-        # looks like nothing at all - the run just takes twenty times as long.
         if self.device == "cpu" and wanted not in ("cpu",):
             _usable, why = cuda_status()
-            told += f" - NOT the GPU: {why}"
+            told += f"; not the GPU: {why}"
             level = "warning"
         if reporter is not None:
             reporter.log(told, level)
@@ -452,30 +389,26 @@ class TiledDetector:
         model_kpts = int(model_kpts[0]) if model_kpts else None
 
         if cfg.needs_keypoints:
-            # The checkpoint is the authority on the count, and it is already
-            # loaded here, so resolve rather than refuse.
             if not model_kpts:
                 raise ValueError(
-                    f"detection.task is 'pose' but {cfg.paths.model} does not report a "
-                    "keypoint shape, so it is not a pose model. Set detection.task to "
-                    "'detect', or point paths.model at pose weights."
+                    f"detection.task is 'pose' but {cfg.paths.model} is not a pose model; "
+                    "set detection.task to 'detect' or use pose weights"
                 )
             cfg.keypoints.nodes = default_node_names(model_kpts)
             print(
                 f"[trackanno] {cfg.paths.model.name} predicts {model_kpts} keypoints; "
-                f"using placeholder names {cfg.keypoints.nodes[0]}..{cfg.keypoints.nodes[-1]}. "
-                "Rename them under keypoints.nodes if you want the skeleton labelled."
+                f"naming them {cfg.keypoints.nodes[0]}..{cfg.keypoints.nodes[-1]} "
+                "(rename under keypoints.nodes)"
             )
         elif cfg.is_pose and model_kpts and model_kpts != cfg.n_keypoints:
             raise ValueError(
                 f"model has {model_kpts} keypoints but keypoints.nodes lists "
-                f"{cfg.n_keypoints}. Fix keypoints.nodes (order matters)."
+                f"{cfg.n_keypoints}; fix keypoints.nodes"
             )
         self.n_kpts = cfg.n_keypoints
         self._grid_cache: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
 
-        # Per-detection CNN features come out of the same forward pass; the hook
-        # is installed once here and lives for the detector's lifetime.
+        # Embedding hook on the head, installed for the detector's lifetime.
         self.extractor = None
         if getattr(cfg, "features", None) is not None and cfg.features.enabled:
             from .features import InstanceFeatures
@@ -511,10 +444,6 @@ class TiledDetector:
             device=self.device, verbose=False,
         )
         if d.half:
-            # ultralytics replaced `half` with a unified `quantize` scheme and
-            # logs a deprecation notice for every call that still uses the old
-            # name - at one call per frame that buries everything else. Send
-            # whichever the installed version actually understands.
             kwargs.update(_precision_kwarg())
         return kwargs
 
@@ -526,20 +455,13 @@ class TiledDetector:
         return out
 
     def _predict_with_features(self, crops: list[np.ndarray], imgsz: int) -> tuple[list, list]:
-        """Predict, capturing per-detection features from the same forward pass.
-
-        Features must be pooled while the hook still holds *this* sub-batch's
-        maps, so extraction happens inside the batching loop rather than after.
-        """
+        """Predict and pool per-detection features per sub-batch, while the hook holds its maps."""
         kwargs = self._predict_kwargs(imgsz)
         batch = self.cfg.detection.batch
         results, feats = [], []
         for i in range(0, len(crops), batch):
             chunk = crops[i : i + batch]
-            # Drop the previous chunk's maps BEFORE predicting: a forward pass
-            # that never reaches the head would otherwise leave them in place and
-            # pooled() would return the PREVIOUS tile's features, correctly
-            # shaped and correctly row-counted.
+            # Drop the previous chunk's maps so they are never pooled again.
             self.extractor.reset()
             chunk_results = self.model.predict(chunk, **kwargs)
             results.extend(chunk_results)
@@ -589,13 +511,9 @@ class TiledDetector:
     def _drop_edge_truncated(
         self, dets: Detections, tile: tuple[int, int, int, int], height: int, width: int
     ) -> tuple[Detections, Detections]:
-        """Split into (kept, suspect) where suspect boxes are clipped by an interior tile border.
+        """Split into (kept, suspect): suspect boxes touch an interior tile border.
 
-        An object straddling a tile border is detected twice: truncated in this
-        tile, complete in the overlapping neighbour. Dropping the truncated copy
-        avoids a merged NMS having to choose between two poor boxes. Boxes that
-        touch a *frame* border are genuinely at the edge and are kept.
-        """
+        The neighbouring tile sees those objects whole; boxes on a frame border are kept."""
         if len(dets) == 0:
             return dets, Detections.empty(self.n_kpts)
         x0, y0, x1, y1 = tile
@@ -619,8 +537,6 @@ class TiledDetector:
         tiled = len(tiles) > 1
 
         crops = [np.ascontiguousarray(frame_rgb[y0:y1, x0:x1]) for x0, y0, x1, y1 in tiles]
-        # `tiling.tile` says how the frame is cut, `detection.imgsz` the
-        # resolution each piece is seen at, tiled or not.
         imgsz = int(self.cfg.detection.imgsz)
         if self.extractor is not None:
             results, feat_blocks = self._predict_with_features(crops, imgsz)
@@ -640,9 +556,7 @@ class TiledDetector:
 
         merged = Detections.concat(kept_parts)
 
-        # Safety net: an object bigger than the tile overlap is truncated in
-        # *every* tile that sees it and would otherwise vanish. Re-admit any
-        # suspect box that no surviving detection covers.
+        # Re-admit suspect boxes nothing else covers (objects larger than the overlap).
         if suspect_parts:
             suspect = Detections.concat(suspect_parts)
             if len(suspect):
@@ -657,7 +571,7 @@ class TiledDetector:
             return merged
         keep = _nms(merged.xyxy, merged.conf, self.cfg.tiling.merge_iou)
         merged = merged.take(keep)
-        # Highest-confidence first keeps downstream behaviour deterministic.
+        # Highest confidence first, for a deterministic order.
         return merged.take(np.argsort(-merged.conf, kind="stable"))
 
     def detect_untiled(self, frame_rgb: np.ndarray) -> Detections:

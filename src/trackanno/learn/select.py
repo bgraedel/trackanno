@@ -1,15 +1,4 @@
-"""Which clips a human should annotate next, ranked by the model's margin.
-
-Probabilities must be raw ``predict_proba`` output over the candidate pool, one
-row per clip, and not :meth:`trackanno.learn.suggest.Suggester.suggest` output,
-which drops audit clips and low-confidence answers.
-
-:func:`select_batch` ranks the candidates by :func:`margin`, breaks ties by
-``clip_id`` so the answer does not depend on row order, and records per clip
-what it scored and where it ranked.
-
-Numpy only, no config, no file I/O: plain arrays in, plain dicts out.
-"""
+"""Rank clips for annotation by the model's margin, from raw ``predict_proba`` rows."""
 
 from __future__ import annotations
 
@@ -20,13 +9,12 @@ __all__ = ["RULE", "margin", "rank_by", "select_batch"]
 # The rule name recorded in each record's ``rule`` field.
 RULE = "margin"
 
-# How far a row may drift from summing to 1: loose enough for float32
-# predict_proba output, tight enough to refuse unsoftmaxed scores.
+# Allowed deviation of a row sum from 1.
 _SUM_TOL = 1e-6
 
 
 def _as_proba(proba, clip_ids=None) -> np.ndarray:
-    """A real probability matrix, or a refusal naming the offending row."""
+    """``proba`` as a validated probability matrix; raises naming the bad row."""
     proba = np.asarray(proba, dtype=float)
     if proba.ndim != 2:
         raise ValueError(
@@ -75,25 +63,15 @@ def rank_by(scores, clip_ids) -> np.ndarray:
     scores = np.asarray(scores, dtype=float)
     ids = np.asarray(clip_ids, dtype=str)
     if scores.shape != ids.shape:
-        raise ValueError(
-            f"{scores.size} score(s) against {ids.size} clip id(s); they are "
-            "matched by position"
-        )
+        raise ValueError(f"{scores.size} score(s) against {ids.size} clip id(s)")
     # lexsort takes the primary key last: score descending, then id ascending.
     return np.lexsort((ids, -scores))
 
 
 def select_batch(proba, clip_ids, classes, n: int, *, candidates=None) -> list[dict]:
-    """Up to ``n`` candidate clips, most contested first, with a record each.
+    """Up to ``n`` candidate clips, most contested first, one record dict each.
 
-    ``proba`` is ``(n_clips, n_classes)`` in the model's class order,
-    ``clip_ids`` names one row each and must be unique, ``classes`` names one
-    column each. ``candidates`` is an optional boolean mask of selectable rows.
-
-    Each record holds ``clip_id``, ``index`` (its row in ``proba``), ``rank``,
-    ``rule``, ``score``, ``predicted_class``, ``predicted_proba`` and
-    ``pool_size``, all plain Python scalars. Fewer than ``n`` come back when the
-    pool is smaller.
+    ``candidates`` is an optional boolean mask of selectable rows; ``clip_ids`` must be unique.
     """
     ids = np.asarray(clip_ids, dtype=str)
     names = [str(c) for c in classes]

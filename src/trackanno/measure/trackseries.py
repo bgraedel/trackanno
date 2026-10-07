@@ -1,25 +1,6 @@
-"""Per-frame series for one track, sliced and reduced into window features.
+"""Per-frame series for one track (:func:`build_series`) and its reduction over any window.
 
-:func:`build_series` walks a track once and returns a per-FRAME table;
-:func:`aggregate_window` slices it to any half-open frame range and collapses
-that to a scalar dict. The window is a free parameter, not a property of the
-clip manifest, and the per-frame ``eigh`` behind ``shape_*`` is paid once per
-track rather than once per overlapping window.
-
-The hard contract: a window's features are a property of the WINDOW and nothing
-else, so aggregating a range out of a whole-track series must equal aggregating
-it out of a series built for that range alone. The gates are part of that -
-where there is too little to measure the feature is NaN rather than computed
-anyway, and that NaN pattern is itself informative to a NaN-native model.
-
-``beat_*`` and ``wave_*`` are ABSENT rather than NaN: they need the whole 2-D
-body-frame displacement matrix and a resolvability floor that is a function of
-window LENGTH, so they change meaning when the window does.
-:func:`trackanno.measure.clipfeatures.window_features` joins them back on.
-
-Frames are addressed by ABSOLUTE frame number: the table is indexed
-``f_start .. f_start + n_frames - 1`` and ``aggregate_window`` takes absolute
-bounds.
+A window's features depend only on its frames; ``beat_*`` and ``wave_*`` are added by clipfeatures.
 """
 
 from __future__ import annotations
@@ -49,13 +30,10 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # the contract
 # --------------------------------------------------------------------------- #
-# Each column maps to the reducers that collapse it over a window; the feature
-# name is column + the reducer's suffix, so this table IS the feature list for
-# every point quantity. Quantities defined by the window's ENDPOINTS live in
-# `WINDOW_FUNCTIONALS`. An empty reducer tuple means no feature of its own.
+# Column -> reducers over a window; feature name is column + reducer suffix.
 SERIES_SPEC: dict[str, tuple[str, ...]] = {
     # -- detection box ------------------------------------------------------- #
-    "cx": (),                       # box centre, the trajectory everything else hangs off
+    "cx": (),                       # box centre
     "cy": (),
     "box_w": (),
     "box_h": (),
@@ -89,9 +67,7 @@ SERIES_SPEC: dict[str, tuple[str, ...]] = {
 
 SERIES_COLUMNS: tuple[str, ...] = tuple(SERIES_SPEC)
 
-# Functionals of the WINDOW, not reductions of a per-frame column. Listed so the
-# schema is fixed whether or not any could be computed (the `setdefault` sweep
-# in `aggregate_window`): never a missing column, always NaN.
+# Functionals of the whole window; NaN when not computable.
 WINDOW_FUNCTIONALS: tuple[str, ...] = (
     "path_length", "net_displacement", "straightness", "radius_gyration",
     "turn_lag_frames", "turn_abs_mean", "turn_std", "turn_abs_p90", "turn_n_valid",
@@ -101,46 +77,30 @@ WINDOW_FUNCTIONALS: tuple[str, ...] = (
     "tip_angle_std", "tip_angular_speed",
 )
 
-# Reducers see the window's FINITE values only, compacted once by `_reduce`, so
-# these are the plain ones. `mean` and `frac` are the same callable on purpose:
-# "frac" averages an INDICATOR, whose own NaN pattern chooses the denominator.
-# `present` is defined at every frame, so present_frac is over the whole window;
-# `immotile` is NaN where no step could be measured, so immotile_frac is over
-# measurable steps.
+# Reducers see finite values only; "frac" is the mean of an indicator.
 _REDUCERS: dict[str, tuple[str, object]] = {
     "mean": ("_mean", np.mean),
-    "std": ("_std", np.std),                          # ddof=0, as everywhere in clipfeatures
+    "std": ("_std", np.std),                          # ddof=0
     "median": ("_median", np.median),
     "p90": ("_p90", lambda v: np.percentile(v, 90)),
     "max": ("_max", np.max),
     "frac": ("_frac", np.mean),
 }
 
-# One existing feature has no reducer suffix. Renaming it would change the input
-# schema of every model already trained against clip_features.parquet.
+# Feature names that do not follow column + suffix.
 _FEATURE_NAMES: dict[tuple[str, str], str] = {
     ("shape_elong", "mean"): "shape_elongation",
 }
 
-# `kpt_conf_mean` pools over keypoint-frames, not frames: `nanmean` of the whole
-# (frames x keypoints) grid, since averaging per-frame means would weight a
-# frame with one keypoint like a frame with eight. The COUNT is carried too.
+# `kpt_conf_mean` is weighted by the per-frame keypoint count.
 _POOLED_WEIGHT: dict[str, str] = {"kpt_conf": "kpt_conf_n"}
 
-# Columns holding a BACKWARD difference: sample i is the step from frame i-1 into
-# frame i. Drop the first in-window sample, which straddles the left edge, or a
-# window's speed depends on a frame outside it and two overlapping windows both
-# claim the shared step. That leaves `[f_start, f_end)` holding exactly the n-1
-# steps interior to it.
+# Backward differences: the first in-window sample straddles the edge and is dropped.
 _BACKWARD_DIFF: tuple[str, ...] = ("speed", "immotile", "body_speed")
 
 
 def feature_names() -> tuple[str, ...]:
-    """Every key :func:`aggregate_window` returns, in a fixed order.
-
-    A schema, not a convenience: a model trained on one project and applied to
-    another must see the same columns in both, NaN ones included.
-    """
+    """Every key :func:`aggregate_window` returns, in a fixed order."""
     names = [
         _FEATURE_NAMES.get((col, name), col + _REDUCERS[name][0])
         for col, reducers in SERIES_SPEC.items()
@@ -155,17 +115,9 @@ def feature_names() -> tuple[str, ...]:
 def build_series(
     sub: pd.DataFrame, cfg: Config, fps: float, f_start: int, n_frames: int
 ) -> pd.DataFrame:
-    """Per-frame quantities for one track, on the full frame grid.
+    """Per-frame quantities for one track on a frame grid starting at ``f_start``, NaN where undetected.
 
-    ``sub`` is one track's rows; ``f_start`` and ``n_frames`` define the grid,
-    normally the track's whole span. Rows outside it are ignored and frames with
-    no row become NaN, as in :func:`~trackanno.measure.clipfeatures._on_grid`. Rates are
-    per SECOND, so :func:`aggregate_window` must be handed the same ``fps``.
-
-    ``present`` and ``flagellum_complete`` are 0.0/1.0, not NaN/1.0: a pose track
-    answers both at every frame, so 0.0 means NO. They go all-NaN only when the
-    project has no keypoints, which keeps ``flagellum_complete_frac`` NaN on a
-    ``task: detect`` project.
+    Rates are per second, so :func:`aggregate_window` needs the same ``fps``.
     """
     sub = sub.sort_values("frame")
     dt = 1.0 / max(fps, 1e-6)
@@ -182,8 +134,6 @@ def build_series(
     has_pose = n_kpts >= 3 and all(c in sub.columns for c in kx + ky)
     has_kpt_conf = has_pose and all(c in sub.columns for c in kc)
 
-    # One `_on_grid` call for every column at once: the gridding rule is the same
-    # for all of them, and splitting it per block costs a take and cast each time.
     wanted = ["x1", "y1", "x2", "y2", "conf"]
     if has_pose:
         wanted += kx + ky + (kc if has_kpt_conf else [])
@@ -194,12 +144,7 @@ def build_series(
     cols["cx"], cols["cy"] = (x1 + x2) / 2, (y1 + y2) / 2
     cols["box_w"], cols["box_h"] = x2 - x1, y2 - y1
     cols["area"] = cols["box_w"] * cols["box_h"]
-    # READ `area` AND `aspect` WITH CARE: the box is AXIS-ALIGNED, so they move
-    # when the cell TURNS even though its shape has not changed (extent L at
-    # angle t gives a box L|cos t| x L|sin t|). `aspect_mean` is therefore an
-    # orientation readout rather than a shape one, and `area_mean` is
-    # contaminated by it. They stay because `detection.task: detect` has no
-    # keypoints; where keypoints exist, prefer the shape_* columns below.
+    # Axis-aligned box: area and aspect also change with orientation; prefer shape_* with keypoints.
     cols["aspect"] = np.where(
         cols["box_h"] > 1e-6, cols["box_w"] / np.maximum(cols["box_h"], 1e-6), np.nan
     )
@@ -210,8 +155,7 @@ def build_series(
         finite_speed, (cols["speed"] < IMMOTILE_PX_PER_SEC).astype(float), np.nan
     )
 
-    # Built from the frame index, not from "is x1 finite": presence is about the
-    # ROW existing, and an unwritable column would otherwise stop it counting.
+    # Presence means a row exists, whatever its values.
     present = np.zeros(n_frames)
     offsets = sub["frame"].to_numpy(dtype=int) - f_start
     inside = (offsets >= 0) & (offsets < n_frames)
@@ -226,8 +170,7 @@ def build_series(
             cols[name] = nan.copy()
         return _frame(cols, f_start, n_frames, fps, has_pose=False)
 
-    # Contiguous copies: the eigen loop's per-frame indexing is slower on a
-    # strided view of the combined grid.
+    # Contiguous copies for faster per-frame indexing.
     px = np.ascontiguousarray(grid[:, 5:5 + n_kpts])
     py = np.ascontiguousarray(grid[:, 5 + n_kpts:5 + 2 * n_kpts])
     conf = (
@@ -241,9 +184,6 @@ def build_series(
         cols["kpt_conf_n"] = np.isfinite(conf).sum(axis=1).astype(float)
 
         # -- rotation-invariant size and elongation -------------------------- #
-        # `np.cov`'s ddof=1 and the ascending-eigenvalue convention of `eigh`,
-        # spelled out. The per-frame `eigh` is the expensive part of the feature
-        # set; running it once per TRACK is most of what this module buys.
         extent = np.full(n_frames, np.nan)
         pc1 = np.full(n_frames, np.nan)
         pc2 = np.full(n_frames, np.nan)
@@ -254,8 +194,7 @@ def build_series(
             xs, ys = px[i, ok], py[i, ok]
             extent[i] = float(np.hypot(xs[:, None] - xs, ys[:, None] - ys).max())
             pts = np.stack([xs - xs.mean(), ys - ys.mean()], axis=1)
-            # `np.cov(pts.T)` spelled out - same maths, without np.cov's
-            # per-call argument handling on a 2x2.
+            # np.cov(pts.T) without its per-call overhead.
             cov = np.array(pts.T)
             cov -= cov.mean(axis=1)[:, None]
             cov = cov @ cov.T
@@ -266,29 +205,23 @@ def build_series(
             pc2[i] = float(minor.max() - minor.min())    # np.ptp, without its wrapper
             pc1[i] = float(major.max() - major.min())
         cols["shape_extent"], cols["shape_pc1"], cols["shape_pc2"] = extent, pc1, pc2
-        # Ratio per FRAME, then averaged: the mean of a ratio is not the ratio of
-        # the means, and it is the per-frame elongation that describes the cell.
         cols["shape_elong"] = pc1 / np.where(pc2 > 1e-6, pc2, np.nan)
 
         # body: node 0 -> node 1 (Head -> Base for this skeleton)
         cols["body_len"] = np.hypot(px[:, 0] - px[:, 1], py[:, 0] - py[:, 1])
 
-        # Only frames where the WHOLE chain is present: nansum would drop the
-        # segments either side of a missing node and read it as a length change.
+        # Only frames with the whole chain present.
         seg = np.hypot(np.diff(px[:, 1:], axis=1), np.diff(py[:, 1:], axis=1))
         complete = np.isfinite(seg).all(axis=1)
         cols["flagellum_len"] = np.where(complete, seg.sum(axis=1), np.nan)
         cols["flagellum_complete"] = complete.astype(float)
 
-        # -- translocation, anchored on the CELL BODY ------------------------ #
-        # The box centroid jitters as fast for a tethered cell thrashing its
-        # flagellum as for a swimmer; the Head-Base midpoint does not.
+        # -- translocation of the Head-Base midpoint ------------------------- #
         cols["anchor_x"] = np.nanmean(px[:, :2], axis=1)
         cols["anchor_y"] = np.nanmean(py[:, :2], axis=1)
         cols["body_speed"] = _backward_step(cols["anchor_x"], cols["anchor_y"]) / dt
 
-        # Base -> Head. `isfinite` on this angle already implies all four
-        # coordinates were finite (arctan2 propagates NaN).
+        # Base -> Head.
         cols["body_axis_ang"] = np.arctan2(py[:, 0] - py[:, 1], px[:, 0] - px[:, 1])
         cols["tip_ang"] = np.arctan2(py[:, -1] - py[:, 1], px[:, -1] - px[:, 1])
 
@@ -296,11 +229,7 @@ def build_series(
 
 
 def _backward_step(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """One-frame displacement aligned so sample i is the step INTO frame i.
-
-    Length matches the frame grid, NaN at the first sample. See `_BACKWARD_DIFF`
-    for why the alignment has to be backwards.
-    """
+    """One-frame displacement where sample i is the step into frame i; NaN at the first."""
     out = np.full(x.shape[0], np.nan)
     if x.shape[0] >= 2:
         out[1:] = np.hypot(np.diff(x), np.diff(y))
@@ -322,14 +251,7 @@ def _frame(
 def aggregate_window(
     series: pd.DataFrame, f_start: int, f_end: int, fps: float, cfg: Config
 ) -> dict[str, float]:
-    """Collapse ``series`` over the half-open frame range to a feature dict.
-
-    Every kinematic feature for those frames, minus the ``beat_*``/``wave_*``
-    spectral block (see the module docstring). ``fps`` must be the value the
-    series was built with, since the speed columns are already per second. Where
-    there is too little to measure - fewer than one measurable step, two present
-    body anchors, eight finite tip angles - this returns NaN.
-    """
+    """Collapse ``series`` over ``[f_start, f_end)`` to a feature dict, NaN where unmeasurable."""
     f_start, f_end = int(f_start), int(f_end)
     if f_end <= f_start:
         raise ValueError(f"empty window [{f_start}, {f_end})")
@@ -339,8 +261,7 @@ def aggregate_window(
 
     out: dict[str, float] = {}
     with warnings.catch_warnings():
-        # All-NaN slices are normal for an undetected stretch, and every reducer
-        # below is nan-aware precisely so that is not an error.
+        # All-NaN slices are normal for undetected stretches.
         warnings.simplefilter("ignore", RuntimeWarning)
         _reduce(win, out)
         _trajectory(win, out, n_frames, dt)
@@ -352,34 +273,23 @@ def aggregate_window(
 
 
 def _window(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, np.ndarray]:
-    """Slice every column to ``[f_start, f_end)``, addressed by absolute frame.
-
-    Positional, not ``reindex``: the index is a contiguous frame range by
-    construction, and hashing frame numbers per window would cost more than every
-    reducer together. One ``to_numpy`` on the whole frame, not ``series[c]`` per
-    column.
-    """
+    """Slice every column to ``[f_start, f_end)`` by absolute frame, positionally."""
     n_rows = len(series.index)
     if n_rows == 0:
         raise ValueError(f"window [{f_start}, {f_end}) asked of an empty series")
     origin = int(series.index[0])
     if int(series.index[-1]) - origin + 1 != n_rows:
-        raise ValueError(
-            "series index is not a contiguous frame range; positional slicing "
-            "would silently return the wrong frames"
-        )
+        raise ValueError("series index is not a contiguous frame range")
     i0, i1 = f_start - origin, f_end - origin
     if i0 < 0 or i1 > n_rows:
         raise ValueError(
             f"window [{f_start}, {f_end}) is not inside the series "
-            f"[{origin}, {origin + n_rows}); build_series was given too narrow a "
-            "frame range, and padding it here would report frames that were never "
-            "looked at as undetected"
+            f"[{origin}, {origin + n_rows}); build the series over a wider range"
         )
     block = series.to_numpy()[i0:i1]
     win = {name: block[:, j] for j, name in enumerate(series.columns)}
     for name in _BACKWARD_DIFF:
-        # Copy before blanking: the slice is a view onto the caller's frame.
+        # Copy: the slice is a view onto the caller's frame.
         edge = win[name].copy()
         edge[0] = np.nan
         win[name] = edge
@@ -387,14 +297,7 @@ def _window(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, np.ndar
 
 
 def _reduce(win: dict[str, np.ndarray], out: dict[str, float]) -> None:
-    """Apply SERIES_SPEC. Everything here is a point quantity by construction.
-
-    Finite values are compacted once per column and the plain reducers run on
-    that: nan-aware reducers rebuild the same mask per feature, and
-    ``np.nanpercentile`` costs three times its plain counterpart. Compacting once
-    also fixes the summation order, so a reduction does not depend on where the
-    NaNs sit.
-    """
+    """Apply SERIES_SPEC to each column's finite values."""
     for col, reducers in SERIES_SPEC.items():
         if not reducers:
             continue
@@ -406,8 +309,6 @@ def _reduce(win: dict[str, np.ndarray], out: dict[str, float]) -> None:
             suffix, fn = _REDUCERS[name]
             key = _FEATURE_NAMES.get((col, name), col + suffix)
             if good.size == 0:
-                # `np.max` of an empty array raises, and reporting a number for a
-                # window with nothing in it would be worse than either.
                 out[key] = np.nan
             elif weight is not None and name == "mean":
                 w = weight[finite]
@@ -422,10 +323,7 @@ def _trajectory(
 ) -> None:
     """Path, spread and turning of the box centroid over this window."""
     cx, cy = win["cx"], win["cy"]
-    # A gate on measurable STEPS, not on present frames. Speed keeps the
-    # per-frame grid while `_path_length` bridges gaps, so a window holding two
-    # detections either side of a gap does have a path length - and is still
-    # refused, that bridge being a guess about the frames the tracker lost.
+    # Needs at least one measurable one-frame step.
     if not np.isfinite(win["speed"]).any():
         return
 
@@ -437,9 +335,7 @@ def _trajectory(
         np.sqrt(np.nanmean((cx - np.nanmean(cx)) ** 2 + (cy - np.nanmean(cy)) ** 2))
     )
 
-    # Heading needs a baseline longer than the localisation jitter, and the lag
-    # that provides it depends on how fast THIS window's cell moved, so it is
-    # re-derived per window rather than stored per frame.
+    # Heading lag is chosen per window to clear the localisation noise.
     lag = _heading_lag(cx, cy, n_frames)
     out["turn_lag_frames"] = float(lag)
     hx, hy = cx[lag:] - cx[:-lag], cy[lag:] - cy[:-lag]
@@ -469,7 +365,6 @@ def _pose(
     anchor_x, anchor_y = win["anchor_x"], win["anchor_y"]
     present = np.flatnonzero(np.isfinite(anchor_x) & np.isfinite(anchor_y))
     if np.isfinite(win["body_speed"]).any() and present.size >= 2:
-        # Same endpoints for path and net, so body_straightness cannot exceed 1.
         path, net = _path_length(anchor_x, anchor_y)
         out["body_net_displacement"] = _safe(net)
         out["body_path_length"] = _safe(path)
@@ -482,18 +377,13 @@ def _pose(
     axis = win["body_axis_ang"]
     valid = np.isfinite(axis)
     if n_frames >= 2 and cfg.n_keypoints >= 3 and valid.sum() >= 2:
-        # Unwrap on the gap-filled grid, then keep only steps whose BOTH
-        # endpoints were really detected: a gap must neither break the unwrap nor
-        # contribute a bridged rotation. The fill is local to the window, which
-        # makes this a window functional rather than a series column.
+        # Unwrap on the filled grid; keep only steps between two detected frames.
         ang = np.unwrap(_interp_nan(axis[:, None])[:, 0])
         turn = np.diff(ang)[valid[1:] & valid[:-1]]
         if turn.size:
             out["body_rotation_speed"] = _safe(np.nanmean(np.abs(turn)) / dt)
 
-    # Unwrap the detected samples only: interpolating a wrapped angle across a
-    # gap can bridge a +-pi crossing and offset everything after it by 2 pi.
-    # Rate steps are kept only between adjacent detected frames.
+    # Unwrap detected samples only; rate steps only between adjacent frames.
     tip = win["tip_ang"]
     idx = np.flatnonzero(np.isfinite(tip))
     if idx.size >= 8:

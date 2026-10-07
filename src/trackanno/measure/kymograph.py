@@ -1,18 +1,6 @@
-"""Curvature kymographs from tracked keypoints.
+"""Curvature kymographs: signed curvature (1/px) along the flagellum against time.
 
-Signed curvature along the arclength against time: a travelling wave is diagonal
-stripes, a standing wave vertical ones, a mistracked frame a white column.
-Curvature is intrinsic, so the crop's own pixels serve directly with no
-stabilisation or body-axis alignment. Being a second derivative it comes from a
-smoothing spline fitted through the chain once per frame and differentiated
-analytically; finite differences on seven noisy points are almost pure noise.
-
-Node convention, matching :mod:`trackanno.measure.clipfeatures`: node 0 is Head, node 1
-is Base, nodes 1..N the flagellum base to tip, arclength ``s`` 0 at the base to
-1 at the tip. Positive curvature bends anticlockwise in the image coordinate
-system walking base to tip - image y points *down*, so clockwise on screen. The
-sign flips under a mirror; only the relative sign matters for reading a beat,
-but it is fixed so two clips can be compared.
+Curvature comes from a smoothing spline per frame; arclength runs 0 at the base to 1 at the tip.
 """
 
 from __future__ import annotations
@@ -26,8 +14,7 @@ __all__ = ["Kymograph", "curvature_kymograph", "resample_centreline", "chain_fro
 
 SIGN_MODES = ("raw", "canonical")
 
-# How much static curvature there has to be, relative to the beat, before its
-# sign is worth believing. The split-half test below guards the rest.
+# Minimum static-to-beat curvature ratio for the static sign to count.
 SIGN_MIN_RATIO = 0.20
 
 
@@ -46,21 +33,7 @@ class SignVerdict:
 
 
 def canonical_sign(kappa, min_ratio: float = SIGN_MIN_RATIO) -> SignVerdict:
-    """Decide a consistent handedness for one clip's curvature field.
-
-    A 2D image cannot tell a cell from its own mirror image: the two produce
-    curvature fields differing by an overall factor of -1. Every EVEN functional
-    of curvature is mirror-invariant and so useless here; the odd one used is the
-    static mode, the time-average ``psi_0(s)`` left once averaging cancels the
-    beat.
-
-    The clip is flipped so its static mode is positive, guarded twice because on
-    a near-symmetric beater that mode is small and its sign is noise: it must be
-    big enough relative to the beat (``min_ratio``), and the two halves of the
-    clip must independently agree. When either fails the verdict is ``+1`` with
-    ``confident=False``, left exactly as measured, and the caller is expected to
-    say so.
-    """
+    """Sign making the clip's static curvature positive, when large and stable enough."""
     field = np.asarray(kappa, dtype=np.float64)
     if field.ndim != 2 or not field.size or not np.isfinite(field).any():
         return SignVerdict(1, False, 0.0, "no curvature to judge")
@@ -80,9 +53,7 @@ def canonical_sign(kappa, min_ratio: float = SIGN_MIN_RATIO) -> SignVerdict:
     norm_beat = float(np.linalg.norm(beat))
     ratio = norm_static / norm_beat if norm_beat > 1e-12 else float("inf")
 
-    # Weighted by its own magnitude so the decision comes from where the static
-    # bend actually is, not from a long tail of near-zero samples that happen to
-    # share a sign.
+    # Weighted by magnitude so near-zero samples do not decide.
     total = float(np.sum(static * np.abs(static)))
     sign = -1 if total < 0 else 1
 
@@ -114,15 +85,7 @@ def canonical_sign(kappa, min_ratio: float = SIGN_MIN_RATIO) -> SignVerdict:
 
 
 def chain_from_edges(n_nodes: int, edges) -> list:
-    """The keypoint indices along the flagellum, taken from the skeleton.
-
-    The order decides which points are joined into a curve and fixes the SIGN of
-    the curvature, since walking a bend from the other end negates it. Read from
-    ``keypoints.edges`` rather than guessed: the longest path through that graph
-    is the flagellum, and a head hanging off the base drops out as a side
-    branch. Returns [] when the skeleton says nothing usable, leaving the caller
-    to fall back to plain node order and say so.
-    """
+    """Keypoint indices along the flagellum: the longest path through the skeleton, or []."""
     adjacency: dict[int, set] = {}
     for a, b in edges or []:
         a, b = int(a), int(b)
@@ -133,8 +96,7 @@ def chain_from_edges(n_nodes: int, edges) -> list:
     if len(adjacency) < MIN_NODES:
         return []
 
-    # Skeletons are a handful of nodes, so an exhaustive longest-simple-path
-    # search is affordable and stays correct on a skeleton with a cycle.
+    # Exhaustive longest-simple-path search; skeletons are small.
     best: list = []
 
     def walk(node: int, seen: list) -> None:
@@ -150,21 +112,16 @@ def chain_from_edges(n_nodes: int, edges) -> list:
     for start in sorted(adjacency):
         walk(start, [start])
 
-    # Two traversals of one path are equally long; take the one that starts at
-    # the lower node index so a given config always gives the same sign.
+    # Start at the lower node index so the sign is deterministic.
     if best and best[0] > best[-1]:
         best.reverse()
     return best if len(best) >= MIN_NODES else []
 
 
-# Below this many tracked points a curve cannot be fitted at all: a cubic needs
-# four, and dropping to a lower order silently changes what curvature means.
+# A cubic spline needs four points.
 MIN_NODES = 4
 
-# Positional noise the spline is fitted against, in pixels: how hard the fit may
-# pull away from the measured keypoints, and the knob that matters most here.
-# Too little and the second derivative amplifies tracking jitter into stripes
-# that are not there; too much and a real beat is flattened into a smear.
+# Per-point positional tolerance of the spline fit, px.
 DEFAULT_SMOOTH_PX = 0.6
 
 
@@ -190,11 +147,7 @@ class Kymograph:
         return bool(self.kappa.size) and bool(np.isfinite(self.kappa).any())
 
     def scale(self, percentile: float = 98.0) -> float:
-        """A symmetric colour limit that one bad frame cannot blow out.
-
-        Tracking failures land at the extremes of a curvature field, so scaling
-        to max() hands the whole colour range to the worst frame.
-        """
+        """A symmetric colour limit at a percentile of absolute curvature."""
         finite = self.kappa[np.isfinite(self.kappa)]
         if not finite.size:
             return 1.0
@@ -202,13 +155,7 @@ class Kymograph:
         return limit if limit > 1e-9 else 1.0
 
     def with_sign(self, mode: str = "canonical", min_ratio: float = SIGN_MIN_RATIO):
-        """(kymograph, verdict) under one of the sign conventions.
-
-        ``raw`` is what was measured. ``canonical`` flips the whole clip so its
-        static curvature is positive, when that is decidable. The flip is a
-        single factor for the WHOLE clip; choosing per frame would destroy the
-        very thing the plot shows, a pattern whose sign alternates in order.
-        """
+        """(kymograph, verdict): ``raw`` as measured, ``canonical`` flipped per clip."""
         if mode != "canonical":
             return self, SignVerdict(1, True, 0.0, "as measured")
 
@@ -219,23 +166,16 @@ class Kymograph:
                 verdict)
 
     def normalised(self) -> np.ndarray:
-        """Curvature made dimensionless as ``kappa * L``.
-
-        1/px cannot be compared between a long cell and a short one, or across
-        magnifications; multiplying by the flagellum's own length gives total
-        turning, which can.
-        """
+        """Dimensionless curvature ``kappa * L``, with L the flagellum length."""
         length = self.length_px[:, None]
         with np.errstate(invalid="ignore"):
             return (self.kappa * length).astype(np.float32)
 
 
 def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX):
-    """Fit one frame's chain and resample it at equal arclength.
+    """Fit one frame's chain and resample at equal arclength.
 
-    Returns ``(points, kappa, length)``: points is (n_samples, 2), kappa is
-    (n_samples,) signed curvature in 1/px and length is the arclength in px.
-    Returns ``(None, None, nan)`` when the chain cannot carry a curve.
+    Returns ``(points, kappa 1/px, length px)``, or ``(None, None, nan)`` if unfittable.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -244,8 +184,7 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     if x.size < MIN_NODES:
         return None, None, float("nan")
 
-    # Duplicate points make the spline parametrisation singular, and a tracker
-    # that loses a node often reports it at the previous node's position.
+    # Duplicate points make the spline singular.
     step = np.hypot(np.diff(x), np.diff(y))
     keep = np.concatenate([[True], step > 1e-6])
     x, y = x[keep], y[keep]
@@ -256,23 +195,17 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
 
     from scipy.interpolate import splev, splprep
 
-    # s bounds the SUM of squared residuals and so scales with the number of
-    # points; a per-point pixel tolerance keeps the knob's meaning the same
-    # whether the model has 6 keypoints or 30.
+    # splprep's s bounds the summed squared residuals, so scale it by point count.
     total = float(x.size) * float(smooth_px) ** 2
     try:
         with warnings.catch_warnings():
-            # "s too small" only means the fit stopped at the iteration cap and
-            # is closer to the data than asked; still a valid smoothing spline,
-            # and it happens on every badly tracked frame.
+            # "s too small" still yields a valid spline.
             warnings.simplefilter("ignore", RuntimeWarning)
             tck, _ = splprep([x, y], s=total, k=3)
     except (TypeError, ValueError):
         return None, None, float("nan")
 
-    # Equal arclength, not equal parameter: splprep parametrises by chord
-    # length, which bunches samples exactly where the curve bends and would
-    # distort every feature read off the result.
+    # Resample by arclength, not by spline parameter.
     dense = np.linspace(0.0, 1.0, max(16 * n_samples, 256))
     dx, dy = splev(dense, tck, der=1)
     speed = np.hypot(dx, dy)
@@ -299,14 +232,9 @@ def curvature_kymograph(
     kx, ky, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX,
     order=None, first_node: int = 1,
 ) -> Kymograph:
-    """Signed curvature along the flagellum for every frame of a clip.
+    """Signed curvature along the flagellum for every frame of (frames, nodes) keypoints.
 
-    ``kx``/``ky`` are (frames, nodes) keypoint coordinates in any single
-    consistent space - the crop's own pixels are the natural one. ``order`` is
-    the keypoint indices along the flagellum, base first; pass the result of
-    :func:`chain_from_edges` so the traversal comes from the project's own
-    skeleton. Without it the fallback is nodes ``first_node..N``, only a
-    convention, matching Head/Base/... in :mod:`trackanno.measure.clipfeatures`.
+    ``order`` is the base-first chain from :func:`chain_from_edges`; else ``first_node..N``.
     """
     kx = np.asarray(kx, dtype=np.float64)
     ky = np.asarray(ky, dtype=np.float64)
@@ -338,12 +266,7 @@ def curvature_kymograph(
 
 def kymograph_from_boxes(boxes, n_kpts: int, n_frames: int, min_conf: float = 0.0,
                          **kwargs) -> Kymograph:
-    """Build one from a clip's box table, which is how the GUI has the data.
-
-    One row per (frame, track): only the target track carries the flagellum, and
-    a frame the tracker missed has no row, so the grid is filled with NaN first
-    and written by frame index, never by row order.
-    """
+    """Kymograph of the target track in a clip's box table, NaN on missing frames."""
     kx = np.full((n_frames, n_kpts), np.nan)
     ky = np.full((n_frames, n_kpts), np.nan)
     if boxes is None or len(boxes) == 0 or n_kpts <= 0:
@@ -363,9 +286,7 @@ def kymograph_from_boxes(boxes, n_kpts: int, n_frames: int, min_conf: float = 0.
         kx[frames, k] = target[cx].to_numpy(dtype=float)[inside]
         ky[frames, k] = target[cy].to_numpy(dtype=float)[inside]
 
-    # A keypoint the model was not confident about is worse than a missing one:
-    # it drags the spline somewhere the flagellum is not. Dropping it lets the
-    # fit span the gap instead.
+    # Drop low-confidence keypoints; the spline spans the gap.
     conf_columns = [f"kp_c_{k}" for k in range(n_kpts)]
     if min_conf > 0 and all(c in target.columns for c in conf_columns):
         conf = np.full((n_frames, n_kpts), np.inf)

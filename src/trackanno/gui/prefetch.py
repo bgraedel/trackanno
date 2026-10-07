@@ -1,9 +1,4 @@
-"""Background clip prefetch.
-
-The cache is an uncompressed memmap, so loading a clip is really a question of
-whether it is already in the OS page cache. Touching upcoming clips on a worker
-thread turns almost every navigation into a warm read, and numpy releases the
-GIL during the copy, so a plain daemon thread is enough."""
+"""Background prefetch: touch upcoming clips so they are in the OS page cache."""
 
 from __future__ import annotations
 
@@ -42,12 +37,7 @@ class Prefetcher:
         self._wake.set()
 
     def stop(self, timeout: float = 5.0) -> bool:
-        """Stop and WAIT for the worker to leave the clip cache.
-
-        Joining is not optional: the caller unmaps the memory this thread reads,
-        and a thread caught inside ``touch()`` then segfaults the process. False
-        if it did not stop in time, so the caller can decline to close the
-        store."""
+        """Stop and join the worker before the cache is unmapped; False on timeout."""
         self._stop = True
         self._wake.set()
         thread = self._thread
@@ -68,4 +58,4 @@ class Prefetcher:
                 try:
                     self.store.touch(index)
                 except Exception:
-                    pass  # a prefetch failure is never worth interrupting the UI
+                    pass  # prefetch failures are harmless

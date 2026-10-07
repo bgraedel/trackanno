@@ -1,17 +1,10 @@
-# trackanno preset. The keys under `set` are applied to the packaged
-# default_config.yaml, so a key not named here keeps its shipped value and the
-# comment that documents it.
+# trackanno preset: the keys under `set` override the packaged default_config.yaml.
 name: suggester
 order: 2
 summary: Keypoint detection, and the CatBoost suggester trained on your labels.
 about: >
-  Detection predicts keypoints as well as boxes and their names are read from the
-  checkpoint, so body and flagellum shape, beat frequency and the waveform
-  decomposition join the trajectory features the classifier is fitted
-  on. It suggests a category beside the clip once it clears the reliability gate,
-  never pre-selects one, and holds a tenth of the clips back so agreement stays
-  measurable. Needs pose weights; the annotator preset is the one for a plain box
-  detector.
+  Pose detection adds shape, beat and waveform features, and a classifier trained
+  on your labels suggests a category beside each clip. Needs pose weights.
 set:
   detection.task: pose
   suggest.enabled: true

@@ -1,29 +1,6 @@
-"""Watching the animal at the frame the boundary is drawn at.
+"""Review footage: frames cut from the movie at one session crop, centred on the track.
 
-A bout is a claim about WHEN behaviour changed, and the review window used to
-make that claim checkable only against itself: a picture of the spans, and no
-way to see the frames under them. The frames used to come from the clip cache
-wherever it reached and from the movie everywhere else, which put a step in the
-picture at every window edge - the cache is sized per movie and centred per
-annotation window, and a bout is neither. So every review frame is now cut from
-the movie, and the checks here are about that cut:
-
-* ONE crop for the whole session, so nothing changes size when the reviewer
-  changes track or movie - the complaint that started this;
-* centred on the track's own boxes every frame, so the animal neither walks out
-  of the picture over the hundreds of frames a bout runs for nor steps sideways
-  where one read of the movie ends and the next begins;
-* the pixels are the movie's own, through the intensity mapping ``prepare``
-  wrote, so the review is not a second renderer;
-* the marker survives the cut: the reticle, the neighbours and - on a pose
-  project - the skeleton, all read off ``tracks.parquet`` on the decode thread;
-* nothing is decoded on the UI thread, and the next chunk is read ahead;
-* a project whose movies are not where the config says loses the video and keeps
-  the timeline, with a sentence, and never a black rectangle.
-
-Every project here carries its own copy of the movie and its own work directory:
-the generated fixture is shared by every suite, and a suite that wrote into it
-would break whichever suite ran next.
+Every project here has its own movie copy and work directory, never the shared fixture's.
 """
 
 from __future__ import annotations
@@ -36,8 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from harness import check
-from test_bout_review import bout_row, ink, loaded, painted
+from fixtures import bout_row, build_case, ink, loaded, painted, SyntheticMovie
 
 GROUP = "behaviour"
 TRACK = 1
@@ -53,12 +29,8 @@ SECOND = "synthetic2"
 # projects with a movie in them
 # --------------------------------------------------------------------------- #
 def _film(cfg, movie_id: str) -> None:
-    """Write the synthetic movie and the intensity curve prepare writes beside
-    it, so the review cuts real pixels through the mapping the cache was cut
-    with."""
+    """Write the synthetic movie and the intensity mapping prepare writes beside it."""
     import tifffile
-    from test_pipeline import SyntheticMovie
-
     from trackanno.annotate.clips import NORM_FILE
     from trackanno.video.movies import Normalizer
 
@@ -82,11 +54,7 @@ def _predict(cfg, movies, tracks=(1, 2)) -> None:
 
 
 def _own_dirs(cfg):
-    """Point the project at a video directory of its own.
-
-    ``build_case`` leaves ``paths.video_dir`` on the shared fixture, and the
-    movie written here must not land there.
-    """
+    """Point the project at a video directory of its own."""
     from trackanno.config import load_config
     from trackanno.project import write_config
 
@@ -97,13 +65,7 @@ def _own_dirs(cfg):
 
 
 def filmed_project(root, name: str, second_movie: bool = False):
-    """A case project with the movie itself, and no cached pixels at all.
-
-    ``build_case`` copies the tables only. The review reads the movie, so the
-    clip cache's ``clips.dat`` is deliberately absent from every project here:
-    if any frame still came out of it, none of these tests would pass.
-    """
-    from test_predict import build_case
+    """A case project with the movie and no clip pixels, so every frame must come from the movie."""
 
     cfg, manifest = build_case(root, name)
     cfg = _own_dirs(cfg)
@@ -112,9 +74,7 @@ def filmed_project(root, name: str, second_movie: bool = False):
     movies = [movie]
 
     if second_movie:
-        # A second movie whose cache was cut at a wider crop, which is what
-        # `clips.crop_size: auto` does per movie and what used to change the
-        # size of the picture when the reviewer changed movie.
+        # A second movie whose cache was cut at a wider crop.
         work = cfg.paths.work_dir
         shutil.copytree(work / movie, work / SECOND)
         rows = pd.read_parquet(work / SECOND / "clips.parquet")
@@ -148,7 +108,6 @@ def filmed_pose_project(root, name: str):
     })
     cfg = load_config(config_path)
     movie = sorted(p.name for p in cfg.paths.work_dir.iterdir() if p.is_dir())[0]
-    # Nothing here may read cached pixels, so there are none to read.
     (cfg.movie_dir(movie) / CACHE_FILE).unlink(missing_ok=True)
     _film(cfg, movie)
     _predict(cfg, [movie])
@@ -164,11 +123,7 @@ def select(panel, movie_id, track_id) -> None:
 
 
 def settle(app, footage, frame: int | None = None, tries: int = 3000) -> str:
-    """Spin the loop until the decode thread has answered, and say what it said.
-
-    Every frame arrives off the UI thread, so nothing in this suite can look at
-    the picture without waiting for it first.
-    """
+    """Spin the loop until the decode thread has answered; return the source line."""
     for _ in range(tries):
         app.processEvents()
         text = footage.source.text()
@@ -183,9 +138,17 @@ def settle(app, footage, frame: int | None = None, tries: int = 3000) -> str:
     return footage.source.text()
 
 
+def _wait(app, condition, tries: int = 3000) -> bool:
+    for _ in range(tries):
+        app.processEvents()
+        if condition():
+            return True
+        time.sleep(0.002)
+    return False
+
+
 def click(timeline, frame: int, y: float | None = None) -> None:
-    """Press the timeline where ``frame`` is drawn, through the widget's own
-    geometry rather than by emitting its signal."""
+    """Press and release the timeline where ``frame`` is drawn."""
     from qtpy.QtCore import QPointF, Qt
     from qtpy.QtGui import QMouseEvent
 
@@ -201,7 +164,7 @@ def click(timeline, frame: int, y: float | None = None) -> None:
 
 
 def decoder(cfg, movie_id: str, track_id: int = TRACK):
-    """A :class:`TrackCutter` on the session's own crop, ready to cut."""
+    """A :class:`TrackCutter` on the session's own crop."""
     from trackanno.gui.review import TrackCutter, review_crop
 
     return TrackCutter(cfg, movie_id, track_id, review_crop(cfg))
@@ -219,6 +182,12 @@ def centres(marks: pd.DataFrame) -> dict[int, tuple[float, float]]:
     }
 
 
+def chunk() -> int:
+    from trackanno.gui.review import REVIEW_CHUNK
+
+    return int(REVIEW_CHUNK)
+
+
 @pytest.fixture(scope="module")
 def filmed(root):
     return filmed_project(root, "footage", second_movie=True)
@@ -231,7 +200,7 @@ def posed_film(root):
 
 @pytest.fixture
 def panel(app, filmed):
-    """A panel per test, on the filmed track, released afterwards."""
+    """A panel per test, on the filmed track."""
     from trackanno.gui.review import BoutReviewPanel
 
     cfg, movie = filmed
@@ -249,20 +218,24 @@ def panel(app, filmed):
     app.processEvents()
 
 
+@pytest.fixture
+def footage(app, filmed):
+    """A bare TrackFootage on the filmed project."""
+    from trackanno.gui.review import TrackFootage
+
+    cfg, _ = filmed
+    widget = TrackFootage(cfg)
+    yield widget
+    widget.release()
+    app.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # one crop for the session
 # --------------------------------------------------------------------------- #
-def test_the_session_has_one_crop_and_it_comes_from_the_whole_project(
-    tmp_path,
-) -> None:
-    """Where the number comes from, and what it may not depend on.
-
-    ``clips.crop_size: auto`` sizes the cache per movie, so the widths on disk
-    genuinely differ between one movie and the next. Taking the crop from
-    whichever movie is on screen is what made the picture change size when the
-    reviewer changed movie; taking it once from the whole project is what stops
-    it.
-    """
+def test_the_session_has_one_crop_and_it_comes_from_the_whole_project(tmp_path) -> None:
+    """The crop is measured over every movie's manifest, robust to outliers."""
+    from trackanno.annotate.clips import MAX_SIZE
     from trackanno.config import load_config
     from trackanno.gui.review import review_crop
     from trackanno.project import create_project, write_config
@@ -281,176 +254,126 @@ def test_the_session_has_one_crop_and_it_comes_from_the_whole_project(
         }).to_parquet(out / "clips.parquet", index=False)
 
     bare = review_crop(cfg)
-    check("a project with no clip manifest still gets a crop, rather than none",
-          bare.side > 0 and bare.size > 0, str(bare))
+    assert bare.side > 0 and bare.size > 0, f"no manifest still gets a crop: {bare}"
 
     manifest("movie_a", [176] * 100)
     manifest("movie_b", [192] * 100)
     crop = review_crop(cfg)
-    check("with manifests it is wide enough for the widest of them",
-          crop.side >= 192, str(crop.side))
-    check("...rounded as the cache's own size is rounded",
-          crop.side % 16 == 0, str(crop.side))
+    assert crop.side >= 192, "wide enough for the widest movie"
+    assert crop.side % 16 == 0, "rounded as the cache's own size is"
+    assert crop.size == crop.side and crop.scale == 1.0, (
+        f"below the cache bound nothing is resampled: {crop}")
 
     manifest("movie_c", [1200])
-    outlier = review_crop(cfg)
-    check("one absurd window - two animals tracked as one - does not shrink "
-          "every other animal in the project to fit it",
-          outlier.side == crop.side, f"{crop.side} -> {outlier.side}")
+    assert review_crop(cfg).side == crop.side, "one absurd window does not widen the crop"
 
     manifest("movie_d", [1200] * 120)
     wide = review_crop(cfg)
-    check("a project that really is cut that wide gets the wide crop",
-          wide.side > crop.side, f"{crop.side} -> {wide.side}")
-    from trackanno.annotate.clips import MAX_SIZE
-
-    check("...but it is never delivered above the cache's own crop bound",
-          wide.size == MAX_SIZE, str(wide.size))
-    check("...and below that bound nothing is resampled at all",
-          crop.size == crop.side and crop.scale == 1.0, str(crop))
+    assert wide.side > crop.side, "a project really cut that wide gets the wide crop"
+    assert wide.size == MAX_SIZE, "but it is never delivered above the cache bound"
 
 
 def test_the_picture_does_not_change_size_across_tracks_or_movies(
     app, panel, filmed,
 ) -> None:
-    """The reported bug, in the two ways it showed.
-
-    A crop taken per movie changes size when the movie changes; a crop taken
-    from a track's own cached windows changes size when the track changes. The
-    reviewer reads either as the animal changing size, which is a claim about
-    the recording that nothing here is entitled to make.
-    """
     cfg, movie = filmed
     footage = panel.footage
-    check("the first track is on screen", footage.showing == "movie",
-          footage.source.text())
+    assert footage.showing == "movie", footage.source.text()
     first = footage.frame_image().shape
     crop = footage.crop
-    check("it is delivered at the session's crop",
-          first == (crop.size, crop.size), f"{first} vs {crop.size}")
+    assert first == (crop.size, crop.size), "delivered at the session's crop"
 
     select(panel, movie, 2)
     settle(app, footage)
-    check("another track of the same movie is the same size",
-          footage.frame_image().shape == first,
-          f"{first} -> {footage.frame_image().shape}")
+    assert footage.frame_image().shape == first, "another track is the same size"
 
     widths = {
         name: int(pd.read_parquet(cfg.paths.work_dir / name / "clips.parquet")
                   ["crop_w"].max())
         for name in (movie, SECOND)
     }
-    check("the two movies really were cached at different crops, which is what "
-          "used to make this jump", widths[movie] != widths[SECOND], str(widths))
+    assert widths[movie] != widths[SECOND], f"the movies differ in cached crop: {widths}"
 
     select(panel, SECOND, TRACK)
     settle(app, footage)
-    check("the other movie is on screen", footage.showing == "movie",
-          footage.source.text())
-    check("...at the same size as the first", footage.frame_image().shape == first,
-          f"{first} -> {footage.frame_image().shape}")
-    check("...off the same crop object, measured once for the session",
-          footage.crop is crop, str(footage.crop))
-    check("and the line under the picture says what that crop is",
-          f"{crop.side} px crop" in footage.source.text(), footage.source.text())
+    assert footage.showing == "movie", footage.source.text()
+    assert footage.frame_image().shape == first, "another movie is the same size"
+    assert footage.crop is crop, "the crop is measured once for the session"
+    assert f"{crop.side} px crop" in footage.source.text(), footage.source.text()
 
 
 # --------------------------------------------------------------------------- #
 # where the crop is centred
 # --------------------------------------------------------------------------- #
-def test_the_animal_stays_in_the_picture_across_a_long_span(app, filmed) -> None:
-    """A bout runs for hundreds of frames and a cached window is fifty.
-
-    The animal drifts steadily across this movie, so a crop fixed over a span
-    that long loses it and a crop re-chosen per read of the movie steps sideways
-    at every read boundary. Both are checked here over a span longer than a
-    cached window, frame by frame.
-    """
-    from trackanno.gui.review import REVIEW_CHUNK
-    from trackanno.view.overlay import build_clip_view
-
+@pytest.fixture(scope="module")
+def long_span(filmed):
+    """Three consecutive reads of the filmed track, from frames 0, 50 and 100."""
     cfg, movie = filmed
     frames = decoder(cfg, movie)
     try:
         reads = {first: frames.cut(first) for first in (0, 50, 100)}
-        span = sum(len(pixels) for pixels, _ in reads.values())
-        check("the span checked is longer than one cached window",
-              span > cfg.clips.frames, f"{span} vs {cfg.clips.frames}")
-        check("...and it took more than one read of the movie to cover it",
-              len(reads) > 1 and REVIEW_CHUNK < span, str(len(reads)))
-
         size = frames.crop.size
-        worst_edge, worst_centre = 0.0, 0.0
-        for first, (pixels, marks) in reads.items():
-            view = build_clip_view(marks, len(pixels), size, mode="locked")
-            for t, (cx, cy) in centres(marks).items():
-                worst_edge = max(worst_edge, -min(view.target[t].min(), 0.0),
-                                 float(view.target[t].max()) - size)
-                worst_centre = max(
-                    worst_centre,
-                    float(np.hypot(view.centre[t][0] - cx, view.centre[t][1] - cy)))
-        check("the animal's box is inside the crop on every frame of the span, "
-              "so it never walks out of the picture", worst_edge <= 0.0,
-              f"{worst_edge:.1f} px outside")
-        check("...and the locked view puts it dead centre on every one of them",
-              worst_centre < 1e-6, f"{worst_centre:.3f} px off centre")
-
-        # The frames either side of a read boundary are consecutive frames of
-        # the same animal and have to look like it.
-        steps = []
-        for first, nxt in ((0, 50), (50, 100)):
-            here, there = centres(reads[first][1]), centres(reads[nxt][1])
-            steps.append(float(np.hypot(
-                there[0][0] - here[nxt - first - 1][0],
-                there[0][1] - here[nxt - first - 1][1])))
-        check("the picture does not step where one read of the movie ends and "
-              "the next begins", max(steps) < 3.0, str([round(s, 2) for s in steps]))
-
-        # The crop follows a moving average, not the box itself, so the animal
-        # still moves inside it. A crop locked on the box every frame would hold
-        # it perfectly still, and "swimming" and "immotile" would look alike.
-        within = np.array(list(centres(reads[0][1]).values()))
-        check("the animal still moves within the crop, so the reviewer who asks "
-              "for a fixed view can see it swim",
-              float(np.ptp(within, axis=0).max()) > 1.0,
-              str(np.ptp(within, axis=0).round(1)))
     finally:
         frames.close()
+    return cfg, reads, size
 
 
-def test_a_frame_is_cut_the_same_way_whichever_read_it_arrives_in(app, filmed) -> None:
-    """The cut is a pure function of the frame, and that is the whole point.
+def test_a_long_span_takes_several_reads(long_span) -> None:
+    cfg, reads, _ = long_span
+    span = sum(len(pixels) for pixels, _ in reads.values())
+    assert span > cfg.clips.frames, "longer than one cached window"
+    assert len(reads) > 1 and chunk() < span, "more than one read of the movie"
 
-    The old fallback centred each read on its own stretch, so the same movie
-    frame came out differently depending on where the reader happened to have
-    started - and scrubbing back and forth over one boundary showed two
-    different pictures of it.
-    """
+
+def test_the_animal_stays_centred_in_the_picture_across_a_long_span(long_span) -> None:
+    from trackanno.view.overlay import build_clip_view
+
+    _, reads, size = long_span
+    worst_edge, worst_centre = 0.0, 0.0
+    for pixels, marks in reads.values():
+        view = build_clip_view(marks, len(pixels), size, mode="locked")
+        for t, (cx, cy) in centres(marks).items():
+            worst_edge = max(worst_edge, -min(view.target[t].min(), 0.0),
+                             float(view.target[t].max()) - size)
+            worst_centre = max(
+                worst_centre,
+                float(np.hypot(view.centre[t][0] - cx, view.centre[t][1] - cy)))
+    assert worst_edge <= 0.0, f"the box leaves the crop by {worst_edge:.1f} px"
+    assert worst_centre < 1e-6, f"the locked view is {worst_centre:.3f} px off centre"
+
+
+def test_the_picture_does_not_step_at_a_read_boundary(long_span) -> None:
+    _, reads, _ = long_span
+    steps = []
+    for first, nxt in ((0, 50), (50, 100)):
+        here, there = centres(reads[first][1]), centres(reads[nxt][1])
+        steps.append(float(np.hypot(
+            there[0][0] - here[nxt - first - 1][0],
+            there[0][1] - here[nxt - first - 1][1])))
+    assert max(steps) < 3.0, [round(s, 2) for s in steps]
+
+
+def test_the_animal_still_moves_within_the_crop(long_span) -> None:
+    """The crop follows a moving average, so swimming stays visible."""
+    _, reads, _ = long_span
+    within = np.array(list(centres(reads[0][1]).values()))
+    assert float(np.ptp(within, axis=0).max()) > 1.0, np.ptp(within, axis=0).round(1)
+
+
+def test_a_frame_is_cut_the_same_way_whichever_read_it_arrives_in(filmed) -> None:
     cfg, movie = filmed
     frames = decoder(cfg, movie)
     try:
         aligned, _ = frames.cut(50)
         offset, _ = frames.cut(45)
-        check("frame 60 is the same picture in both reads",
-              np.array_equal(aligned[10], offset[15]),
-              f"worst difference "
-              f"{int(np.abs(aligned[10].astype(int) - offset[15].astype(int)).max())}")
-        check("...and so is every frame the two reads share",
-              np.array_equal(aligned[:40], offset[5:45]))
+        assert np.array_equal(aligned[10], offset[15]), "frame 60 is the same in both reads"
+        assert np.array_equal(aligned[:40], offset[5:45]), "so is every shared frame"
     finally:
         frames.close()
 
 
-def test_a_review_frame_is_the_movie_and_not_a_second_rendering(app, filmed) -> None:
-    """What replaced the old claim that a movie cut equalled a cached frame.
-
-    That claim cannot hold any more and should not: the cache's crop is sized
-    per movie and centred on a labelled window, and one crop for the session
-    centred on the track cannot be both movies' windows at once. So the cut is
-    checked against the thing it is a cut OF - the movie, through the intensity
-    mapping ``prepare`` wrote beside it - which says the same thing the old
-    claim said, that this is not a second renderer.
-    """
+def test_a_review_frame_is_the_movie_and_not_a_second_rendering(filmed) -> None:
+    """The cut equals the movie frame through prepare's intensity mapping."""
     from trackanno.annotate.clips import NORM_FILE, _crop
     from trackanno.video.movies import Normalizer, open_movie
 
@@ -469,16 +392,11 @@ def test_a_review_frame_is_the_movie_and_not_a_second_rendering(app, filmed) -> 
                              movie.height, movie.width)
         finally:
             movie.close()
-        check("a review frame is the movie's own pixels at the crop it says it "
-              "took", np.array_equal(pixels[10], expected),
-              f"worst difference "
-              f"{int(np.abs(pixels[10].astype(int) - expected.astype(int)).max())}")
-        check("...through the intensity mapping prepare wrote, so it is the "
-              "same grey as the window the label was applied in",
-              int(pixels[10].max()) > 200 and int(pixels[10].min()) < 100,
-              f"{pixels[10].min()}-{pixels[10].max()}")
-        check("nothing is resampled while the crop fits the project's bound",
-              frames.crop.scale == 1.0, str(frames.crop))
+        assert np.array_equal(pixels[10], expected), (
+            f"worst difference {int(np.abs(pixels[10].astype(int) - expected.astype(int)).max())}")
+        assert int(pixels[10].max()) > 200 and int(pixels[10].min()) < 100, (
+            f"the intensity mapping was applied: {pixels[10].min()}-{pixels[10].max()}")
+        assert frames.crop.scale == 1.0, "nothing is resampled within the crop bound"
     finally:
         frames.close()
 
@@ -486,124 +404,96 @@ def test_a_review_frame_is_the_movie_and_not_a_second_rendering(app, filmed) -> 
 # --------------------------------------------------------------------------- #
 # what is marked on it
 # --------------------------------------------------------------------------- #
-def test_a_pose_project_gets_its_skeleton_on_a_frame_cut_from_the_movie(
-    app, posed_film,
-) -> None:
-    """A reticle and no skeleton is a picture of a different thing.
-
-    The cached box table carries the keypoints; a frame cut from the movie has
-    to read them out of ``tracks.parquet`` itself, and the code that used not to
-    handed the viewer a table of boxes. ``_kpt_columns`` then returned None and
-    the skeleton simply did not appear - on a pose project, where the shape of
-    the animal is what the label is about.
-    """
-    from trackanno.gui.review import TrackFootage
-
+@pytest.fixture(scope="module")
+def pose_cut(posed_film):
+    """One read of the pose film: (cfg, pixels, marks, kpts shape, crop size)."""
     cfg, movie = posed_film
-    check("this project really is a pose project with keypoints to draw",
-          cfg.is_pose and cfg.n_keypoints > 0, str(cfg.n_keypoints))
-
     frames = decoder(cfg, movie)
     try:
         pixels, marks = frames.cut(50)
-        columns = [f"kp_x_{k}" for k in range(cfg.n_keypoints)]
-        check("the marks that come back with the pixels carry every keypoint",
-              all(c in marks.columns for c in columns),
-              str([c for c in columns if c not in marks.columns]))
-        check("...read off tracks.parquet on the decode thread, with the pixels, "
-              "rather than looked up while the frame is painted",
-              frames._kpts is not None and frames._kpts.shape[1] == cfg.n_keypoints,
-              "none at all" if frames._kpts is None else str(frames._kpts.shape))
-
-        footage = TrackFootage(cfg)
-        footage.prefs["show_skeleton"] = True
-        try:
-            view = footage._view(marks, pixels)
-            check("the view built from them has the skeleton",
-                  view.kpts is not None and view.kpts.shape[1] == cfg.n_keypoints,
-                  "none at all" if view.kpts is None else str(view.kpts.shape))
-            check("...on every frame of the read, not merely on the first",
-                  bool(np.isfinite(view.kpts).all()),
-                  str(int(np.isfinite(view.kpts).all(axis=(1, 2)).sum())))
-            check("...in the crop's own coordinates, so it lands on the animal",
-                  float(np.nanmin(view.kpts)) > -frames.crop.size
-                  and float(np.nanmax(view.kpts)) < 2 * frames.crop.size,
-                  f"{float(np.nanmin(view.kpts)):.0f}..{float(np.nanmax(view.kpts)):.0f}")
-            footage._mark()
-            check("...and the canvas is told to draw it, not merely handed it",
-                  footage.viewer.canvas.show_skeleton)
-            check("...with the edges that say which keypoint joins which",
-                  footage.viewer.canvas._edges == cfg.keypoints.edge_idx,
-                  str(footage.viewer.canvas._edges))
-
-            footage.prefs["show_skeleton"] = False
-            check("with the skeleton off nothing is computed for a marker "
-                  "nobody draws", footage._view(marks, pixels).kpts is None)
-        finally:
-            footage.release()
+        kpts = None if frames._kpts is None else frames._kpts.shape
+        size = frames.crop.size
     finally:
         frames.close()
+    return cfg, pixels, marks, kpts, size
 
 
-def test_the_movie_cut_marks_the_animal_the_annotation_window_marks(
-    app, filmed,
-) -> None:
-    """The reticle, the neighbours, and the frames nobody detected on.
+def test_a_pose_cut_carries_every_keypoint(pose_cut) -> None:
+    """Keypoints are read off tracks.parquet on the decode thread, with the pixels."""
+    cfg, _, marks, kpts, _ = pose_cut
+    assert cfg.is_pose and cfg.n_keypoints > 0
+    missing = [c for c in (f"kp_x_{k}" for k in range(cfg.n_keypoints))
+               if c not in marks.columns]
+    assert not missing, missing
+    assert kpts is not None and kpts[1] == cfg.n_keypoints, kpts
 
-    The box table a cut hands back has the columns and the coordinates
-    ``build_box_table`` gives the cache, because the two windows have to mark
-    the same animal the same way. A frame the detector missed gets NO row in
-    either, which is what makes the viewer dim the marker there rather than
-    assert a box nobody measured.
-    """
+
+@pytest.fixture
+def pose_footage(app, posed_film):
+    from trackanno.gui.review import TrackFootage
+
+    cfg, _ = posed_film
+    footage = TrackFootage(cfg)
+    footage.prefs["show_skeleton"] = True
+    yield footage
+    footage.release()
+
+
+def test_a_pose_view_has_the_skeleton_in_crop_coordinates(pose_cut, pose_footage) -> None:
+    cfg, pixels, marks, _, size = pose_cut
+    view = pose_footage._view(marks, pixels)
+    assert view.kpts is not None and view.kpts.shape[1] == cfg.n_keypoints
+    assert np.isfinite(view.kpts).all(), "on every frame of the read"
+    lo, hi = float(np.nanmin(view.kpts)), float(np.nanmax(view.kpts))
+    assert -size < lo and hi < 2 * size, f"{lo:.0f}..{hi:.0f}"
+
+
+def test_the_canvas_is_told_to_draw_the_skeleton(pose_cut, pose_footage) -> None:
+    cfg, pixels, marks, _, _ = pose_cut
+    pose_footage._view(marks, pixels)
+    pose_footage._mark()
+    assert pose_footage.viewer.canvas.show_skeleton
+    assert pose_footage.viewer.canvas._edges == cfg.keypoints.edge_idx
+
+
+def test_with_the_skeleton_off_no_keypoints_are_computed(pose_cut, pose_footage) -> None:
+    _, pixels, marks, _, _ = pose_cut
+    pose_footage.prefs["show_skeleton"] = False
+    assert pose_footage._view(marks, pixels).kpts is None
+
+
+def test_the_movie_cut_marks_the_animal_the_annotation_window_marks(filmed) -> None:
+    """The cut's box table has the columns and coordinates of the cache's box table."""
+    from trackanno.annotate.clips import CONTEXT_TRACKS
     from trackanno.view.overlay import build_clip_view
 
     cfg, movie = filmed
-    from trackanno.annotate.clips import CONTEXT_TRACKS
-
-    check("neighbours are recorded, as the cache's own box table does", CONTEXT_TRACKS)
+    assert CONTEXT_TRACKS, "neighbours are recorded"
 
     frames = decoder(cfg, movie)
     try:
         pixels, marks = frames.cut(0)
         size = frames.crop.size
-        target = target_boxes(marks)
-        check("the target is marked on every frame of the read",
-              len(target) == len(pixels), f"{len(target)} of {len(pixels)}")
-        check("...and is named as the target, so the reticle knows which animal "
-              "the bout is about", bool(target["is_target"].all()))
-        check("the marks carry the columns the cache's box table carries",
-              {"t", "track_id", "is_target", "x1", "y1", "x2", "y2", "conf"}
-              <= set(marks.columns), str(sorted(marks.columns)))
-        check("the boxes are in crop pixels, inside the picture",
-              float(target[["x1", "y1"]].to_numpy().min()) >= 0.0
-              and float(target[["x2", "y2"]].to_numpy().max()) <= size,
-              f"{float(target[['x1', 'y1']].to_numpy().min()):.1f}.."
-              f"{float(target[['x2', 'y2']].to_numpy().max()):.1f}")
-
-        other = marks[~marks["is_target"]]
-        check("a neighbour that falls inside the crop comes with it, as it does "
-              "in the annotation window",
-              len(other) == 0 or int(other["track_id"].iloc[0]) != TRACK,
-              str(len(other)))
-
-        view = build_clip_view(marks, len(pixels), size, mode="locked",
-                               with_context=True)
-        check("the view marks every frame of the read",
-              bool(view.detected.all()), str(int(view.detected.sum())))
     finally:
         frames.close()
+    target = target_boxes(marks)
+    assert len(target) == len(pixels), "the target is marked on every frame"
+    assert target["is_target"].all()
+    assert ({"t", "track_id", "is_target", "x1", "y1", "x2", "y2", "conf"}
+            <= set(marks.columns)), sorted(marks.columns)
+    lo = float(target[["x1", "y1"]].to_numpy().min())
+    hi = float(target[["x2", "y2"]].to_numpy().max())
+    assert lo >= 0.0 and hi <= size, f"boxes in crop pixels: {lo:.1f}..{hi:.1f}"
+
+    other = marks[~marks["is_target"]]
+    assert len(other) == 0 or int(other["track_id"].iloc[0]) != TRACK, (
+        "neighbours inside the crop come with it")
+
+    view = build_clip_view(marks, len(pixels), size, mode="locked", with_context=True)
+    assert view.detected.all(), f"{int(view.detected.sum())} frames marked"
 
 
-def test_a_frame_nobody_detected_on_gets_no_box_rather_than_a_guessed_one(
-    app, root,
-) -> None:
-    """The detector misses frames, and the cut has to say so.
-
-    A held box asserted as a detection is a marker that sits still while the
-    animal moves, which reads as the animal having stopped - the very thing a
-    reviewer is here to judge.
-    """
+def test_a_frame_nobody_detected_on_gets_no_box_rather_than_a_guessed_one(root) -> None:
     cfg, movie = filmed_project(root, "footage-gaps")
     path = cfg.movie_dir(movie) / "tracks.parquet"
     table = pd.read_parquet(path)
@@ -615,16 +505,12 @@ def test_a_frame_nobody_detected_on_gets_no_box_rather_than_a_guessed_one(
     try:
         pixels, marks = frames.cut(50)
         seen = set(target_boxes(marks)["t"].astype(int))
-        check("the frames the detector missed carry no box",
-              seen.isdisjoint({f - 50 for f in missing}), str(sorted(seen)))
-        check("...and every other frame of the read still does",
-              seen == set(range(len(pixels))) - {f - 50 for f in missing},
-              str(sorted(seen)))
-        check("the pixels are all there regardless: a missed detection is not a "
-              "missing frame", len(pixels) == 50, str(len(pixels)))
-        check("...and the crop is still centred on the animal over the gap, "
-              "held from the nearest frame that saw it",
-              bool(np.isfinite(frames._path[list(missing)]).all()))
+        gap = {f - 50 for f in missing}
+        assert seen.isdisjoint(gap), f"missed frames carry no box: {sorted(seen)}"
+        assert seen == set(range(len(pixels))) - gap, "every other frame still does"
+        assert len(pixels) == 50, "a missed detection is not a missing frame"
+        assert np.isfinite(frames._path[list(missing)]).all(), (
+            "the crop is held on the animal over the gap")
     finally:
         frames.close()
 
@@ -632,16 +518,10 @@ def test_a_frame_nobody_detected_on_gets_no_box_rather_than_a_guessed_one(
 # --------------------------------------------------------------------------- #
 # off the UI thread, and ahead of the playhead
 # --------------------------------------------------------------------------- #
-def test_nothing_is_decoded_on_the_ui_thread(app, filmed, monkeypatch) -> None:
-    """One seek into a TIFF on a share is long enough to freeze the window.
+def test_nothing_is_decoded_on_the_ui_thread(app, filmed, footage, monkeypatch) -> None:
+    from trackanno.gui.review import TrackCutter
 
-    So asking for a frame has to return before the frame exists, and the decode
-    has to happen somewhere else. Both halves are checked: where the work ran,
-    and that the caller was not waiting for it.
-    """
-    from trackanno.gui.review import TrackCutter, TrackFootage
-
-    cfg, movie = filmed
+    _, movie = filmed
     threads: list[str] = []
     original = TrackCutter.cut
 
@@ -651,32 +531,20 @@ def test_nothing_is_decoded_on_the_ui_thread(app, filmed, monkeypatch) -> None:
 
     monkeypatch.setattr(TrackCutter, "cut", spy)
 
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, TRACK, 0, 120)
-        check("asking for a frame returns before it has been read",
-              footage.showing == "" and footage._wanted == 0,
-              f"{footage.showing!r} {footage._wanted}")
-        check("...and says so rather than showing a stale or black picture",
-              footage.source.text().startswith("reading"), footage.source.text())
-        settle(app, footage, 0)
-        check("the frame arrives", footage.showing == "movie" and footage.position == 0,
-              footage.source.text())
-        check("...and every decode ran off the UI thread",
-              threads and all(name != "MainThread" for name in threads),
-              str(sorted(set(threads))))
-        check("...on the review's own decode thread",
-              all(name.startswith("trackanno-review") for name in threads),
-              str(sorted(set(threads))))
-    finally:
-        footage.release()
-        app.processEvents()
+    footage.set_track(movie, TRACK, 0, 120)
+    assert footage.showing == "" and footage._wanted == 0, (
+        "asking for a frame returns before it has been read")
+    assert footage.source.text().startswith("reading"), footage.source.text()
+    settle(app, footage, 0)
+    assert footage.showing == "movie" and footage.position == 0, footage.source.text()
+    assert threads and all(name.startswith("trackanno-review") for name in threads), (
+        f"every decode ran on the review's decode thread: {sorted(set(threads))}")
 
 
-def test_the_crop_is_never_measured_on_the_ui_thread(app, filmed, monkeypatch) -> None:
+def test_the_crop_is_never_measured_on_the_ui_thread(app, filmed, footage, monkeypatch) -> None:
     """Measuring reads every clips.parquet, so footage without a crop waits for one."""
     import trackanno.gui.review.footage as footage_module
-    from trackanno.gui.review import TrackFootage, review_crop
+    from trackanno.gui.review import review_crop
 
     cfg, movie = filmed
     threads: list[str] = []
@@ -686,170 +554,134 @@ def test_the_crop_is_never_measured_on_the_ui_thread(app, filmed, monkeypatch) -
         return review_crop(config)
 
     monkeypatch.setattr(footage_module, "review_crop", spy)
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, TRACK, 0, 120)
-        check("there is no crop before it is measured", footage.crop is None)
-        settle(app, footage, 0)
-        check("the frame arrives", footage.showing == "movie" and footage.position == 0,
-              footage.source.text())
-        check("...after the crop was measured once, off the UI thread",
-              len(threads) == 1 and threads[0] != "MainThread", str(threads))
+    footage.set_track(movie, TRACK, 0, 120)
+    assert footage.crop is None, "there is no crop before it is measured"
+    settle(app, footage, 0)
+    assert footage.showing == "movie" and footage.position == 0, footage.source.text()
+    assert len(threads) == 1 and threads[0] != "MainThread", threads
 
-        footage.set_config(cfg)
-        footage.set_crop(review_crop(cfg))
-        footage.set_track(movie, TRACK, 0, 120)
-        settle(app, footage, 0)
-        check("a crop handed over by the page is used as it is",
-              footage.showing == "movie" and len(threads) == 1, str(threads))
-    finally:
-        footage.release()
+    footage.set_config(cfg)
+    footage.set_crop(review_crop(cfg))
+    footage.set_track(movie, TRACK, 0, 120)
+    settle(app, footage, 0)
+    assert footage.showing == "movie" and len(threads) == 1, (
+        f"a crop handed over by the page is used as it is: {threads}")
+
+
+def test_the_chunks_around_the_playhead_are_read_ahead(app, filmed, footage) -> None:
+    from trackanno.gui.review import CHUNKS_KEPT, REVIEW_CHUNK
+
+    _, movie = filmed
+    footage.set_track(movie, TRACK, 0, 120)
+    settle(app, footage, 0)
+    assert _wait(app, lambda: REVIEW_CHUNK in footage._cache, 2000), (
+        f"the next chunk is read without being asked for: {sorted(footage._cache)}")
+
+    footage.show_frame(REVIEW_CHUNK + 5)
+    assert footage.position == REVIEW_CHUNK + 5 and footage._wanted is None, (
+        "scrubbing into it shows the frame on the same call")
+    assert footage._shown == REVIEW_CHUNK, "from the chunk that was read ahead"
+
+    held = len(footage._cache)
+    for frame in range(0, 120, 7):
+        footage.show_frame(frame)
         app.processEvents()
+    assert len(footage._cache) <= max(held, CHUNKS_KEPT), (
+        f"a scrub over the track keeps a bounded number of chunks: {sorted(footage._cache)}")
 
 
-def test_the_chunks_around_the_playhead_are_read_ahead(app, filmed) -> None:
-    """A scrub is a request per mouse move and playback walks off the end.
+def test_a_short_span_is_cut_to_its_own_frames(app, filmed, footage) -> None:
+    """A short span is not padded to the grid cell; read-ahead stops at its end."""
+    _, movie = filmed
+    footage.set_track(movie, TRACK, 37, 62)
+    settle(app, footage, 37)
+    _wait(app, lambda: not footage.loading and 50 in footage._cache)
+    held = {first: len(footage._cache.get(first)[0]) for first in footage._cache}
+    assert min(held) == 37, f"the chunk starts at the span: {held}"
+    assert held.get(37) == chunk() - 37, f"runs to the grid edge: {held}"
+    assert held.get(50) == 62 - 50 and max(f + n for f, n in held.items()) <= 62, held
 
-    Without a read-ahead every chunk edge is a stall the length of a decode, and
-    scrubbing one bout is a series of them. With one, the frame the reviewer
-    asks for next is usually already in hand and goes up on the same call.
-    """
-    from trackanno.gui.review import CHUNKS_KEPT, REVIEW_CHUNK, TrackFootage
+
+def test_a_chunk_arrives_once_and_whole(app, filmed) -> None:
+    from trackanno.gui.review import ChunkDecoder, TrackCutter, review_crop
 
     cfg, movie = filmed
-
-    footage = TrackFootage(cfg)
+    crop = review_crop(cfg)
+    chunks = ChunkDecoder(lambda t: TrackCutter(cfg, movie, t, crop))
+    whole = []
+    chunks.ready.connect(lambda gen, first, payload: whole.append((gen, first, len(payload[0]))))
     try:
-        footage.set_track(movie, TRACK, 0, 120)
-        settle(app, footage, 0)
-        for _ in range(2000):
+        chunks.want(7, TRACK, 0, chunk())
+        _wait(app, lambda: bool(whole))
+        for _ in range(20):
             app.processEvents()
-            if REVIEW_CHUNK in footage._cache:
-                break
-            time.sleep(0.002)
-        check("the chunk after the one on screen is read without being asked "
-              "for", REVIEW_CHUNK in footage._cache, str(sorted(footage._cache)))
-
-        footage.show_frame(REVIEW_CHUNK + 5)
-        check("...so scrubbing into it puts the frame up on the same call, with "
-              "no decode to wait for",
-              footage.position == REVIEW_CHUNK + 5 and footage._wanted is None,
-              f"{footage.position} {footage._wanted}")
-        check("...from the chunk that was read ahead",
-              footage._shown == REVIEW_CHUNK, str(footage._shown))
-
-        held = len(footage._cache)
-        for frame in range(0, 120, 7):
-            footage.show_frame(frame)
-            app.processEvents()
-        check("a scrub over the whole track keeps a bounded number of chunks",
-              len(footage._cache) <= max(held, CHUNKS_KEPT), str(sorted(footage._cache)))
+        assert whole == [(7, 0, chunk())], "the whole chunk arrives once, with its generation"
     finally:
-        footage.release()
-        app.processEvents()
+        chunks.stop()
 
 
 # --------------------------------------------------------------------------- #
 # the join with the timeline
 # --------------------------------------------------------------------------- #
-def test_the_video_shows_the_frame_the_timeline_marker_is_on(app, panel, filmed) -> None:
-    """Scrubbing moves the film, and the film moves the marker.
-
-    Both directions, because either one alone is a different tool: a timeline
-    that drives a video is a player, and a video that drives a timeline is a
-    progress bar. Reviewing a boundary needs to go both ways - point at the edge
-    to see it, then play across it to decide.
-    """
+def test_the_panel_opens_on_the_tracks_first_frame_in_the_shared_player(panel) -> None:
     from trackanno.gui.viewer import SimpleViewer
 
-    footage, timeline = panel.footage, panel.timeline
-    check("the frames come from the movie", footage.showing == "movie",
-          footage.source.text())
-    check("they are shown through the annotation window's own player, so the "
-          "overlay and the scaling cannot drift apart from it",
-          isinstance(footage.viewer, SimpleViewer), type(footage.viewer).__name__)
-    check("...and the window opens on the track's first predicted frame",
-          footage.position == 0, str(footage.position))
-    check("the note says which frame of which track is on screen",
-          "frame 0 of track 1" in footage.source.text(), footage.source.text())
+    footage = panel.footage
+    assert footage.showing == "movie", footage.source.text()
+    assert isinstance(footage.viewer, SimpleViewer), "the annotation window's own player"
+    assert footage.position == 0
+    assert "frame 0 of track 1" in footage.source.text(), footage.source.text()
 
+
+def test_the_video_and_the_timeline_marker_follow_each_other(app, panel) -> None:
+    footage, timeline = panel.footage, panel.timeline
     click(timeline, 72)
     settle(app, footage, 72)
-    check("clicking the timeline takes the video to that frame",
-          footage.position == 72, str(footage.position))
-    check("...and the marker is on it too", timeline.position == 72,
-          str(timeline.position))
+    assert footage.position == 72, "clicking the timeline moves the video"
+    assert timeline.position == 72, "and the marker"
 
     click(timeline, 12)
     settle(app, footage, 12)
-    check("scrubbing back into an earlier chunk works the same way",
-          footage.position == 12, str(footage.position))
+    assert footage.position == 12, "scrubbing back into an earlier chunk works too"
 
     footage.viewer.play()
     for _ in range(3):
         footage.viewer._advance()
     app.processEvents()
-    check("playing the video walks the marker along the timeline",
-          timeline.position == 15 and footage.position == 15,
-          f"{timeline.position} {footage.position}")
+    assert timeline.position == 15 and footage.position == 15, (
+        "playing the video walks the marker along")
     footage.viewer.pause()
 
 
 def test_playback_carries_from_one_chunk_into_the_next(app, panel) -> None:
-    """A chunk's last frame is not the end of the track.
-
-    The movie is read in chunks and a behavioural boundary lands wherever it
-    lands, including a frame or two from a chunk edge - which is exactly the
-    boundary worth watching across. Playback that stopped dead at every edge
-    would be unable to show the one thing this window is for.
-    """
-    from trackanno.gui.review import REVIEW_CHUNK
-
     footage = panel.footage
-    last = REVIEW_CHUNK - 1
-    footage.show_frame(last - 1)
-    settle(app, footage, last - 1)
+    edge = chunk()
+    footage.show_frame(edge - 2)
+    settle(app, footage, edge - 2)
     first = footage._shown
-    check("the frame before a chunk edge comes from the chunk that ends there",
-          footage.showing == "movie" and footage.position == last - 1,
-          f"{footage.showing} {footage.position}")
+    assert footage.showing == "movie" and footage.position == edge - 2
 
     footage.viewer.play()
     footage.viewer._advance()             # onto the chunk's last frame
-    for _ in range(2000):
-        app.processEvents()               # the hand-over is queued, not re-entrant
-        if footage.position == REVIEW_CHUNK:
-            break
-        time.sleep(0.002)
-    check("playing past a chunk's last frame carries on into the next frame of "
-          "the track", footage.position == REVIEW_CHUNK, str(footage.position))
-    check("...out of a different chunk", footage._shown != first,
-          f"{first} -> {footage._shown}")
-    check("...and it is still playing", footage.viewer.is_playing)
-    check("the marker went with it", panel.timeline.position == REVIEW_CHUNK,
-          str(panel.timeline.position))
+    # The hand-over is queued, not re-entrant.
+    _wait(app, lambda: footage.position == edge, 2000)
+    assert footage.position == edge, "playback carries into the next chunk"
+    assert footage._shown != first, f"out of a different chunk: {first} -> {footage._shown}"
+    assert footage.viewer.is_playing
+    assert panel.timeline.position == edge, "the marker went with it"
     footage.viewer.pause()
 
 
 def test_the_end_of_a_track_loops_to_the_start_of_the_track(app, panel) -> None:
-    """Not to the start of the chunk it happened to end in.
-
-    The viewer loops the array it holds, which is one decode chunk. Left to do
-    that at the end of a track, playback restarts part-way through - at whatever
-    frame the last chunk began on, so at a different place depending only on how
-    the chunks divided the track. Watched for a minute that reads as a player
-    that skips the beginning.
-    """
+    """Not to the start of the chunk it happened to end in."""
     footage = panel.footage
     f_lo, f_hi = footage._span
-    check("the track is longer than one chunk, or this proves nothing",
-          f_hi - f_lo > REVIEW_CHUNK_FOR_TEST(), f"{f_lo}-{f_hi}")
+    assert f_hi - f_lo > chunk(), f"the track spans more than one chunk: {f_lo}-{f_hi}"
 
     footage.show_frame(f_hi - 2)
     settle(app, footage, f_hi - 2)
     last_chunk = footage._shown
-    check("the playhead is in the final chunk, not the first",
-          last_chunk > f_lo, f"{last_chunk} vs {f_lo}")
+    assert last_chunk > f_lo, "the playhead is in the final chunk"
 
     footage.viewer.play()
     for _ in range(3000):
@@ -858,141 +690,99 @@ def test_the_end_of_a_track_loops_to_the_start_of_the_track(app, panel) -> None:
         if footage.position <= f_lo + 2:
             break
         time.sleep(0.001)
-    check("running off the end goes back to the first frame of the track",
-          f_lo <= footage.position <= f_lo + 2, str(footage.position))
-    check("...and not to the first frame of the last chunk",
-          footage.position < last_chunk, f"{footage.position} vs {last_chunk}")
-    check("...still playing", footage.viewer.is_playing)
+    assert f_lo <= footage.position <= f_lo + 2, footage.position
+    assert footage.position < last_chunk, "not the first frame of the last chunk"
+    assert footage.viewer.is_playing
     footage.viewer.pause()
 
 
 def test_the_player_has_no_scrubber_of_its_own(app, panel) -> None:
-    """One frame axis, and it is the one that spans the track.
-
-    The viewer's own slider spans the decoded chunk, which is 50 frames because
-    that is a convenient amount to read at once - a number with no meaning in
-    the project, and read beside a clip length of 25 it looks like one.
-    """
+    """The timeline spanning the track is the only frame axis."""
     footage = panel.footage
     settle(app, footage)
-    check("the video is showing", footage.showing == "movie")
-    check("but its slider is not", not footage.viewer._slider.isVisibleTo(footage))
-    check("nor its chunk-relative frame counter",
-          not footage.viewer._counter.isVisibleTo(footage))
-    check("play is still there, being about the video and not about frames",
-          footage.viewer._play_btn.isVisibleTo(footage))
-    check("and the lanes beside it are the frame axis, spanning the whole track",
-          panel.timeline.track.f_hi - panel.timeline.track.f_lo
-          > REVIEW_CHUNK_FOR_TEST(),
-          f"{panel.timeline.track.f_lo}-{panel.timeline.track.f_hi}")
+    assert footage.showing == "movie"
+    assert not footage.viewer._slider.isVisibleTo(footage), "no chunk slider"
+    assert not footage.viewer._counter.isVisibleTo(footage), "no chunk-relative counter"
+    assert footage.viewer._play_btn.isVisibleTo(footage), "play is still there"
+    assert panel.timeline.track.f_hi - panel.timeline.track.f_lo > chunk()
 
 
-def REVIEW_CHUNK_FOR_TEST() -> int:
-    from trackanno.gui.review import REVIEW_CHUNK
-
-    return int(REVIEW_CHUNK)
-
-
-def test_changing_the_view_mid_review_re_renders_rather_than_re_decodes(
-    app, panel,
-) -> None:
-    """Both controls are display-time transforms, and have to stay that way.
-
-    Every mode reads the same decoded array through a different transform, so
-    switching one costs a repaint. A control that dropped the frames and went
-    back to the movie would stall on a decode mid-review, which is the one thing
-    the read-ahead is there to prevent.
-    """
+def test_changing_the_view_mid_review_re_renders_rather_than_re_decodes(panel) -> None:
     footage = panel.footage
     before = footage.viewer.canvas._view
     pixels, pixmaps = footage.frame_image(), footage.viewer.canvas._pixmaps
-    check("the controls are on screen with the picture",
-          footage.controls.isVisible())
+    assert footage.controls.isVisible()
 
     footage.follow_combo.setCurrentText("centred")
-    check("choosing another view rebuilds the geometry",
-          footage.viewer.canvas._view is not before and footage.follow == "centred")
-    check("...off the frames already on screen: not one pixel was read again",
-          np.array_equal(footage.frame_image(), pixels)
-          and footage.viewer.canvas._pixmaps is pixmaps)
+    assert footage.viewer.canvas._view is not before and footage.follow == "centred", (
+        "choosing another view rebuilds the geometry")
+    assert np.array_equal(footage.frame_image(), pixels), "not one pixel was read again"
+    assert footage.viewer.canvas._pixmaps is pixmaps
 
+
+def test_the_marker_toggle_switches_the_overlay(panel) -> None:
+    footage = panel.footage
     footage.marker_box.setChecked(False)
-    check("turning the marker off stops it being drawn",
-          not footage.viewer.canvas.show_overlay)
+    assert not footage.viewer.canvas.show_overlay
     footage.marker_box.setChecked(True)
-    check("...and back on brings it back", footage.viewer.canvas.show_overlay)
+    assert footage.viewer.canvas.show_overlay
 
 
-def test_the_review_window_opens_on_a_view_that_re_centres_every_frame(
-    app, filmed,
-) -> None:
-    """``ui.follow`` is chosen for one 25-frame clip, and a bout is not one.
-
-    A moving average removes drift and keeps the beat, which is what an
-    annotator watching a single window wants. Scrubbed across the hundreds of
-    frames a bout runs for, that average lags the animal and it walks out of the
-    middle of the picture - so the reviewer chases the cell instead of reading
-    the boundary.
-    """
-    from trackanno.gui.review import REVIEW_FOLLOW, TrackFootage
+def test_the_review_window_opens_on_a_view_that_re_centres_every_frame(filmed, footage) -> None:
+    """The project's moving-average follow lags the animal over a long bout."""
+    from trackanno.gui.review import REVIEW_FOLLOW
     from trackanno.view.overlay import build_clip_view
 
     cfg, movie = filmed
+    assert footage.follow == REVIEW_FOLLOW == "locked", footage.follow
     frames = decoder(cfg, movie)
-    footage = TrackFootage(cfg)
     try:
-        check("the review window opens on the view that re-centres every frame, "
-              "rather than inheriting the annotation window's average",
-              footage.follow == REVIEW_FOLLOW == "locked",
-              footage.follow)
         pixels, marks = frames.cut(0)
-        view = footage._view(marks, pixels)
-        path = np.array([centres(marks)[t] for t in sorted(centres(marks))])
-        check("...so the animal is in the middle of the picture on every frame "
-              "of the span", np.allclose(view.centre, path),
-              str(float(np.abs(view.centre - path).max())))
-
-        lagged = build_clip_view(marks, len(pixels), int(pixels.shape[1]),
-                                 mode="centred")
-        check("...which is the whole difference: the project's own setting "
-              "leaves it off centre",
-              np.abs(lagged.centre - path).max() > 1.0,
-              str(float(np.abs(lagged.centre - path).max())))
-
-        footage.follow_combo.setCurrentText("centred")
-        check("and the reviewer can still ask for either of the other two, "
-              "which is what the selector is for",
-              footage.follow == "centred"
-              and float(np.ptp(footage._build_view().centre[:, 0])) == 0.0)
     finally:
-        footage.release()
         frames.close()
+    view = footage._view(marks, pixels)
+    path = np.array([centres(marks)[t] for t in sorted(centres(marks))])
+    assert np.allclose(view.centre, path), "the animal is centred on every frame"
+
+    lagged = build_clip_view(marks, len(pixels), int(pixels.shape[1]), mode="centred")
+    assert np.abs(lagged.centre - path).max() > 1.0, "the moving average leaves it off centre"
+
+    footage.follow_combo.setCurrentText("centred")
+    assert footage.follow == "centred"
+    assert float(np.ptp(footage._build_view().centre[:, 0])) == 0.0
+
+
+def test_clicking_the_right_end_of_the_timeline_shows_the_last_frame(app, panel) -> None:
+    footage, timeline = panel.footage, panel.timeline
+    f_lo, f_hi = timeline.track.f_lo, timeline.track.f_hi
+    assert timeline._frame_at(timeline.width() + 50) == f_hi - 1
+
+    click(timeline, f_hi)
+    settle(app, footage, f_hi - 1)
+    assert footage.position == f_hi - 1, footage.source.text()
+    assert footage.showing == "movie" and not footage.source.text().startswith("No video")
+    assert timeline.position == f_hi - 1
+
+    footage.show_frame(f_hi + 500)            # past the end is clamped, not an error
+    settle(app, footage, f_hi - 1)
+    assert footage.position == f_hi - 1 and footage.showing == "movie"
+    click(timeline, f_lo + 12)
+    settle(app, footage, f_lo + 12)
+    assert footage.position == f_lo + 12, footage.source.text()
 
 
 # --------------------------------------------------------------------------- #
 # when there are no pixels
 # --------------------------------------------------------------------------- #
-def test_a_project_whose_movies_are_missing_keeps_the_timeline_and_says_why(
-    app, root,
-) -> None:
-    """The state a project sits in when the recordings are on a share that is
-    not mounted.
-
-    Losing the video must cost the video only. A black rectangle would read as a
-    decoder that failed, and a traceback out of the slot takes the window with
-    it - so the picture goes away and a sentence takes its place.
-    """
-    from test_predict import build_case
-
+def test_a_project_whose_movies_are_missing_keeps_the_timeline_and_says_why(app, root) -> None:
     from trackanno.gui.review import BoutReviewPanel
 
     cfg, manifest = build_case(root, "footage-unfilmed")
-    cfg = _own_dirs(cfg)                  # a video directory of its own, and empty
+    cfg = _own_dirs(cfg)                  # an empty video directory of its own
     movie = str(manifest["movie_id"].iat[0])
     _predict(cfg, [movie])
 
     widget = BoutReviewPanel(cfg)
-
     loaded(app, widget)
     widget.resize(1100, 600)
     widget.show()
@@ -1001,68 +791,46 @@ def test_a_project_whose_movies_are_missing_keeps_the_timeline_and_says_why(
     widget.timeline.resize(820, 260)
     note = settle(app, widget.footage)
     try:
-        check("the timeline still draws the predictions",
-              ink(painted(widget.timeline)) > 500,
-              str(ink(painted(widget.timeline))))
-        check("nothing is on screen where the video would be",
-              not widget.footage.viewer.isVisible(), note)
-        check("...and no controls over a video that is not there",
-              not widget.footage.controls.isVisible())
-        check("...and it says there is no video", note.startswith("No video"), note)
-        check("...and names the movie it could not read", movie in note, note)
-        check("...and that the timeline is unaffected", "timeline is unaffected" in note, note)
+        assert ink(painted(widget.timeline)) > 500, "the timeline still draws"
+        assert not widget.footage.viewer.isVisible(), "no black rectangle"
+        assert not widget.footage.controls.isVisible()
+        assert note.startswith("No video"), note
+        assert movie in note, note
+        assert "timeline is unaffected" in note, note
 
         widget.footage.show_frame(60)
-        check("scrubbing does not ask the missing movie again, which on a dead "
-              "share is a hang per mouse move",
-              bool(widget.footage._problem) and not widget.footage.viewer.isVisible(),
-              widget.footage.source.text())
+        assert widget.footage._problem and not widget.footage.viewer.isVisible(), (
+            "scrubbing does not ask the missing movie again")
     finally:
         widget.close()
         app.processEvents()
 
 
 def test_a_track_the_detector_never_saw_says_so_rather_than_showing_nothing(
-    app, filmed,
+    app, filmed, footage,
 ) -> None:
-    """A predicted track with no detections cannot be centred on.
+    _, movie = filmed
+    footage.set_track(movie, 987, 0, 120)
+    note = settle(app, footage)
+    assert note.startswith("No video"), note
+    assert "987" in note and "never detected" in note, note
+    assert not footage.viewer.isVisible(), "the picture is gone rather than black"
 
-    That is a broken pair of files rather than a normal state, so it is worth a
-    sentence naming both halves - and it must not be an exception out of a Qt
-    slot, which takes the window with it.
-    """
-    from trackanno.gui.review import TrackFootage
 
-    cfg, movie = filmed
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, 987, 0, 120)
-        note = settle(app, footage)
-        check("it says there is no video", note.startswith("No video"), note)
-        check("...and why: the track was never detected in this movie",
-              "987" in note and "never detected" in note, note)
-        check("...and the picture is gone rather than black",
-              not footage.viewer.isVisible(), note)
-    finally:
-        footage.release()
-        app.processEvents()
+def test_an_unreadable_track_does_not_block_the_next_one(app, filmed, footage) -> None:
+    _, movie = filmed
+    footage.set_track(movie, 987, 0, 120)
+    note = settle(app, footage)
+    assert note.startswith("No video") and "987" in note, note
+    footage.set_track(movie, TRACK, 0, 120)
+    settle(app, footage, 0)
+    assert footage.showing == "movie" and footage.position == 0, footage.source.text()
 
 
 # --------------------------------------------------------------------------- #
 # letting go
 # --------------------------------------------------------------------------- #
-def test_hiding_the_panel_lets_go_and_showing_it_gets_the_video_back(
-    app, filmed,
-) -> None:
-    """The Review page keeps one panel for the whole session.
-
-    Holding a movie open and a decode thread running for that long is a file
-    handle and a thread nobody is looking at, so both are dropped whenever the
-    panel goes away - which is what leaving the page does, and which means
-    coming back to it has to put the footage back. A page that returned with a
-    sentence where the video was would look exactly like a project that had
-    lost its recordings.
-    """
+def test_hiding_the_panel_lets_go_and_showing_it_gets_the_video_back(app, filmed) -> None:
     from trackanno.gui.review import BoutReviewPanel
 
     cfg, movie = filmed
@@ -1076,32 +844,23 @@ def test_hiding_the_panel_lets_go_and_showing_it_gets_the_video_back(
         painted(panel.timeline)
         click(panel.timeline, 72)
         settle(app, panel.footage, 72)
-        check("the panel is showing the movie", panel.footage.showing == "movie"
-              and panel.footage.position == 72, panel.footage.source.text())
+        assert panel.footage.showing == "movie" and panel.footage.position == 72
 
         panel.hide()
         app.processEvents()
-        check("hiding it lets go of the movie and stops the decode thread",
-              panel.footage._decoder is None and not panel.footage._cache,
-              str(sorted(panel.footage._cache)))
+        assert panel.footage._decoder is None and not panel.footage._cache, (
+            "hiding lets go of the movie and the decode thread")
 
         panel.show()
         settle(app, panel.footage, 72)
-        check("showing it again brings the video back",
-              panel.footage.showing == "movie", panel.footage.source.text())
-        check("...to the frame it was left on", panel.footage.position == 72,
-              str(panel.footage.position))
+        assert panel.footage.showing == "movie", panel.footage.source.text()
+        assert panel.footage.position == 72, "back on the frame it was left on"
     finally:
         panel.close()
         app.processEvents()
 
 
 def test_closing_the_window_stops_the_decode_thread(app, root) -> None:
-    """A daemon thread left reading a movie outlives the window that wanted it.
-
-    It holds a file handle, it competes for the disk with whatever the user does
-    next, and at interpreter exit it is a crash with no failing test.
-    """
     from trackanno.gui.review import BoutReviewPanel
 
     cfg, movie = filmed_project(root, "footage-release")
@@ -1111,74 +870,20 @@ def test_closing_the_window_stops_the_decode_thread(app, root) -> None:
     app.processEvents()
     select(widget, movie, TRACK)
     settle(app, widget.footage)
-    check("the window really did open the movie",
-          widget.footage._decoder is not None and widget.footage.showing == "movie",
-          widget.footage.source.text())
+    assert widget.footage._decoder is not None and widget.footage.showing == "movie"
     thread = widget.footage._decoder.thread
-    check("...on a thread of its own", thread is not None and thread.is_alive())
+    assert thread is not None and thread.is_alive()
 
     widget.close()
     app.processEvents()
-    check("closing it drops the decoder", widget.footage._decoder is None)
-    for _ in range(500):
-        if not thread.is_alive():
-            break
-        time.sleep(0.002)
-    check("...and the thread it was running on has stopped", not thread.is_alive())
-    check("...and the frames it was holding are gone",
-          not widget.footage._cache and widget.footage.frame_image() is None)
-
-
-def test_a_short_span_is_cut_once_and_arrives_whole(app, filmed) -> None:
-    """A short span is cut to its own frames, not padded to the grid cell,
-    and a chunk arrives as one whole reply."""
-    from trackanno.gui.review import (
-        REVIEW_CHUNK, ChunkDecoder, TrackCutter, TrackFootage, review_crop,
-    )
-
-    cfg, movie = filmed
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, TRACK, 37, 62)
-        settle(app, footage, 37)
-        for _ in range(3000):
-            app.processEvents()
-            if not footage.loading and 50 in footage._cache:
-                break
-            time.sleep(0.002)
-        held = {first: len(footage._cache.get(first)[0]) for first in footage._cache}
-        check("the chunk starts at the span, not at the grid cell",
-              min(held) == 37, str(held))
-        check("...and runs to the grid edge inside the span",
-              held.get(37) == REVIEW_CHUNK - 37, str(held))
-        check("the read-ahead stops at the end of the span",
-              held.get(50) == 62 - 50 and max(f + n for f, n in held.items()) <= 62,
-              str(held))
-    finally:
-        footage.release()
-        app.processEvents()
-
-    crop = review_crop(cfg)
-    decoder = ChunkDecoder(lambda t: TrackCutter(cfg, movie, t, crop))
-    whole = []
-    decoder.ready.connect(lambda gen, first, payload: whole.append((gen, first, len(payload[0]))))
-    try:
-        decoder.want(7, TRACK, 0, REVIEW_CHUNK)
-        for _ in range(3000):
-            app.processEvents()
-            if whole:
-                break
-            time.sleep(0.002)
-        for _ in range(20):
-            app.processEvents()
-        check("the whole chunk arrives once, with its generation",
-              whole == [(7, 0, REVIEW_CHUNK)], str(whole))
-    finally:
-        decoder.stop()
+    assert widget.footage._decoder is None, "closing drops the decoder"
+    thread.join(1.0)
+    assert not thread.is_alive(), "the decode thread has stopped"
+    assert not widget.footage._cache and widget.footage.frame_image() is None
 
 
 # --------------------------------------------------------------------------- #
-# the chunk cache, the right edge and track switches
+# the chunk cache and track switches
 # --------------------------------------------------------------------------- #
 class FakeCutter:
     """A cutter that fills every frame with ``value``, optionally held at a gate."""
@@ -1210,16 +915,7 @@ class FakeCutter:
         self.closed_on = threading.current_thread().name
 
 
-def _wait(app, condition, tries: int = 3000) -> bool:
-    for _ in range(tries):
-        app.processEvents()
-        if condition():
-            return True
-        time.sleep(0.002)
-    return False
-
-
-def test_the_chunk_cache_evicts_the_least_recently_used(app) -> None:
+def test_the_chunk_cache_evicts_the_least_recently_used() -> None:
     from trackanno.gui.review import ChunkCache
 
     cache = ChunkCache(3)
@@ -1230,25 +926,6 @@ def test_the_chunk_cache_evicts_the_least_recently_used(app) -> None:
     assert 50 not in cache and len(cache) == 3
     assert cache.keys() == [100, 0, 150]
     assert cache.get(50) is None
-
-
-def test_clicking_the_right_end_of_the_timeline_shows_the_last_frame(app, panel) -> None:
-    footage, timeline = panel.footage, panel.timeline
-    f_lo, f_hi = timeline.track.f_lo, timeline.track.f_hi
-    assert timeline._frame_at(timeline.width() + 50) == f_hi - 1
-
-    click(timeline, f_hi)
-    settle(app, footage, f_hi - 1)
-    assert footage.position == f_hi - 1, footage.source.text()
-    assert footage.showing == "movie" and not footage.source.text().startswith("No video")
-    assert timeline.position == f_hi - 1
-
-    footage.show_frame(f_hi + 500)            # past the end is clamped, not an error
-    settle(app, footage, f_hi - 1)
-    assert footage.position == f_hi - 1 and footage.showing == "movie"
-    click(timeline, f_lo + 12)
-    settle(app, footage, f_lo + 12)
-    assert footage.position == f_lo + 12, footage.source.text()
 
 
 def test_switching_track_does_not_wait_for_a_slow_decode(app, filmed) -> None:
@@ -1283,29 +960,22 @@ def test_switching_track_does_not_wait_for_a_slow_decode(app, filmed) -> None:
     app.processEvents()
 
 
-def test_a_burst_of_track_switches_opens_only_the_last_track(app, filmed) -> None:
-    from trackanno.gui.review import TrackFootage
-
-    cfg, movie = filmed
+def test_a_burst_of_track_switches_opens_only_the_last_track(app, filmed, footage) -> None:
+    _, movie = filmed
     opened = []
-    footage = TrackFootage(cfg)
     footage.make_cutter = lambda m, t, source=None: opened.append(t) or FakeCutter(t)
-    try:
-        footage.set_track(movie, 1, 0, 120)
-        footage.set_track(movie, 2, 0, 120)
-        footage.show_frame(70)
-        settle(app, footage, 70)
-        assert opened == [2], opened
-        assert int(footage.frame_image().max()) == 2
-    finally:
-        footage.release()
-        app.processEvents()
+    footage.set_track(movie, 1, 0, 120)
+    footage.set_track(movie, 2, 0, 120)
+    footage.show_frame(70)
+    settle(app, footage, 70)
+    assert opened == [2], opened
+    assert int(footage.frame_image().max()) == 2
 
 
-def test_tracks_of_one_movie_share_one_open_movie(app, filmed, monkeypatch) -> None:
-    from trackanno.gui.review import MovieSource, TrackFootage
+def test_tracks_of_one_movie_share_one_open_movie(app, filmed, footage, monkeypatch) -> None:
+    from trackanno.gui.review import MovieSource
 
-    cfg, movie = filmed
+    _, movie = filmed
     opens = []
     original = MovieSource.open
 
@@ -1315,32 +985,24 @@ def test_tracks_of_one_movie_share_one_open_movie(app, filmed, monkeypatch) -> N
         original(self)
 
     monkeypatch.setattr(MovieSource, "open", counting)
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, 1, 0, 120)
-        settle(app, footage, 0)
-        decoder = footage._decoder
-        footage.set_track(movie, 2, 0, 120)
-        settle(app, footage, 0)
-        assert footage.showing == "movie", footage.source.text()
-        assert footage._decoder is decoder and opens == [movie], opens
+    footage.set_track(movie, 1, 0, 120)
+    settle(app, footage, 0)
+    decoder = footage._decoder
+    footage.set_track(movie, 2, 0, 120)
+    settle(app, footage, 0)
+    assert footage.showing == "movie", footage.source.text()
+    assert footage._decoder is decoder and opens == [movie], opens
 
-        footage.set_track(SECOND, 1, 0, 120)
-        settle(app, footage, 0)
-        assert footage._decoder is not decoder and opens == [movie, SECOND], opens
-        assert decoder.done.wait(5)               # the first movie was closed
-    finally:
-        footage.release()
-        app.processEvents()
+    footage.set_track(SECOND, 1, 0, 120)
+    settle(app, footage, 0)
+    assert footage._decoder is not decoder and opens == [movie, SECOND], opens
+    assert decoder.done.wait(5), "the first movie was closed"
 
 
-def test_a_previous_tracks_late_chunk_is_dropped(app, filmed) -> None:
-    from trackanno.gui.review import TrackFootage
-
-    cfg, movie = filmed
+def test_a_previous_tracks_late_chunk_is_dropped(app, filmed, footage) -> None:
+    _, movie = filmed
     gate = threading.Event()
     stale = FakeCutter(1, gate)
-    footage = TrackFootage(cfg)
     footage.make_cutter = lambda m, t, source=None: stale if t == 1 else FakeCutter(2)
     try:
         footage.set_track(movie, 1, 0, 120)
@@ -1358,22 +1020,3 @@ def test_a_previous_tracks_late_chunk_is_dropped(app, filmed) -> None:
         assert int(footage.frame_image().max()) == 2
     finally:
         gate.set()
-        footage.release()
-        app.processEvents()
-
-
-def test_an_unreadable_track_does_not_block_the_next_one(app, filmed) -> None:
-    from trackanno.gui.review import TrackFootage
-
-    cfg, movie = filmed
-    footage = TrackFootage(cfg)
-    try:
-        footage.set_track(movie, 987, 0, 120)
-        note = settle(app, footage)
-        assert note.startswith("No video") and "987" in note, note
-        footage.set_track(movie, TRACK, 0, 120)
-        settle(app, footage, 0)
-        assert footage.showing == "movie" and footage.position == 0, footage.source.text()
-    finally:
-        footage.release()
-        app.processEvents()

@@ -1,14 +1,6 @@
-"""Per-detection embedding vectors and their clip-level summary.
+"""Per-detection embedding vectors, their project-wide PCA, and the per-window summary.
 
-An embedding source supplies one vector per detection, keyed to
-``(movie_id, track_id, frame)``. ``detector`` reads ``instance_features.npy``,
-row-aligned with ``tracks.parquet``; ``file`` reads a table per movie with
-``track_id``, ``frame`` and numeric vector columns.
-
-One PCA per embedding is fitted over every detection of the project, without
-labels, when the clip features are built. Clip features and dense windows both
-summarise the codes through :func:`summarise`, so training, cross-validation and
-prediction see the same columns.
+Sources: ``detector`` (``instance_features.npy``) or ``file`` (a table per movie keyed by track and frame).
 """
 
 from __future__ import annotations
@@ -81,26 +73,20 @@ def _read_table(path: Path) -> pd.DataFrame:
 
 
 def detection_vectors(cfg, spec, movie_dir: Path, tracks: pd.DataFrame) -> np.ndarray:
-    """``(len(tracks), D)`` vectors row-aligned with ``tracks``, NaN where missing.
-
-    ``tracks`` is the movie's full ``tracks.parquet`` table. A movie with no
-    vectors at all is refused; single missing detections become NaN rows. The
-    detector file is memory-mapped.
-    """
+    """``(len(tracks), D)`` vectors row-aligned with ``tracks``, NaN where missing."""
     movie_id = movie_dir.name
     if spec.source == "detector":
         path = movie_dir / DETECTOR_FILE
         if not path.exists():
             raise RuntimeError(
-                f"{movie_id}: embedding {spec.name!r} reads {DETECTOR_FILE}, which "
-                "is missing. Re-prepare the movie with features.enabled, or drop "
-                "the embedding."
+                f"{movie_id}: {DETECTOR_FILE} is missing for embedding {spec.name!r}; "
+                "re-prepare with features.enabled or drop the embedding"
             )
         vectors = np.load(path, mmap_mode="r")
         if len(vectors) != len(tracks):
             raise RuntimeError(
                 f"{movie_id}: {DETECTOR_FILE} has {len(vectors)} rows but "
-                f"tracks.parquet has {len(tracks)}; features are not row-aligned"
+                f"tracks.parquet has {len(tracks)}; re-prepare the movie"
             )
         return vectors
 
@@ -135,9 +121,8 @@ def detection_vectors(cfg, spec, movie_dir: Path, tracks: pd.DataFrame) -> np.nd
     hit = where >= 0
     if len(tracks) and not hit.any():
         raise RuntimeError(
-            f"{path}: none of its {len(table)} rows match a detection of {movie_id} "
-            "by (track_id, frame). Frames are 0-based as in tracks.parquet, and "
-            "track ids change when detection is re-run."
+            f"{path}: none of its {len(table)} rows match a (track_id, frame) of "
+            f"{movie_id}; frames are 0-based and track ids change on re-detection"
         )
     out[hit] = values[where[hit]]
     return out
@@ -150,12 +135,9 @@ def _finite_rows(vectors: np.ndarray) -> np.ndarray:
 
 
 def fit_bases(cfg, vectors: dict, reporter=None) -> dict:
-    """``{name: PCA}``, one per embedding, fitted over every detection.
+    """``{name: PCA}`` fitted over every detection, sampled to PCA_MAX_ROWS.
 
-    ``vectors`` maps embedding name to ``{movie_id: source}``, where a source is
-    an ``(n, D)`` array or ``(n_rows, load)`` with ``load()`` returning one. Movies
-    are loaded one at a time; above PCA_MAX_ROWS each contributes a seeded
-    sample in proportion to its rows.
+    ``vectors`` maps name to ``{movie_id: array or (n_rows, load)}``.
     """
     from sklearn.decomposition import PCA
 
@@ -179,9 +161,8 @@ def fit_bases(cfg, vectors: dict, reporter=None) -> dict:
         if len(set(widths.values())) > 1:
             detail = ", ".join(f"{m} {w}-d" for m, w in sorted(widths.items()))
             raise RuntimeError(
-                f"embedding {name!r} has vectors of different widths across movies "
-                f"({detail}). A detector embedding follows the model's channel "
-                "widths, so re-prepare every movie with the same weights."
+                f"embedding {name!r} has different widths across movies ({detail}); "
+                "re-prepare every movie with the same weights"
             )
         stacked = np.concatenate(parts, axis=0)
         if not len(stacked):
@@ -217,9 +198,8 @@ def to_codes(pca, vectors: np.ndarray, name: str = "", movie_id: str = "") -> np
     """PCA codes for every row, NaN where the vector is incomplete."""
     if vectors.shape[1] != int(pca.n_features_in_):
         raise RuntimeError(
-            f"{movie_id}: embedding {name!r} is {vectors.shape[1]}-d but its saved "
-            f"PCA was fitted on {int(pca.n_features_in_)}-d vectors. Re-prepare "
-            "with the same source, or rebuild the clip features and retrain."
+            f"{movie_id}: embedding {name!r} is {vectors.shape[1]}-d but its PCA "
+            f"expects {int(pca.n_features_in_)}-d; rebuild the clip features and retrain"
         )
     out = np.full((len(vectors), int(pca.n_components_)), np.nan, dtype=np.float64)
     ok = _finite_rows(vectors)

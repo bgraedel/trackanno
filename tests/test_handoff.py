@@ -7,8 +7,8 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-from harness import check
-from test_workflow import StubDetector, _no_detector, _prep_project
+import pytest
+from fixtures import StubDetector, no_detector, prep_project
 
 
 def _detect(cfg, movie, frames):
@@ -24,7 +24,7 @@ def test_tracker_ids_restart_for_every_movie(root: Path) -> None:
     from trackanno.detect.tiling import Detections
     from trackanno.detect.tracking import build_tracker
 
-    cfg, _, _ = _prep_project(root, "tracker-ids")
+    cfg, _, _ = prep_project(root, "tracker-ids")
     cfg.tracking.backend = "tracktrack"
 
     def first_ids() -> list[int]:
@@ -41,126 +41,173 @@ def test_tracker_ids_restart_for_every_movie(root: Path) -> None:
         return sorted(seen)
 
     one, two = first_ids(), first_ids()
-    check("the first movie gets ids", len(one) == 2, str(one))
-    check("the second movie starts from the same id", one == two, f"{one} vs {two}")
-    check("and the construction probe used none of them", one[0] == 1, str(one))
+    assert len(one) == 2, f"the first movie gets ids: {one}"
+    assert one == two, f"the second movie starts from the same id: {one} vs {two}"
+    assert one[0] == 1, f"the construction probe used none of them: {one}"
 
 
-def test_what_makes_a_handoff_stale(root: Path) -> None:
-    from trackanno.detect.prepare import (
-        _config_fingerprint, _legacy_fingerprint, handoff_is_fresh, pin_configured_tiling,
-    )
-
-    cfg, movie, frames = _prep_project(root, "fingerprint")
+@pytest.fixture(scope="module")
+def _detected_once(root: Path):
+    cfg, movie, frames = prep_project(root, "fingerprint")
     _detect(cfg, movie, frames)
-    check("fresh after detecting", handoff_is_fresh(cfg, movie.id))
+    path = cfg.movie_dir(movie.id) / "detect_done.json"
+    return cfg.path, movie, path.read_text(encoding="utf-8")
 
+
+@pytest.fixture
+def detected(_detected_once):
+    """A freshly loaded config over one detected movie, its handoff record restored."""
+    from trackanno.config import load_config
+
+    config_path, movie, text = _detected_once
+    path = load_config(config_path).movie_dir(movie.id) / "detect_done.json"
+    path.write_text(text, encoding="utf-8")
+    return load_config(config_path), movie, path, json.loads(text)
+
+
+def _write_record(path: Path, info: dict, record: dict) -> None:
+    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
+
+
+def test_a_handoff_is_fresh_after_detecting(detected) -> None:
+    from trackanno.detect.prepare import handoff_is_fresh
+
+    cfg, movie, _, _ = detected
+    assert handoff_is_fresh(cfg, movie.id)
+
+
+def test_a_changed_detection_key_marks_the_movie_stale(detected) -> None:
+    from trackanno.detect.prepare import detection_changes, handoff_is_fresh
+
+    cfg, movie, _, _ = detected
+    cfg.detection.conf = 0.9
+    assert not handoff_is_fresh(cfg, movie.id)
+    assert detection_changes(cfg, movie.id) == ["detection.conf"]
+
+
+def test_clip_stage_keys_do_not_mark_the_movie_stale(detected) -> None:
+    from trackanno.detect.prepare import handoff_is_fresh
+
+    cfg, movie, _, info = detected
     cfg.tracking.min_track_length = 7
     cfg.tracking.border_margin_px = 5
     cfg.tracking.border_max_frac = 0.5
     cfg.clips.pad = 3.0
-    check("clip-stage keys do not invalidate detections",
-          handoff_is_fresh(cfg, movie.id))
-    cfg.tiff.fps = 33.0
-    check("fps does, through the tracker's track_buffer",
-          not handoff_is_fresh(cfg, movie.id))
-    cfg.tiff.fps = 100.0
+    cfg.clips.crop_size = 64
+    assert handoff_is_fresh(cfg, movie.id)
+    assert not any(k.startswith("clips.") or k == "tracking.min_track_length"
+                   for k in info["config_fingerprint"]), "the clip stage is not recorded"
 
+
+def test_fps_marks_the_movie_stale(detected) -> None:
+    """fps reaches the tracker through its track buffer."""
+    from trackanno.detect.prepare import handoff_is_fresh
+
+    cfg, movie, _, _ = detected
+    cfg.tiff.fps = 33.0
+    assert not handoff_is_fresh(cfg, movie.id)
+
+
+def test_a_tile_override_does_not_change_the_fingerprint(detected) -> None:
+    from trackanno.detect.prepare import (
+        _config_fingerprint, handoff_is_fresh, pin_configured_tiling,
+    )
+
+    cfg, movie, _, _ = detected
+    before = _config_fingerprint(cfg)
     pin_configured_tiling(cfg)
     cfg.tiling.tile, cfg.tiling.enabled = 128, True
-    check("a --tile override does not either", handoff_is_fresh(cfg, movie.id))
+    assert _config_fingerprint(cfg) == before
+    assert handoff_is_fresh(cfg, movie.id)
     del cfg._configured_tiling
-    check("but the same change in config.yaml does", not handoff_is_fresh(cfg, movie.id))
-    cfg.tiling.tile, cfg.tiling.enabled = 640, "auto"
+    assert not handoff_is_fresh(cfg, movie.id), "the same change in config.yaml is stale"
 
-    path = cfg.movie_dir(movie.id) / "detect_done.json"
-    info = json.loads(path.read_text(encoding="utf-8"))
-    check("the fingerprint names its keys", "detection.conf" in info["config_fingerprint"])
-    check("and leaves the clip stage out",
-          not any(k.startswith("clips.") or k == "tracking.min_track_length"
-                  for k in info["config_fingerprint"]))
 
-    # A key added in a later version is absent from older records.
+def test_the_fingerprint_names_the_inference_keys(detected) -> None:
+    _, _, _, info = detected
+    assert {"detection.conf", "detection.imgsz", "detection.half", "tiling.overlap",
+            "tiling.merge_iou"} <= set(info["config_fingerprint"])
+
+
+@pytest.mark.parametrize("key, other", [("tiling.tile", 320), ("detection.imgsz", 1280)])
+def test_a_key_an_old_record_lacks_compares_at_its_default(detected, key, other) -> None:
+    from trackanno.detect.prepare import handoff_is_fresh
+
+    cfg, movie, path, info = detected
     record = dict(info["config_fingerprint"])
-    record.pop("tiling.tile")
-    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
-    check("a key the record lacks is fine at its default", handoff_is_fresh(cfg, movie.id))
-    cfg.tiling.tile = 320
-    check("but not away from it", not handoff_is_fresh(cfg, movie.id))
-    cfg.tiling.tile = 640
+    record.pop(key)
+    _write_record(path, info, record)
+    assert handoff_is_fresh(cfg, movie.id), "fresh at the default"
+    section, name = key.split(".")
+    setattr(getattr(cfg, section), name, other)
+    assert not handoff_is_fresh(cfg, movie.id), "stale away from it"
+    record[key] = other
+    _write_record(path, info, record)
+    assert handoff_is_fresh(cfg, movie.id), "a record made at that value is fresh"
 
-    # A recorded key that is no longer configurable compares against its constant.
-    for value, fresh in ((0.5, True), (0.7, False)):
-        path.write_text(json.dumps({**info, "config_fingerprint": {
-            **info["config_fingerprint"], "detection.iou": value}}), encoding="utf-8")
-        check(f"a recorded detection.iou of {value} is {'fresh' if fresh else 'stale'}",
-              handoff_is_fresh(cfg, movie.id) is fresh)
 
-    # Inference size: records without it were detected at the default.
-    check("the inference keys are fingerprinted",
-          {"detection.imgsz", "detection.half", "tiling.overlap", "tiling.merge_iou"}
-          <= set(info["config_fingerprint"]))
-    record = dict(info["config_fingerprint"])
-    record.pop("detection.imgsz")
-    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
-    check("no recorded imgsz is fresh at the default", handoff_is_fresh(cfg, movie.id))
-    cfg.detection.imgsz = 1280
-    check("...and stale at another size", not handoff_is_fresh(cfg, movie.id))
-    record["detection.imgsz"] = 1280
-    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
-    check("a record made at that size is fresh", handoff_is_fresh(cfg, movie.id))
-    cfg.detection.imgsz = 640
+@pytest.mark.parametrize("value, fresh", [(0.5, True), (0.7, False)])
+def test_a_retired_key_compares_against_its_constant(detected, value, fresh) -> None:
+    from trackanno.detect.prepare import handoff_is_fresh
 
-    path.write_text(json.dumps({**info, "config_fingerprint": _legacy_fingerprint(cfg)}),
-                    encoding="utf-8")
-    check("an old per-section fingerprint is still accepted", handoff_is_fresh(cfg, movie.id))
+    cfg, movie, path, info = detected
+    _write_record(path, info, {**info["config_fingerprint"], "detection.iou": value})
+    assert handoff_is_fresh(cfg, movie.id) is fresh
+
+
+def test_a_legacy_fingerprint_is_still_checked(detected) -> None:
+    from trackanno.detect.prepare import _legacy_fingerprint, handoff_is_fresh
+
+    cfg, movie, path, info = detected
+    _write_record(path, info, _legacy_fingerprint(cfg))
+    assert handoff_is_fresh(cfg, movie.id)
     cfg.detection.conf = 0.9
-    check("and still checked", not handoff_is_fresh(cfg, movie.id))
-    cfg.detection.conf = 0.25
+    assert not handoff_is_fresh(cfg, movie.id)
 
+
+def test_model_weights_are_part_of_the_fingerprint(detected) -> None:
+    from trackanno.detect.prepare import _config_fingerprint, handoff_is_fresh
+
+    cfg, movie, path, info = detected
     record = _config_fingerprint(cfg)
     record["model.sha256"] = "0" * 64
-    path.write_text(json.dumps({**info, "config_fingerprint": record}), encoding="utf-8")
-    check("unknown weights here are not a mismatch", handoff_is_fresh(cfg, movie.id))
+    _write_record(path, info, record)
+    assert handoff_is_fresh(cfg, movie.id), "unknown weights here are not a mismatch"
     cfg.model.sha256 = "1" * 64
-    check("different weights are", not handoff_is_fresh(cfg, movie.id))
+    assert not handoff_is_fresh(cfg, movie.id), "different weights are"
 
 
-def test_a_removed_normalize_mode_is_not_stale(root: Path) -> None:
-    """`smooth` matches per_frame; `none` gave other pixels than fixed, so it is stale."""
+def test_a_removed_normalize_mode_none_is_stale(detected) -> None:
+    """`none` gave other pixels than `fixed`."""
     from trackanno.detect.prepare import (
         _legacy_digest, _legacy_fingerprint, _legacy_sections, handoff_is_fresh,
     )
 
-    cfg, movie, frames = _prep_project(root, "removed-mode")
-    _detect(cfg, movie, frames)
-    path = cfg.movie_dir(movie.id) / "detect_done.json"
-    info = json.loads(path.read_text(encoding="utf-8"))
-
-    def write(record):
-        path.write_text(json.dumps({**info, "config_fingerprint": record}),
-                        encoding="utf-8")
-
+    cfg, movie, path, info = detected
     cfg.normalize.mode = "fixed"
-    write({**info["config_fingerprint"], "normalize.mode": "none"})
-    check("'none' does not match 'fixed'", not handoff_is_fresh(cfg, movie.id))
+    _write_record(path, info, {**info["config_fingerprint"], "normalize.mode": "none"})
+    assert not handoff_is_fresh(cfg, movie.id)
     normalize = {**_legacy_sections(cfg)["normalize"], "mode": "none"}
-    write({**_legacy_fingerprint(cfg), "normalize": _legacy_digest(normalize)})
-    check("...nor does a legacy digest made under it", not handoff_is_fresh(cfg, movie.id))
+    _write_record(path, info, {**_legacy_fingerprint(cfg), "normalize": _legacy_digest(normalize)})
+    assert not handoff_is_fresh(cfg, movie.id), "nor does a legacy digest made under it"
 
-    for old, new in (("smooth", "per_frame"),):
-        cfg.normalize.mode = new
-        write({**info["config_fingerprint"], "normalize.mode": old})
-        check(f"{old!r} matches {new!r}", handoff_is_fresh(cfg, movie.id))
-        cfg.normalize.mode = "fixed" if new == "per_frame" else "per_frame"
-        check(f"{old!r} does not match another mode", not handoff_is_fresh(cfg, movie.id))
 
-        cfg.normalize.mode = new
-        normalize = {**_legacy_sections(cfg)["normalize"], "mode": old}
-        write({**_legacy_fingerprint(cfg), "normalize": _legacy_digest(normalize)})
-        check(f"a legacy digest made under {old!r} matches too",
-              handoff_is_fresh(cfg, movie.id))
+def test_a_removed_normalize_mode_smooth_matches_per_frame(detected) -> None:
+    from trackanno.detect.prepare import (
+        _legacy_digest, _legacy_fingerprint, _legacy_sections, handoff_is_fresh,
+    )
+
+    cfg, movie, path, info = detected
     cfg.normalize.mode = "per_frame"
+    _write_record(path, info, {**info["config_fingerprint"], "normalize.mode": "smooth"})
+    assert handoff_is_fresh(cfg, movie.id)
+    cfg.normalize.mode = "fixed"
+    assert not handoff_is_fresh(cfg, movie.id), "it does not match another mode"
+
+    cfg.normalize.mode = "per_frame"
+    normalize = {**_legacy_sections(cfg)["normalize"], "mode": "smooth"}
+    _write_record(path, info, {**_legacy_fingerprint(cfg), "normalize": _legacy_digest(normalize)})
+    assert handoff_is_fresh(cfg, movie.id), "a legacy digest made under it matches too"
 
 
 def _logs():
@@ -170,99 +217,115 @@ def _logs():
     return logs, CallbackReporter(on_log=lambda m, _l: logs.append(m))
 
 
-def test_a_stale_handoff_is_reported_not_redetected(root: Path) -> None:
-    from trackanno.detect.prepare import (
-        detect_movie, handoff_is_fresh, prepare_movie, stale_reasons,
-    )
-
-    cfg, movie, frames = _prep_project(root, "stale-skip")
+def _stale(root: Path, name: str):
+    """A detected movie whose config has since changed two detection keys."""
+    cfg, movie, frames = prep_project(root, name)
     _detect(cfg, movie, frames)
-    tracks = cfg.movie_dir(movie.id) / "tracks.parquet"
-    before = tracks.read_bytes()
     cfg.detection.conf = 0.3
     cfg.tiling.tile = 320
+    return cfg, movie, frames
+
+
+def test_a_stale_handoff_is_reported_not_redetected(root: Path) -> None:
+    from trackanno.detect.prepare import detect_movie, prepare_movie, stale_reasons
+
+    cfg, movie, frames = _stale(root, "stale-skip")
+    tracks = cfg.movie_dir(movie.id) / "tracks.parquet"
+    before = tracks.read_bytes()
 
     logs, reporter = _logs()
     stub = StubDetector(frames, movie.n_frames)
     info = prepare_movie(movie, stub, cfg, limit_frames=60, reporter=reporter)
-    check("a stale handoff is not re-detected", stub.calls == 0)
-    check("the movie is reported as skipped", info.get("skipped") is True, str(info))
-    check("the log names the changed keys and the way out",
-          any("detection.conf" in m and "tiling.tile" in m and "--force" in m
-              for m in logs), str(logs))
-    check("and no FAILED", not any("FAILED" in m for m in logs), str(logs))
-    check("the tracks are untouched", tracks.read_bytes() == before)
-    check("stale_reasons names it",
-          any("detection.conf" in r for r in stale_reasons(cfg, movie.id)))
+    assert stub.calls == 0
+    assert info.get("skipped") is True, info
+    assert any("detection.conf" in m and "tiling.tile" in m and "--force" in m
+               for m in logs), f"the log names the changed keys and the way out: {logs}"
+    assert not any("FAILED" in m for m in logs), logs
+    assert tracks.read_bytes() == before
+    assert any("detection.conf" in r for r in stale_reasons(cfg, movie.id))
 
     logs, reporter = _logs()
     detect_movie(movie, stub, cfg, limit_frames=60, reporter=reporter)
-    check("--stage detect skips it too", stub.calls == 0)
-    check("without calling it already detected",
-          not any("already detected" in m for m in logs), str(logs))
+    assert stub.calls == 0, "--stage detect skips it too"
+    assert not any("already detected" in m for m in logs), logs
 
+
+def test_force_redetects_a_stale_handoff(root: Path) -> None:
+    from trackanno.detect.prepare import handoff_is_fresh, prepare_movie
+
+    cfg, movie, frames = _stale(root, "stale-force")
     stub = StubDetector(frames, movie.n_frames)
     info = prepare_movie(movie, stub, cfg, force=True, limit_frames=60)
-    check("--force re-detects", stub.calls > 0)
-    check("and cuts the clips", info["n_clips"] > 0)
-    check("leaving it fresh", handoff_is_fresh(cfg, movie.id))
+    assert stub.calls > 0
+    assert info["n_clips"] > 0
+    assert handoff_is_fresh(cfg, movie.id)
 
+
+def test_a_truncated_handoff_is_skipped_and_force_replaces_it(root: Path) -> None:
+    from trackanno.detect.prepare import prepare_movie
+
+    cfg, movie, frames = prep_project(root, "truncated")
+    _detect(cfg, movie, frames)
     path = cfg.movie_dir(movie.id) / "detect_done.json"
     path.write_text(path.read_text(encoding="utf-8")[:40], encoding="utf-8")
-    (cfg.movie_dir(movie.id) / "prepare_done.json").unlink(missing_ok=True)
     logs, reporter = _logs()
-    info = prepare_movie(movie, _no_detector, cfg, limit_frames=60, reporter=reporter)
-    check("a truncated handoff is skipped, not re-detected",
-          info.get("skipped") is True, str(logs))
+    info = prepare_movie(movie, no_detector, cfg, limit_frames=60, reporter=reporter)
+    assert info.get("skipped") is True, logs
+
     stub = StubDetector(frames, movie.n_frames)
     info = prepare_movie(movie, stub, cfg, force=True, limit_frames=60)
-    check("--force replaces it", stub.calls > 0 and info["n_clips"] > 0)
-    check("and no temporary file is left behind",
-          not list(cfg.movie_dir(movie.id).glob("*.tmp")))
+    assert stub.calls > 0 and info["n_clips"] > 0
+    assert not list(cfg.movie_dir(movie.id).glob("*.tmp")), "no temporary file is left"
+
+
+def _prepared(root: Path, name: str):
+    from trackanno.detect.prepare import prepare_movie
+
+    cfg, movie, frames = prep_project(root, name)
+    prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
+    done = cfg.movie_dir(movie.id) / "prepare_done.json"
+    return cfg, movie, done, json.loads(done.read_text(encoding="utf-8"))
+
+
+def test_unchanged_clip_settings_keep_the_cache(root: Path) -> None:
+    from trackanno.detect.prepare import prepare_movie
+
+    cfg, movie, _, before = _prepared(root, "unchanged")
+    assert before["clip_settings"]["clips.pad"] == 1.6, "the clip settings are recorded"
+    assert prepare_movie(movie, no_detector, cfg) == before
 
 
 def test_changed_clip_settings_are_reported_not_recut(root: Path) -> None:
     from trackanno.detect.prepare import cut_movie, prepare_movie, stale_reasons
+    from trackanno.project import forget_path_probes, project_status
 
-    cfg, movie, frames = _prep_project(root, "recut")
-    prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
-    done = cfg.movie_dir(movie.id) / "prepare_done.json"
-    before = json.loads(done.read_text(encoding="utf-8"))
-    check("the clip settings are recorded", before["clip_settings"]["clips.pad"] == 1.6)
-
-    again = prepare_movie(movie, _no_detector, cfg)
-    check("unchanged settings keep the cache", again == before)
-
+    cfg, movie, done, before = _prepared(root, "recut")
     cfg.clips.crop_size = 64
     logs, reporter = _logs()
-    after = prepare_movie(movie, _no_detector, cfg, reporter=reporter)
-    check("a changed clip setting is skipped", after.get("skipped") is True, str(after))
-    check("naming the key and how to re-cut",
-          any("clips.crop_size" in m and "--force" in m for m in logs), str(logs))
-    check("the cache is left as it was",
-          json.loads(done.read_text(encoding="utf-8")) == before)
-    check("stale_reasons names it",
-          stale_reasons(cfg, movie.id) == ["clip settings changed (clips.crop_size)"],
-          str(stale_reasons(cfg, movie.id)))
-
-    from trackanno.project import forget_path_probes, project_status
+    after = prepare_movie(movie, no_detector, cfg, reporter=reporter)
+    assert after.get("skipped") is True, after
+    assert any("clips.crop_size" in m and "--force" in m for m in logs), logs
+    assert json.loads(done.read_text(encoding="utf-8")) == before, "the cache is left as it was"
+    assert stale_reasons(cfg, movie.id) == ["clip settings changed (clips.crop_size)"]
 
     forget_path_probes()
     status = project_status(cfg)
-    check("the project status counts it as stale but still prepared",
-          status.n_stale == 1 and status.n_prepared == 1, str(status))
+    assert status.n_stale == 1 and status.n_prepared == 1, (
+        f"counted as stale but still prepared: {status}")
 
     after = cut_movie(movie, cfg, force=True)
-    check("a forced cut re-cuts without a detector", after["crop_size"] == 64,
-          str(after["crop_size"]))
+    assert after["crop_size"] == 64, "a forced cut re-cuts without a detector"
     forget_path_probes()
-    check("and is no longer stale", project_status(cfg).n_stale == 0)
+    assert project_status(cfg).n_stale == 0
 
+
+def test_an_unreadable_clip_marker_is_skipped_and_a_forced_cut_replaces_it(root: Path) -> None:
+    from trackanno.detect.prepare import cut_movie, prepare_movie
+
+    cfg, movie, done, _ = _prepared(root, "unreadable")
     done.write_text("{", encoding="utf-8")
-    after = prepare_movie(movie, _no_detector, cfg)
-    check("an unreadable marker is skipped too", after.get("skipped") is True)
-    after = cut_movie(movie, cfg, force=True)
-    check("and a forced cut replaces it", after["n_clips"] > 0)
+    assert prepare_movie(movie, no_detector, cfg).get("skipped") is True
+    assert cut_movie(movie, cfg, force=True)["n_clips"] > 0
 
 
 def test_a_legacy_handoff_survives_clip_stage_changes(root: Path) -> None:
@@ -274,7 +337,7 @@ def test_a_legacy_handoff_survives_clip_stage_changes(root: Path) -> None:
         prepare_movie,
     )
 
-    cfg, movie, frames = _prep_project(root, "legacy")
+    cfg, movie, frames = prep_project(root, "legacy")
     prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
     path = cfg.movie_dir(movie.id) / "detect_done.json"
     info = json.loads(path.read_text(encoding="utf-8"))
@@ -286,8 +349,8 @@ def test_a_legacy_handoff_survives_clip_stage_changes(root: Path) -> None:
     write(_legacy_fingerprint(cfg))
     cfg.tracking.min_track_length = 7
     cfg.tracking.border_margin_px = 5
-    check("a clip-stage change recovered from the clip marker is fresh",
-          handoff_is_fresh(cfg, movie.id), str(detection_changes(cfg, movie.id)))
+    assert handoff_is_fresh(cfg, movie.id), (
+        f"a clip-stage change is fresh: {detection_changes(cfg, movie.id)}")
     cfg.tracking.min_track_length = 40
     cfg.tracking.border_margin_px = 0
 
@@ -295,28 +358,27 @@ def test_a_legacy_handoff_survives_clip_stage_changes(root: Path) -> None:
     tracking.pop("border_margin_px")
     tracking.pop("border_max_frac")
     write({**_legacy_fingerprint(cfg), "tracking": _legacy_digest(tracking)})
-    check("a digest from before the border keys existed is fresh",
-          handoff_is_fresh(cfg, movie.id), str(detection_changes(cfg, movie.id)))
+    assert handoff_is_fresh(cfg, movie.id), (
+        f"a digest without the border keys is fresh: {detection_changes(cfg, movie.id)}")
 
     cfg.tracking.overrides = {"gmc_method": "sparseOptFlow"}
-    check("a detect-stage change in the same section is not",
-          detection_changes(cfg, movie.id) == ["tracking.*"],
-          str(detection_changes(cfg, movie.id)))
+    assert detection_changes(cfg, movie.id) == ["tracking.*"], (
+        "a detect-stage change in the same section is not")
     cfg.tracking.overrides = {"gmc_method": "none"}
 
     write({**_legacy_fingerprint(cfg), "tracking": "0" * 12})
     stub = StubDetector(frames, movie.n_frames)
     out = prepare_movie(movie, stub, cfg, limit_frames=60)
-    check("an unrecoverable legacy digest is reported stale",
-          out.get("skipped") is True, str(out))
-    check("but never re-detected", stub.calls == 0)
+    assert out.get("skipped") is True, (
+        f"an unrecoverable legacy digest is reported stale: {out}")
+    assert stub.calls == 0, "never re-detected"
 
 
 def test_cache_size_must_match_exactly(root: Path) -> None:
     from trackanno.annotate.clips import ClipStore
     from trackanno.detect.prepare import prepare_movie
 
-    cfg, movie, frames = _prep_project(root, "exact-size")
+    cfg, movie, frames = prep_project(root, "exact-size")
     prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
     cache = cfg.movie_dir(movie.id) / "clips.dat"
     with open(cache, "ab") as fh:
@@ -327,20 +389,26 @@ def test_cache_size_must_match_exactly(root: Path) -> None:
             loaded = len(ClipStore(cfg.paths.work_dir))
         except FileNotFoundError:
             loaded = 0
-    check("an oversized clips.dat is refused", loaded == 0)
+    assert loaded == 0, "an oversized clips.dat is refused"
 
 
-def test_an_interrupted_commit_leaves_no_header(root: Path, monkeypatch) -> None:
-    """The header is renamed last, so a commit that dies part-way cannot load."""
+def _staged(out: Path):
     from trackanno.annotate.clips import HEADER_FILE, MANIFEST_FILE, StagedWrite
 
-    out = root / "commit"
     out.mkdir()
     (out / HEADER_FILE).write_text("old", encoding="utf-8")
     staged = StagedWrite(out)
     for name in (HEADER_FILE, MANIFEST_FILE, "clips.dat"):
         staged.path(name).write_text("new", encoding="utf-8")
+    return staged
 
+
+def test_an_interrupted_commit_leaves_no_header(root: Path, monkeypatch) -> None:
+    """A commit that dies part-way cannot load."""
+    from trackanno.annotate.clips import HEADER_FILE
+
+    out = root / "interrupted"
+    staged = _staged(out)
     order: list[str] = []
     real = Path.replace
 
@@ -351,21 +419,54 @@ def test_an_interrupted_commit_leaves_no_header(root: Path, monkeypatch) -> None
         return real(self, target)
 
     monkeypatch.setattr(Path, "replace", failing)
-    try:
+    with pytest.raises(OSError, match="killed"):
         staged.commit()
-    except OSError:
-        pass
-    check("pixels go first", order[0] == "clips.dat", str(order))
-    check("the live header is gone mid-commit", not (out / HEADER_FILE).exists())
+    assert order[0] == "clips.dat", f"pixels go first: {order}"
+    assert not (out / HEADER_FILE).exists()
 
-    monkeypatch.setattr(Path, "replace", real)
-    staged = StagedWrite(out)
-    for name in (HEADER_FILE, MANIFEST_FILE, "clips.dat"):
-        staged.path(name).write_text("new", encoding="utf-8")
-    order.clear()
+
+def test_a_commit_renames_the_header_last(root: Path, monkeypatch) -> None:
+    from trackanno.annotate.clips import HEADER_FILE, MANIFEST_FILE
+
+    staged = _staged(root / "ordered")
+    order: list[str] = []
+    real = Path.replace
     monkeypatch.setattr(
         Path, "replace", lambda self, t: (order.append(Path(t).name), real(self, t))[1]
     )
     staged.commit()
-    check("the header is renamed last", order == ["clips.dat", MANIFEST_FILE, HEADER_FILE],
-          str(order))
+    assert order == ["clips.dat", MANIFEST_FILE, HEADER_FILE]
+
+
+class _Broken(Exception):
+    pass
+
+
+def test_a_failed_forced_redetect_leaves_no_done_marker(root: Path) -> None:
+    from trackanno.detect.prepare import detect_movie
+
+    cfg, movie, _, _ = _prepared(root, "redetect-fails")
+    out = cfg.movie_dir(movie.id)
+
+    class Failing:
+        def is_tiled(self, *_):
+            raise _Broken("detector died")
+
+    with pytest.raises(_Broken):
+        detect_movie(movie, Failing(), cfg, force=True, limit_frames=60)
+    assert not (out / "detect_done.json").exists()
+    assert not (out / "prepare_done.json").exists(), "clips cut from old tracks are not done"
+
+
+def test_a_failed_forced_recut_leaves_no_done_marker(root: Path, monkeypatch) -> None:
+    from trackanno.detect import prepare
+
+    cfg, movie, done, _ = _prepared(root, "recut-fails")
+
+    def broken(*_a, **_k):
+        raise _Broken("cut died")
+
+    monkeypatch.setattr(prepare, "plan_clips", broken)
+    with pytest.raises(_Broken):
+        prepare.cut_movie(movie, cfg, force=True)
+    assert not done.exists()

@@ -23,16 +23,9 @@ from .base import Page, _heading
 
 
 def _install_shared_model(page, entry, config_path) -> None:
-    """Fetch shared weights and let them configure the project at ``config_path``.
+    """Download shared weights in the background and apply their manifest to ``config_path``.
 
-    Two pages reach this from opposite ends: Configure has a project open, New
-    project has just written one. Everything after the choice is the same, and
-    has to stay the same - what the manifest is allowed to decide is a property
-    of the model, not of the screen it was chosen on.
-
-    The digest is computed from the file that actually arrived rather than taken
-    from the registry, so the pin written into the config is of the bytes on this
-    disk.
+    The sha256 pin is computed from the downloaded file, not taken from the registry.
     """
     from ...video.models import apply_manifest, fetch, mismatch_warnings
 
@@ -50,7 +43,7 @@ def _install_shared_model(page, entry, config_path) -> None:
 
     def done(result):
         path, digest = result
-        # Edits made during the download are settled first: the apply rewrites the file.
+        # Settle unsaved edits first: applying rewrites the file.
         config = page.hub.page(ConfigPage)
         if (config is not None and config.cfg is not None
                 and config.cfg.path == config_path and not config.confirm_leave()):
@@ -72,7 +65,7 @@ def _install_shared_model(page, entry, config_path) -> None:
     fetching = f"fetching {entry.id}..."
 
     def settle(text: str) -> None:
-        """Replace the open-ended fetching message, if it is still up."""
+        """Replace the fetching message if it is still shown."""
         bar = page.hub.statusBar()
         if bar.currentMessage() == fetching:
             bar.showMessage(text, 5000)
@@ -89,8 +82,7 @@ def _install_shared_model(page, entry, config_path) -> None:
 class ConfigPage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
-        # Two forms over the same file: the decisions you have to make, and the
-        # tuning knobs. One 54-row scroll is an unusable settings screen.
+        # Basic and advanced forms over the same file.
         self.form = ConfigForm("basic")
         self.advanced = ConfigForm("advanced")
         self.categories = CategoryEditor()
@@ -118,25 +110,22 @@ class ConfigPage(Page):
         self.tabs.addTab(category_scroll, "Labels")
         self.tabs.addTab(keypoint_scroll, "Keypoints")
         self.tabs.addTab(self.advanced, "Advanced")
-        self.tabs.setTabToolTip(0, "What this project points at and how long a clip is")
-        self.tabs.setTabToolTip(1, "The buttons you will press while annotating")
-        self.tabs.setTabToolTip(2, "Only used when the task is 'pose'")
-        self.tabs.setTabToolTip(3, "Detector, tracker, cropping and bulk labelling - "
-                                   "defaults are fine until they are not")
+        self.tabs.setTabToolTip(0, "Paths and clip length.")
+        self.tabs.setTabToolTip(1, "The label buttons used while annotating.")
+        self.tabs.setTabToolTip(2, "Keypoint names, used only when the task is 'pose'.")
+        self.tabs.setTabToolTip(3, "Detector, tracker, cropping and model settings.")
         tabs = self.tabs
         self.KEYPOINT_TAB = 2
 
-        # At the top and persistent: an error that scrolls off is one nobody reads.
+        # Save errors, pinned at the top.
         self.banner = QLabel("")
         self.banner.setWordWrap(True)
         self.banner.setTextFormat(Qt.RichText)
         self.banner.setVisible(False)
         self.banner.setStyleSheet(banner_style("danger"))
 
-        # `task: pose` needs a keypoint count, and the checkpoint knows it.
         self.pose_notice = QLabel(
-            "This project is set to <b>pose</b> but no keypoints are listed. "
-            "The model file knows how many it predicts."
+            "The task is <b>pose</b> but no keypoints are listed. Read them from the model."
         )
         self.pose_notice.setWordWrap(True)
         self.pose_notice.setStyleSheet(banner_style("warning"))
@@ -150,7 +139,7 @@ class ConfigPage(Page):
         pose_layout.addWidget(self.pose_button)
         self.pose_row.setVisible(False)
 
-        # What the checkpoint says, when it disagrees with the form; applied on a click.
+        # Offer the checkpoint's task and keypoint count when they differ from the form.
         self.model_notice = QLabel("")
         self.model_notice.setWordWrap(True)
         self.model_notice.setStyleSheet(banner_style("warning"))
@@ -166,7 +155,7 @@ class ConfigPage(Page):
         self._model_offer: dict = {}
 
         self.revert_button = QPushButton("Revert")
-        self.revert_button.setToolTip("Drop the unsaved edits and reload config.yaml")
+        self.revert_button.setToolTip("Drop unsaved edits and reload config.yaml.")
         self.revert_button.clicked.connect(self.revert)
         self.save_button = QPushButton("Save")
         self.save_button.setProperty("accent", "true")
@@ -179,14 +168,11 @@ class ConfigPage(Page):
         bar.addWidget(self.revert_button)
         bar.addWidget(self.save_button)
 
-        # The usual way to get a model is to download a shared one, so this sits
-        # in the "detection model" row itself, ahead of Browse.
+        # Sits in the "detection model" row, ahead of Browse.
         self.registry_btn = QPushButton("Choose shared model...")
         self.registry_btn.setProperty("accent", "true")
         self.registry_btn.setToolTip(
-            "Download a model from the shared registry. It is fetched once, "
-            "cached for later, and fills in the settings it was trained with. "
-            "Browse instead for a .pt already on this machine."
+            "Download a model and its settings from the shared registry."
         )
         self.registry_btn.clicked.connect(self._pick_registry_model)
         model_field = self.form._widgets.get("paths.model")
@@ -199,18 +185,13 @@ class ConfigPage(Page):
             "Configure",
             "Every setting for this project. Edit, then Save.",
             help="""
-<p><b>Save</b> writes the changed settings back into <b>config.yaml</b>,
-comments and all. <b>Revert</b> drops the edits and reloads the file. The file
-stays readable and hand-editable.</p>
+<p><b>Save</b> writes only the changed settings into <b>config.yaml</b>, keeping
+its comments. <b>Revert</b> drops the edits and reloads the file.</p>
 
-<p>Only settings you changed are written. A key the file does not mention keeps
-the loader's default.</p>
+<p>A save that would not load is refused with the loader's message, and the file
+is left untouched.</p>
 
-<p>Every save is parsed by the real loader first. An edit that would not load
-is refused with the loader's own message, and the file is untouched.</p>
-
-<p>Settings marked <b>*</b> describe how the clips were cut, so changing one
-takes effect only after detection is run again.</p>
+<p>Settings marked <b>*</b> take effect only after detection is run again.</p>
 """,
         )
         layout.addWidget(self.heading)
@@ -220,7 +201,7 @@ takes effect only after detection is run again.</p>
         layout.addWidget(tabs, 1)
         layout.addLayout(bar)
 
-        # Pick a .pt and the page offers its task and keypoint count.
+        # Probe a newly picked .pt for its task and keypoint count.
         self._probed_model: str | None = None
         self._model_info: dict | None = None
         self._model_timer = QTimer(self)
@@ -238,11 +219,7 @@ takes effect only after detection is run again.</p>
         self.keypoints.changed.connect(self._mark_dirty)
 
     def _sync_model_status(self) -> None:
-        """Say which model the project actually runs.
-
-        paths.model still holds a file path when a downloaded model is in use,
-        so the field alone reads as the wrong answer.
-        """
+        """Show under paths.model when a shared model is in use instead."""
         field = self.form._widgets.get("paths.model")
         if field is None or not hasattr(field, "set_status") or "model.source" in self._extra:
             return
@@ -264,22 +241,16 @@ takes effect only after detection is run again.</p>
         else:
             where = "downloads when detection runs"
         field.set_status(
-            f"using shared model <b>{name}</b> ({where}). The path above is not used."
+            f"using shared model <b>{name}</b> ({where}); the path above is not used."
         )
         field.edit.setEnabled(False)
 
     def _use_local_model(self, path: str) -> None:
-        """Browsing to a .pt means run THAT file, shared model or not.
-
-        ``model.source`` outranks ``paths.model`` everywhere downstream, so it
-        is cleared here; picking a file is the one unambiguous signal that the
-        shared model is no longer wanted.
-        """
+        """A browsed .pt replaces the shared model: clear ``model.source`` on save."""
         spec = getattr(self.cfg, "model", None) if self.cfg else None
         if spec is None or not spec.is_remote:
             return
         was = " ".join(b for b in (spec.source, spec.version) if b)
-        # The model block is not a form field, so it goes out with the next save.
         self._extra.update({"model.source": "", "model.version": "", "model.sha256": ""})
         field = self.form._widgets["paths.model"]
         field.edit.setEnabled(True)
@@ -288,7 +259,7 @@ takes effect only after detection is run again.</p>
         self._mark_dirty()
 
     def _pick_registry_model(self) -> None:
-        """Choose shared weights, fetch them, and let them configure the project."""
+        """Pick shared weights, then download and apply them."""
         if self.cfg is None:
             QMessageBox.information(self, "From registry", "Open a project first.")
             return
@@ -298,13 +269,13 @@ takes effect only after detection is run again.</p>
         entry = dialog.chosen()
         if entry is None:
             return
-        # Settled first: the apply rewrites the same file.
+        # Settle unsaved edits first: applying rewrites the file.
         if not self.confirm_leave():
             return
         _install_shared_model(self, entry, self.cfg.path)
 
     def _probe_model(self) -> None:
-        """Read whatever the selected checkpoint says about itself."""
+        """Read the selected checkpoint's metadata off the UI thread."""
         if self.cfg is None:
             return
         raw = self.form._widgets["paths.model"].value()
@@ -313,7 +284,7 @@ takes effect only after detection is run again.</p>
         path = Path(raw)
         if not path.is_absolute():
             path = (self.cfg.path.parent / path).resolve()
-        # Guarded: an unguarded is_file() on a network share blocks the window.
+        # Timeout-guarded: is_file() on a share can block.
         if not _exists(path, "file"):
             return
         if str(path) == self._probed_model:
@@ -336,7 +307,7 @@ takes effect only after detection is run again.</p>
         self.run_bg("probe", work, self._on_model_info, failed)
 
     def _on_model_info(self, info) -> None:
-        """Say what the checkpoint reports, and offer it where the form differs."""
+        """Report the checkpoint's metadata and offer it where the form differs."""
         if not info or self.cfg is None:
             return
         self._model_info = info
@@ -370,8 +341,8 @@ takes effect only after detection is run again.</p>
         if offer:
             said = [f"task {offer['task']}"] if "task" in offer else []
             said += [f"{offer['count']} keypoints"] if "count" in offer else []
-            self.model_notice.setText(f"{name} reports {' and '.join(said)}, which the "
-                                      "settings do not match.")
+            self.model_notice.setText(f"{name} reports {' and '.join(said)}; the "
+                                      "settings differ.")
         self.model_row.setVisible(bool(offer))
         return offer
 
@@ -397,7 +368,7 @@ takes effect only after detection is run again.</p>
         self._paint_dirty()
 
     def _paint_dirty(self) -> None:
-        """Save and Revert only while there is something to save; a title marker."""
+        """Enable Save and Revert and mark the title while there are unsaved edits."""
         self.save_button.setEnabled(self._dirty)
         self.revert_button.setEnabled(self._dirty)
         self.heading.title.setText("Configure *" if self._dirty else "Configure")
@@ -406,12 +377,7 @@ takes effect only after detection is run again.</p>
             window.setWindowModified(self._dirty)
 
     def _refresh_auto(self) -> None:
-        """Tell both tabs what every 'auto' currently stands for.
-
-        Here rather than inside a form because the answer spans the file and
-        usually the tabs: predict.window_stride: auto is clips.frames, which
-        lives on Basics while the stride lives on Advanced.
-        """
+        """Show what each 'auto' resolves to, across both forms."""
         values = {**self.form.current(), **self.advanced.current()}
         self.form.show_resolved(values)
         self.advanced.show_resolved(values)
@@ -422,13 +388,12 @@ takes effect only after detection is run again.</p>
         if self.cfg is None:
             return
         if self._dirty and self.cfg.path == self._loaded_from:
-            # A background reload must not wipe edits the save refused.
+            # Keep edits a refused save left behind.
             self._sync_model_status()
             return
         import yaml
 
-        # Reloading fires every widget's changed signal; the guard stops the
-        # reload triggered BY a save from scheduling another one.
+        # _loading keeps the reload from marking the page dirty.
         self._loading = True
         try:
             raw = yaml.safe_load(self.cfg.path.read_text(encoding="utf-8")) or {}
@@ -454,16 +419,14 @@ takes effect only after detection is run again.</p>
         self._model_timer.start()
 
     def _show_warnings(self) -> None:
-        """Amber outlines for things that point at nothing. Never blocks a save."""
+        """Outline paths that point at nothing (warnings never block a save)."""
         root = self.cfg.path.parent if self.cfg else None
         warnings = {**self.form.warnings(root), **self.advanced.warnings(root)}
-        # A shared model makes paths.model dead text, so an amber outline on it
-        # would be pointing at a value nothing reads.
+        # paths.model is unused under a shared model.
         spec = getattr(self.cfg, "model", None) if self.cfg else None
         if spec is not None and spec.is_remote:
             warnings.pop("paths.model", None)
-        # Outlined together, counted apart: a warning still saves and a problem
-        # does not, so only the warnings reach the "saved - but..." line below.
+        # Problems are outlined too, but only warnings are returned.
         marks = {**warnings, **self.form.problems(), **self.advanced.problems()}
         self.form.mark(marks)
         self.advanced.mark(marks)
@@ -477,7 +440,7 @@ takes effect only after detection is run again.</p>
         return warnings
 
     def _read_keypoints(self) -> None:
-        """Ask the checkpoint how many keypoints it predicts. Names stay yours."""
+        """Read the keypoint count from the checkpoint; names are kept."""
         if self.cfg is None or self.bg_running("keypoints"):
             return
         from ...video.models import local_model_path
@@ -485,7 +448,7 @@ takes effect only after detection is run again.</p>
         model_path = local_model_path(self.cfg)
         if not _exists(model_path, "file"):
             self._fail("Cannot read the keypoint count:",
-                       [f"the model file was not found: {model_path}"])
+                       [f"model file not found: {model_path}"])
             return
         self.keypoints.read_button.setEnabled(False)
         self.keypoints.state.setText("reading the model file...")
@@ -502,18 +465,17 @@ takes effect only after detection is run again.</p>
         if not count:
             self.keypoints.state.setText("")
             self._fail(
-                "That model does not predict keypoints, so it cannot be used for pose:",
-                [f"{self.cfg.paths.model} reports no keypoint shape. Either set the "
-                 "task back to 'detect', or point at pose weights."],
+                "That model has no keypoints:",
+                [f"{self.cfg.paths.model} is not a pose model. Set the task to "
+                 "'detect' or choose pose weights."],
             )
             return
-        # Only the COUNT comes from the model. Names already typed are kept, and
-        # any new rows get kp<N> placeholders to be renamed in the table.
+        # Only the count comes from the model; new rows get kp<N> placeholders.
         self.keypoints.set_count(count, f"{count} from {self.cfg.paths.model.name}")
         self.tabs.setCurrentIndex(self.KEYPOINT_TAB)
         self.status_message.emit(
-            f"{self.cfg.paths.model.name} predicts {count} keypoints - name them in "
-            "the table (order is what has to match the model)", 10000
+            f"{self.cfg.paths.model.name} predicts {count} keypoints: name them in "
+            "model order", 10000
         )
 
     def _on_keypoints_failed(self, message: str) -> None:
@@ -522,46 +484,40 @@ takes effect only after detection is run again.</p>
         self._fail("Could not read the model file:", [message])
 
     def save(self) -> bool:
-        """Validate through the real loader and write the changed settings."""
+        """Validate with the real loader, then write the changed settings."""
         if self.cfg is None:
             return False
 
         problems = self.categories.problems()
         if problems:
             self._fail(
-                "These labels are not usable yet, so nothing was saved:",
+                "Not saved, fix these labels:",
                 problems,
             )
             return False
-        # A field whose text is not the shape the key takes at all. Refused
-        # here, naming the field: handing it to the loader would refuse the
-        # whole file over one stray character, on the keystroke that typed it.
+        # Malformed fields are refused here, by name.
         malformed = {**self.form.problems(), **self.advanced.problems()}
         if malformed:
             self._show_warnings()
-            self._fail("These settings are not usable yet, so nothing was saved:",
+            self._fail("Not saved, fix these settings:",
                        [f"{key}: {why}" for key, why in malformed.items()])
             return False
-        # EVERY tab: one file, so writing only the visible one drops the others.
+        # Every tab writes to the one file.
         updates = {**self.form.values(), **self.advanced.values(), **self._extra}
         categories = self.categories.values()
 
-        # Judged on the value about to be WRITTEN, not the loaded config: a pose
-        # checkpoint changes task and keypoints in one save. Only when the project
-        # is actually pose - a detect project with a stale keypoints block would
-        # be unsaveable with the tab that fixes it greyed out.
+        # Check keypoints only if the task about to be written is pose.
         shown = {**self.form.current(), **self.advanced.current()}
         is_pose = str(shown.get("detection.task", "")) == "pose"
         if is_pose:
             problems = self.keypoints.problems()
             if problems:
-                self._fail("The keypoint layout is not usable yet, so nothing was saved:",
+                self._fail("Not saved, fix the keypoint layout:",
                            problems)
                 return False
 
         keypoints = self.keypoints.values()
         try:
-            # Validated through the real loader first: a bad edit never reaches disk.
             write_config(
                 self.cfg.path, updates,
                 categories=categories if categories != self._categories_at_load else None,
@@ -569,7 +525,7 @@ takes effect only after detection is run again.</p>
                 else None,
             )
         except (ConfigError, ValueError, OSError) as exc:
-            self._fail("This setting is not valid, so nothing was saved:", [str(exc)])
+            self._fail("Not saved, invalid setting:", [str(exc)])
             return False
 
         self.form.saved()
@@ -586,7 +542,7 @@ takes effect only after detection is run again.</p>
         warnings = self._show_warnings()
         self.state.setText(
             "saved" if not warnings
-            else f"saved - but {len(warnings)} path(s) point at nothing (outlined above)"
+            else f"saved, but {len(warnings)} path(s) point at nothing (outlined above)"
         )
         self.status_message.emit(f"saved {self.cfg.path.name}", 4000)
         return True
@@ -632,11 +588,7 @@ takes effect only after detection is run again.</p>
 
 
 class ModelRegistryDialog(QDialog):
-    """Pick shared weights, and set where this machine looks for them.
-
-    The registry URL lives here rather than in ``config.yaml``: a project
-    someone sends you may name a model, but not the server it comes from.
-    """
+    """Pick shared weights and set this machine's registry URL (not stored in config.yaml)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -700,8 +652,7 @@ class ModelRegistryDialog(QDialog):
         self.list.clear()
         if not registry_url():
             self.detail.setText(
-                "No registry is set on this machine. Paste the index URL above "
-                "and press Refresh. Models stay available offline once fetched."
+                "No registry set. Paste the index URL above and press Refresh."
             )
             return
         try:
@@ -710,8 +661,7 @@ class ModelRegistryDialog(QDialog):
             self._entries = []
             self.detail.setText(str(exc))
             return
-        # Only what this project can run. The rest of the registry is counted
-        # rather than listed, so the choice stays a choice.
+        # List runnable models only; count the rest.
         self._entries = [e for e in offered if e.runnable]
         for entry in self._entries:
             here = cached_path(entry.sha256, entry.name) is not None
@@ -719,13 +669,13 @@ class ModelRegistryDialog(QDialog):
         others = len(offered) - len(self._entries)
         if not self._entries:
             self.detail.setText(
-                f"This registry offers {len(offered)} model(s), none of which "
-                "trackanno can run." if offered
+                f"None of the {len(offered)} model(s) in this registry can run "
+                "in trackanno." if offered
                 else "The registry index lists no models."
             )
         elif others:
             self.detail.setText(
-                f"{others} further model(s) here are for other tools, not shown."
+                f"{others} further model(s) for other tools are hidden."
             )
 
     def _describe(self) -> None:

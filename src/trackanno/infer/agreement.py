@@ -1,18 +1,4 @@
-"""Annotation windows whose recorded label is not what the model predicted.
-
-A confusion matrix says a model confuses two classes; this says which clips to
-open. Three rules:
-
-* The unit is the annotation window, one row of ``annotations.csv``. No frame
-  arithmetic and no decode.
-* The model's half is the OUT-OF-FOLD prediction, from a model fitted without
-  that clip's movie. The saved model was fitted on these labels and reproduces
-  them, so its own opinion of one is not evidence about it.
-* A window no fold scored is not a disagreement. Most confident first.
-
-Clips in the audit holdout have no fold prediction and so never appear, which
-keeps the model's opinion of the last unbiased sample away from a reviewer.
-"""
+"""Annotation windows whose label differs from the model's out-of-fold prediction."""
 
 from __future__ import annotations
 
@@ -29,9 +15,7 @@ IDENTITY = ("clip_id", "movie_id", "track_id", "f_start", "f_end")
 
 
 def _groups(annotations: pd.DataFrame, suggestions: Mapping, given) -> list[str]:
-    """Which columns are category groups: named by the caller, or else taken
-    from the suggestions. Not from the CSV's columns, most of which are
-    ``notes``, ``annotator`` and the rest."""
+    """The category group columns: those given, else those the suggestions name."""
     named = [g for g in (given or []) if g in annotations.columns]
     if named:
         return named
@@ -42,29 +26,19 @@ def _groups(annotations: pd.DataFrame, suggestions: Mapping, given) -> list[str]
 
 
 def load_cv_predictions(cfg) -> tuple[dict, str]:
-    """``({clip_id: {group: (value, confidence)}}, problem)`` from the last fit.
-
-    Out-of-fold. ``problem`` is a sentence to show instead when there are none.
-    """
+    """``({clip_id: {group: (value, confidence)}}, problem)`` from the last fit's CV."""
     from ..learn.suggest import CV_PREDICTIONS_FILE
 
     path = cfg.paths.work_dir / CV_PREDICTIONS_FILE
     if not path.exists():
-        return {}, (
-            "this project has no saved cross-validated predictions. Train the "
-            "model again on the Model page: a model fitted before this build "
-            "did not keep them, and the saved model's own opinion of a label it "
-            "was fitted on is not evidence about that label"
-        )
+        return {}, ("no saved cross-validated predictions; Train the model again "
+                    "on the Model page")
     try:
         table = pd.read_parquet(path)
     except (OSError, ValueError) as exc:
         return {}, f"{CV_PREDICTIONS_FILE} could not be read ({exc})"
     if table.empty:
-        return {}, (
-            "the last fit produced no cross-validated predictions, so no group "
-            "cleared the checks needed to score one"
-        )
+        return {}, "the last fit produced no cross-validated predictions"
     out: dict[str, dict[str, tuple[str, float]]] = {}
     for clip_id, group, predicted, confidence in zip(
         table["clip_id"].astype(str), table["group"].astype(str),
@@ -109,11 +83,7 @@ def _clean(value) -> str:
 
 
 def differs(labels: Mapping, suggestion: Mapping, groups=None) -> list[str]:
-    """``["group: predicted"]`` for every group the two disagree on.
-
-    ``labels`` is one annotation row, ``suggestion`` the model's answer for it.
-    The one definition of the comparison, used by both screens.
-    """
+    """``["group: predicted"]`` for each group where an annotation row and the model differ."""
     out = []
     for group, answer in suggestion.items():
         if groups is not None and group not in groups:
@@ -127,11 +97,7 @@ def differs(labels: Mapping, suggestion: Mapping, groups=None) -> list[str]:
 
 def find(annotations: pd.DataFrame, suggestions: Mapping, groups=None
          ) -> list[Disagreement]:
-    """Every labelled window whose label is not what the model predicted.
-
-    ``suggestions`` is ``{clip_id: {group: (value, confidence)}}``, the shape
-    :func:`load_cv_predictions` returns. Most confident first.
-    """
+    """Every labelled window whose label differs from ``suggestions``, most confident first."""
     if annotations.empty or not suggestions:
         return []
     if any(c not in annotations.columns for c in IDENTITY):
@@ -166,8 +132,7 @@ def find(annotations: pd.DataFrame, suggestions: Mapping, groups=None
                 ))
             except (TypeError, ValueError):
                 continue        # a row whose identity will not parse
-    # Unknown last: an estimator with no posterior said nothing about how sure
-    # it was, which is not the same as saying it was not sure at all.
+    # Unknown confidence sorts last.
     out.sort(key=lambda d: (d.confidence is None, -(d.confidence or 0.0),
                             d.movie_id, d.track_id, d.f_start))
     return out

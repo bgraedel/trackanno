@@ -1,8 +1,6 @@
-"""Cutting review frames out of the movie, on one worker thread per track.
+"""Cut review frames from the movie (not the clip cache) on a worker thread.
 
-Every frame is cut from the movie (never the clip cache) at one crop for the
-session, centred on a path smoothed over the whole track, so a frame is cut
-the same way whichever chunk it arrives in.
+One crop per session, centred on a path smoothed over the whole track.
 """
 
 from __future__ import annotations
@@ -29,9 +27,7 @@ class Cancelled(Exception):
 
 @dataclass(frozen=True)
 class ReviewCrop:
-    """The crop every review frame is cut at: ``side`` movie pixels taken,
-    delivered as a ``size`` square. One per project, so the picture never
-    changes size between tracks or movies."""
+    """The project-wide review crop: ``side`` movie pixels, delivered as a ``size`` square."""
 
     side: int
     size: int
@@ -43,8 +39,7 @@ class ReviewCrop:
 
 
 def review_crop(cfg: Config) -> ReviewCrop:
-    """The session crop: the 99th percentile of cached crop widths across the
-    project, rounded up to 16, delivered at most at ``annotate.clips.MAX_SIZE``."""
+    """99th percentile of cached crop widths, rounded up to 16, capped at clips.max_size."""
     from ...annotate.clips import MANIFEST_FILE
 
     widths: list[np.ndarray] = []
@@ -73,8 +68,7 @@ def review_crop(cfg: Config) -> ReviewCrop:
 
 
 class MovieSource:
-    """One opened movie, its intensity mapping and its ``tracks.parquet``,
-    shared by every track cut from it. Owned by one thread."""
+    """An open movie with its normalizer and ``tracks.parquet``; owned by one thread."""
 
     NEEDED = ["frame", "track_id", "x1", "y1", "x2", "y2"]
 
@@ -123,8 +117,7 @@ class MovieSource:
 
 
 class TrackCutter:
-    """Synchronous cutter for one track of a :class:`MovieSource`. Without a
-    source it owns one and closes it with itself."""
+    """Synchronous cutter for one track; opens its own source if none is given."""
 
     def __init__(self, cfg: Config, movie_id: str, track_id: int, crop: ReviewCrop,
                  chunk: int = REVIEW_CHUNK, source: MovieSource | None = None):
@@ -206,8 +199,7 @@ class TrackCutter:
         self._path = self._crop_path()
 
     def _crop_path(self) -> np.ndarray:
-        """Crop centre per frame: a moving average over the whole track, pushed
-        the least distance that keeps the box inside the crop."""
+        """Crop centre per frame: smoothed track centre, nudged to keep the box inside."""
         from ...annotate.clips import _moving_average
 
         boxes = self._boxes
@@ -226,8 +218,7 @@ class TrackCutter:
     def cut(self, first: int, last: int | None = None,
             cancelled: Callable[[], bool] | None = None,
             ) -> tuple[np.ndarray, pd.DataFrame]:
-        """Frames ``first`` to ``last`` (default ``first + chunk``), cropped,
-        with their marks. Shorter at the end of the movie."""
+        """Cropped frames ``first`` to ``last`` (default one chunk) and their marks."""
         import cv2
 
         from ...annotate.clips import _crop
@@ -257,9 +248,7 @@ class TrackCutter:
         return out, self._marks(first, n, origins)
 
     def _marks(self, first: int, n: int, origins: np.ndarray) -> pd.DataFrame:
-        """The box table for these frames, in the columns and coordinates of
-        :func:`trackanno.annotate.clips.build_box_table`. Undetected frames get
-        no row."""
+        """Box table for these frames in ``build_box_table`` layout; undetected frames omitted."""
         scale = self.crop.scale
         span = slice(first, first + n)
         present = self._present[span]
@@ -306,14 +295,9 @@ class TrackCutter:
 
 
 class ChunkDecoder(QObject):
-    """One worker thread cutting whole chunks for one movie.
+    """One worker thread cutting chunks for one movie: one urgent job, one read-ahead.
 
-    A job is ``(generation, track, first, last)``. The worker keeps one cutter
-    for the current track and swaps it when a job names another track, so the
-    movie and its tracks table are opened once per movie. It holds one urgent
-    job and at most one read-ahead; a job whose generation is no longer the
-    latest is abandoned. ``stop`` never waits: the worker closes everything on
-    its own thread and exits.
+    Jobs are ``(generation, track, first, last)``; stale generations are dropped.
     """
 
     ready = Signal(int, int, object)           # generation, first, (pixels, marks)

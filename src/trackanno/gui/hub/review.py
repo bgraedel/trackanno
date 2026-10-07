@@ -12,20 +12,14 @@ from .base import Page, _heading, _muted
 
 
 class ReviewPage(Page):
-    """Where a predicted boundary is checked.
-
-    The panel reads the predictions, so it is built on the first visit rather than
-    at startup, and there is one of it per window. Leaving the page hides it,
-    which is what makes it let go of the movie and its decode thread.
-    """
+    """Hosts the review panel, built on first visit and released when hidden."""
 
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
         self.panel: BoutReviewPanel | None = None
         self._has_predictions = False
         self._project: str | None = None
-        # Set when the file under the panel has changed and the panel has not
-        # been told yet, because it is not on screen to be told.
+        # Predictions changed while the panel was off screen.
         self._stale = False
 
         self.note = _muted(QLabel(""))
@@ -38,9 +32,7 @@ class ReviewPage(Page):
         layout.addWidget(_heading(
             "Review",
             "Check where the model put each boundary, against the footage.",
-            # The panel carries the same `?`, but the panel is not built until
-            # there are predictions - and the page is worth explaining before
-            # then, to somebody wondering what it would show.
+            # Shown before the panel exists, too.
             help=REVIEW_HELP,
         ))
         layout.addWidget(self.note)
@@ -50,8 +42,8 @@ class ReviewPage(Page):
         if self.cfg is None:
             return "no project open"
         if not self._has_predictions:
-            return ("nothing has been predicted yet - run Label every clip on "
-                    "the Model page")
+            return ("nothing predicted yet: run 'Label all clips with the model' "
+                    "on the Model page")
         return ""
 
     def on_project(self) -> None:
@@ -62,7 +54,7 @@ class ReviewPage(Page):
         )
         project = str(self.cfg.path) if self.cfg is not None else None
         if project != self._project:
-            # A different project: the panel holds the old one's tables.
+            # A different project: drop the old panel.
             self._project = project
             self._discard()
         else:
@@ -82,7 +74,6 @@ class ReviewPage(Page):
             self.host.addWidget(self.panel, 1)
             self._stale = False
         elif self._stale:
-            # Re-reads the predictions, and lets go of the previous movie first.
             self.panel.set_config(self.cfg)
             self._stale = False
 

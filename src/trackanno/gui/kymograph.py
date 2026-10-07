@@ -1,12 +1,6 @@
-"""The curvature kymograph, drawn beside the clip it belongs to.
+"""The curvature kymograph under the clip: time left to right, base at top, tip at bottom.
 
-Time runs left to right and arclength top to bottom, base at the top and tip at
-the bottom - the flagellar convention, under which a travelling wave reads as
-diagonal stripes sloping down-right. Curvature is signed and its zero is
-meaningful, so the colour scale is diverging: a neutral grey midpoint and the
-accent and danger tokens as poles. Frames the tracker missed stay bare surface,
-since painting a gap as the midpoint colour would show a straight flagellum
-where there was no measurement.
+Signed curvature on a diverging scale; untracked frames are left blank.
 """
 
 from __future__ import annotations
@@ -21,8 +15,7 @@ from .theme import current, tokens
 
 __all__ = ["KymographView", "diverging_ramp"]
 
-# The neutral midpoint, per theme. Not a token: it has to sit clear of the
-# surface in lightness so "zero curvature" and "no data" cannot be confused.
+# Neutral midpoint per theme, distinct from the blank "no data" surface.
 MIDPOINT = {"dark": (0x45, 0x4C, 0x59), "light": (0xD3, 0xD8, 0xE0)}
 
 MARGIN_LEFT = 46
@@ -43,10 +36,7 @@ def _srgb(c: float) -> float:
 
 
 def diverging_ramp(steps: int = 256, theme: str | None = None) -> np.ndarray:
-    """(steps, 3) uint8 from the negative pole through neutral to the positive.
-
-    Mixed through linear light, not straight sRGB, where the interpolation dips
-    in luminance and leaves a dark band either side of zero."""
+    """(steps, 3) uint8 diverging ramp, interpolated in linear light."""
     t = tokens()
     theme = theme or current()
     negative = QColor(t["accent"])
@@ -84,21 +74,16 @@ class KymographView(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self.setToolTip(
-            "Curvature of the flagellum along its length (top = base, bottom = "
-            "tip) against time.\nA travelling wave appears as diagonal stripes; "
-            "blank columns are frames the tracker missed."
+            "Flagellar curvature from base (top) to tip (bottom) over time; blank columns are untracked frames."
         )
 
     # -- what is actually drawn ---------------------------------------------- #
     def field(self):
-        """The (frames, arclength) array to paint, after the sign choice.
-        Applied here rather than baked into the Kymograph, so switching it
-        repaints without refitting the splines."""
+        """The (frames, arclength) array to paint, with the sign mode applied."""
         if self.kymo is None:
             return None
         data = self.kymo.normalised()
-        # Cached against the clip, since field() runs on every repaint and
-        # mouse move.
+        # Cached per clip; field() runs on every repaint.
         if self.verdict is None or self._verdict_for is not self.kymo:
             self.verdict = canonical_sign(self.kymo.kappa)
             self._verdict_for = self.kymo
@@ -199,11 +184,9 @@ class KymographView(QWidget):
         if self._image is None:
             return
 
-        # The plot ground, so a transparent gap reads as a hole.
         painter.setBrush(QColor(t["raised"]))
         painter.drawRect(plot)
-        # Filtered: both axes sample a continuous quantity, so smoothing invents
-        # nothing.
+        # Smoothing is fine here: both axes are continuous.
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawImage(plot, self._image)
 
@@ -249,12 +232,12 @@ class KymographView(QWidget):
         x = plot.left() + (frame + 0.5) / n * plot.width()
         painter.setPen(QPen(QColor(t["text"]), 1))
         painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
-        # A tick outside the plot too, for where the line sits over a pale field.
+        # Tick below the plot, visible over pale fields.
         painter.setPen(QPen(QColor(t["text"]), 2))
         painter.drawLine(QPointF(x, plot.bottom()), QPointF(x, plot.bottom() + 3))
 
     def _draw_scale(self, painter, plot, t) -> None:
-        """The colour key. A continuous encoding needs one to be readable."""
+        """Draw the colour key."""
         bar = QRectF(plot.right() + 12, plot.top(), 10, plot.height())
         ramp = diverging_ramp(128)
         step = bar.height() / len(ramp)
@@ -282,8 +265,7 @@ class KymographView(QWidget):
             QRectF(bar.right() + 3, bar.center().y() + 6, MARGIN_RIGHT - 26, 12),
             int(Qt.AlignLeft | Qt.AlignVCenter), "kL",
         )
-        # Say when the handedness could not be decided, so the colours do not
-        # imply a convention the data never established.
+        # Flag an undetermined or flipped sign.
         if self.sign_mode == "canonical" and self.verdict is not None:
             if not self.verdict.confident:
                 painter.setPen(QColor(t["warning"]))
@@ -316,7 +298,7 @@ class KymographView(QWidget):
         self.setToolTip(f"frame {frame + 1}   s = {arc:.2f}   {text}")
 
     def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
-        """Click to scrub: the chart is a timeline as much as a picture."""
+        """Click to move the clip to that frame."""
         if self.kymo is None or not self.kymo.n_frames:
             return
         plot = self._plot_rect()

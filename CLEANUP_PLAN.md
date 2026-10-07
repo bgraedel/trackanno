@@ -31,9 +31,9 @@ restructure what is left. One commit per checkbox where practical.
 
 ## Status
 
-Phases 0-4 merged (2026-10-07), including the Phase 4 review fixes; master at
-f2e6c4d passes the suite (2584 checks). Real projects' prepared movies still read
-as fresh. Phase 5 and the docs half of Phase 6 in flight; source prose after Phase 5.
+All phases done (2026-10-07). Master passes the suite (835 tests, ~5 min). Real
+projects' prepared movies still read as fresh. The prose pass was checked to change
+no code (AST compare with docstrings and strings blanked: only tooltip wording).
 
 Not changed on purpose: loader defaults for omitted keys (`detection.task` etc.)
 match the shipped template; all real projects set them explicitly.
@@ -48,8 +48,7 @@ match the shipped template; all real projects set them explicitly.
   old folder until reopen.
 
 **Working method:** parallel agents in git worktrees on disjoint scopes, merged
-into master by the main session; full suite (`uv run pytest -q`, ~5 min, prints
-"N checks passed") plus an independent read-only verifier after each phase.
+into master by the main session; full suite (`uv run pytest -q`, ~5 min, 833 tests) plus an independent read-only verifier after each phase.
 Commit messages: short imperative subject, 1-3 sentence body, no trailers.
 Merged worktrees under `.claude/worktrees/` can be removed with
 `git -c core.longpaths=true worktree remove` (`.claude/` is excluded via
@@ -102,11 +101,11 @@ Merged worktrees under `.claude/worktrees/` can be removed with
 - [x] `recent_projects()` uses the timeout-guarded exists check
 
 ## Phase 5: test overhaul
-- [ ] Plain asserts instead of `check()`; split mega-scenarios
-- [ ] Merge `test_regressions.py` into module test files; dedupe bout/workflow fixtures
-- [ ] Remove `inspect.getsource` and default-pin tests
-- [ ] Add tests: tracker id reset, fingerprint staleness, two-writer CSV
+- [x] Plain asserts instead of `check()`; split mega-scenarios
+- [x] Merge `test_regressions.py` into module test files; dedupe bout/workflow fixtures
+- [x] Remove `inspect.getsource` and default-pin tests
+- [x] Add tests: tracker id reset, fingerprint staleness, two-writer CSV
 
 ## Phase 6: prose and docs
-- [ ] Docstrings to 1-2 lines, no history; one-line error messages; shorter help/tooltips
-- [ ] README and docs/ reflect the cut feature set
+- [x] Docstrings to 1-2 lines, no history; one-line error messages; shorter help/tooltips
+- [x] README and docs/ reflect the cut feature set

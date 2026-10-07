@@ -223,7 +223,7 @@ def test_a_retrain_overtaken_by_a_reload_is_dropped(widget, app, cfg, monkeypatc
 
 
 def test_selection_scores_the_pool_once_per_model(root: Path) -> None:
-    from test_embeddings import synthetic_project
+    from fixtures import synthetic_project
     from trackanno.learn.suggest import Suggester, train
     from trackanno.measure.clipfeatures import build_clip_features
 

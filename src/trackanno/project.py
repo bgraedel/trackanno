@@ -1,14 +1,4 @@
-"""Projects: a folder, a config, and the state of the work done in it.
-
-A *project* is a directory holding
-
-    config.yaml        every setting, with its comments intact
-    work/              the clip cache and the trained suggester
-    annotations.csv    the labels
-
-This module creates one from a template, remembers the ones you have opened,
-and summarises how far each has got without opening a single movie file.
-"""
+"""Project folders (config.yaml, work/, annotations.csv): create, summarise, remember."""
 
 from __future__ import annotations
 
@@ -35,18 +25,13 @@ DEFAULT_CONFIG_FILE = "default_config.yaml"
 
 
 def _default_config() -> str:
-    """The commented config.yaml a new project starts from.
-
-    A data file beside the code rather than a string inside it, so it can be
-    edited, diffed and syntax-checked as the yaml it is.
-    """
+    """The commented config.yaml a new project starts from."""
     path = resources.files(__package__).joinpath(DEFAULT_CONFIG_FILE)
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, FileNotFoundError) as exc:
         raise RuntimeError(
-            f"{DEFAULT_CONFIG_FILE} is missing from the installed package, so a "
-            "new project has no settings to start from. Reinstall trackanno."
+            f"{DEFAULT_CONFIG_FILE} is missing from the package; reinstall trackanno"
         ) from exc
 
 
@@ -72,13 +57,9 @@ def create_project(
     overwrite: bool = False,
     template: str | None = None,
 ) -> Path:
-    """Write a fresh, fully commented ``config.yaml``. Returns its path.
+    """Write a commented ``config.yaml`` from ``template`` (or the default) and return its path.
 
-    ``template`` names a shipped preset or a saved set of settings to start from
-    (:mod:`trackanno.templates`); without one, the packaged default is used. The
-    paths below are applied on top either way, so a template never carries
-    another project's movie folder into this one.
-    """
+    The given paths always override the template's."""
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONFIG_NAME
@@ -102,7 +83,7 @@ def create_project(
         text = replace_section(
             text, "categories", categories,
             "# --- Annotation categories ---------------------------------------------------\n"
-            "# Each group becomes a block of buttons; `key` is its keyboard shortcut.",
+            "# Each group is a block of buttons; `key` is its shortcut.",
         )
 
     path.write_text(text, encoding="utf-8")
@@ -112,7 +93,7 @@ def create_project(
 
 
 def _relative_to(path: Path, root: Path) -> str:
-    """Keep a project portable when its pieces live inside it."""
+    """``path`` relative to ``root`` when inside it, so the project stays portable."""
     path = path.expanduser()
     try:
         resolved = path.resolve()
@@ -133,30 +114,24 @@ def candidate_config(path: str | Path, updates: dict, categories: list[dict] | N
         text = replace_section(
             text, "categories", categories,
             "# --- Annotation categories ---------------------------------------------------\n"
-            "# Each group becomes a block of buttons; `key` is its keyboard shortcut and\n"
-            "# `color` is used for the buttons AND the rendered overlay movie.",
+            "# Each group is a block of buttons; `key` is its shortcut, `color` is used\n"
+            "# on screen and in rendered movies.",
         )
     if keypoints is not None:
         text = replace_section(
             text, "keypoints", keypoints,
-            "# --- Keypoints (order MUST match the trained model) --------------------------",
+            "# --- Keypoints (order must match the model) ----------------------------------",
         )
     return text
 
 
 def write_config(path: str | Path, updates: dict, categories: list[dict] | None = None,
                  keypoints: dict | None = None, validate: bool = True) -> Path:
-    """Apply edits to an existing config.yaml, comments and all.
-
-    With ``validate`` the candidate is parsed by the real loader *before* it
-    replaces anything, so an edit that would not load is refused outright rather
-    than written and rolled back.
-    """
+    """Apply edits to config.yaml, keeping comments; ``validate`` refuses a config that won't load."""
     path = Path(path)
     text = candidate_config(path, updates, categories, keypoints)
 
-    # Same folder, so relative paths inside resolve exactly as they will after
-    # the rename - validating somewhere else would check a different config.
+    # Validate in the same folder so relative paths resolve as after the rename.
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     try:
@@ -180,11 +155,9 @@ class ProjectStatus:
     # None when the folder answered but listing it timed out.
     n_videos: int | None = 0
     n_prepared: int = 0
-    # Movies whose detections are here but whose clips are not: the state a
-    # project is in when detection ran on another machine.
+    # Movies with detections but no clips yet.
     n_detected: int = 0
-    # Movies whose detections or clips no longer match the config. Their clips
-    # still count as prepared; only a forced run replaces them.
+    # Movies whose detections or clips no longer match the config.
     n_stale: int = 0
     n_clips: int = 0
     n_annotated: int = 0
@@ -209,11 +182,7 @@ class ProjectStatus:
 
 
 def _probe(path, kind: str) -> bool:
-    """One raw filesystem question, with "unreachable" folded into "no".
-
-    ``Path.is_dir()`` swallows the ordinary not-found errors but not the ones a
-    dropped network share raises, so a bare is_dir() can crash.
-    """
+    """Whether ``path`` is a dir/file/anything; False when unreachable."""
     try:
         if kind == "dir":
             return path.is_dir()
@@ -224,18 +193,12 @@ def _probe(path, kind: str) -> bool:
         return False
 
 
-# A path that answered once, and when. On a disconnected share a single is_dir()
-# can block for minutes before Windows gives up, and the window calls
-# project_status on every refresh, so the verdict is cached and _PROBE_TIMEOUT
-# keeps even the first probe off the UI thread.
+# (path, kind) -> (answer, time); a dead share can block is_dir() for minutes.
 _PROBE_CACHE: dict = {}
 _PROBE_RUNNING: set = set()
 _PROBE_LOCK = __import__("threading").Lock()
-_PROBE_TTL = 30.0            # seconds a "not found" verdict is trusted for
-_PROBE_TIMEOUT = 0.6         # seconds the caller is willing to wait at all
-# 0.6s because a local path answers in microseconds and a dead share never
-# answers at all; longer only helps a merely-slow share, which the cache picks
-# up on the call after next.
+_PROBE_TTL = 30.0            # seconds a cached verdict is trusted for
+_PROBE_TIMEOUT = 0.6         # seconds the caller waits
 
 
 def forget_path_probes() -> None:
@@ -245,12 +208,7 @@ def forget_path_probes() -> None:
 
 
 def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
-    """Does this path exist? Never blocks the caller for more than ``timeout``.
-
-    A local path answers in microseconds; a share that has gone away answers in
-    minutes, so it is probed on a throwaway thread and reported absent until the
-    real answer lands in the cache.
-    """
+    """Whether ``path`` exists, blocking at most ``timeout``; a slow probe reads as absent."""
     import threading
     import time
 
@@ -258,8 +216,6 @@ def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
     now = time.monotonic()
     with _PROBE_LOCK:
         cached = _PROBE_CACHE.get(key)
-        # A positive verdict is kept until the TTL as well; re-probing a live
-        # share on every repaint is what makes the window feel slow.
         if cached is not None and now - cached[1] < _PROBE_TTL:
             return cached[0]
         in_flight = key in _PROBE_RUNNING
@@ -267,8 +223,6 @@ def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
             _PROBE_RUNNING.add(key)
 
     if in_flight:
-        # Another caller is already waiting on this exact question. Starting a
-        # second thread would just queue a second multi-minute SMB timeout.
         return False
 
     result: list = []
@@ -286,9 +240,7 @@ def _exists(path, kind: str = "any", timeout: float = _PROBE_TIMEOUT) -> bool:
     if result:
         return result[0]
 
-    # Still blocked after the timeout: write a provisional "absent" so the next
-    # call answers instantly. The live thread overwrites it with the truth, and
-    # is a daemon so it cannot hold the app open.
+    # Provisional "absent" until the daemon thread writes the real answer.
     with _PROBE_LOCK:
         _PROBE_CACHE.setdefault(key, (False, time.monotonic()))
     return False
@@ -347,9 +299,6 @@ def _scan_work(cfg, work: Path) -> dict:
     for movie_dir in movie_dirs:
         if not _exists(movie_dir, "dir"):
             continue
-        # Detected but not yet cut: the movie has tracks, from this machine or
-        # a GPU box, and still needs its clips. It is deliberately NOT counted
-        # as prepared - there is nothing to annotate yet.
         has_handoff = _exists(movie_dir / DETECT_FILE)
         if has_handoff:
             out["n_detected"] += 1
@@ -390,15 +339,9 @@ def scan_work(cfg) -> dict:
 
 
 def project_status(cfg) -> ProjectStatus:
-    """Summarise a project without opening a movie or a clip cache.
-
-    Directory listings and small JSON reads only, each bounded in time: this
-    runs every time the workflow window is shown, and any path may be a share.
-    """
+    """Summarise a project from listings and small JSON files, each bounded in time."""
     status = ProjectStatus(config_path=cfg.path)
     video_dir = cfg.paths.video_dir
-    # A path on a disconnected share does not answer "no", it RAISES or hangs:
-    # Windows reports WinError 64 out of is_dir(), glob() and is_file() alike.
     status.video_dir_ok = _exists(video_dir, "dir")
     if status.video_dir_ok:
         def count() -> int:

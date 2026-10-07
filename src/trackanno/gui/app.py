@@ -1,11 +1,6 @@
-"""The annotation surface, hosted as a page of the workflow window.
+"""The annotation screen: one clip at a time, a keypress labels it and moves on.
 
-One clip of one track at a time. A keypress labels it and jumps to the next; the
-CSV is written and fsynced on every annotation, so a session resumes from any
-point, including after a crash.
-
-:class:`AnnotationWidget` is a plain ``QWidget``. It emits ``status_message``
-rather than touching a status bar, and lets its host place that.
+Every label is written to the CSV at once, so a session resumes after a crash.
 """
 
 from __future__ import annotations
@@ -16,7 +11,7 @@ import time
 from qtpy.QtCore import QEvent, Qt, Signal
 from qtpy.QtGui import QKeySequence
 
-try:  # Qt6 puts QShortcut in QtGui, Qt5 in QtWidgets; qtpy aliases but be explicit
+try:  # QtGui on Qt6, QtWidgets on Qt5
     from qtpy.QtGui import QShortcut
 except ImportError:  # pragma: no cover
     from qtpy.QtWidgets import QShortcut
@@ -53,22 +48,17 @@ KYMO_SMOOTH_PX = FIXED_SETTINGS["ui.kymo_smooth_px"]    # centreline fit toleran
 SELECT_BATCH_SIZE = FIXED_SETTINGS["suggest.select_batch_size"]
 AUDIT_VISIBLE = FIXED_SETTINGS["suggest.audit_visible"]  # say when a clip is held out
 
-# Said once per review clip, in place of a suggestion, so the absence reads as a
-# decision rather than a model that has nothing to say.
+# Shown in review mode in place of a suggestion.
 REVIEW_SUGGESTION_NOTE = "no suggestion here: this model was fitted on this label"
 
 
 class AnnotationWidget(QWidget):
-    """Everything on the annotation screen. Hostable anywhere."""
+    """The annotation screen as a plain widget; status goes out via ``status_message``."""
 
     status_message = Signal(str, int)
     counts_changed = Signal(int, int)      # labelled, total in the current filter
-    # Emitted on the UI thread once a new model is in place; re-ranks the queue.
-    model_refreshed = Signal()
-    # Carries a Suggester built on the retrain thread to the UI thread, which
-    # swaps it in. The old one serves until then.
-    suggester_built = Signal(object, int)   # suggester, generation it was started in
-    # The suggester whose selection pool a worker has just scored.
+    model_refreshed = Signal()             # a new model is in place
+    suggester_built = Signal(object, int)  # retrained suggester, its generation
     selection_warmed = Signal(object)
 
     def __init__(self, cfg: Config, store: ClipStore, annotations: AnnotationStore, parent=None):
@@ -76,15 +66,12 @@ class AnnotationWidget(QWidget):
         self.cfg = cfg
         self.store = store
         self.annotations = annotations
-        # Shortcuts use WidgetWithChildrenShortcut so a bare "1" cannot be stolen
-        # by another page - which only works if this widget can hold focus.
+        # Needed for WidgetWithChildrenShortcut, which keeps keys off other pages.
         self.setFocusPolicy(Qt.StrongFocus)
 
-        # "annotate" walks the clips still to do; "review" walks the ones
-        # already labelled, in the order they were labelled, so a session can be
-        # read back. Everything else on this screen is shared.
+        # "annotate" walks unlabelled clips; "review" walks labelled ones in label order.
         self.mode = "annotate"
-        # What the folds said about each labelled clip, read once per mode switch.
+        # Cross-validation predictions per labelled clip.
         self._answers: dict[str, dict] = {}
         self._agreement_problem = ""
 
@@ -97,7 +84,7 @@ class AnnotationWidget(QWidget):
         self._loaded_at = time.time()
         self._current_values: dict[str, str] = {}
         self._suppress_advance = False
-        # A warning raised while committing must outlive the _load() that follows.
+        # A commit warning shown after the next _load().
         self._pending_message: str | None = None
         self._commit_refused = False
         self._clip = None
@@ -106,21 +93,20 @@ class AnnotationWidget(QWidget):
         self._suggestion_note = ""
         self._labels_since_train = 0
         self._retrain_thread = None
-        # Bumped by every reload; a retrain started under an older one is dropped.
+        # Bumped on reload; retrains from older generations are dropped.
         self._suggester_generation = 0
         self.suggester = Suggester(cfg) if cfg.suggest.enabled else None
-        # Every clip the selector has queued, keyed by clip_id (positions shift
-        # when a movie is added).
+        # Selector records by clip_id.
         self._served: dict[str, dict] = {}
 
         self.order: list[int] = list(range(len(store)))
         self.position = 0
-        # Plain list of clip ids: a pandas .iloc per clip makes a keypress O(n).
+        # Plain list: a pandas lookup per keypress is slow.
         self._clip_ids: list[str] = store.manifest["clip_id"].astype(str).tolist()
 
         self._shuffled_index: list[int] = list(store.manifest.index)
         if cfg.ui.shuffle:
-            # Movie-by-movie invites order effects; seeded, so it is reproducible.
+            # Seeded shuffle against order effects.
             import random
 
             random.Random(SHUFFLE_SEED).shuffle(self._shuffled_index)
@@ -133,7 +119,6 @@ class AnnotationWidget(QWidget):
         self.selection_warmed.connect(self._on_selection_warmed)
 
         self.prefetcher = Prefetcher(store, PREFETCH)
-        # The first batch is ranked on a worker and queued behind the first clip.
         self._warming = self._warm_selection()
         self._apply_filters(initial=True)
         if AUTOPLAY:
@@ -154,7 +139,7 @@ class AnnotationWidget(QWidget):
         for movie_id in self.store.movie_ids:
             self.movie_combo.addItem(movie_id, movie_id)
         self.movie_combo.setFocusPolicy(Qt.NoFocus)
-        # Movie ids are long: unelided the combo crushes everything to its right.
+        # Elide long movie ids.
         self.movie_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.movie_combo.setMinimumContentsLength(12)
         self.movie_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -165,30 +150,24 @@ class AnnotationWidget(QWidget):
         self.mode_combo.addItem("review labelled", "review")
         self.mode_combo.setFocusPolicy(Qt.NoFocus)
         self.mode_combo.setToolTip(
-            "annotate walks the clips still to do.\n"
-            "review labelled walks the ones already labelled, oldest first, "
-            "with who judged each and where the model would say otherwise. "
-            "Tab jumps to the next label the model disagrees with."
+            "Annotate unlabelled clips, or review labelled ones (Tab jumps to a disagreement)."
         )
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         self.overlay_box = QCheckBox("marker (o)")
-        self.overlay_box.setToolTip("outline the animal this clip is about")
+        self.overlay_box.setToolTip("Outline the animal this clip follows.")
         self.overlay_box.setChecked(self.show_overlay)
         self.overlay_box.setFocusPolicy(Qt.NoFocus)
         self.overlay_box.stateChanged.connect(self._on_overlay_toggled)
 
         self.context_box = QCheckBox("neighbours")
-        self.context_box.setToolTip(
-            "also outline other tracks in the crop. Off by default, so the "
-            "marker says which animal is being judged."
-        )
+        self.context_box.setToolTip("Also outline other tracks in the crop.")
         self.context_box.setChecked(self.show_context)
         self.context_box.setFocusPolicy(Qt.NoFocus)
         self.context_box.stateChanged.connect(self._on_context_toggled)
 
         self.skeleton_box = QCheckBox("keypoints")
-        self.skeleton_box.setToolTip("draw the pose keypoints on the marker")
+        self.skeleton_box.setToolTip("Draw the pose keypoints on the marker.")
         self.skeleton_box.setChecked(self.show_skeleton)
         self.skeleton_box.setFocusPolicy(Qt.NoFocus)
         self.skeleton_box.setVisible(self.cfg.is_pose)
@@ -200,14 +179,12 @@ class AnnotationWidget(QWidget):
         self.zoom_label = QLabel("1.0x")
         self.zoom_label.setMinimumWidth(38)
         self.zoom_label.setAlignment(Qt.AlignCenter)
-        self.zoom_label.setToolTip("zoom into the crop  (+ / - / 0)")
+        self.zoom_label.setToolTip("Zoom into the crop (+ / - / 0).")
 
         help_btn = compact_button("?", 28, "keyboard shortcuts")
         help_btn.clicked.connect(self._show_help)
 
         top = QHBoxLayout()
-        # Labelled like every other control in this row. Unlabelled it read as
-        # part of the movie filter beside it, and nobody found it.
         top.addWidget(QLabel("mode"))
         top.addWidget(self.mode_combo)
         top.addSpacing(12)
@@ -231,18 +208,15 @@ class AnnotationWidget(QWidget):
         self.uncertain_box = QCheckBox("uncertain (u)")
         self.uncertain_box.setFocusPolicy(Qt.NoFocus)
 
-        # A focused QLineEdit eats every plain keypress, so "1", "o", "s" become
-        # text. Escape and Enter always release focus; "n" grabs it.
+        # A focused line edit eats shortcut keys: "n" enters, Esc/Enter leave.
         self.notes = QLineEdit()
-        self.notes.setPlaceholderText("notes  -  press n to type, Esc when done")
+        self.notes.setPlaceholderText("notes (n to type, Esc when done)")
         self.notes.installEventFilter(self)
         self.notes.returnPressed.connect(self._leave_notes)
 
         self.metadata = MetadataPanel()
 
-        # Who judged this clip and when, and where the model would disagree.
-        # Only in review mode: during annotation it would be the annotator's own
-        # name under every clip, and a suggestion already has its own outline.
+        # Review mode only: who labelled the clip, and any model disagreement.
         self.review_note = QLabel("")
         self.review_note.setWordWrap(True)
         self.review_note.setTextFormat(Qt.RichText)
@@ -265,7 +239,6 @@ class AnnotationWidget(QWidget):
         side.setLayout(side_layout)
         side.setMinimumWidth(280)
 
-        # The kymograph shares the clip's time axis, so it sits directly under it.
         self.kymo_view = KymographView()
         self.kymo_view.frame_picked.connect(self._scrub_to)
         self.kymo_view.set_sign_mode(self.cfg.ui.kymo_sign)
@@ -363,7 +336,7 @@ class AnnotationWidget(QWidget):
     def _apply_filters(self, initial: bool = False) -> None:
         current_id = None
         if not initial and self.order:
-            # Commit first: a filter change must not discard a half-entered note.
+            # Commit first so a half-typed note is kept.
             self._commit()
             current_id = self._clip_ids[self.order[self.position]]
 
@@ -375,15 +348,10 @@ class AnnotationWidget(QWidget):
         if self.reviewing:
             mask &= manifest["clip_id"].isin(self.annotations.done_ids)
 
-        # Shuffle the FULL manifest once, then filter it. Re-permuting the
-        # filtered list would re-randomise the order on every filter change and
-        # strand clips behind the cursor, since navigation only scans forward.
+        # Filter the once-shuffled manifest, so the order is stable across filters.
         selected = set(manifest.index[mask].tolist())
         if self.reviewing:
-            # The order they were labelled in. A review reads a session back,
-            # and the shuffle would scatter that session through the whole
-            # project; the selector's batch is not spliced in either, because
-            # nothing here is waiting to be chosen.
+            # Label order, without shuffle or selector batch.
             self.order = [
                 index for index in map(self.store.index_of,
                                        self.annotations.labelled_order)
@@ -425,12 +393,12 @@ class AnnotationWidget(QWidget):
         return 0
 
     def _empty_reason(self) -> str:
-        """Why there is nothing to show, which is a different sentence per mode."""
+        """Why the current filter shows nothing."""
         if not self.reviewing:
             return "no clips match the current filter"
         if self.annotations.done_ids:
             return "nothing labelled in the current filter"
-        return "nothing labelled here yet - switch back to annotate"
+        return "nothing labelled here yet: switch back to annotate"
 
     def _show_empty(self) -> None:
         self.counter.setText(self._empty_reason())
@@ -439,23 +407,17 @@ class AnnotationWidget(QWidget):
 
     @property
     def reviewing(self) -> bool:
-        """True in review mode: the queue is labels, not work to do."""
+        """True in review mode."""
         return self.mode == "review"
 
     def _refresh_fold_answers(self) -> None:
-        """Read what the last fit's folds predicted for each labelled clip.
-
-        Read from ``cv_predictions.parquet`` and never from the saved model,
-        which was fitted on these labels and so reproduces them.
-        """
+        """Load held-out fold predictions from ``cv_predictions.parquet`` (not the saved model)."""
         self._answers, self._agreement_problem = {}, ""
         if not self.annotations.labelled_order:
             return
         try:
             self._answers, self._agreement_problem = load_cv_predictions(self.cfg)
         except Exception as exc:                     # noqa: BLE001
-            # A model that will not answer is a status line, never a traceback
-            # out of a mode switch.
             self._answers = {}
             self._agreement_problem = f"the fold predictions could not be read ({exc})"
 
@@ -467,24 +429,14 @@ class AnnotationWidget(QWidget):
         self._apply_filters()
         self._status({
             "annotate": "annotating the clips still to do",
-            "review": (
-                "reading back the labels already recorded, oldest first. A pick "
-                "rewrites the label rather than advancing; Tab jumps to the "
-                "next one the model disagrees with"
-            ),
+            "review": "reviewing labels, oldest first; Tab jumps to a disagreement",
         }[self.mode], 10000)
 
     # ------------------------------------------------------------ selection -- #
     def _queue_with_batch(self, order: list[int], anchor: int | None) -> list[int]:
-        """``order`` with the selector's picks moved to just after ``anchor``.
+        """``order`` with the selector's picks moved to just after ``anchor`` (or the front).
 
-        The queue is forward-only, so anything spliced behind the cursor is
-        unreachable: ``anchor``, the clip on screen, keeps its place and the
-        picks go immediately after it. With ``anchor`` ``None`` the splice point
-        is the front, so the top-ranked pick opens the session.
-
-        ``anchor`` is never moved into the batch. Everything not picked keeps
-        its relative order.
+        ``anchor`` and unpicked clips keep their relative order.
         """
         batch = self._fresh_batch(order)
         if not batch:
@@ -507,27 +459,19 @@ class AnnotationWidget(QWidget):
         return rest[:splice] + picked + rest[splice:]
 
     def _fresh_batch(self, order: list[int]) -> list[dict]:
-        """The selector's next picks, or ``[]`` to leave the queue exactly as it is.
-
-        The pool handed over is the clips the current filter makes REACHABLE and
-        not the whole manifest, since a pick outside the movie filter could only
-        be honoured by changing that filter under the annotator.
-        """
+        """The selector's next picks from the filtered clips, or ``[]``."""
         if self.suggester is None or not order or self._warming:
             return []
         try:
-            # `.iloc`, because `order` holds POSITIONS into the manifest, not
-            # labels. A manifest re-indexed without a reset would otherwise give
-            # a KeyError, or a pool scored against the wrong clip_ids.
+            # `order` holds positions, hence .iloc.
             batch = list(self.suggester.selection_batch(
                 self.store.manifest.iloc[order],
                 self.annotations.done_ids,
                 int(SELECT_BATCH_SIZE),
             ))
         except Exception as exc:
-            # Said out loud, and the annotator keeps working: shuffle order is a
-            # worse queue, not a broken one.
-            message = f"clip selection is off - {type(exc).__name__}: {exc}"
+            # Fall back to shuffle order.
+            message = f"clip selection is off: {type(exc).__name__}: {exc}"
             print(f"[trackanno] {message}")
             self._status(message, 10000)
             return []
@@ -561,33 +505,22 @@ class AnnotationWidget(QWidget):
         self._refresh_selection()
 
     def _refresh_selection(self) -> None:
-        """Re-queue after the model changed, without disturbing the clip on screen.
-
-        Hooked to a refit COMPLETING rather than to each label: the ranking is a
-        function of the model, so between refits it has nothing new to say.
-
-        Nothing here calls ``_load``, so the clip on screen keeps its pixels, its
-        half-typed note and its dwell clock; only what comes AFTER it moves.
-        """
+        """Re-queue the clips after the current one when a new model arrives."""
         if not self.order:
             return
         if self.reviewing:
-            # A new model has new opinions. Re-read, but the queue is left
-            # alone: re-ordering under a reviewer mid-clip would lose their place.
+            # Re-read predictions; leave the review order alone.
             self._refresh_fold_answers()
             return
         anchor = self.order[self.position]
         before = self.order
         self.order = self._queue_with_batch(self.order, anchor)
         if self.order == before:
-            # Selection is off, the refit produced nothing to re-queue, or every
-            # pick was already in place. Nothing moved, so say nothing.
             return
         self.position = self.order.index(anchor)
-        # The queue after the cursor is new, so the clips being read ahead are the
-        # wrong ones until this is re-aimed.
+        # Re-aim prefetch at the new queue.
         self.prefetcher.around(self.order, self.position)
-        self._status("model updated - the queue ahead was re-selected", 6000)
+        self._status("model updated: the queue ahead was re-selected", 6000)
 
     # ----------------------------------------------------------- clip load -- #
     def _build_view(self, n_frames: int, size: int):
@@ -610,7 +543,6 @@ class AnnotationWidget(QWidget):
         self._boxes = self.store.clip_boxes(index)
         view = self._build_view(self._clip.shape[0], self._clip.shape[1])
 
-        # Grayscale in, marker painted as vectors: no RGB stack is ever built.
         self.viewer.set_overlay(
             self.show_overlay, self.show_context, self.show_skeleton
         )
@@ -627,7 +559,7 @@ class AnnotationWidget(QWidget):
         existing = self.annotations.get(clip_id)
         self._suppress_advance = True
         self.categories.set_values(existing)
-        # AFTER set_values: it repaints every button, wiping the dashed outline.
+        # After set_values, which repaints the buttons.
         self._paint_suggestion()
         self.uncertain_box.setChecked(bool(existing and existing.get("uncertain") == "1"))
         self.notes.setText((existing or {}).get("notes", ""))
@@ -639,35 +571,26 @@ class AnnotationWidget(QWidget):
         self._loaded_at = time.time()
         self._update_progress(index, meta, (time.perf_counter() - started) * 1000)
         self.prefetcher.around(self.order, self.position)
-        # Only from annotate mode: the resume point is where the work stopped,
-        # and a detour through the labels already done is not where to come back.
+        # The resume point tracks annotate mode only.
         if not self.reviewing:
             self._save_state(str(meta["clip_id"]))
 
     def _resuggest(self, clip_id: str) -> None:
-        """Ask the current model about ``clip_id``; sets the suggestion and its note."""
+        """Set the suggestion and its note for ``clip_id``."""
         self._current_suggestion = (
             self.suggester.suggest(clip_id) if self.suggester and self.suggester.ready else {}
         )
         self._suggestion_note = self._why_no_suggestion(clip_id)
 
     def _paint_suggestion(self) -> None:
-        """Show the suggestion, or only the review note while reviewing.
-
-        The model was fitted on the labels under review, so an outline there
-        would reproduce the label rather than test it.
-        """
+        """Show the suggestion; in review mode show only the review note."""
         if self.reviewing:
             self.categories.set_suggestion({}, REVIEW_SUGGESTION_NOTE)
         else:
             self.categories.set_suggestion(self._current_suggestion, self._suggestion_note)
 
     def _disagreement(self, clip_id: str, suggestion: dict | None = None) -> list[str]:
-        """Groups where the recorded label is not what the folds predicted.
-
-        Empty for a clip no fold scored: the audit holdout, a clip with no
-        features, or one labelled since the last fit.
-        """
+        """Groups where the label differs from the fold prediction ([] if unscored)."""
         row = self.annotations.get(clip_id)
         if row is None:
             return []
@@ -676,11 +599,7 @@ class AnnotationWidget(QWidget):
         return differs(row, suggestion)
 
     def _paint_review_note(self, clip_id: str, existing: dict | None) -> None:
-        """Who judged this clip and when, and where the folds said otherwise.
-
-        ``existing`` is a label row with the buttons' current values laid over
-        it, so the disagreement clears as the label is changed.
-        """
+        """Show who labelled the clip and where the fold prediction differs."""
         if not self.reviewing:
             return
         if not existing:
@@ -692,7 +611,6 @@ class AnnotationWidget(QWidget):
         if existing.get("uncertain") == "1":
             line += ", marked uncertain"
 
-        # The fold prediction, from a model fitted without this clip's movie.
         folds = self._answers.get(clip_id) or {}
         disagrees = {entry.split(":", 1)[0] for entry in differs(existing, folds)}
         if disagrees:
@@ -702,10 +620,8 @@ class AnnotationWidget(QWidget):
                 for group, (value, confidence) in folds.items()
                 if group in disagrees
             )
-            line += (
-                f"<br><b>held out, the model said</b> {body}"
-                "<br>One of the two is wrong. This clip is what says which."
-            )
+            line += (f"<br><b>held out, the model said</b> {body}"
+                     "<br>Check the clip to see which is right.")
         elif folds:
             line += "<br>held out, the model agreed with this label"
         else:
@@ -728,8 +644,7 @@ class AnnotationWidget(QWidget):
         total = len(self.order)
         self.progress.setRange(0, max(1, total))
         if self.reviewing:
-            # Everything here is labelled, so the bar is how far through the
-            # review this is rather than how much of it is done.
+            # The bar shows review position.
             self.progress.setValue(self.position + 1)
             self.counter.setText(f"reviewing {self.position + 1} / {total} labelled")
         else:
@@ -768,13 +683,8 @@ class AnnotationWidget(QWidget):
         ]
         self._current_values = values
 
-        # Reviewing is checking, not labelling: the clip being judged must not
-        # be yanked away by the keypress that judged it, since the next thing
-        # the reviewer usually does is look at it again.
+        # Review mode never auto-advances; repaint the note against the buttons.
         if self.reviewing:
-            # Repaint against what is on the buttons NOW, not against the row on
-            # disk: the point of changing a label here is to watch the
-            # disagreement clear, and it has not been committed yet.
             clip_id = self._clip_ids[self.order[self.position]]
             self._paint_review_note(
                 clip_id, {**(self.annotations.get(clip_id) or {}), **values}
@@ -782,7 +692,7 @@ class AnnotationWidget(QWidget):
             return
         if not self.cfg.ui.auto_advance or not changed_single:
             return
-        # Only a single-choice pick advances; a checkbox never yanks the clip away.
+        # Only a single-choice pick advances.
         if self.annotations.missing_required(values):
             return
         self._commit()
@@ -813,7 +723,7 @@ class AnnotationWidget(QWidget):
         has_any = any(values.values()) or uncertain or notes
         existing = self.annotations.get(str(meta["clip_id"]))
         if not has_any:
-            # De-selecting everything must actually un-label the clip.
+            # Deselecting everything un-labels the clip.
             if existing is not None:
                 try:
                     self.annotations.clear(str(meta["clip_id"]))
@@ -825,25 +735,20 @@ class AnnotationWidget(QWidget):
                 return True
             return False
 
-        # Revisiting an already-labelled clip must not rewrite the CSV: editing a
-        # row is a full atomic rewrite, and the undo stack would fill with no-ops.
+        # Unchanged: skip the rewrite and the no-op undo entry.
         if existing is not None and self._on_screen_matches(existing):
             return False
 
         missing = self.annotations.missing_required(values)
         if missing and not self.uncertain_box.isChecked():
-            # Don't block navigation, but never drop input silently.
             self._pending_message = (
-                f"not saved - {', '.join(missing)} still unset "
+                f"not saved: {', '.join(missing)} still unset "
                 f"(press u to mark uncertain instead)"
             )
             self._commit_refused = True
             return False
 
-        # Record the model's answer and whether it was visible: agreement is not
-        # influence unless the two are recorded apart. A revision records neither:
-        # the suggestion on screen now comes from today's model, and the original
-        # judgement was not made under it.
+        # Record the shown suggestion, except on a revision.
         revising = self.annotations.get(str(meta["clip_id"])) is not None
         primary = None if revising else next(
             ((g.name, self._current_suggestion[g.name])
@@ -859,7 +764,7 @@ class AnnotationWidget(QWidget):
                 selected_by=self._served.get(str(meta["clip_id"])),
             )
         except OSError as exc:
-            # The store rolls back and re-raises; escaping a Qt slot aborts.
+            # Report instead of raising out of a Qt slot.
             self._pending_message = self._write_failed(exc)
             self._commit_refused = True
             return False
@@ -873,7 +778,7 @@ class AnnotationWidget(QWidget):
             return
         if self._labels_since_train < self.cfg.suggest.retrain_every:
             return
-        # Two trainings at once race on the model file, so skip rather than queue.
+        # One retrain at a time.
         if self._retrain_thread is not None and self._retrain_thread.is_alive():
             return
         self._labels_since_train = 0
@@ -889,15 +794,13 @@ class AnnotationWidget(QWidget):
 
                 from ..learn.suggest import train
 
-                # Snapshot, never the live CSV: on Windows an open handle makes
-                # the UI thread's atomic rewrite fail outright.
+                # Train on a snapshot so the live CSV stays writable on Windows.
                 snapshot = live.paths.work_dir / ".annotations_snapshot.csv"
                 self.annotations.snapshot(snapshot)
                 cfg = copy(live)
                 cfg.paths = copy(live.paths)
                 cfg.paths.csv = snapshot
                 train(cfg, verbose=False)
-                # Built and scored here; the UI thread only swaps it in.
                 built = Suggester(live, labels_csv=snapshot)
                 built.warm()
                 self.suggester_built.emit(built, generation)
@@ -911,21 +814,18 @@ class AnnotationWidget(QWidget):
 
     # ---------------------------------------------------------- kymograph -- #
     def _kymograph_wanted(self) -> bool:
-        """Only on a pose project: with no keypoints there is no curve to fit."""
+        """Whether to show the kymograph (pose projects with 2+ keypoints)."""
         return bool(SHOW_KYMOGRAPH and self.cfg.is_pose
                     and self.cfg.n_keypoints >= 2)
 
     def _why_no_suggestion(self, clip_id: str) -> str:
-        """One line explaining an empty suggestion, or "" to stay silent. Only
-        spoken when AUDIT_VISIBLE is on, because knowing a clip is
-        audited is the influence the holdout exists to exclude."""
+        """Why there is no suggestion, or "" (silent unless AUDIT_VISIBLE)."""
         if self._current_suggestion or self.suggester is None:
             return ""
         if not AUDIT_VISIBLE:
             return ""
         if self.suggester.is_audit_clip(clip_id):
-            return ("held out for audit: no suggestion is shown on this clip at "
-                    "any confidence, so your answer stays independent")
+            return "held out for audit: no suggestion on this clip"
         if not self.suggester.ready:
             return self.suggester.status_line()
         return "the model has nothing to say about this clip"
@@ -938,8 +838,7 @@ class AnnotationWidget(QWidget):
         self.kymo_view.set_sign_mode(cfg.ui.kymo_sign)
 
     def _warm_spline_import(self) -> None:
-        """Import scipy off the UI thread, so the first kymograph does not pay
-        for it."""
+        """Import scipy off the UI thread ahead of the first kymograph."""
         if not self._kymograph_wanted():
             return
         import threading
@@ -948,19 +847,18 @@ class AnnotationWidget(QWidget):
             try:
                 import scipy.interpolate  # noqa: F401
             except Exception:
-                pass          # the failure surfaces properly at the first use
+                pass          # surfaces at first use
 
         threading.Thread(target=work, name="trackanno-spline-warm",
                          daemon=True).start()
 
     def _update_kymograph(self, boxes) -> None:
-        """Recompute for the clip now on screen. Cheap enough to run inline."""
+        """Recompute the kymograph for the clip on screen."""
         if not self._kymograph_wanted():
             return
         from ..measure.kymograph import chain_from_edges, kymograph_from_boxes
 
-        # Which points form the flagellum, and in which direction, comes from the
-        # project's skeleton: the order sets the sign of every value on the chart.
+        # The skeleton's chain order sets the sign of the chart.
         order = chain_from_edges(self.cfg.n_keypoints, self.cfg.keypoints.edge_idx)
         try:
             kymo = kymograph_from_boxes(
@@ -984,9 +882,7 @@ class AnnotationWidget(QWidget):
             viewer.seek(int(frame))
 
     def reload_suggester(self) -> str:
-        """Pick up a model that was just (re)trained, without losing your place.
-        The model is not part of what the panel is built from, so it is reloaded
-        in place rather than by rebuilding."""
+        """Load a newly trained model in place, keeping the current clip."""
         self._suggester_generation += 1
         if not self.cfg.suggest.enabled:
             self.suggester = None
@@ -995,8 +891,7 @@ class AnnotationWidget(QWidget):
         return self.suggester.status_line()
 
     def _adopt_suggester(self, built, generation: int) -> None:
-        """Swap in a Suggester built on the retrain thread, unless a reload or
-        config change came after the retrain started."""
+        """Swap in a retrained Suggester unless a reload happened since."""
         if generation != self._suggester_generation:
             return
         if self.suggester is None or not self.cfg.suggest.enabled:
@@ -1032,10 +927,10 @@ class AnnotationWidget(QWidget):
         self._update_progress(self.order[self.position], meta, 0.0)
 
     def _write_failed(self, exc: OSError) -> str:
-        """One sentence the annotator can act on, instead of a traceback."""
+        """A one-line write error with a likely cause."""
         hint = ""
         if getattr(exc, "errno", None) in (13, 30) or "Permission" in type(exc).__name__:
-            hint = " - is it open in Excel, or is the folder read-only?"
+            hint = " (is it open in Excel, or is the folder read-only?)"
         return f"could not write {self.annotations.path.name}: {exc}{hint}"
 
     def _undo(self) -> None:
@@ -1073,7 +968,7 @@ class AnnotationWidget(QWidget):
         self._commit()
         if self.position + 1 >= len(self.order):
             if self._commit_refused:
-                # Reloading would wipe the partial input the refusal kept.
+                # Do not reload: it would wipe the kept input.
                 self._status(self._pending_message or "not saved", 6000)
                 self._pending_message = None
                 return
@@ -1091,27 +986,20 @@ class AnnotationWidget(QWidget):
         self._load()
 
     def _on_next_gap(self) -> None:
-        """Tab: the next clip worth stopping at, which is not the same question
-        in each mode. Annotating, it is the next one with no label; reviewing,
-        the next one whose label the model would not have chosen."""
+        """Tab: next unlabelled clip, or next disagreement in review mode."""
         if self.reviewing:
             self.next_disagreement()
         else:
             self.next_unannotated()
 
     def next_disagreement(self) -> None:
-        """The next labelled clip the FOLDS labelled differently.
-
-        Where to start a review: a label a held-out model reproduced is evidence
-        about neither of them, and one it contradicted is either a mistake or
-        the thing the model still has to learn.
-        """
+        """Jump to the next labelled clip the fold prediction disagrees with."""
         self._commit()
         if not self._answers:
             self._status(
                 self._agreement_problem
-                or "no held-out predictions to hold these labels up against. "
-                   "Train the model on the Model page", 6000)
+                or "no held-out predictions yet: train the model on the Model page",
+                6000)
             return
         for pos in range(self.position + 1, len(self.order)):
             if self._disagreement(self._clip_ids[self.order[pos]]):
@@ -1119,8 +1007,7 @@ class AnnotationWidget(QWidget):
                 self._load()
                 return
         self._status(
-            "the model agrees with every label after this one, or has nothing "
-            "to say about them", 4000)
+            "no disagreements after this clip", 4000)
 
     def next_unannotated(self) -> None:
         self._commit()
@@ -1179,7 +1066,7 @@ class AnnotationWidget(QWidget):
                 self._leave_notes()
                 return True
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                # `Return` is also bound to "next clip" and pre-empts returnPressed.
+                # Return is also "next clip" and would pre-empt returnPressed.
                 self._leave_notes()
                 return True
         return super().eventFilter(obj, event)
@@ -1187,7 +1074,7 @@ class AnnotationWidget(QWidget):
     def _focus_notes(self) -> None:
         self.notes.setFocus(Qt.ShortcutFocusReason)
         self.notes.selectAll()
-        self._status("typing notes - Esc or Enter to return to shortcuts", 4000)
+        self._status("typing notes: Esc or Enter to return to shortcuts", 4000)
 
     def _leave_notes(self) -> None:
         self.notes.clearFocus()
@@ -1210,34 +1097,26 @@ class AnnotationWidget(QWidget):
         lines.append("</table>")
 
         lines.append(
-            "<br><b>Two modes, same keys</b><br>"
-            "<i>annotate</i> walks the clips still to do. <i>review labelled</i> "
-            "walks the ones already done, oldest first, showing who judged each "
-            "and where the model would now say otherwise. There a pick rewrites "
-            "the label instead of advancing, and Tab jumps to the next label the "
-            "model argues with."
+            "<br><b>Modes</b><br>"
+            "<i>annotate</i> walks unlabelled clips. <i>review labelled</i> walks "
+            "labelled ones, oldest first; a pick rewrites the label and Tab jumps "
+            "to the next disagreement."
         )
 
-        # Why a confident model shows nothing on some clips. Explained HERE and
-        # not on the clip: knowing it is audited is the influence to exclude.
+        # Explained here, not on the clip, so audit clips stay unmarked.
         share = self.cfg.suggest.audit_fraction
         if self.cfg.suggest.enabled and share > 0:
             lines.append(
                 "<br><b>Why some clips show no suggestion</b><br>"
-                f"About {share:.0%} of clips are held out of the suggestion loop. "
-                "They are never trained on and never carry a suggestion, whatever "
-                "the model's confidence, so how often you and the model agree on "
-                "them is an honest measure rather than a measure of how much the "
-                "suggestion nudged you.<br>"
-                "<i>suggest.audit_fraction</i> controls the share; set it to 0 to "
-                "see a suggestion on every clip and give up that measure."
+                f"About {share:.0%} of clips are an audit holdout: never trained on "
+                "and never suggested, so agreement on them is unbiased. Set "
+                "<i>suggest.audit_fraction</i> to 0 to turn this off."
             )
         QMessageBox.information(self, "Shortcuts", "".join(lines))
 
     # ---------------------------------------------------------------- close -- #
     def shutdown(self) -> None:
-        # try/finally: a failing commit must still release the prefetch thread
-        # and the clip cache.
+        # Release the prefetch thread and cache even if the commit fails.
         try:
             self._commit()
         except Exception as exc:
@@ -1245,8 +1124,7 @@ class AnnotationWidget(QWidget):
         finally:
             if not self.prefetcher.stop():
                 print("[trackanno] prefetch thread did not stop in time")
-        # Every one of these is a VIEW on the clip cache's memory map, and while
-        # any of them lives the file cannot be rewritten on Windows.
+        # Drop views on the cache's memory map so Windows can rewrite it.
         self._clip = None
         self._boxes = None
         if hasattr(self.viewer, "clear"):

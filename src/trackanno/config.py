@@ -1,9 +1,4 @@
-"""Typed configuration loaded from ``config.yaml``.
-
-One dataclass per section. Each field carries its default, a one-line help
-string and its allowed values; :func:`_parse_section` reads any section from
-that metadata. Hand-written code is kept for rules that span fields.
-"""
+"""Typed ``config.yaml``: one dataclass per section, each field with default, help and limits."""
 
 from __future__ import annotations
 
@@ -23,10 +18,8 @@ __all__ = ["Config", "ConfigError", "load_config", "CategoryGroup", "CategoryOpt
            "SECTIONS", "section_defaults", "effective_values", "schema_keys", "help_for",
            "meta_for"]
 
-# A category group becomes a CSV column, so a group named like a built-in column
-# would overwrite it. Mirrors ``store.IDENTITY_COLUMNS`` and
-# ``store.TRAILING_COLUMNS`` (not imported, to avoid a cycle);
-# ``tests/test_store_provenance.py`` asserts they are equal.
+# Built-in CSV columns a category group may not be named after; mirrors the
+# column lists in ``annotate.store`` (a test keeps them equal).
 RESERVED_GROUP_NAMES = frozenset({
     "clip_id", "movie_id", "source_file", "series", "channel",
     "track_id", "f_start", "f_end",
@@ -44,8 +37,7 @@ class ConfigError(ValueError):
 # --------------------------------------------------------------------------- #
 # migration tables
 # --------------------------------------------------------------------------- #
-# Settings that are no longer configurable, with the value now used. Modules
-# read their constants from here, so the warning and the code cannot disagree.
+# Removed settings and the fixed value used instead; modules read these constants.
 FIXED_SETTINGS: dict[str, Any] = {
     "normalize.subsample": 4,
     "detection.iou": 0.5,
@@ -88,13 +80,12 @@ FIXED_SETTINGS: dict[str, Any] = {
     "render.quality": 8,
 }
 
-# Extra advice for a fixed setting whose old value had a replacement.
+# Advice for a fixed setting that has a replacement.
 _FIXED_HINTS = {
     "tracking.tracker_cfg": "set tracker parameters under tracking.overrides",
 }
 
-# Display toggles that moved to per-user settings in the annotation window,
-# with the default each starts at.
+# Display toggles kept per user in the annotation window, with their defaults.
 VIEW_SETTINGS: dict[str, Any] = {
     "ui.show_overlay": True,
     "ui.show_skeleton": False,
@@ -103,13 +94,13 @@ VIEW_SETTINGS: dict[str, Any] = {
     "ui.view_zoom": 1.0,
 }
 
-# Keys removed outright, with the one-line reason.
+# Removed keys, with the reason.
 _REMOVED_KEYS = {
-    "predict.decode": "Viterbi decoding was removed; predict.min_bout_frames is the hard floor",
-    "predict.self_transition": "Viterbi decoding was removed; predict.min_bout_frames is the hard floor",
+    "predict.decode": "Viterbi decoding was removed; use predict.min_bout_frames",
+    "predict.self_transition": "Viterbi decoding was removed; use predict.min_bout_frames",
 }
 
-# Removed values of settings that remain, and what an old config now gets.
+# Removed values of current settings, and their replacement.
 REMOVED_VALUES: dict[str, dict[str, str]] = {
     "normalize.mode": {"smooth": "per_frame", "none": "fixed"},
     "suggest.select_rule": {"least_confidence": "margin", "entropy": "margin"},
@@ -122,7 +113,7 @@ def _warn(message: str) -> None:
     warnings.warn(message, stacklevel=4)
 
 
-# Old values that already meant the fixed one.
+# Values equivalent to the fixed one.
 _FIXED_ALIASES = {"tracking.tracker_cfg": (None,)}
 
 
@@ -138,7 +129,7 @@ def _same(value, fixed) -> bool:
 
 
 def _migrate_key(dotted: str, value) -> bool:
-    """Warn about a key the schema no longer has. True when it was handled."""
+    """Warn about a removed key; True when it was one."""
     if dotted in FIXED_SETTINGS:
         fixed = FIXED_SETTINGS[dotted]
         hint = _FIXED_HINTS.get(dotted)
@@ -163,12 +154,8 @@ def _migrate_key(dotted: str, value) -> bool:
 # --------------------------------------------------------------------------- #
 def knob(default, help: str = "", *, choices=None, min=None, max=None, below=None,
          special: tuple = (), parse: Callable | None = None):
-    """A setting: its default, one line of help and what it accepts.
-
-    ``choices`` limits string values (a callable is read lazily), ``min``/``max``
-    bound numbers inclusively and ``below`` exclusively, ``special`` lists words
-    a numeric setting also takes (``auto``), ``parse`` replaces the coercion.
-    """
+    """A setting with its default, help and limits (``below`` is exclusive, ``special`` words
+    such as ``auto`` are accepted as is, ``parse`` replaces the coercion)."""
     meta = {"help": help, "choices": choices, "min": min, "max": max, "below": below,
             "special": tuple(special), "parse": parse}
     if isinstance(default, (list, dict)):
@@ -455,7 +442,8 @@ class Tiling(_Section):
     enabled: bool | str = knob("auto", "auto tiles only frames larger than one tile.",
                                special=("auto",))
     tile: int = knob(640, "Tile size cut from the frame, in pixels.", min=32)
-    overlap: float = knob(0.25, "Share of a tile shared with its neighbour.", min=0.0, below=1.0)
+    overlap: float = knob(0.25, "Fraction of a tile that overlaps its neighbour.", min=0.0,
+                          below=1.0)
     merge_iou: float = knob(0.6, "Overlap above which boxes from two tiles are one animal.",
                             min=0.0, max=1.0)
 
@@ -467,9 +455,9 @@ class Tracking(_Section):
     backend: str = knob("tracktrack", "Which tracker links detections across frames.",
                         choices=_trackers)
     min_track_length: int = knob(40, "Drop tracks seen in fewer frames than this.", min=1)
-    border_margin_px: int = knob(0, "How near the frame edge counts as at it; 0 is off.",
+    border_margin_px: int = knob(0, "Pixels from the edge that count as at it; 0 is off.",
                                  min=0)
-    border_max_frac: float = knob(0.0, "Share of one clip's frames allowed at the edge.",
+    border_max_frac: float = knob(0.0, "Fraction of a clip's frames allowed at the edge.",
                                   min=0.0, max=1.0)
     overrides: dict = knob({"gmc_method": "none"}, "Parameters passed to the tracker.")
 
@@ -607,8 +595,7 @@ _CLIP_ID = re.compile(r"^(?P<movie>.+)__t(?P<track>\d+)__f\d+$")
 
 
 def audit_track_key(clip_id: str) -> str:
-    """``movie_id::track_id`` for a clip_id, the unit the audit holdout is drawn
-    over. An id not in ``clip_id_for`` form is its own key."""
+    """``movie_id::track_id`` for a clip_id, the audit holdout unit; other ids map to themselves."""
     m = _CLIP_ID.match(str(clip_id))
     if m is None:
         return str(clip_id)
@@ -636,7 +623,7 @@ class Suggest(_Section):
     retrain_every: int = knob(10, "Refit in the background after this many new labels.",
                               min=1)
     min_per_class: int = knob(5, "A class with fewer labels is not modelled.", min=1)
-    audit_fraction: float = knob(0.10, "Share of tracks held out from the suggester.",
+    audit_fraction: float = knob(0.10, "Fraction of tracks held out to measure agreement.",
                                  min=0.0, below=1.0)
     min_confidence: float = knob(0.0, "Hide suggestions below this confidence.",
                                  min=0.0, max=1.0)
@@ -652,11 +639,7 @@ class Suggest(_Section):
         return self.select_rule != "off"
 
     def audit_by_hash(self, clip_id: str) -> bool:
-        """Whether ``clip_id``'s track hashes into the audit holdout (fallback).
-
-        Hashed on ``movie_id::track_id`` so every clip of a track lands on the
-        same side. A labelled clip's recorded membership wins over this.
-        """
+        """Whether ``clip_id``'s track hashes into the audit holdout; a stored stamp wins."""
         frac = float(self.audit_fraction)
         if frac <= 0:
             return False
@@ -694,9 +677,8 @@ class Suggest(_Section):
         if self.context_frames > 0 and "context" not in groups:
             unused.append("context")
         if "feature_groups" in raw and unused:
-            _warn(f"{unused} are configured (suggest.embeddings, suggest.context_frames) "
-                  "but suggest.feature_groups does not list them, so the model will "
-                  "not use them")
+            _warn(f"{unused} are configured but not in suggest.feature_groups; "
+                  "the model ignores them")
         self.feature_groups = groups
         if self.feature_columns is not None:
             _check_columns(self.feature_columns, groups)
@@ -707,8 +689,8 @@ class Suggest(_Section):
                               f"not {self.model!r}")
         if self.select_rule != "off" and self.audit_fraction <= 0.0:
             raise ConfigError(f"suggest.select_rule {self.select_rule!r} needs "
-                              "suggest.audit_fraction above 0 (e.g. 0.10) to keep an "
-                              "unbiased holdout, or select_rule 'off'")
+                              "suggest.audit_fraction above 0 (e.g. 0.10) for an unbiased "
+                              "holdout, or select_rule 'off'")
         if self.select_rule != "off" and not self.enabled:
             raise ConfigError(f"suggest.select_rule {self.select_rule!r} needs "
                               "suggest.enabled: true")
@@ -716,11 +698,12 @@ class Suggest(_Section):
 
 @dataclass
 class Spectral(_Section):
-    """The window a beat is measured over, centred on the clip."""
+    """The window a beat is measured over."""
 
     NAME: ClassVar[str] = "spectral"
 
-    window: int = knob(75, "Frames the beat spectrum is measured over.", min=8)
+    window: int = knob(75, "Frames the beat spectrum is measured over, centred on the clip.",
+                       min=8)
 
 
 @dataclass
@@ -744,11 +727,7 @@ class Predict(_Section):
 
 @dataclass
 class ModelSource(_Section):
-    """Where the detection weights come from, when not ``paths.model``.
-
-    ``source`` is a registry id or an ``https://`` URL; ``sha256`` is written on
-    the first fetch and pins the weights from then on.
-    """
+    """Remote detection weights: a registry id or https URL, pinned by ``sha256``."""
 
     NAME: ClassVar[str] = "model"
 
@@ -1027,7 +1006,7 @@ def load_config(path: str | Path | None = None) -> Config:
     cfg = Config(path=path, categories=_parse_categories(data.get("categories")),
                  keys=keys, **sections)
 
-    # Before embeddings, an unset feature_groups meant the detector's cnn group.
+    # A suggest section without feature_groups or embeddings uses no detector embeddings.
     old = data.get("suggest")
     if (isinstance(old, dict) and "feature_groups" not in old
             and "embeddings" not in old and cfg.features.enabled):
@@ -1077,7 +1056,7 @@ def help_for(dotted: str) -> str:
 
 
 def meta_for(dotted: str) -> dict:
-    """A key's metadata with ``choices`` resolved: help, choices, min, max, below, special."""
+    """A key's metadata (help, choices, limits, type) with ``choices`` resolved."""
     f = _field(dotted)
     if f is None:
         return {}
@@ -1088,11 +1067,7 @@ def meta_for(dotted: str) -> dict:
 
 
 def effective_values(data: dict) -> dict[str, Any]:
-    """Every schema key as the loader sets it from the raw mapping ``data``.
-
-    Paths keep the file's text. A section that does not load shows its raw
-    values over the defaults.
-    """
+    """Every schema key as loaded from raw ``data``; paths keep their text."""
     out: dict[str, Any] = {}
     for name, cls in SECTIONS.items():
         raw = data.get(name) if isinstance(data.get(name), dict) else {}

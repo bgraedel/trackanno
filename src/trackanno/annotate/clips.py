@@ -1,19 +1,6 @@
-"""Clip planning, crop geometry and the pre-cropped clip cache.
+"""Clip planning, crop geometry and the pre-cropped ``S x S`` clip cache.
 
-A *clip* is ``clips.frames`` consecutive frames of one track, cropped to a
-square window around it and pre-extracted by ``trackanno prepare`` into an
-uncompressed ``np.memmap``: one contiguous read (~1 MB) per clip, no decoding.
-
-Crop geometry rules:
-
-* Centred on the track and **never slid back inside the frame**; ``_crop``
-  zero-pads instead. Clamping pins border-swimming animals against their own
-  crop edge.
-* Sized to hold the animal on every frame plus ``clips.pad`` of margin, which
-  is what lets the GUI zoom and re-centre at display time from the one cache.
-* Uniform ``S x S``. A clip needing more is downscaled and its ``scale``
-  recorded, so every cached pixel maps back to an exact original coordinate.
-"""
+Crops follow the track, are zero-padded at the frame edge and downscaled into ``S`` when larger."""
 
 from __future__ import annotations
 
@@ -48,9 +35,7 @@ HEADER_FILE = "cache.json"
 TRACKS_FILE = "tracks.parquet"
 NORM_FILE = "norm.json"
 DONE_FILE = "prepare_done.json"
-# The detection stage's marker. Separate from DONE_FILE because `project_status`
-# counts that one as "this movie has clips": a movie detected on a GPU box but
-# not yet cut must still read as unprepared.
+# The detection stage's marker; DONE_FILE alone means the clips are cut.
 DETECT_FILE = "detect_done.json"
 
 
@@ -76,20 +61,12 @@ class ClipSpec:
 # planning
 # --------------------------------------------------------------------------- #
 def clip_id_for(movie_id: str, track_id: int, f_start: int) -> str:
-    """The join key for a (movie, track, window).
-
-    Used by the annotation CSV, the manifest and the feature tables, so a grid
-    built elsewhere must produce byte-identical ids. It embeds the track id, so
-    re-running detection renumbers tracks and changes every id (see
-    :mod:`trackanno.annotate.reassociate`).
-    """
+    """The clip id joining the CSV, manifest and feature tables for a (movie, track, window)."""
     return f"{movie_id}__t{int(track_id):04d}__f{int(f_start):06d}"
 
 
 def _windows(cfg: Config, n_frames: int) -> list[tuple[int, int]]:
-    """Global window grid for a movie, aligned to the movie's frame grid rather
-    than to each track's start, so clips from different tracks share frame
-    ranges."""
+    """The movie-wide window grid, shared by all tracks."""
     length, stride = cfg.clips.frames, cfg.clips.stride
     if cfg.clips.window_mode == "first":
         return [(0, min(length, n_frames))] if n_frames >= cfg.clips.min_clip_frames else []
@@ -131,38 +108,21 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 
 BORDER_BOX_COLUMNS = ("x1", "y1", "x2", "y2")
-# Carried on the planner's own copy of the tracks table, so the border test is
-# run once per movie rather than once per window.
+# Column on the planner's copy of the tracks table.
 _AT_BORDER = "_at_border"
 
 
 def border_flags(tracks: pd.DataFrame, frame_size, cfg: Config) -> "pd.Series":
-    """Per detection, whether its box comes within
-    ``tracking.border_margin_px`` of any side of the frame.
-
-    At the edge the box is truncated by the frame rather than by the animal
-    ending, so a pose model places its keypoints against a shape that is not all
-    there. Such a detection is treated as no detection: it is the frames that
-    go, not the track, so an animal that visits the edge and swims back is
-    measured over the rest of its life as usual.
-
-    All False unless ``tracking.border_margin_px`` says otherwise, and refuses
-    rather than passing everything through when it cannot be measured.
-    """
+    """Per detection, whether its box is within ``tracking.border_margin_px`` of the frame edge."""
     off = pd.Series(False, index=tracks.index, dtype=bool)
     if int(cfg.tracking.border_margin_px) <= 0 or tracks.empty:
         return off
     if frame_size is None:
-        raise ValueError(
-            "tracking.border_margin_px is set, so detections at the frame edge "
-            "are to be excluded, but this caller did not say how big the frame "
-            "is and the rule cannot be applied without it"
-        )
+        raise ValueError("tracking.border_margin_px needs the frame size, which was not given")
     if any(c not in tracks.columns for c in BORDER_BOX_COLUMNS):
         raise ValueError(
-            "tracking.border_margin_px is set, but this tracks table carries no "
-            f"{', '.join(BORDER_BOX_COLUMNS)} columns, so how near the edge a "
-            "detection sits cannot be measured. Re-run detection to rebuild it"
+            f"tracking.border_margin_px needs {', '.join(BORDER_BOX_COLUMNS)} in the tracks "
+            "table; re-run detection"
         )
     height, width = int(frame_size[0]), int(frame_size[1])
     m = float(cfg.tracking.border_margin_px)
@@ -176,12 +136,7 @@ def border_flags(tracks: pd.DataFrame, frame_size, cfg: Config) -> "pd.Series":
 
 def drop_border_rows(tracks: pd.DataFrame, frame_size, cfg: Config
                      ) -> tuple[pd.DataFrame, dict[int, float]]:
-    """``tracks`` without the detections at the frame edge, and the share of
-    each affected track that went.
-
-    The track itself survives: only the frames inside the margin are removed,
-    and what comes before and after them is planned as usual.
-    """
+    """``tracks`` without edge detections, and the fraction removed per affected track."""
     flags = border_flags(tracks, frame_size, cfg)
     if not flags.any():
         return tracks, {}
@@ -192,14 +147,7 @@ def drop_border_rows(tracks: pd.DataFrame, frame_size, cfg: Config
 
 
 def too_much_border(n_border: int, n_present: int, cfg: Config) -> bool:
-    """Whether a window spent too much of itself at the frame edge to be a unit.
-
-    ``tracking.border_max_frac`` is the share of a window's detections allowed
-    inside the margin. 0, the default, refuses a window that reaches the edge at
-    all; the same track's windows before and after the excursion are untouched.
-    Without this the edge frames would only be missing, and a window mostly at
-    the edge would still be cut around the few frames that were not.
-    """
+    """Whether a window's fraction of edge detections exceeds ``tracking.border_max_frac``."""
     if n_border <= 0:
         return False
     return n_border / (n_border + n_present) > float(cfg.tracking.border_max_frac)
@@ -207,32 +155,13 @@ def too_much_border(n_border: int, n_present: int, cfg: Config) -> bool:
 
 def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
                frame_size=None, at_border: dict | None = None) -> list[ClipSpec]:
-    """Turn a movie's tracks table into clip specs. Reads no pixels.
+    """Clip specs from a movie's tracks table, reading no pixels.
 
-    Crop size comes from the *per-frame* box (``crop_from: bbox``), not the
-    track's whole excursion, so the crop has to move. ``clips.follow`` says how:
-
-    ``track``   re-centred every frame - smallest crop, but translation becomes
-                invisible, so "swimming" and "immotile" look identical.
-    ``smooth``  moving average of the centre - drift removed, local motion kept.
-                Default.
-    ``fixed``   one crop for the window - all motion visible, biggest crop.
-
-    ``frame_size`` is ``(height, width)`` and is only needed by
-    ``tracking.border_margin_px``; without it that setting cannot be applied and
-    refuses rather than passing everything through.
-
-    ``at_border``, when given, is filled with ``{track_id: share of its
-    detections at the frame edge}`` for every track that reached it. A caller
-    wanting to report them takes them from here, since recomputing the number
-    means restating which detections were candidates in the first place.
-    """
+    ``frame_size`` is ``(height, width)``; ``at_border`` receives each edge track's edge fraction."""
     if tracks.empty:
         return []
 
-    # A detection inside the margin is not one to measure, so it counts neither
-    # towards min_track_length nor towards a clip's frames. Marked rather than
-    # dropped, because a window still has to see how much of itself was there.
+    # Edge detections count toward neither min_track_length nor a clip's frames.
     edge_flags = border_flags(tracks, frame_size, cfg).to_numpy()
     if at_border is not None and edge_flags.any():
         share = pd.Series(edge_flags).groupby(tracks["track_id"].to_numpy()).mean()
@@ -294,8 +223,7 @@ def plan_clips(tracks: pd.DataFrame, movie_id: str, n_frames: int, cfg: Config,
             else:
                 base = float(np.percentile(extents, 95))
 
-            # The crop must still hold the animal on every frame given the
-            # (possibly smoothed) centre, so take whichever is larger.
+            # Also big enough to hold the animal around the (smoothed) centre.
             reach = np.max(np.abs(
                 np.concatenate([boxes[:, :2] - path, boxes[:, 2:] - path], axis=1)
             ), axis=1)
@@ -343,31 +271,22 @@ def choose_crop_size(specs: list[ClipSpec], cfg: Config) -> int:
 
 
 def finalise_geometry(specs: list[ClipSpec], size: int, n_frames: int) -> np.ndarray:
-    """Fix each clip's crop rectangle and scale; return per-frame crop origins.
-
-    An ``(n_clips, T, 2)`` int32 array of top-left corners in original pixel
-    coordinates: the crop moves with the track, so one origin per clip cannot
-    map pixels back. ``ClipSpec.crop_x0/y0`` keeps the ``f_start`` value.
-    """
+    """Fix each clip's crop size and scale; returns ``(n_clips, T, 2)`` per-frame crop origins."""
     origins = np.zeros((len(specs), n_frames, 2), dtype=np.int32)
     for row, s in enumerate(specs):
         path = s.__dict__.pop("_path", None)
         if path is None:
-            # Never guess: zeros crop every clip to the frame's top-left corner
-            # while the manifest and clip_boxes still look well-formed.
             raise ValueError(
-                f"{s.clip_id}: no crop path. finalise_geometry() must be called exactly "
-                "once, on specs straight from plan_clips() (a spec rebuilt from "
-                "clips.parquet has lost its trajectory)."
+                f"{s.clip_id}: no crop path; call finalise_geometry() once, on specs "
+                "from plan_clips()"
             )
 
-        # <= S: crop exactly S px and keep 1:1 (free extra context).
-        # >  S: crop what is needed and downscale into S.
+        # Crop S px at 1:1 if it fits, else crop what is needed and downscale.
         side = size if s.crop_w <= size else s.crop_w
         s.crop_w = s.crop_h = int(side)
         s.scale = size / float(side)
 
-        # Deliberately NOT clamped into the frame; `_crop` pads outside with black.
+        # Not clamped into the frame; `_crop` pads with black.
         corners = np.round(path - side / 2.0).astype(np.int64)
         origins[row] = corners.astype(np.int32)
 
@@ -383,20 +302,11 @@ def build_box_table(
     specs: list[ClipSpec], origins: np.ndarray, tracks: pd.DataFrame, cfg: Config,
     n_kpts: int,
 ) -> pd.DataFrame:
-    """Per clip and frame: the target track's box plus any neighbour inside the
-    crop, in *cache* pixels so the GUI needs to know nothing about the original
-    movie.
-
-    One vectorised pass per clip, over the slice of a frame-sorted copy its
-    window covers. Per FRAME it was a DataFrame filter and an ``itertuples``
-    row, which is clips x clips.frames pandas calls: minutes of silence in the
-    middle of a run on a movie with a few thousand clips.
-    """
+    """Per clip and frame, the target's box and neighbours inside the crop, in cache pixels."""
     if not specs or tracks.empty:
         return pd.DataFrame()
 
-    # Stable, so detections keep their order within a frame and the table comes
-    # out in the order the per-frame loop produced.
+    # Stable, so detections keep their order within a frame.
     order = np.argsort(tracks["frame"].to_numpy(), kind="stable")
     frames = tracks["frame"].to_numpy()[order].astype(np.int64)
     ids = tracks["track_id"].to_numpy()[order].astype(np.int64)
@@ -472,9 +382,7 @@ def write_clip_cache(
     progress=None,
     staged: "StagedWrite | None" = None,
 ) -> None:
-    """Cut every clip's pixels in ONE sequential pass: each frame is read at most
-    once and scattered into every clip that needs it, because random access into
-    a large TIFF/ND2 on a share would dominate the runtime."""
+    """Cut every clip's pixels in one sequential pass, reading each frame once."""
     import cv2
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -488,9 +396,7 @@ def write_clip_cache(
         "movie": movie.describe(),
     }
 
-    # Staged beside the real names and renamed in at the very end, so a cancelled
-    # or killed run leaves the previous cache intact. The caller may pass its own
-    # staging area to land the manifest and box table in the SAME commit.
+    # Staged and renamed at the end; a caller's ``staged`` commits other files with it.
     owned = staged is None
     staged = staged or StagedWrite(out_dir)
     staged.path(HEADER_FILE).write_text(json.dumps(header, indent=2), encoding="utf-8")
@@ -502,8 +408,7 @@ def write_clip_cache(
         return
 
     try:
-        # Through a file object: np.save appends ".npy" to any path not already
-        # ending in it, which would rename the staged "clip_origins.npy.part".
+        # A file object stops np.save appending ".npy" to the staged name.
         with open(staged.path(ORIGINS_FILE), "wb") as fh:
             np.save(fh, origins)
 
@@ -513,13 +418,9 @@ def write_clip_cache(
         )
     except OSError as exc:
         staged.discard()
-        # EINVAL here almost always means "something has this file mapped".
         raise OSError(
-            f"could not write the clip cache in {out_dir}: {exc}\n"
-            "On Windows a memory-mapped file cannot be overwritten, so this "
-            "usually means something still has the cache open - another "
-            "trackanno window, a notebook, or a file browser preview. Close it "
-            "and run again."
+            f"could not write the clip cache in {out_dir} ({exc}); close any other "
+            "program that has it open and run again"
         ) from exc
 
     # frame -> [(row, spec), ...]
@@ -550,12 +451,7 @@ def write_clip_cache(
         cache.flush()
         del cache
     except BaseException:
-        # Cancelled, killed, or the share went away: discard the staged files.
-        # Rebinding rather than `del`, which is what this used to do: on the
-        # happy path `cache` is deleted before the flushes that can fail, so an
-        # unconditional `del` raises NameError over the real error and skips the
-        # discard. Windows cannot unlink a mapped file, so the references do
-        # have to go before `staged.discard()`.
+        # Release the memmap (Windows cannot unlink a mapped file), then discard.
         cache = None  # noqa: F841 - releases the memmap for discard()
         staged.discard()
         raise
@@ -565,19 +461,14 @@ def write_clip_cache(
 
 
 class StagedWrite:
-    """Write beside the real names, then rename everything into place at once.
-
-    ``os.replace`` is atomic per file, not across files. The live header goes
-    first and comes back last, so a crash between renames leaves no cache.json
-    and ``ClipStore`` refuses the movie.
-    """
+    """Write files beside their real names, then rename them in, header last."""
 
     SUFFIX = ".part"
 
     def __init__(self, out_dir: Path):
         self.out_dir = Path(out_dir)
         self._names: list[str] = []
-        # A previous crash may have left staged files behind.
+        # Remove leftovers from a crashed run.
         for leftover in self.out_dir.glob(f"*{self.SUFFIX}"):
             leftover.unlink(missing_ok=True)
 
@@ -627,18 +518,13 @@ def specs_to_frame(specs: list[ClipSpec]) -> pd.DataFrame:
 # cache reading
 # --------------------------------------------------------------------------- #
 class ClipStore:
-    """Read-only view over every prepared movie's clip cache.
-
-    One flat, deterministically ordered index across all movies. The GUI
-    addresses clips by that index; ``clip_id`` stays the stable CSV key, so
-    re-preparing a movie never corrupts existing labels.
-    """
+    """Read-only view over every prepared movie's clip cache, as one ordered index."""
 
     def __init__(self, work_dir: Path):
         self.work_dir = Path(work_dir)
         if not self.work_dir.exists():
             raise FileNotFoundError(
-                f"clip cache not found: {self.work_dir}\nRun `trackanno prepare` first."
+                f"clip cache not found: {self.work_dir}; run `trackanno prepare` first"
             )
 
         manifests, boxes, self._headers = [], [], {}
@@ -652,13 +538,10 @@ class ClipStore:
                 continue
             reason = self._inconsistent(movie_dir, man)
             if reason:
-                # Refuse rather than mis-associate: a manifest that disagrees with
-                # its cache pairs each row with another clip's pixels, which looks
-                # completely normal while you label it.
+                # A mismatched manifest would pair rows with the wrong pixels.
                 self.incomplete[movie_dir.name] = reason
                 warnings.warn(
-                    f"{movie_dir.name}: {reason}. Skipping it; re-run detection "
-                    "for this movie with 'redo' ticked.",
+                    f"{movie_dir.name}: {reason}; skipped, prepare it again with redo",
                     stacklevel=2,
                 )
                 continue
@@ -676,7 +559,7 @@ class ClipStore:
 
         if not manifests:
             raise FileNotFoundError(
-                f"no prepared clips under {self.work_dir}\nRun `trackanno prepare` first."
+                f"no prepared clips under {self.work_dir}; run `trackanno prepare` first"
             )
 
         self.manifest = (
@@ -695,11 +578,7 @@ class ClipStore:
 
     @staticmethod
     def _inconsistent(movie_dir: Path, manifest: pd.DataFrame) -> str:
-        """Why this movie's cache cannot be trusted, or "" if it can.
-
-        Manifest, cache header and file size record the same shape
-        independently, so disagreement means they came from different runs.
-        """
+        """Why manifest, header and cache size disagree, or "" if they match."""
         header_path = movie_dir / HEADER_FILE
         if not header_path.exists():
             return "cache.json is missing"
@@ -748,8 +627,7 @@ class ClipStore:
     # -- pixels -------------------------------------------------------------- #
     def _memmap(self, movie_id: str) -> np.memmap:
         if self._closed:
-            # Otherwise a late prefetch re-creates the mapping the caller just
-            # released, re-locking the file.
+            # A late prefetch must not re-map a released file.
             raise RuntimeError("this clip cache has been closed")
         mm = self._mm.get(movie_id)
         if mm is None:
@@ -764,7 +642,7 @@ class ClipStore:
         return mm
 
     def clip(self, index: int) -> np.ndarray:
-        """(T, S, S) uint8 - one contiguous read from the cache."""
+        """(T, S, S) uint8, one contiguous read from the cache."""
         m = self.meta(index)
         return np.asarray(self._memmap(m["movie_id"])[int(m["row"])])
 
@@ -775,11 +653,7 @@ class ClipStore:
         _ = int(arr[0, 0, 0]) + int(arr[-1, -1, -1])
 
     def origins(self, index: int) -> np.ndarray | None:
-        """(T, 2) top-left corners in ORIGINAL pixel coords, one per frame.
-
-        The crop follows the track: a cached pixel maps back as
-        ``origins[t] + cache_xy / scale``. crop_x0/y0 is only the f_start value.
-        """
+        """(T, 2) crop corners in original pixels; cache pixel xy maps to ``origins[t] + xy / scale``."""
         m = self.meta(index)
         movie_id = str(m["movie_id"])
         if movie_id not in self._origins:
@@ -789,12 +663,7 @@ class ClipStore:
         return None if arr is None else np.asarray(arr[int(m["row"])])
 
     def close(self) -> None:
-        """Release every memory map this store holds.
-
-        Windows will not let a mapped file be overwritten, so the GUI must call
-        this before running detection; otherwise re-preparing a movie whose cache
-        is open fails with ``OSError: [Errno 22] Invalid argument``.
-        """
+        """Release every memory map, so the cache can be rewritten (required on Windows)."""
         self._closed = True
         for holder in (self._mm, self._origins):
             for key in list(holder):

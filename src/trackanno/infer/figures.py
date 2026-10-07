@@ -1,8 +1,6 @@
-"""Figures over a transitions report, decoded bouts, and dense features.
+"""Figures over a transitions report, decoded bouts and dense features, for the analysis notebook.
 
-The downstream-analysis notebook binds its knobs and palette here; every
-function takes plain data plus a palette and returns the matplotlib figure.
-Style (fonts, grid, spines) is inherited from the caller's rcParams.
+Each function takes plain data and a palette and returns a matplotlib figure in the caller's style.
 """
 
 from __future__ import annotations
@@ -23,11 +21,7 @@ GREY = "#c8c8c8"
 
 
 def _pyplot():
-    """matplotlib, imported here because it is a dependency of the drawing only.
-
-    Agg is forced only while pyplot is not yet imported, so a headless run gets
-    a writable backend and a notebook that already chose one keeps it.
-    """
+    """pyplot, with Agg selected unless a backend is already in use."""
     try:
         import matplotlib
         if "matplotlib.pyplot" not in sys.modules:
@@ -156,8 +150,7 @@ def survival(markov: dict, palette: dict, *, group: str = ""):
     for k, name in enumerate(classes):
         ax = axes[k // cols][k % cols]
         s = markov["survival"][name]
-        # One mask for all three. Filtering each list on its own Nones shifts
-        # them against each other, and a KM point is (t, p) or nothing.
+        # One mask for all three lists, so they stay aligned.
         raw_t, raw_p, raw_f = s["t"], s["p"], s["fit"]
         keep = [i for i, (a, b) in enumerate(zip(raw_t, raw_p))
                 if a is not None and b is not None]
@@ -411,8 +404,7 @@ def phase_cycles(results: dict, classes: list, flag_chain: list, *,
     x0, y0 = pts.min(0)
     x1, y1 = pts.max(0)
     w = max(x1 - x0, 1.0)
-    # The cycle is long and flat; a panel squashed to the data strip has no
-    # room for its own labels, so the height gets a floor.
+    # Height floor so a flat cycle still leaves room for labels.
     h = max(y1 - y0, 0.35 * w, 1.0)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     xlim = xlim or (cx - 0.58 * w, cx + 0.58 * w)

@@ -30,8 +30,7 @@ class ProjectPage(Page):
         open_btn.clicked.connect(self._open_project)
         self.template_btn = QPushButton("Save as template...")
         self.template_btn.setToolTip(
-            "Keep this project's settings, minus its paths, to start the next "
-            "project from."
+            "Save this project's settings, without its paths, for new projects."
         )
         self.template_btn.clicked.connect(self._save_template)
         self.template_btn.setEnabled(False)
@@ -89,24 +88,15 @@ class ProjectPage(Page):
             "Pick the folder to work in.",
             help="""
 <p>A <b>project</b> is a folder holding <b>config.yaml</b>, <b>work/</b> (the
-clip cache) and <b>annotations.csv</b>. This window operates on the open one.</p>
+clip cache) and <b>annotations.csv</b>.</p>
 
-<p><i>New project</i> writes a fully commented config.yaml with the paths
-filled in.</p>
+<p><b>Presets</b> under <b>start from</b>: <b>annotator</b> (label by hand from a
+box detector), <b>suggester</b> (pose weights plus a trained classifier) and
+<b>dense bouts</b> (score every frame and review bouts).</p>
 
-<p><b>Presets.</b> <b>start from</b> in <i>New project</i> offers three shipped
-settings, a ladder: <b>annotator</b> labels clips by hand from a box detector,
-<b>suggester</b> moves to pose weights and trains a classifier on those labels,
-<b>dense bouts</b> scores every frame and cuts it into bouts to review. Each step
-up is a handful of settings the Configure page can also set by hand.</p>
-
-<p><b>Templates.</b> <i>Save as template</i> stores the open project's settings
-under a name, and <i>New project</i> offers them under <b>start from</b> beside
-the presets.</p>
-
-<p>A template is a whole config.yaml, comments included, kept outside any
-project. It carries every setting except video_dir, work_dir and csv, which
-describe one project on one disk and are reset.</p>
+<p><b>Templates</b>: <i>Save as template</i> stores this project's config.yaml
+without video_dir, work_dir and csv, and <i>New project</i> offers it under
+<b>start from</b>.</p>
 """,
         ))
         layout.addLayout(buttons)
@@ -122,7 +112,7 @@ describe one project on one disk and are reset.</p>
             item.setData(Qt.UserRole, str(path))
             self.recent.addItem(item)
         if self.recent.count() == 0:
-            self.recent.addItem("nothing yet - create or open a project above")
+            self.recent.addItem("nothing yet: create or open a project above")
 
     def _open_recent(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.UserRole)
@@ -150,17 +140,14 @@ describe one project on one disk and are reset.</p>
             entry = dialog.chosen_model()
             if entry is None:
                 self.status_message.emit(
-                    "project created - check the settings, then run detection", 8000
+                    "project created: check the settings, then run detection", 8000
                 )
                 return
-            # The download is the slow half and the project is already on disk,
-            # so it runs in the background against the config just written. Its
-            # own reporting takes over from here, including what the manifest
-            # decided about this project.
+            # Download in the background into the config just written.
             _install_shared_model(self, entry, path)
 
     def _save_template(self) -> None:
-        """Store the open project's settings for the next project to start from."""
+        """Save the open project's settings as a named template."""
         from ...templates import find_template, save_template
 
         if self.cfg is None:
@@ -186,22 +173,20 @@ describe one project on one disk and are reset.</p>
             QMessageBox.warning(self, "Save as template", str(exc))
             return
         self.status_message.emit(
-            f"saved template {template.name!r} - New project can start from it", 8000
+            f"saved template {template.name!r}", 8000
         )
 
     def _go_next(self) -> None:
         self.hub.go_to(self._next_page)
 
     def refresh_gate(self) -> None:
-        # Cheap: repaint counts and advice from hub.status, no recents rebuild.
+        # Cheap repaint from hub.status.
         if self.cfg is None or self.hub.status is None:
             return
         self._paint_summary()
 
     # -- display ------------------------------------------------------------ #
     def on_project(self) -> None:
-        # Saving a template needs a config, nothing more: it copies the file and
-        # does not care whether anything has been prepared or annotated.
         self.template_btn.setEnabled(self.cfg is not None)
         self.refresh_recent()
         self._paint_summary()
@@ -243,7 +228,7 @@ describe one project on one disk and are reset.</p>
 
 
 class NewProjectDialog(QDialog):
-    """Deliberately a plain form: a project is a name and three paths."""
+    """Name, location, template, video folder and detection model for a new project."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -255,16 +240,11 @@ class NewProjectDialog(QDialog):
         self.videos = _Browse("dir", "")
         self.model = _Browse("file", "", "PyTorch weights (*.pt);;All files (*)")
 
-        # Most people do not have a .pt yet, which is the whole reason the
-        # registry exists; offering it only after the project is made sends them
-        # to the Configure page for the one setting they came here without.
         self._entry = None
         self.registry_btn = QPushButton("Choose shared model...")
         self.registry_btn.setProperty("accent", "true")
         self.registry_btn.setToolTip(
-            "Download a model from the shared registry. It is fetched once the "
-            "project is created, cached for later, and fills in the settings it "
-            "was trained with. Browse instead for a .pt already on this machine."
+            "Download a model and its settings from the shared registry after the project is created."
         )
         self.registry_btn.clicked.connect(self._pick_shared_model)
         self.model.layout().insertWidget(1, self.registry_btn)
@@ -296,21 +276,12 @@ class NewProjectDialog(QDialog):
         form.addRow(self.model_note)
 
         note = QLabel(
-            "Everything else comes from the template, and can be changed later "
-            "on the Configure page."
+            "Everything else comes from the template and can be changed on the "
+            "Configure page."
         )
         note.setWordWrap(True)
         note.setProperty("role", "muted")
-        note.setToolTip(
-            "The clip cache and annotations.csv are created inside the project "
-            "folder.\n\n"
-            "The presets are a ladder: annotator labels by hand from a box "
-            "detector, suggester wants pose weights and trains a classifier, "
-            "dense bouts scores every frame. Start low, and climb from Configure.\n\n"
-            "'Save as template' on the Project page makes one from a project "
-            "you have already tuned.\n\n"
-            "None of it is final: every setting is on the Configure page."
-        )
+        note.setToolTip("The clip cache and annotations.csv go inside the project folder.")
 
         ok = QPushButton("Create")
         ok.setDefault(True)
@@ -328,7 +299,7 @@ class NewProjectDialog(QDialog):
         layout.addLayout(buttons)
 
     def _accept(self) -> None:
-        """Refuse what cannot work; warn about what merely will not work yet."""
+        """Refuse a missing name or existing project; ask about missing paths."""
         if not self.name.text().strip():
             QMessageBox.warning(self, "New project", "Give the project a name.")
             return
@@ -339,8 +310,7 @@ class NewProjectDialog(QDialog):
         if _exists(target / CONFIG_NAME):
             QMessageBox.warning(
                 self, "New project",
-                f"There is already a project in\n{target}\n\nOpen it instead, or "
-                "pick a different name.",
+                f"A project already exists in {target}. Open it or pick another name.",
             )
             return
 
@@ -348,19 +318,18 @@ class NewProjectDialog(QDialog):
         if not self.videos.value():
             missing.append("no movie folder chosen")
         elif not _exists(Path(self.videos.value()), "dir"):
-            missing.append(f"the movie folder does not exist:\n    {self.videos.value()}")
+            missing.append(f"movie folder not found: {self.videos.value()}")
         if self._entry is not None:
-            pass          # a shared model is chosen, and fetched after creation
+            pass          # fetched after creation
         elif not self.model.value():
             missing.append("no detection model chosen")
         elif not _exists(Path(self.model.value()), "file"):
-            missing.append(f"the model file does not exist:\n    {self.model.value()}")
+            missing.append(f"model file not found: {self.model.value()}")
         if missing:
             answer = QMessageBox.question(
                 self, "Create anyway?",
-                "The project will be created, but detection (step 3) cannot run until "
-                "this is sorted:\n\n- " + "\n- ".join(missing)
-                + "\n\nYou can set both on the Configure page. Create it anyway?",
+                "Detection cannot run until this is fixed on the Configure page:\n\n- "
+                + "\n- ".join(missing) + "\n\nCreate the project anyway?",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
@@ -368,7 +337,7 @@ class NewProjectDialog(QDialog):
         self.accept()
 
     def run(self) -> bool:
-        """Qt5 spells it exec_, Qt6 exec; qtpy does not alias it on QDialog."""
+        """Run the dialog modally (exec_ on Qt5, exec on Qt6)."""
         runner = getattr(self, "exec_", None) or self.exec
         return bool(runner())
 
@@ -390,7 +359,7 @@ class NewProjectDialog(QDialog):
         self.template.currentIndexChanged.connect(self._sync_selection)
 
     def _sync_selection(self) -> None:
-        """A preset says what it is under the picker, and cannot be forgotten."""
+        """Show the template summary; only saved templates can be forgotten."""
         from ...templates import find_template
 
         template = find_template(self.template.currentData())
@@ -411,11 +380,7 @@ class NewProjectDialog(QDialog):
             self._fill_templates()
 
     def _pick_shared_model(self) -> None:
-        """Choose registry weights now; they are fetched once the project exists.
-
-        Nothing is downloaded here. This dialog can still be cancelled, and a
-        cancelled dialog that had already put 200 MB in the cache is a surprise.
-        """
+        """Choose registry weights; they are downloaded after the project is created."""
         dialog = ModelRegistryDialog(self)
         if not dialog.run():
             return
@@ -426,25 +391,20 @@ class NewProjectDialog(QDialog):
         self.model.edit.setText("")
         self.model.edit.setEnabled(False)
         self.model_note.setText(
-            f"will download <b>{entry.label}</b> when the project is created, and "
-            "take the settings it was trained with. The path above is not used."
+            f"<b>{entry.label}</b> and its settings will be downloaded when the "
+            "project is created; the path above is not used."
         )
         self.model_note.setVisible(True)
 
     def _drop_shared_model(self, _path: str = "") -> None:
-        """Browsing to a .pt means run THAT file, shared model or not."""
+        """A browsed .pt replaces the chosen shared model."""
         self._entry = None
         self.model.edit.setEnabled(True)
         self.model_note.clear()
         self.model_note.setVisible(False)
 
     def chosen_model(self):
-        """The registry entry to fetch after the project is written, or None.
-
-        Kept out of :meth:`values`, which goes straight to ``create_project``: a
-        project is created from paths, and weights that are not on this disk yet
-        are not one.
-        """
+        """The registry entry to fetch after the project is created, or None."""
         return self._entry
 
     def values(self) -> dict:
@@ -458,8 +418,7 @@ class NewProjectDialog(QDialog):
 
 
 class _Browse(QWidget):
-    # Picking a file is not the same event as the text changing: it is the one
-    # that means "run THIS file", and a shared model has to give way to it.
+    # Emitted on Browse only, not on typing.
     picked = Signal(str)
 
     def __init__(self, kind: str, initial: str = "", filter_: str = "All files (*)"):

@@ -1,11 +1,6 @@
-"""Long jobs on a worker thread, with a panel to watch and stop them.
+"""Long jobs on a worker thread, and the panel that shows and cancels them.
 
-Detection takes minutes to hours, so it cannot run on the UI thread.
-:class:`TaskRunner` is a ``QThread`` that hands the job a
-:class:`~trackanno.progress.CallbackReporter` whose callbacks emit signals;
-never touch a widget from the worker thread, since a queued signal is the only
-safe route. :class:`TaskPanel` renders those signals - stage, progress, an
-overall bar across movies, a log - for every long-running page in the hub.
+The worker reports through signals only; it never touches a widget.
 """
 
 from __future__ import annotations
@@ -119,25 +114,17 @@ class TaskPanel(QWidget):
         return self._runner is not None and self._runner.isRunning()
 
     def set_run_label(self, text: str) -> None:
-        """Rename the run button. Also the label restored when a run finishes,
-        which is why it cannot just be `run_button.setText`."""
+        """Rename the run button, including the label restored after a run."""
         self._run_label = text
         if not self.busy:
             self.run_button.setText(text)
 
     def set_work(self, build_work: Callable | None) -> None:
-        """``build_work()`` returns the ``work(reporter)`` callable, or None to
-        refuse the run (after the page has explained why)."""
+        """``build_work()`` returns ``work(reporter)``, or None to refuse the run."""
         self._build_work = build_work
 
     def append(self, message: str, level: str = "info") -> None:
-        """One message in its level's colour, and nothing else in that colour.
-
-        red = failed, amber = carried on but worth knowing, green = finished,
-        plain = ordinary progress. Written through an explicit character format,
-        because appendHtml and appendPlainText take theirs from the visible
-        cursor and so carry a colour forward.
-        """
+        """Append one message in its level's colour (error, warning, good or plain)."""
         palette = tokens()
         colour = {"error": palette["danger"], "warning": palette["warning"],
                   "good": palette["success"]}.get(level)
@@ -146,14 +133,11 @@ class TaskPanel(QWidget):
         cursor.movePosition(QTextCursor.End)
         if not document.isEmpty():
             cursor.insertBlock()
-        # Set, not merge: an empty format is what puts an ordinary line back to
-        # the widget's own colour after a coloured one.
+        # Set, not merge, so colour does not carry over to the next line.
         fmt = QTextCharFormat()
         if colour:
             fmt.setForeground(QColor(colour))
         cursor.setCharFormat(fmt)
-        # Newlines inside the message become blocks of their own, each carrying
-        # this format, so a traceback is red the whole way down.
         cursor.insertText(message)
         self.log.moveCursor(QTextCursor.End)
 
@@ -173,8 +157,7 @@ class TaskPanel(QWidget):
         runner.overall.connect(self._on_overall)
         runner.succeeded.connect(lambda _r: self._on_done(True, "finished"))
         runner.failed.connect(lambda message: self._on_done(False, message))
-        # Amber and not red: stopping a job is something the user did, not
-        # something that went wrong.
+        # Cancelling is a warning, not an error.
         runner.was_cancelled.connect(
             lambda: self._on_done(False, "cancelled", "warning"))
         self._runner = runner
@@ -228,12 +211,10 @@ class TaskPanel(QWidget):
         self.finished.emit(ok)
 
     def shutdown(self, timeout: int = 5000) -> bool:
-        """Ask a running job to stop and wait. Returns False if it is still going.
+        """Stop a running job and wait; False if it is still running.
 
-        A job's prologue is not always interruptible - importing torch has no
-        cancellation point - and destroying a live QThread aborts during
-        teardown. If it will not stop, cut it loose: reparent to the application
-        and let it delete itself when it finishes."""
+        A job that will not stop is reparented to the application to finish on its own.
+        """
         runner = self._runner
         if runner is None:
             return True

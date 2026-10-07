@@ -34,7 +34,6 @@ def count_orphans(csv_path: Path, work_dir: Path) -> int:
         for path in sorted(work_dir.glob(f"*/{MANIFEST_FILE}")):
             known.update(pd.read_parquet(path, columns=["clip_id"])["clip_id"].astype(str))
     except Exception as exc:
-        # A bad CSV or manifest is not worth taking the page down for.
         print(f"[trackanno] could not check the label links: {exc}")
         return 0
     return int((~labels.isin(known)).sum()) if known else 0
@@ -63,35 +62,29 @@ class ModelPage(Page):
         self.tasks.set_work(self._build_work)
         self.tasks.finished.connect(self._on_finished)
 
-        # Re-running detection renumbers tracks, so older clip_ids stop resolving
-        # and those labels drop silently out of the fit.
+        # Labels whose clip_id no longer resolves (e.g. after re-detection).
         self._orphans = 0
         self.repair_note = _muted(QLabel(""))
         self.repair_note.setWordWrap(True)
         self.repair_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        # Labelling everything shares the task panel below; only the gate differs.
+        # Training and predicting share the task panel.
         self._job = "train"
         self._predict_blocker = "no project open"
         self._predict_state = "no project open"
         self._predict_summary = ""
-        # The plan the config resolves to, stated before the run. Built on a
-        # worker: it reads tracks.parquet per movie.
+        # Prediction plan summary, built off-thread.
         self._plan_line = ""
         self.predict_button = QPushButton("Label all clips with the model")
         self.predict_button.setEnabled(False)
         self.predict_button.setToolTip(
-            "Score every clip with the trained model and write predictions.parquet. "
-            "Your annotation CSV is never written to."
+            "Score every clip and write predictions.parquet (the annotation CSV is untouched)."
         )
         self.predict_button.clicked.connect(self._label_all)
         self.predict_note = _muted(QLabel(""))
         self.predict_note.setWordWrap(True)
         self.predict_note.setToolTip(
-            "What the settings on the Configure page resolve to: how long each "
-            "prediction window is, how far apart the windows start, how many of "
-            "them speak for one frame, and how many there are in this project. "
-            "Halving predict.window_stride roughly doubles that count."
+            "Window length, stride and count under the current settings."
         )
 
         self._has_predictions = False
@@ -100,7 +93,6 @@ class ModelPage(Page):
         predict_row.addWidget(self.predict_button)
         predict_row.addWidget(self.predict_note, 1)
 
-        # How the labels are spread, beside what the last fit made of them.
         self.distribution = DistributionView()
         results = QTabWidget()
         results.addTab(self.report, "Last report")
@@ -116,27 +108,21 @@ class ModelPage(Page):
             "Model",
             "Learn from your labels, and label everything with what it learnt.",
             help="""
-<p>Fits a classifier on the labels so far and cross-validates it <b>leaving
-whole movies out</b>, so the score is performance on an unseen movie.</p>
+<p>Fits a classifier on your labels and cross-validates it <b>leaving whole
+movies out</b>, so the score is for an unseen movie.</p>
 
-<p>The suggestion is <b>displayed, never pre-selected</b>, and stays silent
-unless agreement beats chance by a bootstrapped margin. The gate is Cohen's
-kappa: accuracy rejects an informative model sitting below the majority rate,
-and accepts a near-degenerate one that clears it by luck.</p>
+<p>The suggestion is <b>shown, never pre-selected</b>, and only when Cohen's
+kappa beats chance by a bootstrapped margin.</p>
 
-<p>About a tenth of clips are held out of the suggestion loop entirely, never
-trained on and never carrying a suggestion. Your agreement with the model on
-<i>those</i> is the honest measure.</p>
+<p>About a tenth of clips are an audit holdout: never trained on, never
+suggested. Agreement on those is the honest measure.</p>
 
-<p><b>Label distribution</b> shows how the labels are spread. It flags values
-with nothing labelled yet; values below <b>suggest.min_per_class</b>, dropped at
-training time; values appearing in only one movie, which grouped
-cross-validation cannot hold out; values in the CSV but no longer in the config;
-and any value over 90% of the labels, where a constant predictor scores well.</p>
+<p><b>Label distribution</b> flags values with no labels, values below
+<b>suggest.min_per_class</b>, values in only one movie, values no longer in the
+config, and any value over 90% of the labels.</p>
 
-<p><b>Label every clip</b> writes predictions.parquet, read by the Review and
-Export pages. It never writes to your annotation CSV: a model
-trained on its own output has lost the ground truth.</p>
+<p><b>Label all clips with the model</b> writes predictions.parquet for the
+Review and Export pages. It never writes to your annotation CSV.</p>
 """,
         ))
         layout.addWidget(self.repair_note)
@@ -147,15 +133,14 @@ trained on its own output has lost the ground truth.</p>
         if self.cfg is None or self.hub.status is None:
             return "no project open"
         if self.hub.status.n_annotated < 2:
-            return "nothing labelled yet - annotate some clips first"
+            return "nothing labelled yet: annotate some clips first"
         return ""
 
     def refresh_gate(self) -> None:
-        # Marked stale and rebuilt when shown, not once per annotation.
+        # Rebuilt when shown, not per annotation.
         self.distribution.stale = True
-        # While busy this button IS Cancel, so a refresh must not grey it out.
+        # Busy means this button is Cancel; leave it clickable.
         self.tasks.run_button.setEnabled(self.tasks.busy or not self.blocker())
-        # Cached too: a reliable model appears only when one is trained.
         self.predict_button.setEnabled(not self._predict_blocker and not self.tasks.busy)
 
     def on_project(self) -> None:
@@ -171,9 +156,7 @@ trained on its own output has lost the ground truth.</p>
             self.distribution.reload()
 
     def _refresh_predict_gate(self) -> None:
-        """Re-read whether any group cleared the reliability bar, and re-plan.
-        Only from :meth:`on_project` and when a job finishes - never from
-        :meth:`refresh_gate`, which runs on the annotation keystroke path."""
+        """Re-read the prediction gate and re-plan (not on the per-annotation path)."""
         if self.cfg is None:
             self._predict_blocker = "no project open"
             self._has_predictions = False
@@ -195,7 +178,7 @@ trained on its own output has lost the ground truth.</p>
         self._plan_preview()
 
     def _paint_predict_note(self) -> None:
-        """Where the run stands, then what it would do. Either may be empty."""
+        """Show the prediction state and the plan line."""
         self.predict_note.setText(
             "\n".join(line for line in (self._predict_state, self._plan_line) if line)
         )
@@ -213,8 +196,7 @@ trained on its own output has lost the ground truth.</p>
             reporter.raise_if_cancelled()
             return predict_plan_line(cfg)
 
-        # A previous answer stays up while this one is worked out; only the first
-        # pass has nothing to show.
+        # Keep the previous line up while recomputing.
         if not self._plan_line:
             self._on_plan_line("working out what these settings would do...")
         self.run_bg("plan", work, self._on_plan_line, lambda message: self._on_plan_line(
@@ -225,7 +207,7 @@ trained on its own output has lost the ground truth.</p>
         self._paint_predict_note()
 
     def _count_orphans(self) -> None:
-        """Count, off the UI thread, the labels whose clip_id the cache no longer has."""
+        """Count orphaned labels off the UI thread."""
         if self.cfg is None:
             self._on_orphans(0)
             return
@@ -242,9 +224,8 @@ trained on its own output has lost the ground truth.</p>
 
     def _paint_repair_note(self) -> None:
         self.repair_note.setText(
-            f"{self._orphans} label(s) point at clips that no longer exist and are "
-            f"being ignored by every fit below. Run {self._repair_command()} to "
-            "re-link them." if self._orphans else ""
+            f"{self._orphans} label(s) point at missing clips and are ignored. "
+            f"Run {self._repair_command()} to re-link them." if self._orphans else ""
         )
 
     def _repair_command(self) -> str:
@@ -255,10 +236,7 @@ trained on its own output has lost the ground truth.</p>
 
     # -- labelling everything with the model --------------------------------- #
     def _label_all(self) -> None:
-        """Score every clip with the trained model, off the UI thread.
-
-        Never touches the annotation CSV: predictions land in
-        predictions.parquet, so a hand label stays distinguishable from a guess."""
+        """Score every clip into predictions.parquet, off the UI thread."""
         if self.cfg is None or self.tasks.busy:
             return
         self._refresh_predict_gate()
@@ -275,7 +253,6 @@ trained on its own output has lost the ground truth.</p>
             from ...infer.predict import predict_all, summarise
 
             frame = predict_all(cfg, reporter=reporter)
-            # Stashed for the status bar; the full tally is already in the log.
             self._predict_summary = summarise(frame).splitlines()[0]
             return frame
 
@@ -299,26 +276,24 @@ trained on its own output has lost the ground truth.</p>
 
     def _on_finished(self, ok: bool) -> None:
         if self._job == "predict":
-            # Predicting changes no model and no label; only the gates move.
             self._job = "train"
             self._refresh_predict_gate()
             self.hub.reload_project()
             if ok:
                 self.status_message.emit(
-                    f"predictions written - {self._predict_summary}", 12000
+                    f"predictions written: {self._predict_summary}", 12000
                 )
             return
         self._load_report()
         self.hub.reload_project()
         if not ok:
             return
-        # The model is not part of the annotation panel's fingerprint, so
-        # reload_project does not reach it: hand the new model over explicitly.
+        # The model is not in the panel's fingerprint, so hand it over directly.
         annotate = self.hub.page(AnnotatePage)
         panel = getattr(annotate, "panel", None)
         if panel is not None:
             line = panel.reload_suggester()
-            self.status_message.emit(f"model reloaded into the annotator - {line}", 8000)
+            self.status_message.emit(f"model reloaded into the annotator: {line}", 8000)
 
     def shutdown(self) -> None:
         self.tasks.shutdown()
@@ -349,7 +324,7 @@ def _format_report(reports: dict) -> str:
             f"<span style='color:{tokens()['success']};'>suggesting</span>" if live
             else f"<span style='color:{tokens()['warning']};'>staying silent</span>"
         )
-        parts.append(f"<h3>{group} &mdash; {badge}</h3>")
+        parts.append(f"<h3>{group}: {badge}</h3>")
         parts.append(
             f"<p>{rep.get('n_labels', 0)} labels over {rep.get('n_classes', 0)} classes"
             f"<br>{rep.get('scope', '')}"
@@ -362,14 +337,13 @@ def _format_report(reports: dict) -> str:
         if not live:
             parts.append(f"<p><i>{rep.get('reason', '')}</i></p>")
         if rep.get("n_orphaned"):
-            # Loud and in colour: this is data loss, not a modelling result.
             by_class = ", ".join(
                 f"{k} ({v})" for k, v in rep.get("orphaned_by_class", {}).items()
             )
             parts.append(
                 f"<p style='color:{tokens()['warning']};'><b>{rep['n_orphaned']} label(s) "
                 "were ignored</b>: their clips are not in the feature table"
-                + (f" - {by_class}" if by_class else "")
+                + (f" ({by_class})" if by_class else "")
                 + ". Run trackanno repair-links, then retrain.</p>"
             )
         if rep.get("dropped_classes"):
@@ -402,14 +376,7 @@ def _format_report(reports: dict) -> str:
 
 
 def _feature_table(features: list, top: int = 10) -> str:
-    """The columns the fitted model leans on, most first.
-
-    Worth the space on this page: which measurement is carrying a decision is
-    the first thing to look at when two classes keep being confused, and it was
-    only ever printed by the CLI. Bars are drawn relative to the top feature,
-    so a model resting on one column and one resting on thirty look different
-    at a glance rather than after reading fifteen numbers.
-    """
+    """HTML table of the top feature importances, bars scaled to the largest."""
     if not features:
         return ""
     shown = features[:top]

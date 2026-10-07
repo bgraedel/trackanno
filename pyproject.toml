@@ -126,11 +126,7 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-# ---------------------------------------------------------------------------
-# The suites are ordinary pytest modules, but most of a suite's value is in the
-# NAMED claims inside a test (see tests/harness.py), so a run reports checks as
-# well as tests. `-p no:cacheprovider` keeps .pytest_cache out of the tree.
-# ---------------------------------------------------------------------------
+# `-p no:cacheprovider` keeps .pytest_cache out of the tree.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -p no:cacheprovider"
+addopts = "-p no:cacheprovider"

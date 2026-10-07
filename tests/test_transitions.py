@@ -1,22 +1,4 @@
-"""Checks for :mod:`trackanno.infer.transitions`, the bout-to-bout statistics.
-
-Every number below is measured against a PLANTED sequence of bouts, so the
-expected answer is available by counting on your fingers and a disagreement is
-an error in the module rather than a disagreement between two implementations.
-
-Five things are worth testing separately:
-
-* the transition counts are exactly the ones planted, with a denominator beside
-  every probability;
-* a gap, a track boundary and a movie boundary each BREAK a pair rather than
-  joining across it, and each is counted as skipped;
-* a bout that runs to a track end or into a gap does not enter the dwell
-  estimate as if it were complete, and a bout whose start was never seen is
-  dropped;
-* the Kaplan-Meier estimate is the textbook one, and collapses to the sample
-  mean when nothing is censored;
-* a predictions file that does not hold bouts is refused.
-"""
+"""Bout-to-bout statistics, measured against planted bout sequences."""
 
 from __future__ import annotations
 
@@ -24,7 +6,7 @@ import json
 
 import numpy as np
 import pandas as pd
-from harness import check
+import pytest
 from trackanno.infer.transitions import (
     TRANSITIONS_FILE, analyse, compute, exponential_fit, kaplan_meier,
     movie_fps, summarise, write_report,
@@ -39,11 +21,9 @@ TOL = 1e-9
 # --------------------------------------------------------------------------- #
 def plant(spec, *, movie: str = "movie_a", track: int = 0, start: int = 0,
           group: str = GROUP, human=()) -> list[dict]:
-    """``(label, n_frames)`` pairs into gapless bout rows.
+    """``(label, n_frames)`` pairs into gapless bout rows; ``""`` is an unlabelled run.
 
-    ``""`` is a run the decode could not label, which is what a real decode
-    emits for frames no window reached. ``human`` names positions whose bouts
-    overlap hand-labelled frames.
+    ``human`` names positions whose bouts overlap hand-labelled frames.
     """
     rows, f = [], int(start)
     for i, (label, n) in enumerate(spec):
@@ -95,83 +75,49 @@ def test_a_planted_sequence_yields_exactly_the_transitions_planted() -> None:
     report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
-    check("the planted transitions are counted exactly once each",
-          pairs(report) == {("swim", "turn"): 2, ("turn", "swim"): 1,
-                            ("turn", "stop"): 1, ("stop", "swim"): 1},
-          f"got {pairs(report)}")
-    check("every consecutive pair of the one track is considered",
-          t["n_pairs_considered"] == 5, f"got {t['n_pairs_considered']}")
-    check("all five are counted, none skipped",
-          t["n_counted"] == 5 and t["skipped"] == {
-              "gap": 0, "not_adjacent": 0, "human_overlap": 0},
-          f"got {t['n_counted']} counted, skipped {t['skipped']}")
-    check("a row total is the denominator of that row's probabilities",
-          t["row_totals"] == {"stop": 1, "swim": 2, "turn": 2},
-          f"got {t['row_totals']}")
-    check("turn splits evenly between the two states that followed it",
-          abs(t["probabilities"]["turn"]["swim"] - 0.5) < TOL
-          and abs(t["probabilities"]["turn"]["stop"] - 0.5) < TOL)
-    check("swim only ever went to turn, at probability 1",
-          t["probabilities"]["swim"] == {"turn": 1.0},
-          f"got {t['probabilities']['swim']}")
-    check("every row of probabilities sums to 1",
-          all(abs(sum(row.values()) - 1.0) < TOL
-              for row in t["probabilities"].values()))
-    check("the diagonal is empty, because a decode emits maximal runs",
-          all(a != b for a, b in pairs(report)))
-    check("the summary states that the diagonal is empty by construction",
-          "diagonal is empty by construction" in t["note"])
+    assert pairs(report) == {("swim", "turn"): 2, ("turn", "swim"): 1,
+                             ("turn", "stop"): 1, ("stop", "swim"): 1}, pairs(report)
+    assert t["n_pairs_considered"] == 5, t["n_pairs_considered"]
+    assert t["n_counted"] == 5, t["n_counted"]
+    assert t["skipped"] == {"gap": 0, "not_adjacent": 0, "human_overlap": 0}, t["skipped"]
+    assert t["row_totals"] == {"stop": 1, "swim": 2, "turn": 2}, t["row_totals"]
+    assert abs(t["probabilities"]["turn"]["swim"] - 0.5) < TOL
+    assert abs(t["probabilities"]["turn"]["stop"] - 0.5) < TOL
+    assert t["probabilities"]["swim"] == {"turn": 1.0}, t["probabilities"]["swim"]
+    assert all(abs(sum(row.values()) - 1.0) < TOL for row in t["probabilities"].values())
+    assert all(a != b for a, b in pairs(report)), "the diagonal is empty for maximal runs"
+    assert "diagonal is empty by construction" in t["note"], t["note"]
 
 
 def test_a_gap_breaks_the_transition_rather_than_joining_across_it() -> None:
-    """A run the decode could not label is not a transition between its neighbours."""
     frame = table(plant([
         ("swim", 20), ("turn", 30), ("", 40), ("stop", 50), ("swim", 60),
     ]))
     report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
-    check("only the two pairs that touch a labelled bout on both sides count",
-          pairs(report) == {("swim", "turn"): 1, ("stop", "swim"): 1},
-          f"got {pairs(report)}")
-    check("turn -> stop is never invented across the gap",
-          ("turn", "stop") not in pairs(report))
-    check("the two pairs the gap sits in are counted as skipped",
-          t["skipped"]["gap"] == 2, f"got {t['skipped']}")
-    check("the skipped pairs are still counted as considered",
-          t["n_pairs_considered"] == 4 and t["n_counted"] == 2,
-          f"got {t['n_pairs_considered']} / {t['n_counted']}")
-    check("the gap bout is reported rather than silently dropped",
-          report["groups"][GROUP]["n_bouts_gap"] == 1)
-    check("the gap is not a class of its own",
-          "" not in report["groups"][GROUP]["classes"])
+    assert pairs(report) == {("swim", "turn"): 1, ("stop", "swim"): 1}, pairs(report)
+    assert t["skipped"]["gap"] == 2, t["skipped"]
+    assert t["n_pairs_considered"] == 4 and t["n_counted"] == 2, (
+        f"{t['n_pairs_considered']} considered, {t['n_counted']} counted")
+    assert report["groups"][GROUP]["n_bouts_gap"] == 1, "the gap bout is reported"
+    assert "" not in report["groups"][GROUP]["classes"], "the gap is not a class"
 
 
 def test_a_track_boundary_and_a_movie_boundary_are_not_transitions() -> None:
     """Contiguous frames across two tracks, and across two movies, join nothing."""
     frame = table(
-        # Track 0 ends at frame 30 and track 1 starts there, so only the track
-        # id separates the last bout of one from the first of the next.
         plant([("turn", 10), ("swim", 20)], track=0, start=0),
         plant([("turn", 30), ("stop", 40)], track=1, start=30),
-        # Same track id, other movie, again picking up where the last left off.
         plant([("turn", 50), ("stop", 60)], movie="movie_b", track=1, start=100),
     )
     report = analyse(frame, fps=100.0, min_bout_frames=12)
     t = report["groups"][GROUP]["transitions"]
 
-    check("the three within-track changes are the only ones counted",
-          pairs(report) == {("turn", "swim"): 1, ("turn", "stop"): 2},
-          f"got {pairs(report)}")
-    check("swim -> turn is never formed across the track boundary",
-          ("swim", "turn") not in pairs(report))
-    check("stop -> turn is never formed across the movie boundary",
-          ("stop", "turn") not in pairs(report))
-    check("a pair is never even considered across a boundary",
-          t["n_pairs_considered"] == 3, f"got {t['n_pairs_considered']}")
-    check("the boundaries that produced no successor are reported",
-          t["n_track_ends"] == 3 and t["n_movie_ends"] == 2,
-          f"got {t['n_track_ends']} track ends over {t['n_movie_ends']} movies")
+    assert pairs(report) == {("turn", "swim"): 1, ("turn", "stop"): 2}, pairs(report)
+    assert t["n_pairs_considered"] == 3, t["n_pairs_considered"]
+    assert t["n_track_ends"] == 3 and t["n_movie_ends"] == 2, (
+        f"{t['n_track_ends']} track ends over {t['n_movie_ends']} movies")
 
 
 def test_excluding_hand_labelled_bouts_breaks_the_pair_it_sits_in() -> None:
@@ -183,66 +129,52 @@ def test_excluding_hand_labelled_bouts_breaks_the_pair_it_sits_in() -> None:
     dropped = analyse(frame, fps=100.0, min_bout_frames=12,
                       exclude_human_overlap=True)
 
-    check("with the hand-labelled bout kept, both changes are counted",
-          pairs(kept) == {("swim", "turn"): 1, ("turn", "stop"): 1},
-          f"got {pairs(kept)}")
-    check("excluding it counts no transitions at all",
-          pairs(dropped) == {}, f"got {pairs(dropped)}")
-    check("swim -> stop is never invented over the excluded bout",
-          ("swim", "stop") not in pairs(dropped))
-    check("the excluded pairs are counted under their own reason",
-          dropped["groups"][GROUP]["transitions"]["skipped"]["human_overlap"] == 2,
-          f"got {dropped['groups'][GROUP]['transitions']['skipped']}")
-    check("both counts are reported either way",
-          kept["groups"][GROUP]["n_bouts_human_overlap"] == 1
-          and kept["groups"][GROUP]["n_bouts_used"] == 3
-          and dropped["groups"][GROUP]["n_bouts_human_overlap"] == 1
-          and dropped["groups"][GROUP]["n_bouts_used"] == 2)
-    check("the option taken is recorded in the report",
-          dropped["options"]["exclude_human_overlap"] is True
-          and kept["options"]["exclude_human_overlap"] is False)
+    assert pairs(kept) == {("swim", "turn"): 1, ("turn", "stop"): 1}, pairs(kept)
+    assert pairs(dropped) == {}, pairs(dropped)
+    assert dropped["groups"][GROUP]["transitions"]["skipped"]["human_overlap"] == 2, (
+        dropped["groups"][GROUP]["transitions"]["skipped"])
+    assert kept["groups"][GROUP]["n_bouts_human_overlap"] == 1
+    assert kept["groups"][GROUP]["n_bouts_used"] == 3
+    assert dropped["groups"][GROUP]["n_bouts_human_overlap"] == 1
+    assert dropped["groups"][GROUP]["n_bouts_used"] == 2
+    assert dropped["options"]["exclude_human_overlap"] is True
+    assert kept["options"]["exclude_human_overlap"] is False
 
 
 # --------------------------------------------------------------------------- #
 # dwell times and censoring
 # --------------------------------------------------------------------------- #
 def test_a_track_final_bout_does_not_enter_the_dwell_estimate_as_if_complete() -> None:
-    """Six bouts: one starts unseen, one ends unseen, four are whole.
+    """``turn`` has complete bouts of 20 and 300 and a censored final 200.
 
-    ``turn`` has complete bouts of 20 and 300 frames and a track-final one of
-    200. Three means separate the treatments: 160 counts only the complete
-    ones, 173.33 would count the censored one as if it had ended, and the
-    Kaplan-Meier estimate is 206.67.
+    Complete-case mean 160, naive mean 173.33, Kaplan-Meier 206.67.
     """
     frame = table(plant([
         ("swim", 10), ("turn", 20), ("swim", 30),
         ("turn", 300), ("swim", 40), ("turn", 200),
     ]))
     report = analyse(frame, fps=100.0, min_bout_frames=12)
-    turn, swim = dwell(report, "turn"), dwell(report, "swim")
+    turn = dwell(report, "turn")
 
-    check("the track-final bout is counted as censored, not as complete",
-          turn["n_complete"] == 2 and turn["n_right_censored"] == 1,
-          f"got {turn['n_complete']} complete, {turn['n_right_censored']} censored")
-    check("the complete-case mean is over the complete bouts alone",
-          abs(turn["frames"]["mean"] - 160.0) < TOL, f"got {turn['frames']['mean']}")
-    check("the censored bout is not averaged in as if it had ended",
-          abs(turn["frames"]["mean"] - 500.0 / 3.0) > 1.0)
-    check("Kaplan-Meier folds the censored bout in as a lower bound",
-          abs(turn["km_frames"]["restricted_mean"] - 620.0 / 3.0) < 1e-6,
-          f"got {turn['km_frames']['restricted_mean']}")
-    check("the censoring-aware mean exceeds the complete-case one here",
-          turn["km_frames"]["restricted_mean"] > turn["frames"]["mean"])
-    check("the Kaplan-Meier population is the complete plus the censored",
-          turn["km_frames"]["n"] == 3 and turn["km_frames"]["n_events"] == 2
-          and turn["km_frames"]["n_censored"] == 1)
-    check("a bout whose start was never seen is dropped and counted",
-          swim["n_left_open_dropped"] == 1 and swim["n_complete"] == 2,
-          f"got {swim['n_left_open_dropped']} dropped, {swim['n_complete']} complete")
-    check("the track-start bout is not in the complete-case mean either",
-          abs(swim["frames"]["mean"] - 35.0) < TOL, f"got {swim['frames']['mean']}")
-    check("seconds come from the frame rate beside the frames",
-          abs(turn["seconds"]["mean"] - 1.6) < TOL, f"got {turn['seconds']['mean']}")
+    assert turn["n_complete"] == 2 and turn["n_right_censored"] == 1, (
+        f"{turn['n_complete']} complete, {turn['n_right_censored']} censored")
+    assert abs(turn["frames"]["mean"] - 160.0) < TOL, turn["frames"]["mean"]
+    assert abs(turn["km_frames"]["restricted_mean"] - 620.0 / 3.0) < 1e-6, (
+        turn["km_frames"]["restricted_mean"])
+    assert (turn["km_frames"]["n"] == 3 and turn["km_frames"]["n_events"] == 2
+            and turn["km_frames"]["n_censored"] == 1), turn["km_frames"]
+    assert abs(turn["seconds"]["mean"] - 1.6) < TOL, turn["seconds"]["mean"]
+
+
+def test_a_bout_whose_start_was_never_seen_is_dropped() -> None:
+    frame = table(plant([
+        ("swim", 10), ("turn", 20), ("swim", 30),
+        ("turn", 300), ("swim", 40), ("turn", 200),
+    ]))
+    swim = dwell(analyse(frame, fps=100.0, min_bout_frames=12), "swim")
+    assert swim["n_left_open_dropped"] == 1 and swim["n_complete"] == 2, (
+        f"{swim['n_left_open_dropped']} dropped, {swim['n_complete']} complete")
+    assert abs(swim["frames"]["mean"] - 35.0) < TOL, swim["frames"]["mean"]
 
 
 def test_a_gap_censors_the_bouts_on_either_side_of_it() -> None:
@@ -252,205 +184,173 @@ def test_a_gap_censors_the_bouts_on_either_side_of_it() -> None:
     ]))
     report = analyse(frame, fps=100.0, min_bout_frames=12)
 
-    check("the bout that runs into the gap is right-censored, not complete",
-          dwell(report, "turn")["n_right_censored"] == 1
-          and dwell(report, "turn")["n_complete"] == 0)
-    check("the bout that comes out of the gap has an unseen start and is dropped",
-          dwell(report, "stop")["n_left_open_dropped"] == 1
-          and dwell(report, "stop")["n_complete"] == 0)
-    check("no class claims a complete bout in this track",
-          all(dwell(report, name)["n_complete"] == 0
-              for name in report["groups"][GROUP]["classes"]))
+    assert dwell(report, "turn")["n_right_censored"] == 1
+    assert dwell(report, "turn")["n_complete"] == 0
+    assert dwell(report, "stop")["n_left_open_dropped"] == 1
+    assert dwell(report, "stop")["n_complete"] == 0
+    assert all(dwell(report, name)["n_complete"] == 0
+               for name in report["groups"][GROUP]["classes"])
 
 
 def test_the_floor_the_decode_imposes_is_in_the_output() -> None:
-    """The shortest possible bout is a setting, and the report says so."""
     frame = table(plant([("swim", 20), ("turn", 30), ("swim", 40)]))
     floored = analyse(frame, fps=100.0, min_bout_frames=12)
+
+    assert floored["groups"][GROUP]["dwell"]["floor_frames"] == 12
+    assert ("predict.min_bout_frames: 12"
+            in floored["groups"][GROUP]["dwell"]["floor_source"])
+    assert any("min_bout_frames: 12" in c for c in floored["caveats"]), floored["caveats"]
+    assert "shortest possible bout 12 frame(s)" in summarise(floored)
+    assert dwell(floored, "swim")["observed_min_frames"] == 20.0, (
+        "the observed shortest bout is reported beside the floor")
+
+
+def test_no_floor_is_declared_without_one() -> None:
+    frame = table(plant([("swim", 20), ("turn", 30), ("swim", 40)]))
     free = analyse(frame, fps=100.0, min_bout_frames=0)
-
-    check("min_bout reports its floor as a number, not only as prose",
-          floored["groups"][GROUP]["dwell"]["floor_frames"] == 12)
-    check("the setting that set the floor is named in the report",
-          "predict.min_bout_frames: 12"
-          in floored["groups"][GROUP]["dwell"]["floor_source"])
-    check("the floor is a caveat on the whole report, not only on one group",
-          any("min_bout_frames: 12" in c for c in floored["caveats"]),
-          f"got {floored['caveats']}")
-    check("the floor reaches the printed summary",
-          "shortest possible bout 12 frame(s)" in summarise(floored))
-    check("without a decode there is no floor to declare",
-          free["groups"][GROUP]["dwell"]["floor_frames"] == 1
-          and "No hard floor" in free["groups"][GROUP]["dwell"]["floor_source"])
-    check("the observed shortest bout is reported beside the settable floor",
-          dwell(floored, "swim")["observed_min_frames"] == 20.0)
+    assert free["groups"][GROUP]["dwell"]["floor_frames"] == 1
+    assert "No hard floor" in free["groups"][GROUP]["dwell"]["floor_source"]
 
 
-def test_kaplan_meier_is_the_textbook_estimate() -> None:
-    """Hand-computed curves, and the uncensored case that must be the mean."""
+# --------------------------------------------------------------------------- #
+# estimators
+# --------------------------------------------------------------------------- #
+def test_kaplan_meier_without_censoring_is_the_sample_mean() -> None:
     plain = kaplan_meier([1.0, 2.0, 3.0], [True, True, True])
-    check("with nothing censored the restricted mean is the sample mean",
-          abs(plain["restricted_mean"] - 2.0) < TOL,
-          f"got {plain['restricted_mean']}")
-    check("with nothing censored the curve reaches zero",
-          plain["reaches_zero"] and plain["restricted_to"] == 3.0)
-    check("the median is the first time survival drops to a half",
-          plain["median"] == 2.0, f"got {plain['median']}")
+    assert abs(plain["restricted_mean"] - 2.0) < TOL, plain["restricted_mean"]
+    assert plain["reaches_zero"] and plain["restricted_to"] == 3.0
+    assert plain["median"] == 2.0, plain["median"]
 
-    # S drops to 2/3 at t=20 and to 0 at t=300; the 200 is censored in between.
+
+def test_kaplan_meier_keeps_a_censored_observation_at_risk() -> None:
+    """S drops to 2/3 at t=20 and to 0 at t=300; the 200 is censored in between."""
     censored = kaplan_meier([20.0, 200.0, 300.0], [True, False, True])
-    check("a censored observation stays at risk until its own time",
-          abs(censored["restricted_mean"] - (20.0 + (2.0 / 3.0) * 280.0)) < 1e-9,
-          f"got {censored['restricted_mean']}")
-    check("the censored observation is counted but is not an event",
-          censored["n"] == 3 and censored["n_events"] == 2
-          and censored["n_censored"] == 1)
+    assert abs(censored["restricted_mean"] - (20.0 + (2.0 / 3.0) * 280.0)) < 1e-9, (
+        censored["restricted_mean"])
+    assert (censored["n"] == 3 and censored["n_events"] == 2
+            and censored["n_censored"] == 1), censored
 
+
+def test_kaplan_meier_that_never_reaches_zero_restricts_its_mean() -> None:
     tail = kaplan_meier([10.0, 50.0, 100.0], [True, False, False])
-    check("a curve that never reaches zero says so, and restricts its mean",
-          not tail["reaches_zero"] and tail["restricted_to"] == 100.0
-          and tail["median"] is None)
-    check("an empty sample is answered with None rather than a number",
-          kaplan_meier([], [])["restricted_mean"] is None)
+    assert not tail["reaches_zero"]
+    assert tail["restricted_to"] == 100.0
+    assert tail["median"] is None
 
 
+def test_kaplan_meier_of_nothing_is_none() -> None:
+    assert kaplan_meier([], [])["restricted_mean"] is None
+
+
+def test_the_exponential_fit_is_the_textbook_estimate() -> None:
+    """Two ends over ten units at risk is a mean of five, censoring included."""
+    fit = exponential_fit([1.0, 2.0, 3.0, 4.0], [True, False, True, False])
+    assert abs(fit["mean"] - 5.0) < TOL and fit["n_ends"] == 2, fit
+    assert abs(fit["rate"] - 0.2) < TOL, fit["rate"]
+    assert exponential_fit([1.0, 2.0], [False, False])["mean"] is None
+
+
+# --------------------------------------------------------------------------- #
+# the Markov summary
+# --------------------------------------------------------------------------- #
 ALTERNATING = [
     ("swim", 20), ("turn", 50), ("swim", 20), ("turn", 50),
     ("swim", 20), ("turn", 50), ("swim", 20),
 ]
 
 
-def test_a_lifetime_is_the_time_at_risk_over_the_ends_seen() -> None:
-    """The exponential fit of Fig. 1h, planted so it is exact.
-
-    Seven alternating bouts on one track. The first has no seen start and is
-    dropped; the last runs off the end of the track and contributes its time
-    without an end. So swim offers 3 x 0.2 s against 2 ends and turn 3 x 0.5 s
-    against 3, and the two means come apart by exactly that censoring.
-    """
-    frame = table(plant(ALTERNATING))
-    m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
-
-    check("the lifetimes are in seconds where a frame rate is known",
-          m["unit"] == "seconds")
-    check("swim was seen to end twice over 0.6 s at risk",
-          m["lifetime"]["swim"]["n_ends"] == 2
-          and abs(m["lifetime"]["swim"]["at_risk"] - 0.6) < TOL)
-    check("swim's fitted lifetime is 0.6 s over 2 ends",
-          abs(m["lifetime"]["swim"]["mean"] - 0.3) < TOL)
-    check("turn's fitted lifetime is 1.5 s over 3 ends",
-          abs(m["lifetime"]["turn"]["mean"] - 0.5) < TOL)
-    check("a censored bout lifts the fit above the mean it was censored out of",
-          m["lifetime"]["swim"]["mean"] > m["lifetime"]["swim"]["km_restricted_mean"])
-    check("the fit is carried beside the measured curve it is judged against",
-          len(m["survival"]["turn"]["t"]) == len(m["survival"]["turn"]["fit"])
-          and m["survival"]["turn"]["p"][0] == 1.0
-          and m["lifetime"]["turn"]["fit_max_deviation"] is not None)
+@pytest.fixture(scope="module")
+def alternating() -> pd.DataFrame:
+    """Seven alternating bouts: the first has no seen start, the last no seen end."""
+    return table(plant(ALTERNATING))
 
 
-def test_the_exponential_fit_is_the_textbook_estimate() -> None:
-    """Two ends over ten units at risk is a mean of five, censoring included."""
-    fit = exponential_fit([1.0, 2.0, 3.0, 4.0], [True, False, True, False])
-    check("the mean is the total time at risk over the number of ends",
-          abs(fit["mean"] - 5.0) < TOL and fit["n_ends"] == 2)
-    check("the rate is one over that mean", abs(fit["rate"] - 0.2) < TOL)
-    check("nothing having ended leaves the mean unstated",
-          exponential_fit([1.0, 2.0], [False, False])["mean"] is None)
+def test_a_lifetime_is_the_time_at_risk_over_the_ends_seen(alternating) -> None:
+    """swim offers 3 x 0.2 s against 2 ends, turn 3 x 0.5 s against 3."""
+    m = markov(analyse(alternating, fps=100.0, min_bout_frames=0))
+
+    assert m["unit"] == "seconds"
+    assert m["lifetime"]["swim"]["n_ends"] == 2
+    assert abs(m["lifetime"]["swim"]["at_risk"] - 0.6) < TOL
+    assert abs(m["lifetime"]["swim"]["mean"] - 0.3) < TOL
+    assert abs(m["lifetime"]["turn"]["mean"] - 0.5) < TOL
+    assert m["lifetime"]["swim"]["mean"] > m["lifetime"]["swim"]["km_restricted_mean"], (
+        "a censored bout lifts the fit above the restricted mean")
+    assert len(m["survival"]["turn"]["t"]) == len(m["survival"]["turn"]["fit"])
+    assert m["survival"]["turn"]["p"][0] == 1.0
+    assert m["lifetime"]["turn"]["fit_max_deviation"] is not None
 
 
-def test_a_rate_is_a_jump_probability_over_a_lifetime() -> None:
-    """q(i->j) = P(next=j | in i) / lifetime(i), on the same planted bouts."""
-    frame = table(plant(ALTERNATING))
-    report = analyse(frame, fps=100.0, min_bout_frames=0)
+def test_a_rate_is_a_jump_probability_over_a_lifetime(alternating) -> None:
+    """q(i->j) = P(next=j | in i) / lifetime(i)."""
+    report = analyse(alternating, fps=100.0, min_bout_frames=0)
     m = markov(report)
     probabilities = report["groups"][GROUP]["transitions"]["probabilities"]
 
-    check("turn always follows swim here, and swim always follows turn",
-          abs(m["jump"]["swim"]["turn"]["p"] - 1.0) < TOL
-          and abs(m["jump"]["turn"]["swim"]["p"] - 1.0) < TOL)
-    check("the jump matrix is the transition matrix, counted once",
-          m["jump"]["swim"]["turn"]["p"] == probabilities["swim"]["turn"])
-    check("a directed rate is that probability over the lifetime",
-          abs(m["rates"]["swim"]["turn"]["q"] - 1.0 / 0.3) < TOL
-          and abs(m["rates"]["turn"]["swim"]["q"] - 2.0) < TOL)
-    check("the exit rate is one over the lifetime",
-          abs(m["exit_rate"]["swim"] - 1.0 / 0.3) < TOL
-          and abs(m["exit_rate"]["turn"] - 2.0) < TOL)
-    check("with no floor imposed the rates are not called lower bounds",
-          "LOWER BOUNDS" not in m["caveat"])
-
-    floored = analyse(frame, fps=100.0, min_bout_frames=12)
-    check("with a floor imposed the rates are called lower bounds",
-          "LOWER BOUNDS" in markov(floored)["caveat"])
+    assert abs(m["jump"]["swim"]["turn"]["p"] - 1.0) < TOL
+    assert abs(m["jump"]["turn"]["swim"]["p"] - 1.0) < TOL
+    assert m["jump"]["swim"]["turn"]["p"] == probabilities["swim"]["turn"], (
+        "the jump matrix is the transition matrix")
+    assert abs(m["rates"]["swim"]["turn"]["q"] - 1.0 / 0.3) < TOL
+    assert abs(m["rates"]["turn"]["swim"]["q"] - 2.0) < TOL
+    assert abs(m["exit_rate"]["swim"] - 1.0 / 0.3) < TOL
+    assert abs(m["exit_rate"]["turn"] - 2.0) < TOL
 
 
-def test_the_steady_state_weights_a_state_by_how_long_it_is_held() -> None:
-    """The occupancies of Fig. 1i: time spent, not bouts counted.
+@pytest.mark.parametrize("floor, lower", [(0, False), (12, True)])
+def test_rates_are_lower_bounds_only_under_a_floor(alternating, floor, lower) -> None:
+    caveat = markov(analyse(alternating, fps=100.0, min_bout_frames=floor))["caveat"]
+    assert ("LOWER BOUNDS" in caveat) is lower, caveat
 
-    Swim and turn alternate, so each is entered as often as the other and the
-    jump chain alone puts them at a half each. Weighted by a lifetime of 0.3 s
-    against 0.5 s they come to 3/8 and 5/8.
-    """
-    frame = table(plant(ALTERNATING))
-    m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
+
+def test_the_steady_state_weights_a_state_by_how_long_it_is_held(alternating) -> None:
+    """Entered equally often, held 0.3 s against 0.5 s: 3/8 and 5/8."""
+    m = markov(analyse(alternating, fps=100.0, min_bout_frames=0))
     steady = m["steady_state"]
 
-    check("the steady state is stated",
-          steady is not None and m["steady_state_refusal"] is None)
-    check("it is time-weighted and not a count of bouts",
-          abs(steady["swim"]["p"] - 0.375) < TOL
-          and abs(steady["turn"]["p"] - 0.625) < TOL)
-    check("it sums to one", abs(sum(v["p"] for v in steady.values()) - 1.0) < TOL)
-    check("the share measured off the record is reported beside it",
-          abs(m["occupancy_observed"]["swim"] - 80.0 / 230.0) < TOL
-          and abs(m["occupancy_observed"]["turn"] - 150.0 / 230.0) < TOL)
+    assert steady is not None and m["steady_state_refusal"] is None
+    assert abs(steady["swim"]["p"] - 0.375) < TOL, steady
+    assert abs(steady["turn"]["p"] - 0.625) < TOL, steady
+    assert abs(sum(v["p"] for v in steady.values()) - 1.0) < TOL
+    assert abs(m["occupancy_observed"]["swim"] - 80.0 / 230.0) < TOL
+    assert abs(m["occupancy_observed"]["turn"] - 150.0 / 230.0) < TOL
 
 
 def test_a_state_with_no_successor_has_no_steady_state_and_says_so() -> None:
-    """Three classes in a row that never returns has no stationary law."""
     frame = table(plant([("a", 10), ("b", 10), ("c", 10)]))
     m = markov(analyse(frame, fps=100.0, min_bout_frames=0))
 
-    check("no steady state is invented", m["steady_state"] is None)
-    check("the refusal names the reason",
-          "no observed successor" in m["steady_state_refusal"])
-    check("the transitions that were seen are still reported",
-          abs(m["jump"]["a"]["b"]["p"] - 1.0) < TOL)
+    assert m["steady_state"] is None
+    assert "no observed successor" in m["steady_state_refusal"], m["steady_state_refusal"]
+    assert abs(m["jump"]["a"]["b"]["p"] - 1.0) < TOL, "seen transitions are still reported"
+
+
+def test_one_track_cannot_support_an_error_bar(alternating) -> None:
+    one = markov(analyse(alternating, fps=100.0, min_bout_frames=0))
+    assert one["lifetime"]["turn"]["se"] is None
+    assert one["bootstrap"]["n_tracks"] == 1
 
 
 def test_the_error_bars_come_from_resampling_whole_tracks() -> None:
-    """One track cannot support an error bar; eight unequal ones can."""
-    one = markov(analyse(table(plant(ALTERNATING)), fps=100.0, min_bout_frames=0))
-    check("a single track leaves every error unstated",
-          one["lifetime"]["turn"]["se"] is None
-          and one["bootstrap"]["n_tracks"] == 1)
-
     spread = table(*[
         plant([("swim", 20), ("turn", 30 + 10 * t), ("swim", 20),
                ("turn", 30 + 10 * t), ("swim", 20)], track=t)
         for t in range(8)
     ])
     m = markov(analyse(spread, fps=100.0, min_bout_frames=0))
-    check("eight tracks are eight bootstrap units", m["bootstrap"]["n_tracks"] == 8)
-    check("the resampling unit is named", m["bootstrap"]["unit"] == "track")
-    check("a lifetime that differs between tracks carries an error bar",
-          m["lifetime"]["turn"]["se"] > 0.0)
-    check("so does a steady state probability",
-          m["steady_state"]["swim"]["se"] > 0.0)
+    assert m["bootstrap"]["n_tracks"] == 8
+    assert m["bootstrap"]["unit"] == "track"
+    assert m["lifetime"]["turn"]["se"] > 0.0
+    assert m["steady_state"]["swim"]["se"] > 0.0
 
     again = markov(analyse(spread, fps=100.0, min_bout_frames=0))
-    check("the same bouts and the same seed give the same error bar",
-          again["lifetime"]["turn"]["se"] == m["lifetime"]["turn"]["se"])
+    assert again["lifetime"]["turn"]["se"] == m["lifetime"]["turn"]["se"], (
+        "the same bouts and seed give the same error bar")
 
 
-def test_a_simulated_chain_comes_back_with_its_own_parameters() -> None:
-    """Ground truth by simulation rather than by planting: a memoryless chain
-    with known lifetimes and jump matrix, cut into 400 short tracks, must come
-    back with those parameters. Geometric dwells are the discrete memoryless
-    case, so the censored fit (time at risk over ends) is consistent for the
-    true mean, while the complete-bouts-only mean shows the truncation bias
-    the censoring exists to remove.
-    """
+@pytest.fixture(scope="module")
+def simulated():
+    """A memoryless 3-state chain with known lifetimes, cut into 400 tracks."""
     names = ("A", "B", "C")
     tau = np.array([20.0, 60.0, 40.0])                 # mean dwell, frames
     rho = np.array([[0.0, 0.7, 0.3],
@@ -472,113 +372,105 @@ def test_a_simulated_chain_comes_back_with_its_own_parameters() -> None:
             s = int(rng.choice(3, p=rho[s]))
         blocks.append(plant(spec, track=track))
     report = analyse(table(*blocks), n_bootstrap=50, bootstrap_seed=0)
-    m = markov(report)
+    return names, tau, rho, pi, report
 
+
+def test_a_simulated_chain_returns_its_lifetimes(simulated) -> None:
+    names, tau, _, _, report = simulated
+    m = markov(report)
     est = np.array([m["lifetime"][name]["mean"] for name in names])
     se = np.array([m["lifetime"][name]["se"] for name in names])
-    check("every lifetime is within three bootstrap errors of the truth",
-          bool(np.all(np.abs(est - tau) < 3.0 * se)),
-          f"{est.round(1)} vs {tau} +- {se.round(1)}")
+    assert np.all(np.abs(est - tau) < 3.0 * se), f"{est.round(1)} vs {tau} +- {se.round(1)}"
 
     naive = np.array([dwell(report, name)["frames"]["mean"] for name in names])
-    check("the complete-bouts-only mean sits below the censored fit",
-          bool(np.all(naive < est)) and naive[1] < 0.9 * tau[1],
-          f"complete-only {naive.round(1)} vs fitted {est.round(1)}")
+    assert np.all(naive < est) and naive[1] < 0.9 * tau[1], (
+        f"complete-only {naive.round(1)} is not below fitted {est.round(1)}")
 
+    worst = max(m["lifetime"][name]["fit_max_deviation"] for name in names)
+    assert worst < 0.05, f"a memoryless chain fits its exponential badly: {worst:.3f}"
+
+
+def test_a_simulated_chain_returns_its_jump_matrix_and_occupancy(simulated) -> None:
+    names, _, rho, pi, report = simulated
+    m = markov(report)
     jump = np.array([[(m["jump"].get(a, {}).get(b) or {}).get("p") or 0.0
                       for b in names] for a in names])
-    check("the jump matrix is the one simulated",
-          float(np.abs(jump - rho).max()) < 0.03,
-          f"max error {float(np.abs(jump - rho).max()):.4f}")
+    assert float(np.abs(jump - rho).max()) < 0.03, float(np.abs(jump - rho).max())
 
     steady = np.array([m["steady_state"][name]["p"] for name in names])
     occupancy = np.array([m["occupancy_observed"][name] for name in names])
-    check("the steady state and the observed occupancy both recover pi",
-          float(np.abs(steady - pi).max()) < 0.02
-          and float(np.abs(occupancy - pi).max()) < 0.02,
-          f"steady {steady.round(3)} vs true {pi.round(3)}")
-
-    worst = max(m["lifetime"][name]["fit_max_deviation"] for name in names)
-    check("a genuinely memoryless chain fits its exponential closely",
-          worst < 0.05, f"worst gap {worst:.3f}")
+    assert float(np.abs(steady - pi).max()) < 0.02, f"{steady.round(3)} vs {pi.round(3)}"
+    assert float(np.abs(occupancy - pi).max()) < 0.02, f"{occupancy.round(3)} vs {pi.round(3)}"
 
 
-def test_seconds_come_from_each_movies_own_frame_rate() -> None:
-    """Two movies at different rates, so one conversion cannot serve both."""
-    frame = table(
+# --------------------------------------------------------------------------- #
+# frame rates
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def two_rates() -> pd.DataFrame:
+    """The same bouts in a 100 fps movie and a 10 fps one."""
+    return table(
         plant([("swim", 10), ("turn", 100), ("swim", 10)], movie="fast"),
         plant([("swim", 10), ("turn", 100), ("swim", 10)], movie="slow", track=1),
     )
-    report = analyse(frame, fps={"fast": 100.0, "slow": 10.0})
 
-    check("the two complete turn bouts convert to 1 s and 10 s, mean 5.5",
-          abs(dwell(report, "turn")["seconds"]["mean"] - 5.5) < TOL
-          and dwell(report, "turn")["seconds"]["min"] == 1.0
-          and dwell(report, "turn")["seconds"]["max"] == 10.0,
-          f"got {dwell(report, 'turn')['seconds']}")
-    check("frames stay the same for both, which is what makes seconds necessary",
-          abs(dwell(report, "turn")["frames"]["mean"] - 100.0) < TOL)
-    check("a single frame rate is not claimed when the movies disagree",
-          report["fps"]["uniform"] is None
-          and report["fps"]["per_movie"] == {"fast": 100.0, "slow": 10.0})
 
-    partial = analyse(frame, fps={"fast": 100.0})
-    check("a movie with no frame rate is named rather than assumed",
-          partial["fps"]["missing"] == ["slow"])
-    check("bouts with no frame rate are counted and left out of seconds",
-          dwell(partial, "turn")["n_without_fps"] == 1
-          and abs(dwell(partial, "turn")["seconds"]["mean"] - 1.0) < TOL)
-    check("the summary says which movie has no frame rate",
-          "no frame rate for slow" in summarise(partial))
+def test_seconds_come_from_each_movies_own_frame_rate(two_rates) -> None:
+    report = analyse(two_rates, fps={"fast": 100.0, "slow": 10.0})
+    seconds = dwell(report, "turn")["seconds"]
+
+    assert abs(seconds["mean"] - 5.5) < TOL, seconds
+    assert seconds["min"] == 1.0 and seconds["max"] == 10.0, seconds
+    assert abs(dwell(report, "turn")["frames"]["mean"] - 100.0) < TOL
+    assert report["fps"]["uniform"] is None
+    assert report["fps"]["per_movie"] == {"fast": 100.0, "slow": 10.0}
+
+
+def test_a_movie_with_no_frame_rate_is_named_and_left_out_of_seconds(two_rates) -> None:
+    partial = analyse(two_rates, fps={"fast": 100.0})
+    assert partial["fps"]["missing"] == ["slow"]
+    assert dwell(partial, "turn")["n_without_fps"] == 1
+    assert abs(dwell(partial, "turn")["seconds"]["mean"] - 1.0) < TOL
+    assert "no frame rate for slow" in summarise(partial)
 
 
 # --------------------------------------------------------------------------- #
 # what the file has to be
 # --------------------------------------------------------------------------- #
-def test_a_windows_file_is_refused_with_an_actionable_message() -> None:
-    """A window grid has no bouts in it, and is refused."""
-    windows = pd.DataFrame({
-        "clip_id": ["a", "b"],
-        "movie_id": ["movie_a", "movie_a"],
-        "track_id": [0, 0],
-        "f_start": [0, 50],
-        "f_end": [50, 100],
-        "skip_reason": ["", ""],
-        f"{GROUP}_pred": ["swim", "turn"],
-        f"{GROUP}_conf": [0.9, 0.8],
-    })
-    clips = windows.drop(columns=["skip_reason"])
+_WINDOWS = pd.DataFrame({
+    "clip_id": ["a", "b"],
+    "movie_id": ["movie_a", "movie_a"],
+    "track_id": [0, 0],
+    "f_start": [0, 50],
+    "f_end": [50, 100],
+    "skip_reason": ["", ""],
+    f"{GROUP}_pred": ["swim", "turn"],
+    f"{GROUP}_conf": [0.9, 0.8],
+})
 
-    def refusal(frame) -> str:
-        try:
-            analyse(frame, fps=100.0)
-        except ValueError as exc:
-            return str(exc)
-        return ""
 
-    windows_message = refusal(windows)
-    clips_message = refusal(clips)
+@pytest.mark.parametrize("frame", [
+    pytest.param(_WINDOWS, id="dense-windows"),
+    pytest.param(_WINDOWS.drop(columns=["skip_reason"]), id="clip-manifest"),
+])
+def test_a_table_that_is_not_bouts_is_refused(frame) -> None:
+    with pytest.raises(ValueError, match="not decoded bouts"):
+        analyse(frame, fps=100.0)
 
-    check("a dense windows file is refused rather than measured",
-          "not decoded bouts" in windows_message, windows_message)
-    check("a clip manifest is refused by the same rule",
-          "not decoded bouts" in clips_message, clips_message)
 
+def test_a_bout_table_missing_a_column_is_refused_by_name() -> None:
     thin = table(plant([("swim", 20), ("turn", 30)])).drop(columns=["n_covering_mean"])
-    check("a bout table missing a required column is refused by name",
-          "n_covering_mean" in refusal(thin), refusal(thin))
+    with pytest.raises(ValueError, match="n_covering_mean"):
+        analyse(thin, fps=100.0)
 
 
 def test_the_report_says_these_are_predictions_and_points_at_the_confusion() -> None:
-    """A transition between two classes the model confuses is not evidence."""
     frame = table(plant([
         ("swim", 20), ("turn", 30), ("swim", 40), ("turn", 50),
     ]))
     model = {GROUP: {
         "classes": ["swim", "turn"],
-        # 30 of 100 true turns were called swim, so turn -> swim is the least
-        # trustworthy row of the matrix.
-        "confusion": [[95, 5], [30, 70]],
+        "confusion": [[95, 5], [30, 70]],      # 30 of 100 true turns called swim
         "kappa": 0.61,
         "accuracy": 0.83,
         "reliable": True,
@@ -586,27 +478,23 @@ def test_the_report_says_these_are_predictions_and_points_at_the_confusion() -> 
     report = analyse(frame, fps=100.0, min_bout_frames=12,
                      model_report=model, model_report_path="work/suggest_report.json")
     text = summarise(report)
+    worst = report["groups"][GROUP]["model"]["most_confused"]
 
-    check("the report says outright that these are decoded predictions",
-          any("DECODED PREDICTIONS, not ground truth" in c
-              for c in report["caveats"]), f"got {report['caveats']}")
-    check("the caveat points at the confusion matrix, not at a docstring",
-          any("suggest_report.json" in c for c in report["caveats"]))
-    check("the pointer reaches the printed summary",
-          "suggest_report.json" in text)
-    check("the model's worst confusion is named for the reader",
-          report["groups"][GROUP]["model"]["most_confused"]["from"] == "turn"
-          and report["groups"][GROUP]["model"]["most_confused"]["to"] == "swim"
-          and abs(report["groups"][GROUP]["model"]["most_confused"]["frac"] - 0.3) < TOL)
-    check("the printed summary names it too",
-          "mistakes turn for swim" in text, text)
-    check("the model's agreement score is carried beside it",
-          abs(report["groups"][GROUP]["model"]["kappa"] - 0.61) < TOL)
+    assert any("DECODED PREDICTIONS, not ground truth" in c for c in report["caveats"]), (
+        report["caveats"])
+    assert any("suggest_report.json" in c for c in report["caveats"]), report["caveats"]
+    assert "suggest_report.json" in text
+    assert worst["from"] == "turn" and worst["to"] == "swim", worst
+    assert abs(worst["frac"] - 0.3) < TOL, worst
+    assert "mistakes turn for swim" in text, text
+    assert abs(report["groups"][GROUP]["model"]["kappa"] - 0.61) < TOL
 
+
+def test_a_missing_model_report_is_stated() -> None:
+    frame = table(plant([("swim", 20), ("turn", 30)]))
     silent = analyse(frame, fps=100.0, min_bout_frames=12)
-    check("with no report beside the predictions the absence is stated",
-          any("there is no suggest_report.json" in c for c in silent["caveats"]),
-          f"got {silent['caveats']}")
+    assert any("there is no suggest_report.json" in c for c in silent["caveats"]), (
+        silent["caveats"])
 
 
 def test_the_printed_summary_answers_the_four_questions() -> None:
@@ -618,45 +506,27 @@ def test_the_printed_summary_answers_the_four_questions() -> None:
     )
     text = summarise(analyse(frame, fps=100.0, min_bout_frames=12))
 
-    check("a probability is printed beside its count",
-          "turn 1.00 (2)" in text, text)
-    check("a row denominator is printed",
-          "n=2" in text, text)
-    check("the dwell table names the complete, censored and dropped counts",
-          "compl" in text and "cens" in text and "drop" in text)
-    check("the unit the durations are in is named",
-          "durations in seconds" in text, text)
-    check("the evidence behind the counts is printed",
-          "pairs counted" in text, text)
-    check("the steady state is printed beside the share measured off the record",
-          "steady" in text and "measured" in text, text)
-    check("an error bar says what it was resampled over",
-          "track resamples" in text, text)
+    for needle in ("turn 1.00 (2)", "n=2", "compl", "cens", "drop",
+                   "durations in seconds", "pairs counted", "steady", "measured",
+                   "track resamples"):
+        assert needle in text, f"{needle!r} missing from: {text}"
 
 
 def test_the_report_is_json_with_no_nan_in_it() -> None:
-    """The artefact has to survive a strict reader, so nothing may be NaN."""
     frame = table(
         plant([("swim", 20), ("turn", 30)]),
-        # A track with a single bout: no transitions, nothing complete, every
-        # statistic undefined.
-        plant([("stop", 40)], track=9, start=500),
+        plant([("stop", 40)], track=9, start=500),     # every statistic undefined
     )
     report = analyse(frame, fps=None)
     text = json.dumps(report, indent=2, allow_nan=False)
 
-    check("the whole report serialises without a NaN",
-          "NaN" not in text and "Infinity" not in text)
-    check("an undefined statistic is null rather than absent",
-          json.loads(text)["groups"][GROUP]["dwell"]["per_class"]["stop"]
-          ["frames"]["mean"] is None)
-    check("a class nothing followed still appears with a zero denominator",
-          report["groups"][GROUP]["transitions"]["row_totals"]["stop"] == 0)
-    check("with no frame rate at all the seconds are simply absent",
-          report["fps"]["per_movie"] == {}
-          and dwell(report, "swim")["seconds"]["n"] == 0)
-    check("a summary can still be printed from it",
-          "transitions and dwell times" in summarise(report))
+    assert "NaN" not in text and "Infinity" not in text
+    assert (json.loads(text)["groups"][GROUP]["dwell"]["per_class"]["stop"]
+            ["frames"]["mean"] is None), "an undefined statistic is null rather than absent"
+    assert report["groups"][GROUP]["transitions"]["row_totals"]["stop"] == 0
+    assert report["fps"]["per_movie"] == {}
+    assert dwell(report, "swim")["seconds"]["n"] == 0
+    assert "transitions and dwell times" in summarise(report)
 
 
 # --------------------------------------------------------------------------- #
@@ -669,9 +539,7 @@ def test_a_project_is_measured_from_its_own_files(root) -> None:
 
     project = root / "measured"
     config_path = create_project(project)
-    write_config(config_path, {
-        "predict.min_bout_frames": 12,
-    })
+    write_config(config_path, {"predict.min_bout_frames": 12})
     cfg = load_config(config_path)
     work = cfg.paths.work_dir
     (work / "movie_a").mkdir(parents=True, exist_ok=True)
@@ -687,28 +555,19 @@ def test_a_project_is_measured_from_its_own_files(root) -> None:
         ("immotile", 50), ("swimming", 60),
     ])).to_parquet(work / "predictions.parquet", index=False)
 
-    check("the frame rate is read from the movie's own cache.json",
-          movie_fps(cfg) == {"movie_a": 50.0}, f"got {movie_fps(cfg)}")
+    assert movie_fps(cfg) == {"movie_a": 50.0}, movie_fps(cfg)
 
     report = compute(cfg)
-    check("the decode settings are read from the config, not guessed",
-          report["source"]["min_bout_frames"] == 12)
-    check("the floor comes through to the dwell section",
-          report["groups"][GROUP]["dwell"]["floor_frames"] == 12)
-    check("the transitions are the planted ones",
-          pairs(report) == {("swimming", "immotile"): 2,
-                            ("immotile", "swimming"): 2}, f"got {pairs(report)}")
-    check("seconds use the 50 fps the cache.json declares",
-          abs(dwell(report, "immotile")["seconds"]["mean"] - 0.8) < TOL,
-          f"got {dwell(report, 'immotile')['seconds']['mean']}")
-    check("the model report beside the predictions is found and pointed at",
-          report["source"]["suggest_report"].endswith("suggest_report.json"))
+    assert report["source"]["min_bout_frames"] == 12
+    assert report["groups"][GROUP]["dwell"]["floor_frames"] == 12
+    assert pairs(report) == {("swimming", "immotile"): 2,
+                             ("immotile", "swimming"): 2}, pairs(report)
+    assert abs(dwell(report, "immotile")["seconds"]["mean"] - 0.8) < TOL, (
+        dwell(report, "immotile")["seconds"]["mean"])
+    assert report["source"]["suggest_report"].endswith("suggest_report.json")
 
     path = write_report(cfg, report)
-    check("the artefact lands beside the other work-dir files",
-          path == work / TRANSITIONS_FILE and path.exists())
-    check("what was written reads back as the report that was computed",
-          json.loads(path.read_text(encoding="utf-8"))["groups"][GROUP]
-          ["transitions"]["counts"] == report["groups"][GROUP]["transitions"]["counts"])
-    check("nothing staged is left behind",
-          not list(work.glob("*.part")))
+    assert path == work / TRANSITIONS_FILE and path.exists()
+    assert (json.loads(path.read_text(encoding="utf-8"))["groups"][GROUP]
+            ["transitions"]["counts"] == report["groups"][GROUP]["transitions"]["counts"])
+    assert not list(work.glob("*.part")), "nothing staged is left behind"

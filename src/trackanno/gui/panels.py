@@ -17,8 +17,7 @@ __all__ = ["CategoryPanel", "MetadataPanel"]
 
 
 def _button_style(color: str, checked: bool) -> str:
-    """A category button: its own colour, the theme's shape. Checked fills with
-    the colour, unchecked keeps a tinted left edge."""
+    """Category button style: filled when checked, a coloured left edge otherwise."""
     t = tokens()
     if checked:
         return (
@@ -53,8 +52,7 @@ class CategoryPanel(QWidget):
         for group in cfg.categories:
             layout.addWidget(self._build_group(group))
 
-        # Suggestions are DISPLAYED, never pre-selected: the annotator presses
-        # the real key, so labels stay independent of the model trained on them.
+        # Suggestions are shown, never pre-selected.
         self.suggestion = QLabel("")
         self.suggestion.setWordWrap(True)
         self.suggestion.setProperty("role", "muted")
@@ -73,7 +71,6 @@ class CategoryPanel(QWidget):
         self._suggested = {}
 
         if not suggestions:
-            # A note instead of silence, when the caller has a reason to give.
             self.suggestion.setText(note or "")
             self.suggestion.setVisible(bool(note))
             return
@@ -92,7 +89,7 @@ class CategoryPanel(QWidget):
                     f"border:1px dashed {option.color};border-left:3px solid {option.color};"
                     f"border-radius:{RADIUS}px;padding:8px 10px;text-align:left;}}"
                 )
-            lines.append(f"suggests <b>{option_name}</b> ({conf:.2f}) - press {option.key}")
+            lines.append(f"suggests <b>{option_name}</b> ({conf:.2f}), press {option.key}")
         self.suggestion.setText("<br>".join(lines))
         self.suggestion.setVisible(bool(lines))
 
@@ -101,7 +98,7 @@ class CategoryPanel(QWidget):
         box = QGroupBox(title)
         box.setToolTip(
             f"{'one choice' if not group.is_multi else 'any number of choices'}"
-            f"{' - required' if group.required else ''}"
+            f"{', required' if group.required else ''}"
         )
         inner = QVBoxLayout(box)
         inner.setSpacing(4)
@@ -176,7 +173,7 @@ class CategoryPanel(QWidget):
 
 
 class MetadataPanel(QWidget):
-    """Where the pixels on screen came from."""
+    """Source movie, track, frames and crop of the clip on screen."""
 
     def __init__(self, parent=None):
         super().__init__(parent)

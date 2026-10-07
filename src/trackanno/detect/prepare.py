@@ -1,32 +1,6 @@
-"""Entry point 1: detection + tracking + clip cache.
+"""``trackanno prepare``: detect and track (stage 1, GPU), then cut the clip cache (stage 2).
 
-    trackanno prepare [--movies ID ...] [--force] [--limit-frames N] [--self-test]
-
-Two stages, because only the first needs a GPU. Once per movie:
-
-    work/<movie_id>/
-      stage 1, `--stage detect`:
-        norm.json          the movie's fixed intensity mapping
-        tracks.parquet     every detection, in ORIGINAL full-frame coordinates
-        instance_features.npy  (N, D) CNN features, ROW-ALIGNED with
-                               tracks.parquet; absent unless every frame produced
-                               them
-        detect_done.json   the handoff: what stage 2 cannot work out for itself
-      stage 2, `--stage clips`:
-        clips.parquet      one row per annotatable clip + its crop geometry
-        clip_boxes.parquet overlay geometry, in cache coordinates
-        clips.dat          the pre-cropped pixels (uncompressed memmap)
-        cache.json         cache shape + movie metadata
-        prepare_done.json  resume marker
-
-Stage 2 needs no model, no GPU and no network, so detection can run on a remote
-box and the clips - the multi-gigabyte artefact - be cut where they are read.
-Copy ``work/<movie_id>/`` back between the two; the four stage-1 files are small.
-
-Without ``--stage``, each movie gets whatever it is still missing, so a run
-started elsewhere is finished rather than repeated. Finished movies are skipped
-unless ``--force``. So are movies whose detections or clips no longer match the
-config: the changed keys are reported, and only ``--force`` detects or cuts again.
+Stage 2 needs only stage 1's files in ``work/<movie_id>/``, so it can run on another machine.
 """
 
 from __future__ import annotations
@@ -68,10 +42,7 @@ def run_tracking(
     limit_frames: int | None = None,
     reporter: Reporter | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray | None]:
-    """One sequential pass: detect, then track on the merged full-frame boxes.
-
-    Returns ``(tracks, instance_features)``; features are None unless
-    ``features.enabled`` and every frame produced them."""
+    """Detect and track every frame; returns ``(tracks, features)``, features possibly None."""
     reporter = reporter or NullReporter()
     tracker = build_tracker(cfg, movie.fps, (movie.height, movie.width))
     n_frames = min(movie.n_frames, limit_frames) if limit_frames else movie.n_frames
@@ -112,8 +83,7 @@ def run_tracking(
             data[f"kp_y_{k}"] = kpts[:, k, 1]
             data[f"kp_c_{k}"] = kpts[:, k, 2]
 
-    # Keep features only if EVERY frame produced them; a partial array silently
-    # misaligns against the tracks table.
+    # Keep features only if every frame produced them, so rows stay aligned.
     feats = (
         np.concatenate(feat_c, axis=0)
         if feat_c and len(feat_c) == len(frames_c)
@@ -125,8 +95,7 @@ def run_tracking(
 # --------------------------------------------------------------------------- #
 # the stage handoff
 # --------------------------------------------------------------------------- #
-# Settings that change what detection writes, fps included. Clip-stage keys
-# (min_track_length, border_*) and where it runs (device, batch) are left out.
+# Settings that change what detection writes (not clip-stage keys, device or batch).
 _DETECT_KEYS = (
     "detection.task", "detection.conf", "detection.imgsz", "detection.half",
     "tiling.enabled", "tiling.tile", "tiling.overlap", "tiling.merge_iou",
@@ -253,11 +222,7 @@ _ABSENT = object()
 def _legacy_matches_without_clip_keys(
     cfg: Config, movie_id: str, name: str, values: dict, digest: str
 ) -> bool:
-    """Whether some old value of the section's clip-stage keys reproduces ``digest``.
-
-    Old digests covered clip-stage keys too. Candidates for their old values are
-    the key being absent, its default, and what the clip marker recorded.
-    """
+    """Whether absent, default or recorded clip-key values reproduce the old ``digest``."""
     import itertools
     from dataclasses import MISSING
 
@@ -290,8 +255,7 @@ def _legacy_matches_without_clip_keys(
     return False
 
 
-# Removed normalize modes whose replacement gives the same pixels. `none` maps
-# to `fixed` on load but rescales differently, so a record of it is stale.
+# Removed normalize modes whose replacement gives the same pixels (not `none`).
 _SAME_PIXELS = {"smooth": "per_frame"}
 
 
@@ -332,7 +296,7 @@ def _changed(cfg: Config, was: dict, now: dict) -> list[str]:
     changed = []
     for key, value in now.items():
         if key == _MODEL_KEY:
-            # Unknown on one side, e.g. no weights where the clips are cut: skip.
+            # Skip when unknown on one side (no weights on this machine).
             if was.get(key) and value and was[key] != value:
                 changed.append(key)
         elif key in was:
@@ -374,19 +338,15 @@ def _load_handoff(cfg: Config, movie_id: str) -> dict:
         info = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise FileNotFoundError(
-            f"{movie_id}: no {DETECT_FILE} in {path.parent}. Detection has not run for "
-            f"this movie - run it here, or copy work/{movie_id}/ back from the machine "
-            "that did."
+            f"{movie_id}: no {DETECT_FILE} in {path.parent}; run detection or copy "
+            f"work/{movie_id}/ from the machine that did"
         ) from exc
     except ValueError as exc:
         raise ValueError(f"{path.name} is not valid JSON: {exc}") from exc
 
     was = info.get("config_fingerprint") if isinstance(info, dict) else None
     if not was or not isinstance(was, dict):
-        raise ValueError(
-            f"{DETECT_FILE} records no config fingerprint, so nothing here can say "
-            "whether these detections were made under this project's settings"
-        )
+        raise ValueError(f"{DETECT_FILE} records no config fingerprint")
     return info
 
 
@@ -401,11 +361,9 @@ def _detection_changes(
 
 
 def detection_changes(cfg: Config, movie_id: str, check_model: bool = True) -> list[str]:
-    """Detection keys changed since the handoff was written; empty when it is fresh.
+    """Detection keys changed since the handoff; raises without a readable handoff.
 
-    Raises FileNotFoundError without a handoff, ValueError when it cannot be
-    checked. ``check_model=False`` skips hashing the weights.
-    """
+    ``check_model=False`` skips hashing the weights."""
     return _detection_changes(cfg, movie_id, _load_handoff(cfg, movie_id), check_model)
 
 
@@ -414,26 +372,19 @@ _REDO = "--force (Prepare page: 'redo movies that are already prepared')"
 
 
 def read_handoff(cfg: Config, movie_id: str) -> dict:
-    """What the detection stage recorded for one movie.
-
-    Raises if it is absent or was made under different settings.
-    """
+    """The movie's detection handoff; raises if absent or made under different settings."""
     info = _load_handoff(cfg, movie_id)
     changed = _detection_changes(cfg, movie_id, info)
     if changed:
         raise ValueError(
-            f"{movie_id}: these detections were made with a different config "
-            f"({', '.join(changed)} changed since). Re-detect with {_REDO}, "
-            "or put those settings back the way they were."
+            f"{movie_id}: detections were made with a different config "
+            f"({', '.join(changed)}); re-detect with {_REDO} or restore those settings"
         )
     return info
 
 
 def clip_changes(cfg: Config, movie_id: str) -> list[str] | None:
-    """Clip keys changed since the clips were cut; None when nothing is cut.
-
-    Raises ValueError when the prepared marker is there but unreadable.
-    """
+    """Clip keys changed since the clips were cut; None when nothing is cut."""
     path = cfg.movie_dir(movie_id) / DONE_FILE
     if not path.exists():
         return None
@@ -442,7 +393,7 @@ def clip_changes(cfg: Config, movie_id: str) -> list[str] | None:
         raise ValueError(f"{DONE_FILE} is unreadable")
     was = info.get("clip_settings")
     if not isinstance(was, dict):
-        # Cut before clip settings were recorded: trusted rather than re-cut.
+        # No recorded clip settings: trust the clips.
         return []
     return _changed(cfg, was, _settings(cfg, _CLIP_KEYS))
 
@@ -495,11 +446,7 @@ def _skip_stale(movie_id: str, reasons: list[str], reporter: Reporter) -> dict:
 
 
 def _needs_detection(cfg: Config, movie_id: str, force: bool = False) -> bool:
-    """Whether stage 1 has to run before this movie's clips can be cut.
-
-    Without ``force`` only a movie with neither clips nor a handoff does; a stale
-    one is reported and skipped, never detected again.
-    """
+    """Whether stage 1 must run: with ``force``, or with neither clips nor a handoff."""
     if force:
         return True
     out = cfg.movie_dir(movie_id)
@@ -530,10 +477,7 @@ def detect_movie(
     limit_frames: int | None = None,
     reporter: Reporter | None = None,
 ) -> dict:
-    """Normalise, detect and track. Writes the tracks, the features and the handoff.
-
-    The half that needs the model, and so the half that can run on a GPU box.
-    """
+    """Stage 1: normalise, detect and track; writes tracks, features and the handoff."""
     reporter = reporter or NullReporter()
     out_dir = cfg.movie_dir(movie.id)
     handoff_path = out_dir / DETECT_FILE
@@ -548,10 +492,7 @@ def detect_movie(
         return info
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Clear the markers BEFORE touching anything: the artefacts are only
-    # self-consistent once all of them are there, so one surviving a cancelled
-    # rebuild pairs a new cache with the old manifest. Re-detecting also
-    # invalidates any clips already cut, so that marker goes too.
+    # Clear both markers first; re-detecting invalidates any cut clips.
     handoff_path.unlink(missing_ok=True)
     (out_dir / DONE_FILE).unlink(missing_ok=True)
     started = time.time()
@@ -597,9 +538,7 @@ def detect_movie(
         "width": movie.width,
         "n_detections": int(len(tracks)),
         "n_tracks": int(tracks["track_id"].nunique()) if not tracks.empty else 0,
-        # Resolved from the checkpoint's kpt_shape when the detector was built.
-        # The machine that cuts the clips may never load that checkpoint, so the
-        # names have to travel with the detections.
+        # Names may come from the checkpoint, which stage 2 never loads.
         "keypoint_nodes": list(cfg.keypoints.nodes),
         "tiled": bool(tiled),
         "n_tiles": n_tiles,
@@ -608,11 +547,11 @@ def detect_movie(
         "model": cfg.paths.model.name,
         "model_sha256": _model_identity(cfg),
         "config_fingerprint": _config_fingerprint(cfg),
-        # A `--tile` override is not in the fingerprint, so it is recorded here.
+        # Records a `--tile` override, which the fingerprint leaves out.
         "tiling_used": _plain(asdict(cfg.tiling)),
         "detect_seconds": round(time.time() - started, 1),
     }
-    # Written LAST: its presence is the promise that everything above it landed.
+    # Written last: it marks everything above as complete.
     _write_json(handoff_path, info)
     reporter.log(
         f"-> {info['n_tracks']} tracks, {info['n_detections']} detections "
@@ -622,10 +561,7 @@ def detect_movie(
 
 
 def _already_prepared(cfg: Config, movie_id: str, reporter: Reporter) -> dict | None:
-    """What to return for a movie with clips, or None when it has none yet.
-
-    Current clips return their marker; stale ones are reported and skipped.
-    """
+    """The marker of a movie with current clips, a skip record if stale, or None without clips."""
     if not (cfg.movie_dir(movie_id) / DONE_FILE).exists():
         return None
     reasons = stale_reasons(cfg, movie_id)
@@ -648,11 +584,7 @@ def cut_movie(
     force: bool = False,
     reporter: Reporter | None = None,
 ) -> dict:
-    """Plan the clips and cut their pixels, from what the detection stage left.
-
-    No model, no GPU, no network. Its output is the clip cache, so it runs where
-    the annotating does.
-    """
+    """Stage 2: plan the clips and cut the clip cache from the stage-1 handoff."""
     reporter = reporter or NullReporter()
     out_dir = cfg.movie_dir(movie.id)
     done_path = out_dir / DONE_FILE
@@ -670,47 +602,31 @@ def cut_movie(
     done_path.unlink(missing_ok=True)
     started = time.time()
 
-    # The names came from the checkpoint, not from config.yaml. Without this a
-    # pose project whose config lists no `keypoints.nodes` would cut a box table
-    # with no keypoint columns at all, and say nothing about it.
+    # Keypoint names recorded by stage 1 (possibly from the checkpoint).
     nodes = detected.get("keypoint_nodes") or []
     if cfg.is_pose and nodes and list(cfg.keypoints.nodes) != list(nodes):
         cfg.keypoints.nodes = list(nodes)
 
-    # Named before it starts, not after: reading a big tracks table and laying
-    # the window grid over it is seconds to a minute with nothing to count, and
-    # an unlabelled bar there reads as a hang.
     reporter.stage(f"{movie.id}  planning clips", None)
     tracks = pd.read_parquet(out_dir / TRACKS_FILE)
-    # Loaded rather than remeasured, even when detection just ran in this
-    # process: the mapping the labels were applied under is the one the review
-    # view reloads, and one route through it is easier to keep honest than two.
     normalizer = Normalizer.load(out_dir / NORM_FILE)
 
     n_frames = int(detected.get("n_frames") or movie.n_frames)
     frame_size = (movie.height, movie.width)
-    # Reported by plan_clips as it goes, since it decides which detections were
-    # candidates and counting them here would restate that rule.
     at_border: dict = {}
     specs = plan_clips(tracks, movie.id, n_frames, cfg, frame_size=frame_size,
                        at_border=at_border)
     if at_border:
         worst = max(at_border.values())
         reporter.log(
-            f"{len(at_border)} track(s) reach within "
-            f"{cfg.tracking.border_margin_px}px of the frame edge "
-            f"(tracking.border_margin_px); the worst spent "
-            f"{100 * worst:.0f}% of its life there. Those frames are excluded "
-            f"and the rest of each track still becomes clips. Their rows are "
-            f"still in {TRACKS_FILE}",
+            f"{len(at_border)} track(s) come within {cfg.tracking.border_margin_px}px "
+            f"of the frame edge (worst {100 * worst:.0f}% of frames); those frames "
+            "are excluded from clips",
             "warning",
         )
     size = choose_crop_size(specs, cfg)
     origins = finalise_geometry(specs, size, cfg.clips.frames)
     if specs:
-        # Said BEFORE the pixels are cut, because this is the number that decides
-        # how long the rest takes and how much disk it wants, and finding it out
-        # afterwards is finding it out too late.
         reporter.log(
             f"{movie.id}: {len(specs)} clips, crop {size}px, "
             f"{len(specs) * cfg.clips.frames * size * size / 1e6:.0f} MB of cache"
@@ -722,8 +638,7 @@ def cut_movie(
         manifest["series"] = movie.series
         manifest["channel"] = movie.channel
 
-    # One commit: the pixels, the manifest and the box table only make sense
-    # together.
+    # Pixels, manifest and box table commit together.
     staged = StagedWrite(out_dir)
     boxes = build_box_table(specs, origins, tracks, cfg, cfg.n_keypoints)
     try:
@@ -756,8 +671,7 @@ def cut_movie(
         "clip_frames": cfg.clips.frames,
         "window_mode": cfg.clips.window_mode,
         "clip_settings": _settings(cfg, _CLIP_KEYS),
-        # Carried through from the detection stage: these describe how the boxes
-        # were found, and this half never built a detector to ask.
+        # Carried over from the detection handoff.
         "tiled": bool(detected.get("tiled", False)),
         "n_tiles": int(detected.get("n_tiles", 1)),
         "feature_dim": int(detected.get("feature_dim", 0)),
@@ -778,9 +692,9 @@ def cut_movie(
             if cfg.tracking.border_margin_px > 0 else ""
         )
         reporter.log(
-            f"{n_tracks} tracks but 0 clips. Tracks may be shorter than "
+            f"{n_tracks} tracks but 0 clips; tracks may be shorter than "
             f"clips.min_clip_frames ({cfg.clips.min_clip_frames}) or "
-            f"tracking.min_track_length ({cfg.tracking.min_track_length}){border}.",
+            f"tracking.min_track_length ({cfg.tracking.min_track_length}){border}",
             "warning",
         )
     return info
@@ -797,12 +711,7 @@ def prepare_movie(
     limit_frames: int | None = None,
     reporter: Reporter | None = None,
 ) -> dict:
-    """Whatever this movie still needs in order to have a clip cache.
-
-    Not "run both stages": a movie detected elsewhere already has its handoff, so
-    only its clips are cut. ``detector`` may be a callable returning one, and is
-    not called when there is nothing left to detect.
-    """
+    """Run the stages this movie still needs; ``detector`` may be a factory, called only if needed."""
     reporter = reporter or NullReporter()
     if not force:
         info = _already_prepared(cfg, movie.id, reporter)
@@ -816,39 +725,29 @@ def prepare_movie(
         detect_movie(movie, _detector(detector), cfg, force, limit_frames, reporter)
     else:
         reporter.log(f"{movie.id}: detections already here, cutting clips only")
-    # The marker was checked above, so the clips are cut regardless of it.
+    # The marker was checked above, so force the cut.
     return cut_movie(movie, cfg, True, reporter)
 
 
 # --------------------------------------------------------------------------- #
-# batch driver - shared by the CLI and the GUI
+# batch driver, shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
 class _LazyDetector:
-    """Builds the detector on first use, and not at all if nothing needs one.
-
-    So a batch with nothing left to detect needs no weights, torch or registry.
-    """
+    """Builds the detector on first use, so a batch with nothing to detect needs no weights."""
 
     def __init__(self, cfg: Config, reporter: Reporter):
         self._cfg, self._reporter, self._made = cfg, reporter, None
 
     def __call__(self) -> TiledDetector:
         if self._made is None:
-            # Before the import, not after: resolving a registry model can go to
-            # the network and loading torch takes tens of seconds, and both are
-            # otherwise a silent gap that reads as a hang.
             self._reporter.stage("loading the detection model", None)
             from ..video.models import resolve_model
 
-            # Resolve a registry model to a cached file first, then carry on as if
-            # it had always been local: nothing downstream needs to know a network
-            # was involved.
             self._cfg.paths.model = resolve_model(self._cfg, self._reporter)
             if not self._cfg.paths.model.exists():
                 raise FileNotFoundError(
-                    f"detection model not found: {self._cfg.paths.model}\n"
-                    "Set paths.model to the .pt weights file, or model.source to a "
-                    "model from the registry."
+                    f"detection model not found: {self._cfg.paths.model}; set paths.model "
+                    "or model.source"
                 )
             self._reporter.log(f"loading model {self._cfg.paths.model.name}...")
             self._made = TiledDetector(self._cfg, reporter=self._reporter)
@@ -863,21 +762,14 @@ def prepare_all(
     reporter: Reporter | None = None,
     stage: str = "all",
 ) -> list[dict]:
-    """Prepare every requested movie; one bad movie never stops the batch. The
-    CLI and the GUI both come through here, differing only in the Reporter.
+    """Prepare each requested movie, continuing past failures.
 
-    ``stage`` is ``all`` (do whatever each movie still needs), ``detect`` (stop
-    after the tracks, for a GPU box) or ``clips`` (cut from tracks that are
-    already there, for the machine that annotates).
-    """
+    ``stage``: ``all`` (whatever each movie needs), ``detect`` (stage 1) or ``clips`` (stage 2)."""
     if stage not in ("all", "detect", "clips"):
         raise ValueError(f"stage must be 'all', 'detect' or 'clips', not {stage!r}")
     reporter = reporter or NullReporter()
 
     cfg.paths.work_dir.mkdir(parents=True, exist_ok=True)
-    # Every movie in the folder is opened to be identified, ND2 positions and
-    # all, so on a share this is minutes before the first frame is read. Named,
-    # or the run looks stuck before it has started.
     reporter.stage(f"looking for movies in {cfg.paths.video_dir}", None)
     movies = discover_movies(cfg, only=movie_ids)
     reporter.log(f"found {len(movies)} movie(s) in {cfg.paths.video_dir}")
@@ -885,10 +777,7 @@ def prepare_all(
         return []
 
     detector = _LazyDetector(cfg, reporter)
-    # Up front when anything in this batch will actually detect, and only then.
-    # Deliberately outside the per-movie try/except below: a missing checkpoint is
-    # one thing wrong with the whole run, and finding that out before the first
-    # movie beats finding it out once per movie after an hour of work.
+    # Load the model up front, outside the per-movie try, so a missing one fails once.
     if stage != "clips" and any(_needs_detection(cfg, m.id, force) for m in movies):
         detector()
 
@@ -913,7 +802,7 @@ def prepare_all(
             except Cancelled:
                 reporter.log("cancelled", "warning")
                 raise
-            except Exception as exc:  # keep going; one bad movie shouldn't stop the batch
+            except Exception as exc:  # one bad movie does not stop the batch
                 reporter.log(f"{movie.id}: FAILED - {type(exc).__name__}: {exc}", "error")
             finally:
                 movie.close()
@@ -937,15 +826,13 @@ def prepare_all(
 # self test
 # --------------------------------------------------------------------------- #
 def self_test(movie: MovieSource, detector: TiledDetector, cfg: Config, n_frames: int = 5) -> None:
-    """Compare tiled vs. whole-frame inference on the same frames. Real movies
-    are larger than the model input, so this only says anything on a small movie
-    with tiling forced (``--tile 320``)."""
+    """Compare tiled and whole-frame inference on a few frames (small movie, ``--tile``)."""
     from .tiling import _iou_matrix
 
     if not detector.is_tiled(movie.height, movie.width):
         print(
-            f"  {movie.id}: {movie.width}x{movie.height} fits in one {cfg.tiling.tile}px tile, "
-            f"so there is nothing to compare. Re-run with e.g. --tile {max(64, movie.width // 2)}."
+            f"  {movie.id}: {movie.width}x{movie.height} fits in one {cfg.tiling.tile}px tile; "
+            f"re-run with e.g. --tile {max(64, movie.width // 2)}"
         )
         return
 
@@ -974,27 +861,22 @@ def self_test(movie: MovieSource, detector: TiledDetector, cfg: Config, n_frames
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="trackanno prepare",
-        description="Run tiled YOLO detection + tracking and build the annotation clip cache.",
+        description="Detect and track animals, then build the annotation clip cache.",
     )
     p.add_argument("--config", default=None, help="path to config.yaml")
     p.add_argument("--movies", nargs="*", default=None, metavar="ID",
-                   help="only these movie ids (default: all found in paths.video_dir)")
+                   help="only these movie ids (default: all)")
     p.add_argument("--force", action="store_true", help="redo movies that are already prepared")
     p.add_argument("--stage", choices=("all", "detect", "clips"), default="all",
-                   help="all (default): give each movie whatever it still needs. "
-                        "detect: stop after the tracks, for a GPU box. "
-                        "clips: cut clips from tracks that are already there.")
+                   help="all: whatever each movie needs; detect: tracks only; "
+                        "clips: cut clips from existing tracks")
     p.add_argument("--limit-frames", type=int, default=None,
-                   help="only process the first N frames (quick smoke test)")
-    # A config.yaml carries whatever the Configure page's Browse button put in it,
-    # which is an absolute path on the machine that picked it. These three let the
-    # same project run on a second machine without editing the file - the point of
-    # a split run, where the GPU box mounts the movies somewhere else entirely.
+                   help="only process the first N frames")
+    # Path overrides let the same project run on another machine.
     p.add_argument("--video-dir", default=None, help="override paths.video_dir")
     p.add_argument("--work-dir", default=None, help="override paths.work_dir")
     p.add_argument("--model", default=None,
-                   help="override paths.model; also clears model.source, since naming "
-                        "a file says the shared model is not wanted")
+                   help="override paths.model (clears model.source)")
     p.add_argument("--device", default=None, help="override detection.device, e.g. cpu")
     p.add_argument("--tile", type=int, default=None, help="override tiling.tile")
     p.add_argument("--batch", type=int, default=None, help="override detection.batch")
@@ -1014,8 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.paths.work_dir = Path(args.work_dir).expanduser().resolve()
     if args.model:
         cfg.paths.model = Path(args.model).expanduser().resolve()
-        # model.source outranks paths.model, so leaving it set would silently
-        # ignore the file just named on the command line.
+        # model.source outranks paths.model.
         if getattr(cfg, "model", None) is not None:
             cfg.model.source = ""
     if args.device:
@@ -1030,8 +911,7 @@ def main(argv: list[str] | None = None) -> int:
     work = cfg.paths.work_dir
     if str(work).startswith("//") or str(work).startswith("\\\\"):
         warnings.warn(
-            f"paths.work_dir is on a network share ({work}). The GUI does ~1 MB random reads "
-            "per clip; put the cache on a local disk or annotation will feel sluggish.",
+            f"paths.work_dir is on a network share ({work}); use a local disk for fast annotation",
             stacklevel=1,
         )
 
@@ -1066,8 +946,8 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
     if args.stage == "detect":
-        print(f"\nDetections: {work}\nNext: copy work/ to the annotating machine, "
-              "then run there with --stage clips (or just open trackanno).")
+        print(f"\nDetections: {work}\nNext: copy work/ to the annotating machine and run "
+              "--stage clips there (or open trackanno).")
     else:
         print(f"\nClip cache: {work}\nNext: open trackanno and annotate.")
     return 0

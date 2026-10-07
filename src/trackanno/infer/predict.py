@@ -1,18 +1,6 @@
-"""Label every frame of every track with the trained model, as decoded bouts.
+"""``trackanno predict``: label every frame of every track as decoded bouts.
 
-    trackanno predict --config config.yaml
-
-Windows of ``clips.frames`` are laid over every track every
-``predict.window_stride`` frames (see :mod:`trackanno.infer.densepredict`),
-their class probabilities are averaged onto the frames they cover, and that
-per-frame posterior is cut into bouts no shorter than
-``predict.min_bout_frames``. :mod:`trackanno.infer.bouts` holds the arithmetic.
-
-* **Predictions never touch the annotation CSV.** They go to
-  ``predictions.parquet`` only, and every bout carries ``human_overlap_frac``
-  so a consumer can tell hand-labelled frames from predicted ones.
-* **A group the report gated off is not predicted**, and is named as skipped.
-* **The file is replaced atomically.**
+Writes ``predictions.parquet`` for the groups the report calls reliable; the CSV is never touched.
 """
 
 from __future__ import annotations
@@ -58,28 +46,19 @@ class Verdict:
 
 
 def verdict(cfg: Config) -> Verdict:
-    """Read the saved report and decide what a bulk labelling run may do.
-
-    Two file probes and a small JSON read, cheap enough for the Model page to
-    ask on every repaint. The gate is ``suggest_report.json``, not the model
-    payload; when the two disagree the refusing answer wins.
-    """
+    """Which groups a labelling run may predict, from ``suggest_report.json``; cheap to call."""
     work = cfg.paths.work_dir
     if not (work / MODEL_FILE).exists():
-        return Verdict(problem="no model has been trained yet - train one on the Model page")
+        return Verdict(problem="no model has been trained yet; train one on the Model page")
     if not (work / CLIP_FEATURES_FILE).exists():
         return Verdict(
-            problem=f"{CLIP_FEATURES_FILE} is missing - retrain to rebuild it"
+            problem=f"{CLIP_FEATURES_FILE} is missing; retrain to rebuild it"
         )
 
     report_path = work / REPORT_FILE
     if not report_path.exists():
         return Verdict(
-            problem=(
-                f"there is no {REPORT_FILE} beside the model, so nothing says any "
-                "category group ever cleared the reliability bar. Retrain on the "
-                "Model page rather than labelling a whole project on trust."
-            )
+            problem=f"there is no {REPORT_FILE} beside the model; retrain on the Model page"
         )
     try:
         reports = json.loads(report_path.read_text(encoding="utf-8"))
@@ -99,7 +78,7 @@ def verdict(cfg: Config) -> Verdict:
         out.problem = (
             "no category group is reliable enough to label with"
             + (f" ({detail})" if detail else "")
-            + ". Annotate more clips and retrain."
+            + "; annotate more clips and retrain"
         )
     return out
 
@@ -113,14 +92,7 @@ def prediction_blocker(cfg: Config) -> str:
 # what the rows are made of
 # --------------------------------------------------------------------------- #
 def _human_spans(cfg: Config, groups: list[str]) -> dict[tuple[str, int], list]:
-    """{(movie_id, track_id): [(f_start, f_end)]} a person has already judged.
-
-    A bout has no clip id, so "did a person decide this" is asked in FRAMES and
-    answered as ``human_overlap_frac``. The spans of every predicted group are
-    unioned, which over-reports contamination: the safe direction for a
-    provenance flag. Read-only; a CSV that will not parse means nothing can be
-    claimed to be hand labelled, not that the run stops.
-    """
+    """{(movie_id, track_id): [(f_start, f_end)]} labelled in any of ``groups``."""
     out: dict[tuple[str, int], list] = {}
     if not cfg.paths.csv.exists():
         return out
@@ -148,8 +120,7 @@ def _human_spans(cfg: Config, groups: list[str]) -> dict[tuple[str, int], list]:
     starts = pd.to_numeric(rows["f_start"], errors="coerce").to_numpy()
     ends = pd.to_numeric(rows["f_end"], errors="coerce").to_numpy()
     for movie_id, track_id, f_start, f_end in zip(movies, tracks, starts, ends):
-        # A row whose geometry will not parse is dropped rather than defaulted:
-        # a guessed span would put a hand label on frames nobody annotated.
+        # Drop rows whose span will not parse.
         if not (np.isfinite(track_id) and np.isfinite(f_start) and np.isfinite(f_end)):
             continue
         out.setdefault((str(movie_id), int(track_id)), []).append(
@@ -159,12 +130,7 @@ def _human_spans(cfg: Config, groups: list[str]) -> dict[tuple[str, int], list]:
 
 
 def _labelled_mask(spans, f_lo: int, f_hi: int) -> np.ndarray:
-    """Which frames of ``[f_lo, f_hi)`` fall inside a hand-labelled clip.
-
-    A mask rather than an interval intersection, because annotation clips may
-    OVERLAP each other (``clips.stride`` below ``clips.frames``) and summing
-    per-clip overlaps would report a fraction above 1.
-    """
+    """Mask of the frames of ``[f_lo, f_hi)`` inside any (possibly overlapping) labelled clip."""
     mask = np.zeros(max(int(f_hi) - int(f_lo), 0), dtype=bool)
     for start, end in spans:
         lo = max(int(start), int(f_lo)) - int(f_lo)
@@ -190,40 +156,26 @@ def _detected_spans(cfg: Config, movie_ids) -> dict[tuple[str, int], tuple[int, 
 
 
 def _bout_id(movie_id: str, track_id: int, f_start: int, f_end: int) -> str:
-    """The identity of one decoded bout, and deliberately NOT a ``clip_id``.
-
-    Both ends are embedded so it cannot collide with a clip id (which is built
-    from the start alone), and a bout row carries no ``clip_id`` column, so a
-    merge on it fails loudly. Not unique across groups: the row key is
-    (``group``, ``bout_id``).
-    """
+    """A bout's id, with both ends so it never collides with a ``clip_id``; unique per group."""
     return (f"{movie_id}__t{int(track_id):04d}"
             f"__f{int(f_start):06d}-{int(f_end):06d}")
 
 
 def _rows_to_score(cfg: Config, suggester, reporter):
-    """The dense feature table, its window ends, and why a row cannot be scored.
-
-    ``skip_reason`` is "" for every row the model can be given a vector for.
-    """
+    """The dense feature table, its window ends, and each row's ``skip_reason`` ("" if scorable)."""
     from .densepredict import DENSE_FEATURES_FILE, build_dense_features
 
-    # Embeddings are summarised in the model's own basis, never the one on disk.
+    # Embeddings use the model's own basis, not the one on disk.
     features = build_dense_features(cfg, reporter=reporter,
                                     embeddings=suggester.embedding_inputs(),
                                     required=suggester.columns)
-    # The dense table is built without consulting the model, so this is where
-    # the two meet; most often an embedding basis went missing with its columns.
     missing = [c for c in suggester.columns if c not in features.columns]
     if missing:
         shown = ", ".join(missing[:6]) + ("..." if len(missing) > 6 else "")
         raise RuntimeError(
             f"{DENSE_FEATURES_FILE} is missing {len(missing)} of the "
-            f"{len(suggester.columns)} columns the model was fitted on "
-            f"({shown}). Rebuild the clip features (retrain) so the saved "
-            "embedding bases and the model agree, then label again."
+            f"{len(suggester.columns)} model columns ({shown}); retrain, then label again"
         )
-    # An input undefined for EVERY window is one the model is guessing without.
     blank = [
         c for c in suggester.columns
         if not np.isfinite(features[c].to_numpy(dtype=np.float64)).any()
@@ -232,8 +184,7 @@ def _rows_to_score(cfg: Config, suggester, reporter):
         shown = ", ".join(blank[:6]) + ("..." if len(blank) > 6 else "")
         reporter.log(
             f"{len(blank)} of the model's {len(suggester.columns)} input "
-            f"columns are undefined for every dense window ({shown}); the "
-            "model will see NaN for them. Retrain if they matter.",
+            f"columns are NaN for every dense window ({shown})",
             "warning",
         )
     reason = features["skip_reason"].astype(str).to_numpy()
@@ -241,11 +192,7 @@ def _rows_to_score(cfg: Config, suggester, reporter):
 
 
 def _write_atomic(frame: pd.DataFrame, work: Path, name: str = PREDICTIONS_FILE) -> Path:
-    """Write ``name`` beside its real name and rename it in.
-
-    Everything downstream treats ``predictions.parquet`` as authoritative, so a
-    run that dies mid-write must leave the previous predictions intact.
-    """
+    """Write ``name`` in ``work`` atomically."""
     work.mkdir(parents=True, exist_ok=True)
     staged = StagedWrite(work)
     try:
@@ -264,24 +211,9 @@ def _bout_predictions(
     cfg: Config, features: pd.DataFrame, ends: np.ndarray, skip_reason: np.ndarray,
     suggester, groups: list[str], reporter,
 ) -> pd.DataFrame:
-    """One row per (group, decoded bout).
+    """One row per (group, decoded bout), each track's posterior cut to its detected span.
 
-    The windows are read OFF THE FEATURE TABLE rather than re-planned with
-    :func:`trackanno.infer.densepredict.plan_dense_windows`: the table's rows ARE that
-    plan, and :func:`trackanno.infer.bouts.frame_posterior` matches windows to
-    probability rows BY POSITION, so a second copy could disagree with the rows
-    actually scored.
-
-    A window that could not be featurised is LEFT OUT of the array handed to
-    ``frame_posterior``, never passed as NaN, because that function's running sum
-    would spread one NaN over every later frame. A frame no window reaches comes
-    back as an all-NaN posterior row, decodes to ``-1``, and leaves the span as a
-    bout with an empty label and a ``skip_reason``.
-
-    The posterior is built over the union of a track's windows, then cut to its
-    first and last detection before decoding, so no bout covers frames before
-    the track appears or after it ends. Gaps inside the track are left to the
-    windows: one too thin to featurise yields an unlabelled bout.
+    Unscored windows are left out; frames no window covers become bouts with a ``skip_reason``.
     """
     movie_ids = features["movie_id"].astype(str).to_numpy()
     track_ids = features["track_id"].to_numpy(dtype=np.int64)
@@ -289,18 +221,12 @@ def _bout_predictions(
     stops = np.asarray(ends, dtype=np.int64)
     scorable = np.asarray(skip_reason).astype(str) == ""
     scored = np.flatnonzero(scorable)
-    # THE SCORED ROWS ONLY, ONE COLUMN AT A TIME. `features[columns].to_numpy(
-    # dtype=np.float32)` would build two whole copies of the model's input space
-    # (pandas materialises the subset at the table's float64, then numpy casts)
-    # and `matrix[scored]` a third. Same values in the same order; the transient
-    # is one column of the table.
+    # Scored rows only, one column at a time, to avoid whole-table copies.
     matrix = np.empty((scored.size, len(suggester.columns)), dtype=np.float32)
     for position, column in enumerate(suggester.columns):
         matrix[:, position] = features[column].to_numpy(dtype=np.float32)[scored]
 
-    # Row of `features` -> its row in the compact posteriors below, -1 for a
-    # window that was never scored. Every position the decode slices with comes
-    # from `scorable`, so it never looks one of those up.
+    # Row of `features` -> its row in the compact scores, -1 if unscored.
     rank = np.full(len(features), -1, dtype=np.int64)
     rank[scored] = np.arange(scored.size)
 
@@ -311,36 +237,25 @@ def _bout_predictions(
         reporter.raise_if_cancelled()
         model = suggester.models[group]
         classes = [str(c) for c in np.asarray(model.classes_)]
-        # (n_scored, n_classes), not (n_rows, n_classes): these are held for
-        # every group at once until the decode below has walked every track, and
-        # the rows a skip_reason withheld would be a NaN block nothing reads.
-        # `rank` keeps the compact form addressable by row position.
+        # (n_scored, n_classes), addressed through `rank`.
         scores = np.empty((0, len(classes)))
         if scored.size:
             proba = np.asarray(model.predict_proba(matrix), dtype=np.float64)
             if proba.ndim != 2 or len(proba) != scored.size:
                 raise RuntimeError(
                     f"{group}: the model returned {proba.shape} probabilities for "
-                    f"{scored.size} windows; the model and the feature table disagree"
+                    f"{scored.size} windows; retrain"
                 )
             if proba.shape[1] != len(classes):
                 raise RuntimeError(
                     f"{group}: the model returned {proba.shape[1]} probabilities per "
-                    f"window but names {len(classes)} classes; the posterior columns "
-                    "would be labelled with the wrong behaviour"
+                    f"window but names {len(classes)} classes; retrain"
                 )
             if not np.isfinite(proba).all():
-                # Caught here rather than in `frame_posterior`, which would
-                # report a position within one track's windows and blame the
-                # caller for passing an unscored window. This is the other case:
-                # the window WAS scored and the model's answer is not a
-                # probability.
                 bad = int(np.flatnonzero(~np.isfinite(proba).all(axis=1))[0])
                 raise RuntimeError(
-                    f"{group}: the model returned a non-finite probability for the "
-                    f"window at row {int(scored[bad])} of the dense feature table. "
-                    "A decode averages probabilities across windows, so one of these "
-                    "would spread over every frame the window touches"
+                    f"{group}: the model returned a non-finite probability for row "
+                    f"{int(scored[bad])} of the dense feature table"
                 )
             scores = proba
         proba_by_group[group] = scores
@@ -350,8 +265,6 @@ def _bout_predictions(
         )
         reporter.advance()
 
-    # The models have been asked everything they are going to be asked, and the
-    # decode below allocates per track.
     del matrix
 
     labelled = _human_spans(cfg, groups)
@@ -400,23 +313,15 @@ def _bout_predictions(
                     "f_end": int(bout["f_end"]),
                     "n_frames": int(bout["n_frames"]),
                     "group": group,
-                    # How much evidence the row rests on, the way `n_present`
-                    # says it for a window: a bout at the start of a track, where
-                    # only one window reaches, would otherwise read like one
-                    # several windows agreed on.
+                    # Mean number of windows behind each frame of the bout.
                     "n_covering_mean": float(covering[lo:hi].mean()),
                     "skip_reason": "" if bout["label"] else (
                         f"no window over frames {bout['f_start']}-{bout['f_end']} "
-                        f"could be featurised, so those frames have no posterior "
-                        f"to decode; a window needs {min_frames} detections"
+                        f"could be featurised; a window needs {min_frames} detections"
                     ),
                     "human_overlap_frac": float(human[lo:hi].mean()),
                 }
-                # Every predicted group gets its pair of columns on every row, so
-                # the file has one schema rather than one per group; only the
-                # group that owns the bout fills them in. The renderer already
-                # skips an empty prediction, so another group's rows are
-                # invisible to it.
+                # Every group's columns on every row; only the owning group fills them.
                 for other in groups:
                     row[f"{other}_pred"] = bout["label"] if other == group else ""
                     row[f"{other}_conf"] = bout["conf"] if other == group else np.nan
@@ -424,16 +329,11 @@ def _bout_predictions(
         reporter.advance()
 
     if not rows:
-        raise RuntimeError(
-            "the decode produced no bouts at all, which means the dense feature "
-            "table had no windows to decode; rebuild it and label again"
-        )
+        raise RuntimeError("the decode produced no bouts; rebuild the features and label again")
     out = pd.DataFrame(rows)
     for group in groups:
         out[f"{group}_pred"] = out[f"{group}_pred"].astype(str)
         out[f"{group}_conf"] = pd.to_numeric(out[f"{group}_conf"], errors="coerce")
-    # One flag for all groups; the fraction beside it says how much of the bout a
-    # person actually decided.
     out["human_labelled"] = out["human_overlap_frac"] > 0.0
     return out
 
@@ -442,12 +342,7 @@ def _bout_predictions(
 # the run
 # --------------------------------------------------------------------------- #
 def predict_all(cfg: Config, reporter=None) -> pd.DataFrame:
-    """Score the whole project with the trained model, into ``predictions.parquet``.
-
-    One row per (group, decoded bout), carrying ``bout_id`` and no ``clip_id``;
-    see :func:`_bout_id`. Every window is scored, hand-labelled or not, and each
-    bout reports ``human_overlap_frac``.
-    """
+    """Score the whole project into ``predictions.parquet``, one row per (group, decoded bout)."""
     from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
@@ -464,8 +359,6 @@ def predict_all(cfg: Config, reporter=None) -> pd.DataFrame:
         if group in suggester.models:
             groups.append(group)
         else:
-            # Reliable per the report but absent from the payload: the two files
-            # came from different runs.
             skipped[group] = (
                 f"{REPORT_FILE} calls it reliable but {MODEL_FILE} holds no "
                 "classifier for it; retrain"
@@ -478,12 +371,11 @@ def predict_all(cfg: Config, reporter=None) -> pd.DataFrame:
     for group, why in skipped.items():
         reporter.log(f"group {group!r} not predicted: {why}", "warning")
 
-    # Checked before the features are built, which is the expensive part.
+    # Checked before the expensive feature build.
     length = int(cfg.clips.frames)
     suggester.refuse_window_mismatch(
         length,
-        f"The dense window is clips.frames ({length}); retrain at this length, "
-        "or put clips.frames back.",
+        f"(The dense window is clips.frames, {length}.)",
         reporter,
     )
     suggester.refuse_context_mismatch(cfg.suggest.context_frames)
@@ -506,43 +398,31 @@ def predict_all(cfg: Config, reporter=None) -> pd.DataFrame:
 # reading it back
 # --------------------------------------------------------------------------- #
 def load_predictions(cfg: Config, group_name: str | None = None) -> pd.DataFrame:
-    """Read ``predictions.parquet``, or say what to do about its absence.
-
-    Raises rather than returning an empty frame: on screen "nothing was drawn"
-    is indistinguishable from "the model predicted nothing".
-    """
+    """Read ``predictions.parquet``; raises if it is missing, empty or lacks ``group_name``."""
     path = predictions_path(cfg)
     if not path.exists():
         raise FileNotFoundError(
-            f"no predictions at {path}. Run 'Label all clips with the model' on "
-            "the Model page first (or `trackanno predict`)."
+            f"no predictions at {path}; run 'Label all clips with the model' on "
+            "the Model page or `trackanno predict`"
         )
     frame = pd.read_parquet(path)
     if frame.empty:
         raise RuntimeError(f"{path} has no rows; re-run the labelling pass")
     if "bout_id" not in frame.columns:
-        raise RuntimeError(
-            f"{path} holds windows from an older version, not decoded bouts; "
-            "re-run the labelling pass"
-        )
+        raise RuntimeError(f"{path} holds windows, not decoded bouts; re-run the labelling pass")
     if group_name is not None and f"{group_name}_pred" not in frame.columns:
         available = sorted(
             c[: -len("_pred")] for c in frame.columns if c.endswith("_pred")
         )
         raise ValueError(
-            f"the predictions carry no column for {group_name!r} - it was not "
-            f"reliable enough to label with when they were written. Predicted "
-            f"groups: {available or 'none'}"
+            f"the predictions have no column for {group_name!r} (not reliable when "
+            f"predicted); predicted groups: {available or 'none'}"
         )
     return frame
 
 
 def staleness(cfg: Config) -> str:
-    """Why the predictions no longer match what made them, or "" if they do.
-
-    Only mtimes, so it is cheap enough to ask on every render. Never blocks: a
-    stale file is reported, not refused.
-    """
+    """Why the predictions are older than the model or features, or ""; compares mtimes only."""
     path = predictions_path(cfg)
     if not path.exists():
         return f"there are no predictions at {path}"
@@ -558,11 +438,7 @@ def staleness(cfg: Config) -> str:
 
 
 def _distinct_frames(frame: pd.DataFrame) -> int:
-    """Frames at least one row speaks for, counted ONCE.
-
-    A bout table carries one row per (group, bout), so the groups' identical
-    spans are merged per (movie_id, track_id) before counting.
-    """
+    """Distinct track-frames covered by any row, spans merged per track."""
     if not {"movie_id", "track_id", "f_start", "f_end"}.issubset(frame.columns):
         return 0
     starts = pd.to_numeric(frame["f_start"], errors="coerce").to_numpy(dtype=np.int64)
@@ -590,8 +466,7 @@ def summarise(frame: pd.DataFrame) -> str:
     groups = [c[: -len("_pred")] for c in frame.columns if c.endswith("_pred")]
     n_human = int(frame["human_labelled"].sum()) if "human_labelled" in frame else 0
     lines = [
-        # One row per (group, bout): with three groups "600 bouts" is 200
-        # stretches of behaviour asked three questions.
+        # One row per (group, bout).
         f"{len(frame)} bouts over {len(groups)} category group(s), {n_human} of "
         "them overlapping a clip a person labelled"
     ]
@@ -622,8 +497,7 @@ def summarise(frame: pd.DataFrame) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="trackanno predict",
-        description="Label every frame with the trained model, as decoded bouts "
-                    "(never the annotation CSV).",
+        description="Label every frame with the trained model, as decoded bouts.",
     )
     p.add_argument("--config", default=None, help="path to config.yaml")
     args = p.parse_args(argv)

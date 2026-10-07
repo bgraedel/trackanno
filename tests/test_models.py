@@ -1,12 +1,7 @@
 """Fetching detection weights from a registry, and what they configure.
 
-Everything here runs against a throwaway HTTP server on the loopback interface,
-so no test reaches the internet and none needs a certificate. Loopback is the one
-carve-out from the https rule, for exactly that reason.
-
-The stakes are unusual for this project: loading a checkpoint executes the pickle
-inside it, so most of what follows checks that the wrong bytes are REFUSED rather
-than that the right ones arrive.
+Runs against a loopback HTTP server. Loading a checkpoint executes its pickle, so
+most tests check that the wrong bytes are refused.
 """
 
 from __future__ import annotations
@@ -19,7 +14,6 @@ import threading
 
 import pytest
 
-from harness import check
 from trackanno.video import models as M
 from trackanno.config import ConfigError, load_config
 from trackanno.project import create_project, write_config
@@ -29,7 +23,7 @@ DIGEST = hashlib.sha256(WEIGHTS).hexdigest()
 
 
 class _Server:
-    """A directory served over loopback, with a switch to take it offline."""
+    """A directory served over loopback."""
 
     def __init__(self, directory):
         handler = functools.partial(
@@ -79,53 +73,43 @@ def registry(root):
     server.stop()
 
 
-def test_the_index_is_read_and_cached(registry, root) -> None:
+def test_the_index_is_read_and_cached(registry) -> None:
     models = M.list_models(refresh=True)
-    check("the registry lists its models", [m.id for m in models] == ["trypanosome-pose"])
+    assert [m.id for m in models] == ["trypanosome-pose"]
     entry = M.find_model("trypanosome-pose")
-    check("an entry carries its version and task",
-          (entry.version, entry.task) == ("v2", "pose"))
-    check("and the notes a person needs to choose", "brightfield" in entry.notes)
-    check("a version that does not exist matches nothing",
-          M.find_model("trypanosome-pose", "v9") is None)
-    check("nor does an unknown id", M.find_model("no-such-model") is None)
-    check("the index is cached on disk for the next open",
-          (M.cache_dir() / M.INDEX_NAME).exists())
+    assert (entry.version, entry.task) == ("v2", "pose")
+    assert "brightfield" in entry.notes
+    assert (M.cache_dir() / M.INDEX_NAME).exists(), "cached on disk for the next open"
 
 
-def test_only_a_channel_that_cannot_be_rewritten_is_accepted() -> None:
-    """Weights run when they load, so the transport is a security boundary."""
-    check("https is fine", M.is_trusted_url("https://example.org/a.pt"))
-    check("loopback http is fine, being untamperable in transit",
-          M.is_trusted_url("http://127.0.0.1:8000/a.pt")
-          and M.is_trusted_url("http://localhost:8000/a.pt"))
-    check("plain http to anywhere else is not",
-          not M.is_trusted_url("http://example.org/a.pt"))
-    check("nor is a file or ftp url",
-          not M.is_trusted_url("file:///etc/passwd") and not M.is_trusted_url("ftp://x/a.pt"))
+def test_an_unknown_id_or_version_matches_nothing(registry) -> None:
+    assert M.find_model("trypanosome-pose", "v9") is None
+    assert M.find_model("no-such-model") is None
 
-    try:
+
+def test_only_a_channel_that_cannot_be_rewritten_is_trusted() -> None:
+    assert M.is_trusted_url("https://example.org/a.pt")
+    assert M.is_trusted_url("http://127.0.0.1:8000/a.pt"), "loopback cannot be tampered with"
+    assert M.is_trusted_url("http://localhost:8000/a.pt")
+    assert not M.is_trusted_url("http://example.org/a.pt")
+    assert not M.is_trusted_url("file:///etc/passwd")
+    assert not M.is_trusted_url("ftp://x/a.pt")
+
+
+def test_an_index_offering_a_plain_http_model_is_refused() -> None:
+    with pytest.raises(M.RegistryError):
         M.ModelEntry.parse({"id": "x", "url": "http://example.org/a.pt"})
-        refused = False
-    except M.RegistryError:
-        refused = True
-    check("an index offering a plain-http model is refused", refused)
 
 
 def test_a_config_may_name_a_model_but_not_a_server(root) -> None:
     """The registry URL is a machine setting, so a shared config cannot redirect it."""
     path = create_project(root / "cfg-only")
     write_config(path, {"model.source": "trypanosome-pose"})
-    check("a project may name an id", load_config(path).model.source == "trypanosome-pose")
-    try:
+    assert load_config(path).model.source == "trypanosome-pose"
+    with pytest.raises(ConfigError):
         write_config(path, {"model.source": "http://evil.example.org/a.pt"})
-        refused = False
-    except ConfigError:
-        refused = True
-    check("but may not point the fetch at plain http", refused)
-    check("and the section has no key for redirecting the fetch at all",
-          set(load_config(path).model.__dict__) == {"source", "version", "sha256"},
-          str(sorted(load_config(path).model.__dict__)))
+    # The section has no key for redirecting the fetch at all.
+    assert set(load_config(path).model.__dict__) == {"source", "version", "sha256"}
 
 
 def test_it_downloads_verifies_and_caches(registry, root) -> None:
@@ -133,149 +117,116 @@ def test_it_downloads_verifies_and_caches(registry, root) -> None:
     write_config(path, {"model.source": "trypanosome-pose", "model.version": "v2"})
 
     local = M.resolve_model(load_config(path))
-    check("the weights arrive", local.exists() and local.read_bytes() == WEIGHTS)
-    check("in a directory named for their digest", local.parent.name == DIGEST[:16])
-    check("with a manifest beside them", (local.parent / "manifest.json").exists())
+    assert local.exists() and local.read_bytes() == WEIGHTS
+    assert local.parent.name == DIGEST[:16], "a directory named for the digest"
+    assert (local.parent / "manifest.json").exists()
 
     # Content addressing: a second id serving identical bytes shares the copy.
     same = M.ModelEntry(id="other-pose", url=f"{registry.base}/other-pose.pt", sha256=DIGEST)
-    check("identical weights under another id reuse the one cached copy",
-          M.fetch(same) == local)
+    assert M.fetch(same) == local
 
 
-def test_a_cache_hit_never_reaches_the_network(registry, root) -> None:
-    """Offline is the normal case once a model has been used once."""
+def test_a_cache_hit_never_reaches_the_network(registry, root, monkeypatch) -> None:
     path = create_project(root / "offline")
     write_config(path, {"model.source": "trypanosome-pose"})
     first = M.resolve_model(load_config(path))
 
-    saved = M._get
-    M._get = lambda *a, **k: (_ for _ in ()).throw(AssertionError("went to the network"))
-    try:
-        again = M.resolve_model(load_config(path))
-    finally:
-        M._get = saved
-    check("the second resolve is served from the cache", again == first)
+    def offline(*a, **k):
+        raise AssertionError("went to the network")
+
+    monkeypatch.setattr(M, "_get", offline)
+    assert M.resolve_model(load_config(path)) == first
 
 
 def test_weights_that_are_not_what_they_claim_are_refused(registry, root) -> None:
-    """The digest is the whole defence: a mismatch must not reach the cache."""
-    served = root / "release"
+    """A sha256 mismatch is refused and never reaches the cache."""
     swapped = b"different bytes entirely"
-    (served / "swapped.pt").write_bytes(swapped)
-    # A digest nothing has cached, so the fetch really runs and really fails.
-    claimed = "cd" * 32
+    (root / "release" / "swapped.pt").write_bytes(swapped)
+    claimed = "cd" * 32                     # nothing cached under it, so the fetch runs
     entry = M.ModelEntry(id="swapped", url=f"{registry.base}/swapped.pt", sha256=claimed)
 
-    try:
+    with pytest.raises(M.RegistryError) as caught:
         M.fetch(entry)
-        refused = False
-        message = ""
-    except M.RegistryError as exc:
-        refused, message = True, str(exc)
-    check("a file whose sha256 disagrees with the manifest is refused", refused)
-    check("and the message says what arrived and what was expected",
-          hashlib.sha256(swapped).hexdigest()[:16] in message and claimed[:16] in message,
-          message[:120])
-    check("nothing partial was left in the cache",
-          not list(M.cache_dir().glob("*.part")))
-    check("and it was not cached under its own digest either",
-          M.cached_path(hashlib.sha256(swapped).hexdigest()) is None)
+    message = str(caught.value)
+    assert hashlib.sha256(swapped).hexdigest()[:16] in message, "names what arrived"
+    assert claimed[:16] in message, "names what was expected"
+    assert not list(M.cache_dir().glob("*.part"))
+    assert M.cached_path(hashlib.sha256(swapped).hexdigest()) is None
 
 
 def test_a_pin_survives_the_release_moving(registry, root) -> None:
     """A tag that later points at other weights is a mismatch, not a substitution."""
     path = create_project(root / "pinned")
     write_config(path, {"model.source": "trypanosome-pose", "model.sha256": "ab" * 32})
-    try:
+    with pytest.raises(M.RegistryError):
         M.resolve_model(load_config(path))
-        refused = False
-    except M.RegistryError:
-        refused = True
-    check("weights that do not match the project's pin are refused", refused)
 
 
 def test_an_unknown_model_says_what_is_on_offer(registry, root) -> None:
     path = create_project(root / "unknown")
     write_config(path, {"model.source": "not-a-model"})
-    try:
+    with pytest.raises(M.RegistryError) as caught:
         M.resolve_model(load_config(path))
-        message = ""
-    except M.RegistryError as exc:
-        message = str(exc)
-    check("the failure names the id that was asked for", "not-a-model" in message)
-    check("the registry it looked in", registry.base in message)
-    check("and what that registry does offer", "trypanosome-pose" in message)
+    message = str(caught.value)
+    assert "not-a-model" in message
+    assert registry.base in message
+    assert "trypanosome-pose" in message, "what the registry does offer"
 
 
 def test_an_empty_source_means_the_local_file(root) -> None:
-    """Projects built around a checkpoint on this disk keep working untouched."""
     weights = root / "local.pt"
     weights.write_bytes(b"")
-    path = create_project(root / "local", model=weights)
-    cfg = load_config(path)
-    check("resolve returns paths.model unchanged", M.resolve_model(cfg) == weights.resolve())
-    check("and the status probe does not download anything",
-          M.local_model_path(cfg) == weights.resolve())
+    cfg = load_config(create_project(root / "local", model=weights))
+    assert M.resolve_model(cfg) == weights.resolve()
+    assert M.local_model_path(cfg) == weights.resolve(), "the status probe downloads nothing"
 
 
 def test_the_manifest_configures_the_project(registry, root) -> None:
-    """The point of the exercise: the settings a person otherwise types by hand."""
     path = create_project(root / "manifest")
-    entry = M.find_model("trypanosome-pose")
-    told = M.apply_manifest(path, entry, DIGEST)
+    told = M.apply_manifest(path, M.find_model("trypanosome-pose"), DIGEST)
     cfg = load_config(path)
 
-    check("the size it was trained at is applied", cfg.detection.imgsz == 1280, str(told))
-    check("so did the confidence it was validated at", abs(cfg.detection.conf - 0.3) < 1e-9)
-    check("and a tile size that suits it", cfg.tiling.tile == 512)
-    check("the task followed the checkpoint", cfg.detection.task == "pose")
-    check("the keypoint NAMES came across, which no checkpoint stores",
-          cfg.keypoints.nodes[:2] == ["Head", "Base"] and len(cfg.keypoints.nodes) == 8)
-    check("so did the skeleton, which cannot be inferred at all",
-          len(cfg.keypoints.edges) == 3, str(cfg.keypoints.edges))
-    check("the digest was pinned into the project", cfg.model.sha256 == DIGEST)
-    check("and it reported every change rather than editing silently",
-          any("conf" in t for t in told) and any("keypoint" in t for t in told), str(told))
-
-    check("a manifest cannot repoint the project at other movies",
-          cfg.paths.video_dir == (root / "manifest" / "videos").resolve(),
-          str(cfg.paths.video_dir))
-    check("the comments in config.yaml survived the edit",
-          path.read_text(encoding="utf-8").count("#") > 40)
+    assert cfg.detection.imgsz == 1280, told
+    assert abs(cfg.detection.conf - 0.3) < 1e-9
+    assert cfg.tiling.tile == 512
+    assert cfg.detection.task == "pose"
+    assert cfg.keypoints.nodes[:2] == ["Head", "Base"] and len(cfg.keypoints.nodes) == 8
+    assert len(cfg.keypoints.edges) == 3, cfg.keypoints.edges
+    assert cfg.model.sha256 == DIGEST, "the digest is pinned into the project"
+    assert any("conf" in t for t in told) and any("keypoint" in t for t in told), (
+        f"every change is reported: {told}")
+    assert cfg.paths.video_dir == (root / "manifest" / "videos").resolve(), (
+        "a manifest cannot repoint the project at other movies")
+    assert path.read_text(encoding="utf-8").count("#") > 40, "the comments survive"
 
 
 def test_it_warns_where_the_project_disagrees_with_the_model(registry, root) -> None:
-    """Reported, never corrected: only the person knows if it is the experiment."""
+    """Reported, never corrected."""
     path = create_project(root / "assumes")
     write_config(path, {"tiff.fps": 30})
-    entry = M.find_model("trypanosome-pose")
-    warnings = M.mismatch_warnings(load_config(path), entry)
-    check("a frame rate the model was not trained at is called out",
-          any("100" in w and "30" in w for w in warnings), str(warnings))
-    check("as is a different pixel size", any("0.325" in w for w in warnings))
+    warnings = M.mismatch_warnings(load_config(path), M.find_model("trypanosome-pose"))
+    assert any("100" in w and "30" in w for w in warnings), f"frame rate: {warnings}"
+    assert any("0.325" in w for w in warnings), f"pixel size: {warnings}"
 
 
-def test_the_cache_can_be_pruned(registry, root) -> None:
+def test_the_cache_can_be_pruned(registry) -> None:
     M.fetch(M.find_model("trypanosome-pose"))
-    check("the weights are cached", M.cached_path(DIGEST) is not None)
-    check("pruning keeps what is asked for", M.prune_cache(keep={DIGEST}) == 0)
-    check("and removes what is not", M.prune_cache(keep=set()) >= 1)
-    check("after which the cache is empty", M.cached_path(DIGEST) is None)
+    assert M.cached_path(DIGEST) is not None
+    assert M.prune_cache(keep={DIGEST}) == 0, "keeps what is asked for"
+    assert M.prune_cache(keep=set()) >= 1, "removes what is not"
+    assert M.cached_path(DIGEST) is None
 
 
 # --------------------------------------------------------------------------- #
 # private repositories, which have no anonymous download url
 # --------------------------------------------------------------------------- #
-def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None:
-    """A private repo's assets are reachable only with a token, through the API.
+def test_a_github_registry_url_parses() -> None:
+    assert M._github_source("github://o/r") == ("o", "r", "")
+    assert M._github_source("github://o/r@v2") == ("o", "r", "v2")
 
-    ``github://owner/repo`` resolves the release, finds each asset by name and
-    downloads it with ``Accept: application/octet-stream``, which is the one
-    combination GitHub serves for a private release. Assets are looked up by
-    name every time rather than by id, so re-uploading a release does not
-    invalidate the index.
-    """
+
+def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None:
+    """Assets are found by name and downloaded as octet-stream with the token."""
     seen: list[tuple[str, dict]] = []
     release = {
         "tag_name": "v2",
@@ -286,21 +237,24 @@ def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None
     }
     index = json.dumps({"models": [{
         "id": "tryp", "version": "v2", "task": "pose", "asset": "tryp.pt",
-        "framework": "ultralytics",
-        "sha256": DIGEST, "size": len(WEIGHTS),
+        "framework": "ultralytics", "sha256": DIGEST, "size": len(WEIGHTS),
     }]}).encode("utf-8")
 
     class _Response:
         def __init__(self, body):
             self.body = body
+
         def read(self, n=-1):
             out, self.body = (self.body, b"") if n == -1 else (self.body[:n], self.body[n:])
             return out
+
         @property
         def headers(self):
             return {}
+
         def __enter__(self):
             return self
+
         def __exit__(self, *a):
             return False
 
@@ -318,27 +272,19 @@ def test_a_private_release_is_fetched_through_the_api(root, monkeypatch) -> None
     monkeypatch.setenv("GH_TOKEN", "ghp_pretend")
     monkeypatch.setenv(M.ENV_REGISTRY, "github://o/r")
 
-    check("a github:// registry is accepted", M._github_source("github://o/r") == ("o", "r", ""))
-    check("and a pinned tag comes through",
-          M._github_source("github://o/r@v2") == ("o", "r", "v2"))
-
     models = M.list_models(refresh=True)
-    check("the index is read out of the release", [m.id for m in models] == ["tryp"])
-    check("an entry may name an asset instead of a url", models[0].asset == "tryp.pt")
-    check("and still knows what to call the file", models[0].name == "tryp.pt")
+    assert [m.id for m in models] == ["tryp"], "the index is read out of the release"
+    assert models[0].asset == "tryp.pt", "an entry may name an asset instead of a url"
+    assert models[0].name == "tryp.pt"
 
     M.prune_cache(keep=set())
-    path = M.fetch(models[0])
-    check("the weights arrive through the API", path.read_bytes() == WEIGHTS)
-    check("the asset was requested as a byte stream, which is what serves a "
-          "private release",
-          any(u.endswith("/assets/2") and o["accept"] == "application/octet-stream"
-              for u, o in seen), str(seen[-1]))
-    check("and the token was available for it", all(o["token"] for _u, o in seen))
+    assert M.fetch(models[0]).read_bytes() == WEIGHTS
+    assert any(u.endswith("/assets/2") and o["accept"] == "application/octet-stream"
+               for u, o in seen), seen[-1]
+    assert all(o["token"] for _u, o in seen)
 
 
-def test_a_token_is_only_ever_sent_to_github(root, monkeypatch) -> None:
-    """A registry may name any host; the credential must not follow it there."""
+def test_a_token_is_only_ever_sent_to_github(monkeypatch) -> None:
     monkeypatch.setenv("GH_TOKEN", "ghp_pretend")
     sent: dict = {}
 
@@ -352,72 +298,54 @@ def test_a_token_is_only_ever_sent_to_github(root, monkeypatch) -> None:
     monkeypatch.setattr(M.urllib.request, "urlopen", capture)
     for url in ("https://elsewhere.example.org/index.json", "http://127.0.0.1:1/x"):
         sent.clear()
-        try:
+        with pytest.raises(_Boom):
             M._get(url)
-        except _Boom:
-            pass
-        check(f"no credential goes to {url.split('/')[2]}",
-              not any(k.lower() == "authorization" for k in sent), str(sent))
+        assert not any(k.lower() == "authorization" for k in sent), f"{url}: {sent}"
 
     sent.clear()
-    try:
+    with pytest.raises(_Boom):
         M._get("https://api.github.com/repos/o/r/releases/latest")
-    except _Boom:
-        pass
-    check("but api.github.com does get one",
-          any(k.lower() == "authorization" for k in sent), str(sent))
+    assert any(k.lower() == "authorization" for k in sent), sent
 
 
-def test_a_model_this_tool_cannot_run_is_listed_and_explained(root, monkeypatch) -> None:
-    """The registry is broader than trackanno: segmentation and fluorescence
-    models belong beside the detectors even while this tool cannot drive them.
+# --------------------------------------------------------------------------- #
+# models this tool cannot run
+# --------------------------------------------------------------------------- #
+SEG = M.ModelEntry(id="leish-seg", url="https://example.org/seg.pt",
+                   task="segment", modality="fluorescence", framework="ultralytics",
+                   config={"detection": {"conf": 0.4}})
 
-    Hiding them would make the registry lie about its own contents, and writing
-    their task into detection.task would fail the whole apply with a config
-    error that says nothing about the real reason.
-    """
-    seg = M.ModelEntry(id="leish-seg", url="https://example.org/seg.pt",
-                       task="segment", modality="fluorescence",
-                       framework="ultralytics",
-                       config={"detection": {"conf": 0.4}})
-    check("a segmentation model parses fine", seg.task == "segment")
-    check("but is not runnable here", not seg.runnable)
-    check("and says why, naming what this tool does run",
-          "segment" in seg.unsupported_reason and "detect" in seg.unsupported_reason)
-    check("the framework and modality show in the picker label",
-          "fluorescence" in seg.label and "ultralytics" in seg.label, seg.label)
 
-    pose = M.ModelEntry(id="p", url="https://example.org/p.pt", task="pose",
-                        framework="ultralytics")
-    detect = M.ModelEntry(id="d", url="https://example.org/d.pt", task="detect",
-                          framework="ultralytics")
-    unstated = M.ModelEntry(id="u", url="https://example.org/u.pt",
-                            framework="ultralytics")
-    check("pose and detect are runnable", pose.runnable and detect.runnable)
-    check("and so is an entry that states no task", unstated.runnable)
-    check("an entry that states no framework is not, since nothing knows how to "
-          "load it", not M.ModelEntry(id="q", url="https://example.org/q.pt").runnable)
+def test_a_model_this_tool_cannot_run_is_listed_and_explained() -> None:
+    assert SEG.task == "segment"
+    assert not SEG.runnable
+    assert "segment" in SEG.unsupported_reason and "detect" in SEG.unsupported_reason
+    assert "fluorescence" in SEG.label and "ultralytics" in SEG.label, SEG.label
 
+
+def test_runnable_needs_a_supported_task_and_a_framework() -> None:
+    for task in ("pose", "detect"):
+        assert M.ModelEntry(id=task, url="https://example.org/p.pt", task=task,
+                            framework="ultralytics").runnable
+    assert M.ModelEntry(id="u", url="https://example.org/u.pt",
+                        framework="ultralytics").runnable, "no task stated is fine"
+    assert not M.ModelEntry(id="q", url="https://example.org/q.pt").runnable, (
+        "no framework stated means nothing knows how to load it")
+
+
+def test_an_unrunnable_manifest_applies_its_settings_but_not_its_task(root) -> None:
     path = create_project(root / "seg")
-    told = M.apply_manifest(path, seg)
+    told = M.apply_manifest(path, SEG)
     cfg = load_config(path)
-    check("its inference settings still apply", cfg.detection.conf == 0.4)
-    check("the task is left alone rather than written and rejected",
-          cfg.detection.task in ("detect", "pose"), cfg.detection.task)
-    check("and the report says it was not applied",
-          any(t.startswith("NOT applied") for t in told), str(told))
+    assert cfg.detection.conf == 0.4
+    assert cfg.detection.task in ("detect", "pose"), cfg.detection.task
+    assert any(t.startswith("NOT applied") for t in told), told
 
 
 def test_the_cache_holds_whatever_the_asset_is(registry, root) -> None:
-    """An entry is bytes plus a digest, so the format is not the cache's business.
-
-    A Mask2Former checkpoint, an ONNX export or a zipped model directory all
-    cache and verify the same way. Only running them is trackanno-specific, and
-    `runnable` is what says so.
-    """
-    served = root / "release"
+    """An entry is bytes plus a digest, whatever the format."""
     payload = b"not a torch checkpoint at all" * 100
-    (served / "m2f.tar.gz").write_bytes(payload)
+    (root / "release" / "m2f.tar.gz").write_bytes(payload)
     sha = hashlib.sha256(payload).hexdigest()
     entry = M.ModelEntry(id="leish-m2f", url=f"{registry.base}/m2f.tar.gz", sha256=sha,
                          task="segment", framework="hf-transformers",
@@ -425,56 +353,42 @@ def test_the_cache_holds_whatever_the_asset_is(registry, root) -> None:
                                      "normalize": {"mean": [0.485], "std": [0.229]}})
 
     path = M.fetch(entry)
-    check("a non-.pt asset caches like any other", path.read_bytes() == payload)
-    check("under a name of its own", path.name == "m2f.tar.gz", path.name)
-    check("and is found again without knowing the extension",
-          M.cached_path(sha) == path, str(M.cached_path(sha)))
-    check("the sidecar manifest is not mistaken for the model",
-          M.cached_path(sha).name != "manifest.json")
-    check("preprocessing travels with it, for whatever runs the model",
-          entry.preprocess["input_size"] == [1024, 1024])
-    check("but trackanno declines to run it, naming the framework it does",
-          not entry.runnable and "ultralytics" in entry.unsupported_reason)
+    assert path.read_bytes() == payload
+    assert path.name == "m2f.tar.gz"
+    assert M.cached_path(sha) == path, "found again without knowing the extension"
+    assert entry.preprocess["input_size"] == [1024, 1024]
+    assert not entry.runnable and "ultralytics" in entry.unsupported_reason
+
+
+# --------------------------------------------------------------------------- #
+# scale ranges and bad manifest values
+# --------------------------------------------------------------------------- #
+def test_a_scale_range_reads_as_its_span() -> None:
+    assert M.span([0.2, 0.65]) == (0.2, 0.65)
+    assert M.span([0.325, 0.65, 1.3]) == (0.325, 1.3), "discrete values read as their span"
+    assert M.span(0.325) == (0.325, 0.325)
+    assert M.describe_span(0.325, "um") == "0.325 um"
+    assert M.describe_span([0.2, 0.65], "um") == "0.2 to 0.65 um"
 
 
 def test_a_scale_range_is_compared_rather_than_announced(root) -> None:
-    """A model trained across magnifications has no single pixel size to state."""
-    path = create_project(root / "scales")
+    """A multi-scale model warns only when a measured pixel size falls outside it."""
+    cfg = load_config(create_project(root / "scales"))
     multi = M.ModelEntry(id="multi", url="https://x/m.pt", framework="ultralytics",
                          assumes={"pixel_size_um": [0.2, 0.65], "fps": 100})
     single = M.ModelEntry(id="single", url="https://x/s.pt", framework="ultralytics",
                           assumes={"pixel_size_um": 0.325})
-    cfg = load_config(path)
 
-    check("a range reads as the interval it covers", M.span([0.2, 0.65]) == (0.2, 0.65))
-    check("discrete values read as their span", M.span([0.325, 0.65, 1.3]) == (0.325, 1.3))
-    check("a scalar is an interval of no width", M.span(0.325) == (0.325, 0.325))
-    check("and it is described as one number, not a range",
-          M.describe_span(0.325, "um") == "0.325 um"
-          and M.describe_span([0.2, 0.65], "um") == "0.2 to 0.65 um")
-
-    check("a multi-scale model says nothing when there is nothing to compare",
-          not any("pixel" in w for w in M.mismatch_warnings(cfg, multi)),
-          str(M.mismatch_warnings(cfg, multi)))
-    check("a single-scale one states its constraint",
-          any("0.325" in w for w in M.mismatch_warnings(cfg, single)))
-
+    assert not any("pixel" in w for w in M.mismatch_warnings(cfg, multi))
+    assert any("0.325" in w for w in M.mismatch_warnings(cfg, single))
     inside = M.mismatch_warnings(cfg, multi, pixel_size_um=0.5)
     outside = M.mismatch_warnings(cfg, multi, pixel_size_um=1.3)
-    check("a measured pixel size inside the range is not a warning",
-          not any("pixel" in w for w in inside), str(inside))
-    check("one outside it is, quoting both", any("1.3" in w and "0.65" in w for w in outside),
-          str(outside))
-    check("and the picker can say what a model was trained on",
-          multi.trained_at == "100 fps, 0.2 to 0.65 um/px", multi.trained_at)
+    assert not any("pixel" in w for w in inside), inside
+    assert any("1.3" in w and "0.65" in w for w in outside), outside
+    assert multi.trained_at == "100 fps, 0.2 to 0.65 um/px"
 
 
 def test_a_value_the_loader_rejects_costs_only_that_value(root) -> None:
-    """A manifest is written elsewhere, so one bad number must not stop a model
-    configuring the rest of the project.
-
-    One refused value used to fail the whole apply, leaving nothing set.
-    """
     path = create_project(root / "badvalue")
     entry = M.ModelEntry(id="sloppy", url="https://x/s.pt", framework="ultralytics",
                          task="pose",
@@ -482,21 +396,13 @@ def test_a_value_the_loader_rejects_costs_only_that_value(root) -> None:
                                  "tiling": {"tile": 1280, "enabled": "sometimes"}})
     told = M.apply_manifest(path, entry)
     cfg = load_config(path)
-
-    check("the good values still applied", cfg.detection.conf == 0.4 and cfg.tiling.tile == 1280,
-          f"conf {cfg.detection.conf}, tile {cfg.tiling.tile}")
-    check("the bad one did not", cfg.tiling.enabled == "auto", str(cfg.tiling.enabled))
-    check("and it is reported with the loader's own complaint",
-          any("NOT applied" in t and "enabled" in t for t in told), str(told))
-    check("the project still loads", load_config(path) is not None)
+    assert cfg.detection.conf == 0.4 and cfg.tiling.tile == 1280
+    assert cfg.tiling.enabled == "auto", "the bad value is not applied"
+    assert any("NOT applied" in t and "enabled" in t for t in told), told
 
 
-def test_the_picker_offers_only_what_this_tool_can_run(app, root, monkeypatch) -> None:
-    """Choosing a model is the point, so the list is models this project can use.
-
-    The rest of the registry is counted rather than listed: hidden entirely it
-    would look like the registry was smaller than it is.
-    """
+def test_the_picker_offers_only_what_this_tool_can_run(app, monkeypatch) -> None:
+    """Unrunnable entries are counted, not listed."""
     from trackanno.gui.hub import ModelRegistryDialog
 
     offered = [
@@ -512,15 +418,11 @@ def test_the_picker_offers_only_what_this_tool_can_run(app, root, monkeypatch) -
 
     dialog = ModelRegistryDialog()
     listed = [dialog.list.item(i).text() for i in range(dialog.list.count())]
-    check("only the runnable model is listed", len(listed) == 1 and "pose" in listed[0],
-          str(listed))
-    check("the others are counted, not hidden", "2 further" in dialog.detail.text(),
-          dialog.detail.text())
+    assert len(listed) == 1 and "pose" in listed[0], listed
+    assert "2 further" in dialog.detail.text(), dialog.detail.text()
 
     dialog.list.setCurrentRow(0)
-    check("choosing it enables the download", dialog.ok.isEnabled())
-    check("and the button says what it will do", "Download" in dialog.ok.text(),
-          dialog.ok.text())
-    check("the description is what a person needs to choose",
-          "the one to use" in dialog.detail.text(), dialog.detail.text())
+    assert dialog.ok.isEnabled()
+    assert "Download" in dialog.ok.text()
+    assert "the one to use" in dialog.detail.text()
     dialog.close()

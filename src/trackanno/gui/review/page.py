@@ -20,14 +20,12 @@ from .reader import PredictionReader, TrackPredictions
 __all__ = ["REVIEW_HELP", "BoutReviewPanel"]
 
 REVIEW_HELP = """
-<h3>What the lanes are</h3>
-<p>Each bar is one decoded <b>bout</b>. Bar height is the bout's mean posterior
-for its class, so a marginal bout is a short bar.</p>
-<p>A hatched stretch is one no window could score; hover it for the reason.</p>
+<h3>Lanes</h3>
+<p>Each bar is one predicted <b>bout</b>; its height is the mean confidence.</p>
+<p>Hatched stretches could not be scored; hover for the reason.</p>
 
-<h3>The video</h3>
-<p>Click or drag on the lanes to move the video there. Frames are cut from the
-movie at one crop for the whole session.</p>
+<h3>Video</h3>
+<p>Click or drag on the lanes to move the video there.</p>
 """
 
 
@@ -146,8 +144,7 @@ class BoutReviewPanel(QWidget):
                          name="trackanno-review-load", daemon=True).start()
 
     def _load(self, gen: int, cfg: Config) -> None:
-        """Worker: read the predictions, the first movie's tracks and the
-        session crop, hand them over, then warm the other movies' track lists."""
+        """Worker: read predictions, first movie's tracks and crop, then warm the rest."""
         crop = None
         try:
             reader = PredictionReader(cfg)
@@ -195,8 +192,7 @@ class BoutReviewPanel(QWidget):
         return self.reader is not None
 
     def select(self, movie_id: str, track_id: int) -> bool:
-        """Show one (movie, track) directly, painting only that track. Before
-        the predictions are loaded the choice is kept and applied on arrival."""
+        """Show one (movie, track); before loading finishes, the choice is queued."""
         if self.reader is None:
             self._pending = (str(movie_id), int(track_id))
             return True
@@ -267,12 +263,12 @@ class BoutReviewPanel(QWidget):
             if not track.empty else "<b>predicted bouts</b>; this track has none."
         )
         if self.reader.stale:
-            head += (f"<br><span style='color:{tokens()['warning']}'>These "
-                     f"predictions may be out of date: {self.reader.stale}.</span>")
+            head += (f"<br><span style='color:{tokens()['warning']}'>Predictions "
+                     f"may be out of date: {self.reader.stale}.</span>")
         self.headline.setText(head)
 
     def _say(self, problem: str) -> None:
-        """One line where the lanes would be; the selectors stay usable."""
+        """Show a message in place of the lanes and footage."""
         self.headline.setText("")
         self._track = None
         self.timeline.set_track(TrackPredictions("", 0), note=problem)

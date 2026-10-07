@@ -1,26 +1,4 @@
-"""Checks for :mod:`trackanno.measure.wavespectra`, the sliding-window beat spectrum.
-
-Everything here is generated from a travelling wave with known parameters -
-``psi(s, t) = A sin(2 pi f t - k s)`` integrated into a keypoint chain - so the
-truth is known exactly and no annotation, movie or network share is involved.
-The four things worth testing separately are:
-
-* that a window read out of a whole-track series is the same measurement as one
-  computed on those frames alone - the sliding machinery is supposed to change
-  the COST and nothing else, so anything it leaks across a window edge (the
-  global time unwrap, the whole-track interpolation, the STFT's own slice grid)
-  shows up as a disagreement here;
-* that the shape descriptors have the values the wave's own algebra says they
-  must, which is what stops a plausible-looking Legendre fit from being wrong
-  in a way no ground-truth frequency check would notice;
-* that ``f``, ``lambda`` and ``lambda / L`` come back, for a retrograde wave as
-  well as an anterograde one - a direction estimator that cannot be made to say
-  -1 is not measuring direction;
-* that a reversal inside a track is LOCATED, which is the entire reason the
-  sliding version exists;
-* that the guards still fire - the interpolation ceiling, the band floor, the
-  red-noise excess - and that a failure is reported as NaN rather than as 0.0.
-"""
+"""Tests for :mod:`trackanno.measure.wavespectra`, on synthetic travelling waves."""
 
 from __future__ import annotations
 
@@ -28,8 +6,8 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 from scipy.signal import ShortTimeFFT
-from harness import check
 from trackanno.measure.wavespectra import (
     DEFAULT_FLOW_FRAMES, DEFAULT_HOP, DEFAULT_WINDOW, SERIES_COLUMNS,
     _detrend_coeffs, spectral_series, track_spectral_series, window_values,
@@ -37,11 +15,26 @@ from trackanno.measure.wavespectra import (
 
 FPS = 100.0
 N_KEYPOINTS = 8            # Head, Base, Flag1..Flag5, Tip
+N_SEG = N_KEYPOINTS - 2
 
 
-# --------------------------------------------------------------------------- #
-# the generator
-# --------------------------------------------------------------------------- #
+def chain(psi: np.ndarray, length_px: float = 60.0) -> tuple[np.ndarray, np.ndarray]:
+    """Keypoints whose segment tangent angles are ``psi`` (frames x segments)."""
+    n_frames = psi.shape[0]
+    ds = length_px / N_SEG
+    x = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
+    y = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
+    px = np.zeros((n_frames, N_KEYPOINTS))
+    py = np.zeros((n_frames, N_KEYPOINTS))
+    px[:, 1:], py[:, 1:] = x, y
+    px[:, 0], py[:, 0] = 20.0, 0.0                     # Head, out along +x from Base
+    return px, py
+
+
+def s_mid(length_px: float = 60.0) -> np.ndarray:
+    return (np.arange(N_SEG) + 0.5) * length_px / N_SEG
+
+
 def travelling_wave(
     n_frames: int,
     freq_hz: float = 8.0,
@@ -51,49 +44,36 @@ def travelling_wave(
     k_sign: int = +1,
     noise_px: float = 0.0,
     seed: int = 0,
-    flip_at: int | None = None,
+    flip_at: int | tuple | None = None,
     fps: float = FPS,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Keypoints of a flagellum carrying ``psi(s, t) = A sin(2 pi f t - k s)``.
+    """Keypoints of ``psi(s, t) = pi + A sin(2 pi f t - k s)``; ``k_sign=+1`` runs Base to Tip.
 
-    The tangent angle is the primitive here and the keypoints are its integral,
-    which is the inverse of what the module does - so a recovered ``psi`` that
-    matches is a genuine round trip rather than an algebraic identity.
-
-    ``k_sign = +1`` is a wave running Base -> Tip and must read
-    ``wave_direction = +1``; ``-1`` is retrograde and must read ``-1``. With
-    ``flip_at`` the wavevector reverses at that frame while the temporal phase
-    stays continuous, which is what a real cell reversing its beat looks like -
-    the wave turns round, it does not restart.
-
-    The chain is laid out with Head at ``+x`` from Base so the flagellum's
-    tangent angle sits near ``+-pi``, on ``arctan2``'s branch cut. That is the
-    awkward case (54% of real clips land within 0.5 rad of it) and it is
-    deliberate: a static mode taken as a plain mean rather than a circular one
-    fails here and nowhere else.
+    The angle sits near the arctan2 branch cut on purpose; ``flip_at`` reverses
+    the wavevector at those frames with a continuous temporal phase.
     """
     rng = np.random.default_rng(seed)
-    n_seg = N_KEYPOINTS - 2
-    ds = length_px / n_seg
-    s_mid = (np.arange(n_seg) + 0.5) * ds
     k = 2.0 * np.pi / (wavelength_ratio * length_px)
-
     sign = np.full(n_frames, float(k_sign))
     for i, at in enumerate(np.atleast_1d(flip_at) if flip_at is not None else ()):
         sign[int(at):] = float(k_sign) * (-1.0) ** (i + 1)
     phase = np.cumsum(np.full(n_frames, 2.0 * np.pi * freq_hz / fps))
-    psi = np.pi + amplitude * np.sin(phase[:, None] - sign[:, None] * k * s_mid[None, :])
-
-    x = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
-    y = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
-    px = np.zeros((n_frames, N_KEYPOINTS))
-    py = np.zeros((n_frames, N_KEYPOINTS))
-    px[:, 1:], py[:, 1:] = x, y
-    px[:, 0], py[:, 0] = 20.0, 0.0                     # Head, out along +x from Base
+    psi = np.pi + amplitude * np.sin(
+        phase[:, None] - sign[:, None] * k * s_mid(length_px)[None, :])
+    px, py = chain(psi, length_px)
     if noise_px:
         px = px + rng.normal(0.0, noise_px, px.shape)
         py = py + rng.normal(0.0, noise_px, py.shape)
     return px, py
+
+
+def wandering_wave(n_frames: int, mean_hz: float, swing_hz: float):
+    """A wave whose frequency swings sinusoidally around ``mean_hz`` at 0.6 Hz."""
+    t = np.arange(n_frames) / FPS
+    instantaneous = mean_hz + swing_hz * np.sin(2.0 * np.pi * 0.6 * t)
+    phase = np.cumsum(2.0 * np.pi * instantaneous / FPS)
+    psi = np.pi + 0.6 * np.sin(phase[:, None] - (2.0 * np.pi / 60.0) * s_mid()[None, :])
+    return chain(psi)
 
 
 def measurable(series: pd.DataFrame) -> pd.DataFrame:
@@ -101,35 +81,21 @@ def measurable(series: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-def test_window_placement_is_self_consistent() -> None:
-    """A window read out of the track must equal that window computed alone.
-
-    This is the load-bearing test of the sliding machinery. Everything the
-    module does once per TRACK rather than once per window - the arclength unwrap
-    then the time unwrap, the whole-track NaN fill, the single
-    :class:`ShortTimeFFT` the slices are read out of, the per-window linear
-    detrend that is supposed to absorb whatever the global unwrap left behind -
-    is an optimisation, and an optimisation that changes the answer is a bug.
-
-    Handing ``spectral_series`` exactly one window's frames makes it produce that
-    window on its own, with nothing outside it to leak in. On a gapless track the
-    two must agree to floating-point noise; the docstring's claim that a global
-    unwrap "agrees up to a constant per node, which the detrend removes" is
-    precisely what is being checked.
-    """
+# sliding windows
+# --------------------------------------------------------------------------- #
+def test_a_slid_window_equals_that_window_computed_alone() -> None:
+    """Per-track work (unwrap, fill, one STFT) must not change any window's answer."""
     px, py = travelling_wave(400, noise_px=0.4, seed=11)
     window = 75
     series = spectral_series(px, py, FPS, window, hop=1)
     mid = window // 2
 
-    worst_key, worst = "", 0.0
-    compared = 0
+    worst_key, worst, compared = "", 0.0, 0
     for centre in series.index[::37]:
         start = int(centre) - mid
         alone = spectral_series(px[start:start + window], py[start:start + window],
                                 FPS, window=window, hop=1)
-        check(f"the window at frame {centre} computes on its own", len(alone) == 1,
-              f"{len(alone)} rows")
+        assert len(alone) == 1, f"window at frame {centre}: {len(alone)} rows"
         for key in series.columns:
             here = float(series.loc[centre, key])
             solo = float(alone.iloc[0][key])
@@ -139,91 +105,46 @@ def test_window_placement_is_self_consistent() -> None:
             deviation = abs(here - solo) / max(1.0, abs(here))
             if deviation > worst:
                 worst_key, worst = key, deviation
-    check("every column of a slid window matches the window computed alone to 1e-9",
-          worst < 1e-9, f"worst {worst:.2e} on {worst_key} over {compared} comparisons")
-
-    # And on a track with real gaps in it, where the fill has to do some work.
-    # Here the two are NOT expected to be identical, by design: the module
-    # interpolates over the WHOLE track, so a gap straddling the window edge is
-    # bridged from both sides instead of being clamped to the last value inside
-    # the window. What must survive is the physics, so it is checked against the
-    # wave that was generated rather than against another estimate of it.
-    holes = px.copy(), py.copy()
-    rng = np.random.default_rng(2)
-    drop = rng.choice(np.arange(120, 260), size=14, replace=False)
-    holes[0][drop] = np.nan
-    holes[1][drop] = np.nan
-    gapped = spectral_series(holes[0], holes[1], FPS, window, hop=1)
-    centre = 190
-    check("a gapped window still reports the direction the wave was built with",
-          gapped.loc[centre, "wave_direction"] == 1.0,
-          str(gapped.loc[centre, "wave_direction"]))
-    check("a gapped window is within one bin of the frequency it was built with",
-          abs(float(gapped.loc[centre, "wave_freq_hz"]) - 8.0) <= FPS / window + 1e-9,
-          f"{gapped.loc[centre, 'wave_freq_hz']} vs 8.0")
+    assert worst < 1e-9, f"worst {worst:.2e} on {worst_key} over {compared} comparisons"
 
 
-def test_shape_coefficients_are_analytic() -> None:
-    """The Legendre descriptors, against the algebra of the wave that made them.
-
-    ``psi(s, t) = pi + A sin(2 pi f t - sign * k s)`` has, by construction:
-
-    * a static mode that is the constant ``pi``, so its circular readout is
-      ``cos = -1``, ``sin = 0`` and both shape coefficients are zero;
-    * a FLAT amplitude profile ``a(s) = A``, so the asymmetric and parabolic
-      amplitude coefficients are zero and only the mean survives;
-    * a LINEAR phase profile. For ``f(s) = a + b s`` on ``s`` in [0, 1] the
-      shifted-Legendre expansion is ``(a + b/2) P0 + (b/2) P1 + 0 P2``, and the
-      total phase across the flagellum is ``-sign * k L = -sign * 2 pi / ratio``.
-      So ``wave_phase_asym = -sign * pi / ratio`` exactly, and
-      ``wave_phase_para`` is zero.
-
-    These are the columns no frequency or wavelength check touches. Without this
-    the whole Legendre projection could be transposed, mis-scaled or fitted on
-    the wrong axis and every other test in the file would still pass.
-    """
-    for ratio in (1.0, 0.75, 1.25):
-        for k_sign in (+1, -1):
-            px, py = travelling_wave(600, freq_hz=8.0, wavelength_ratio=ratio,
-                                     amplitude=0.6, k_sign=k_sign)
-            rows = measurable(spectral_series(px, py, FPS, 75, 5))
-            med = {c: float(rows[c].median()) for c in rows.columns}
-            tag = f"(k_sign={k_sign:+d} lam/L={ratio})"
-
-            check(f"the static mode is the constant it was built as {tag}",
-                  abs(med["wave_static_cos"] + 1.0) < 1e-3
-                  and abs(med["wave_static_sin"]) < 1e-3
-                  and abs(med["wave_static_asym"]) < 1e-3
-                  and abs(med["wave_static_para"]) < 1e-3,
-                  f"cos {med['wave_static_cos']:.4f} sin {med['wave_static_sin']:.4f} "
-                  f"asym {med['wave_static_asym']:.4f} para {med['wave_static_para']:.4f}")
-            check(f"a flat amplitude profile has no shape terms {tag}",
-                  abs(med["wave_amp_asym"]) < 1e-3 and abs(med["wave_amp_para"]) < 1e-3,
-                  f"asym {med['wave_amp_asym']:.5f} para {med['wave_amp_para']:.5f}")
-            expected_asym = -k_sign * np.pi / ratio
-            check(f"the phase asymmetry is -sign * pi / ratio {tag}",
-                  abs(med["wave_phase_asym"] - expected_asym) < 1e-3,
-                  f"{med['wave_phase_asym']:.5f} vs {expected_asym:.5f}")
-            check(f"a linear phase profile has no parabolic term {tag}",
-                  abs(med["wave_phase_para"]) < 1e-3, f"{med['wave_phase_para']:.5f}")
-            # The slope is per PIXEL: k = 2 pi / (ratio * L), signed by -k_sign.
-            expected_slope = -k_sign * 2.0 * np.pi / (ratio * 60.0)
-            check(f"the phase slope is the wavevector in px^-1 {tag}",
-                  abs(med["wave_phase_slope"] - expected_slope) < 1e-4,
-                  f"{med['wave_phase_slope']:.6f} vs {expected_slope:.6f}")
+def test_a_gapped_window_still_recovers_the_wave() -> None:
+    """Gaps are bridged from the whole track, so check against the generated wave."""
+    px, py = travelling_wave(400, noise_px=0.4, seed=11)
+    window = 75
+    drop = np.random.default_rng(2).choice(np.arange(120, 260), size=14, replace=False)
+    px[drop] = np.nan
+    py[drop] = np.nan
+    gapped = spectral_series(px, py, FPS, window, hop=1)
+    assert gapped.loc[190, "wave_direction"] == 1.0
+    assert abs(float(gapped.loc[190, "wave_freq_hz"]) - 8.0) <= FPS / window + 1e-9
 
 
-def test_detrend_is_exact() -> None:
-    """The analytic detrend must equal SciPy's per-slice one, not approximate it.
+@pytest.mark.parametrize("ratio", [1.0, 0.75, 1.25])
+@pytest.mark.parametrize("k_sign", [+1, -1])
+def test_shape_coefficients_are_analytic(ratio: float, k_sign: int) -> None:
+    """Legendre descriptors match the wave's algebra: constant static mode, flat amplitude, linear phase."""
+    px, py = travelling_wave(600, freq_hz=8.0, wavelength_ratio=ratio,
+                             amplitude=0.6, k_sign=k_sign)
+    rows = measurable(spectral_series(px, py, FPS, 75, 5))
+    med = {c: float(rows[c].median()) for c in rows.columns}
 
-    ``spectral_series`` subtracts the fitted line in the FREQUENCY domain -
-    ``rfft(w*(x-a-bt)) = rfft(w*x) - a rfft(w) - b rfft(w*t)`` - because
-    ``ShortTimeFFT.stft_detrend`` runs an ``lstsq`` per slice from Python and
-    that cost 64% of the runtime. The identity is exact, so the test is exact.
-    """
+    for key, want in (("wave_static_cos", -1.0), ("wave_static_sin", 0.0),
+                      ("wave_static_asym", 0.0), ("wave_static_para", 0.0),
+                      ("wave_amp_asym", 0.0), ("wave_amp_para", 0.0),
+                      ("wave_phase_asym", -k_sign * np.pi / ratio),
+                      ("wave_phase_para", 0.0)):
+        assert abs(med[key] - want) < 1e-3, f"{key}: {med[key]:.5f} vs {want:.5f}"
+    # The slope is per pixel: k = 2 pi / (ratio * L), signed by -k_sign.
+    expected_slope = -k_sign * 2.0 * np.pi / (ratio * 60.0)
+    assert abs(med["wave_phase_slope"] - expected_slope) < 1e-4
+
+
+def test_analytic_detrend_equals_scipys() -> None:
+    """The frequency-domain detrend is an exact identity with stft_detrend."""
     rng = np.random.default_rng(5)
     n, m, hop, n_node = 500, 75, 5, 6
-    signal = rng.normal(size=(n, n_node)).cumsum(axis=0)     # a random walk, as psi is
+    signal = rng.normal(size=(n, n_node)).cumsum(axis=0)
     win = np.hanning(m)
     sft = ShortTimeFFT(win, hop=hop, fs=FPS, fft_mode="onesided", phase_shift=None)
     starts = np.arange(int(np.ceil(sft.m_num_mid / hop)),
@@ -236,555 +157,346 @@ def test_detrend_is_exact() -> None:
                 - np.fft.rfft(win)[:, None, None] * alpha.T[None]
                 - np.fft.rfft(win * np.arange(m, dtype=float))[:, None, None] * beta.T[None])
     scale = np.abs(reference).max()
-    check("analytic detrend equals ShortTimeFFT.stft_detrend",
-          float(np.abs(reference - analytic).max()) < 1e-8 * scale,
-          f"max abs diff {np.abs(reference - analytic).max():.3e} on scale {scale:.3e}")
+    assert float(np.abs(reference - analytic).max()) < 1e-8 * scale
 
-    # And the phase reference is the window's FIRST sample, as np.fft.rfft uses -
-    # SciPy defaults to the window midpoint, which is a constant per bin and so
-    # invisible in the phase gradient but wrong in the absolute phase.
+    # The phase reference is the window's first sample, as in np.fft.rfft.
     manual = np.fft.rfft(signal[starts[3]:starts[3] + m] * win[:, None], axis=0)
     plain = sft.stft(signal, p0=p0, p1=p0 + starts.size, axis=0)[:, :, 3]
-    check("phase reference matches np.fft.rfft (phase_shift=None)",
-          float(np.abs(manual - plain).max()) < 1e-8 * np.abs(manual).max())
+    assert float(np.abs(manual - plain).max()) < 1e-8 * np.abs(manual).max()
 
 
-def test_synthetic_recovery() -> None:
-    """f, lambda and lambda/L come back, in both propagation directions."""
-    cases = [(8.0, 1.00, 60.0), (12.0, 0.75, 80.0), (6.0, 1.25, 45.0)]
-    for k_sign in (+1, -1):
-        for freq, ratio, length in cases:
-            px, py = travelling_wave(400, freq_hz=freq, wavelength_ratio=ratio,
-                                     length_px=length, k_sign=k_sign)
-            series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-            good = measurable(series)
-            tag = f"k_sign={k_sign:+d} f={freq} lam/L={ratio}"
-            check(f"frequency recovered ({tag})",
-                  abs(float(good["wave_freq_hz"].median()) - freq) <= FPS / DEFAULT_WINDOW,
-                  f"got {good['wave_freq_hz'].median()}")
-            check(f"wavelength recovered ({tag})",
-                  abs(float(good["wave_wavelength_px"].median()) - ratio * length)
-                  < 0.02 * ratio * length,
-                  f"got {good['wave_wavelength_px'].median()} want {ratio * length}")
-            check(f"lambda/L recovered ({tag})",
-                  abs(float(good["wave_wavelength_ratio"].median()) - ratio) < 0.02 * ratio,
-                  f"got {good['wave_wavelength_ratio'].median()}")
-            check(f"flagellum length recovered ({tag})",
-                  abs(float(good["wave_length_px"].median()) - length) < 0.01 * length)
-            check(f"phase profile is linear, rsq > 0.99 ({tag})",
-                  float(good["wave_phase_rsq"].median()) > 0.99)
-            # THE sign convention: +1 is Base -> Tip. Verified against 170 real
-            # hand labels at 85% with no training; a flip here inverts the whole
-            # behaviour classifier.
-            check(f"direction is {k_sign:+d} on every window ({tag})",
-                  bool((series["wave_direction"].dropna() == k_sign).all()),
-                  f"{(series['wave_direction'] == k_sign).mean():.3f} agreed")
+# --------------------------------------------------------------------------- #
+# recovery
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("k_sign", [+1, -1])
+@pytest.mark.parametrize("freq,ratio,length", [(8.0, 1.00, 60.0), (12.0, 0.75, 80.0),
+                                               (6.0, 1.25, 45.0)])
+def test_frequency_wavelength_and_direction_come_back(freq, ratio, length, k_sign) -> None:
+    px, py = travelling_wave(400, freq_hz=freq, wavelength_ratio=ratio,
+                             length_px=length, k_sign=k_sign)
+    series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
+    good = measurable(series)
+    assert abs(float(good["wave_freq_hz"].median()) - freq) <= FPS / DEFAULT_WINDOW
+    assert abs(float(good["wave_wavelength_px"].median()) - ratio * length) < 0.02 * ratio * length
+    assert abs(float(good["wave_wavelength_ratio"].median()) - ratio) < 0.02 * ratio
+    assert abs(float(good["wave_length_px"].median()) - length) < 0.01 * length
+    assert float(good["wave_phase_rsq"].median()) > 0.99
+    # The sign convention: +1 is Base to Tip.
+    assert bool((series["wave_direction"].dropna() == k_sign).all()), (
+        f"{(series['wave_direction'] == k_sign).mean():.3f} agreed")
 
-    # Amplitude is a real number with the Hanning coherent gain in it, not an
-    # arbitrary scale: a pure tone of amplitude A must read back as A.
-    for amp in (0.3, 0.6):
-        px, py = travelling_wave(400, amplitude=amp)
-        good = measurable(spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP))
-        check(f"amplitude {amp} recovered within 5%",
-              abs(float(good["wave_amp_mean"].median()) - amp) < 0.05 * amp,
-              f"got {good['wave_amp_mean'].median()}")
 
-    # A noisy chain must not flip the answer - noise costs precision, not sign.
+@pytest.mark.parametrize("amp", [0.3, 0.6])
+def test_amplitude_reads_back_as_built(amp: float) -> None:
+    """The Hanning coherent gain is divided out, so a tone of amplitude A reads A."""
+    px, py = travelling_wave(400, amplitude=amp)
+    good = measurable(spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP))
+    assert abs(float(good["wave_amp_mean"].median()) - amp) < 0.05 * amp
+
+
+def test_noise_does_not_flip_the_direction() -> None:
     px, py = travelling_wave(400, noise_px=1.0, seed=3, k_sign=-1)
     series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-    check("direction survives 1 px of localisation noise",
-          float((series["wave_direction"] == -1).mean()) > 0.95,
-          f"{(series['wave_direction'] == -1).mean():.3f}")
+    assert float((series["wave_direction"] == -1).mean()) > 0.95
 
 
-def test_reversal_is_located() -> None:
-    """A track that turns its wave round at frame 250 must show it there.
-
-    This is the point of the sliding version. The clip-at-a-time estimator can
-    only say that two neighbouring clips disagree; this says where.
-    """
+# --------------------------------------------------------------------------- #
+# reversals and flow direction
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("window,hop", [(50, 5), (75, 5), (75, 1), (100, 5)])
+def test_reversal_is_located(window: int, hop: int) -> None:
     flip = 250
     px, py = travelling_wave(500, flip_at=flip, noise_px=0.3, seed=9)
-    for window, hop in ((50, 5), (75, 5), (75, 1), (100, 5)):
-        series = spectral_series(px, py, FPS, window, hop)
-        direction = series["wave_direction"].to_numpy(float)
-        centres = series.index.to_numpy(int)
-        finite = np.isfinite(direction)
-        # Where does the sign change for good?
-        negative = np.flatnonzero(finite & (direction < 0))
-        located = int(centres[negative[0]]) if negative.size else -1
-        check(f"reversal located within one hop (window={window}, hop={hop})",
-              abs(located - flip) <= hop, f"found at {located}, true {flip}")
-        before = direction[finite & (centres < flip - window // 2)]
-        after = direction[finite & (centres > flip + window // 2)]
-        check(f"pure +1 before the reversal (window={window}, hop={hop})",
-              bool((before > 0).all()), f"{(before > 0).mean():.3f}")
-        check(f"pure -1 after the reversal (window={window}, hop={hop})",
-              bool((after < 0).all()), f"{(after < 0).mean():.3f}")
-        # A window straddling the reversal is NOT looking at a travelling wave,
-        # and the phase linearity is the column that has to say so - otherwise a
-        # caller has no way to tell a transition from a clean measurement.
-        straddling = series.loc[np.abs(centres - flip) < window // 4, "wave_phase_rsq"]
-        clean = series.loc[np.abs(centres - flip) > window, "wave_phase_rsq"]
-        check(f"phase linearity dips across the reversal (window={window}, hop={hop})",
-              float(straddling.median()) < float(clean.median()),
-              f"{straddling.median():.4f} vs {clean.median():.4f}")
-
-    # A single long window over the same track averages the reversal away - the
-    # failure mode the whole module exists to avoid. Worth asserting so that a
-    # future "just use a longer window" cannot pass the suite.
-    whole = spectral_series(px, py, FPS, 500, 5)
-    check("a whole-track window cannot see the reversal",
-          len(whole) == 1, f"{len(whole)} rows")
+    series = spectral_series(px, py, FPS, window, hop)
+    direction = series["wave_direction"].to_numpy(float)
+    centres = series.index.to_numpy(int)
+    finite = np.isfinite(direction)
+    negative = np.flatnonzero(finite & (direction < 0))
+    located = int(centres[negative[0]]) if negative.size else -1
+    assert abs(located - flip) <= hop, f"found at {located}, true {flip}"
+    assert bool((direction[finite & (centres < flip - window // 2)] > 0).all())
+    assert bool((direction[finite & (centres > flip + window // 2)] < 0).all())
+    # A window straddling the reversal is not one travelling wave, and rsq says so.
+    straddling = series.loc[np.abs(centres - flip) < window // 4, "wave_phase_rsq"]
+    clean = series.loc[np.abs(centres - flip) > window, "wave_phase_rsq"]
+    assert float(straddling.median()) < float(clean.median())
 
 
-def test_flow_direction_needs_no_resolvable_beat() -> None:
-    """Why the flow columns exist at all.
-
-    ``wave_direction`` is read at the dominant STFT bin, so a beat with fewer
-    than ``BEAT_MIN_CYCLES`` cycles in one window is measured at whatever bin
-    the argmax fell into - ``wave_censored`` is the column that says so. The
-    flow columns read a gradient rather than a spectrum, so nothing there has a
-    band to run out of.
-    """
-    for k_sign in (+1, -1):
-        # 2.5 Hz: below the 4 Hz floor a 75-frame window at 100 fps can search.
-        px, py = travelling_wave(400, freq_hz=2.5, k_sign=k_sign)
-        series = spectral_series(px, py, FPS)
-        censored = float(series["wave_censored"].mean())
-        flow = series["wave_flow_direction"].dropna()
-        coherence = float(series["wave_flow_coherence"].median())
-        check(f"a 2.5 Hz beat is below the window's floor (k_sign={k_sign})",
-              censored > 0.5, f"{censored:.2f} of windows censored")
-        check(f"...but the flow direction still reads {k_sign:+d}",
-              len(flow) > 0 and bool((flow == k_sign).all()),
-              f"{(flow == k_sign).mean():.3f} agreed over {len(flow)} windows")
-        check(f"...and calls it one coherent wave (k_sign={k_sign})",
-              coherence > 0.8, f"{coherence:.3f}")
+def test_a_whole_track_window_cannot_see_the_reversal() -> None:
+    px, py = travelling_wave(500, flip_at=250, noise_px=0.3, seed=9)
+    assert len(spectral_series(px, py, FPS, 500, 5)) == 1
 
 
-def test_the_flow_direction_does_not_depend_on_the_spectral_window() -> None:
-    """Its support is ``flow_frames``, and that is the whole design.
+@pytest.mark.parametrize("k_sign", [+1, -1])
+def test_flow_direction_needs_no_resolvable_beat(k_sign: int) -> None:
+    """A 2.5 Hz beat is below the window's floor; the flow columns still read it."""
+    px, py = travelling_wave(400, freq_hz=2.5, k_sign=k_sign)
+    series = spectral_series(px, py, FPS)
+    flow = series["wave_flow_direction"].dropna()
+    assert float(series["wave_censored"].mean()) > 0.5
+    assert len(flow) > 0 and bool((flow == k_sign).all()), (
+        f"{(flow == k_sign).mean():.3f} agreed over {len(flow)} windows")
+    assert float(series["wave_flow_coherence"].median()) > 0.8
 
-    ``spectral.window`` is set by what the FREQUENCY needs. Anything read at the
-    dominant bin inherits it; this does not, so changing the window must not
-    move a single value.
-    """
+
+@pytest.mark.parametrize("window", [50, 150, 250])
+def test_the_flow_direction_does_not_depend_on_the_spectral_window(window: int) -> None:
     px, py = travelling_wave(500, flip_at=250, noise_px=0.3, seed=9)
     reference = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-    for window in (50, 150, 250):
-        series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
-        shared = reference.index.intersection(series.index)
-        check(f"the two runs share centres to compare (window={window})",
-              len(shared) > 10, f"{len(shared)} shared")
-        for column in ("wave_flow", "wave_flow_coherence", "wave_flow_direction"):
-            same = np.allclose(reference.loc[shared, column],
-                               series.loc[shared, column], equal_nan=True)
-            check(f"{column} is untouched by window={window}", same)
-        # ...while what the spectrum can see does move with it, which is the
-        # contrast. The floor, not the recovered frequency: a clean 8 Hz wave
-        # reads 8 Hz at every window that can resolve it.
-        moved = not np.allclose(reference.loc[shared, "wave_resolvable_hz"],
-                                series.loc[shared, "wave_resolvable_hz"],
-                                equal_nan=True)
-        check(f"...and the band the spectrum searches does move with it ({window})",
-              moved)
+    series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
+    shared = reference.index.intersection(series.index)
+    assert len(shared) > 10
+    for column in ("wave_flow", "wave_flow_coherence", "wave_flow_direction"):
+        assert np.allclose(reference.loc[shared, column], series.loc[shared, column],
+                           equal_nan=True), column
+    # The resolvable band does move with the window, which is the contrast.
+    assert not np.allclose(reference.loc[shared, "wave_resolvable_hz"],
+                           series.loc[shared, "wave_resolvable_hz"], equal_nan=True)
 
 
-def test_flow_locates_a_reversal_within_a_hop() -> None:
-    """Both directions turn at the flip; the flow does so at any window."""
+@pytest.mark.parametrize("window", [50, 75, 150])
+def test_flow_locates_a_reversal_within_a_hop(window: int) -> None:
     flip = 250
     px, py = travelling_wave(500, flip_at=flip, noise_px=0.3, seed=9)
-    for window in (50, 75, 150):
-        series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
-        centres = series.index.to_numpy(int)
-        value = series["wave_flow_direction"].to_numpy(float)
-        finite = np.isfinite(value)
-        negative = np.flatnonzero(finite & (value < 0))
-        located = int(centres[negative[0]]) if negative.size else -1
-        check(f"flow reversal located within one hop (window={window})",
-              abs(located - flip) <= DEFAULT_HOP, f"found at {located}, true {flip}")
-        wrong = finite & (value != np.where(centres < flip, 1.0, -1.0))
-        check(f"...and its error does not grow with the window ({window})",
-              int(wrong.sum()) * DEFAULT_HOP <= 2 * DEFAULT_FLOW_FRAMES,
-              f"{int(wrong.sum()) * DEFAULT_HOP} frames wrong")
+    series = spectral_series(px, py, FPS, window, DEFAULT_HOP)
+    centres = series.index.to_numpy(int)
+    value = series["wave_flow_direction"].to_numpy(float)
+    finite = np.isfinite(value)
+    negative = np.flatnonzero(finite & (value < 0))
+    located = int(centres[negative[0]]) if negative.size else -1
+    assert abs(located - flip) <= DEFAULT_HOP, f"found at {located}, true {flip}"
+    wrong = finite & (value != np.where(centres < flip, 1.0, -1.0))
+    assert int(wrong.sum()) * DEFAULT_HOP <= 2 * DEFAULT_FLOW_FRAMES
 
-    # A 30-frame reversal, well under the spectral window. Both estimators see
-    # it on a clean wave - the Hanning taper concentrates the transform on the
-    # middle of its window, so the spectral one is not simply a boxcar average
-    # over `window` frames. Asserted so that the flow column is not credited
-    # with an advantage it only has on noisy or unresolvable beats.
+
+def test_both_directions_see_a_bout_shorter_than_the_window() -> None:
+    """A 30-frame reversal on a clean wave is seen by the spectral and the flow column."""
     px, py = travelling_wave(500, flip_at=(250, 280), noise_px=0.3, seed=9)
     series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
     centres = series.index.to_numpy(int)
     inside = (centres >= 250 + DEFAULT_FLOW_FRAMES) & (centres < 280 - DEFAULT_FLOW_FRAMES)
     for column in ("wave_direction", "wave_flow_direction"):
         value = series[column].to_numpy(float)[inside]
-        check(f"{column} reports a bout shorter than the window",
-              float((value < 0).mean()) > 0.5,
-              f"{(value < 0).mean():.3f} of {int(inside.sum())} rows inside it")
+        assert float((value < 0).mean()) > 0.5, f"{column}: {(value < 0).mean():.3f}"
 
 
-def test_a_standing_wave_has_no_direction_to_report() -> None:
-    """``psi = A sin(wt) cos(ks)`` oscillates without travelling.
-
-    The sign of such a thing is noise, so the coherence beside it has to be the
-    column that says "not one travelling wave" - otherwise a direction read off
-    a standing beat is indistinguishable from a real one.
-    """
-    n_frames, n_seg = 400, N_KEYPOINTS - 2
-    ds = 60.0 / n_seg
-    s_mid = (np.arange(n_seg) + 0.5) * ds
+def test_a_standing_wave_has_no_flow_coherence() -> None:
+    """``psi = A sin(wt) cos(ks)`` does not travel, so its coherence is low."""
+    n_frames = 400
     phase = 2.0 * np.pi * 8.0 * np.arange(n_frames) / FPS
     psi = np.pi + 0.6 * np.sin(phase)[:, None] * np.cos(
-        (2.0 * np.pi / 60.0) * s_mid)[None, :]
-    x = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
-    y = np.concatenate([np.zeros((n_frames, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
-    px = np.zeros((n_frames, N_KEYPOINTS))
-    py = np.zeros((n_frames, N_KEYPOINTS))
-    px[:, 1:], py[:, 1:] = x, y
-    px[:, 0], py[:, 0] = 20.0, 0.0
-
-    standing = spectral_series(px, py, FPS)["wave_flow_coherence"].median()
-    travelling = spectral_series(*travelling_wave(n_frames), FPS)[
-        "wave_flow_coherence"].median()
-    check("a standing wave reads as barely coherent",
-          float(standing) < 0.2, f"{standing:.3f}")
-    check("...well below a travelling one", float(standing) < 0.5 * float(travelling),
-          f"{standing:.3f} vs {travelling:.3f}")
+        (2.0 * np.pi / 60.0) * s_mid())[None, :]
+    standing = float(spectral_series(*chain(psi), FPS)["wave_flow_coherence"].median())
+    travelling = float(spectral_series(*travelling_wave(n_frames), FPS)[
+        "wave_flow_coherence"].median())
+    assert standing < 0.2
+    assert standing < 0.5 * travelling
 
 
 def test_flow_survives_the_readout() -> None:
-    """The clip-level column, and the tie a median of +-1 would produce."""
     px, py = travelling_wave(300, k_sign=-1)
     series = spectral_series(px, py, FPS)
     values = window_values(series, 100, 125)
-    check("the readout carries a flow direction",
-          values["wave_flow_direction"] == -1.0, str(values["wave_flow_direction"]))
-    check("...taken from the signed coefficient, so it never ties at zero",
-          np.sign(values["wave_flow"]) == values["wave_flow_direction"],
-          f"{values['wave_flow']} vs {values['wave_flow_direction']}")
-    check("...with its coherence beside it",
-          0.0 <= values["wave_flow_coherence"] <= 1.0,
-          str(values["wave_flow_coherence"]))
+    assert values["wave_flow_direction"] == -1.0
+    # Taken from the signed coefficient, so it never ties at zero.
+    assert np.sign(values["wave_flow"]) == values["wave_flow_direction"]
+    assert 0.0 <= values["wave_flow_coherence"] <= 1.0
 
     empty = window_values(series.iloc[0:0], 0, 25)
-    check("an empty series reports no direction rather than zero",
-          np.isnan(empty["wave_flow_direction"]) and np.isnan(empty["wave_flow"]))
+    assert np.isnan(empty["wave_flow_direction"]) and np.isnan(empty["wave_flow"])
 
 
-def test_beat_stability() -> None:
-    """Frequency wander is measured, and a steady beat reads as steady."""
-    steady, _py = travelling_wave(500, freq_hz=8.0)
-    steady_series = spectral_series(steady, _py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-
-    # A beat whose frequency swings between 6 and 12 Hz, same mean, same
-    # amplitude, same wavelength. A single whole-record FFT smears this into one
-    # broad peak and reports a number indistinguishable from the steady cell.
-    n = 500
-    t = np.arange(n) / FPS
-    instantaneous = 9.0 + 3.0 * np.sin(2.0 * np.pi * 0.6 * t)
-    phase = np.cumsum(2.0 * np.pi * instantaneous / FPS)
-    n_seg, length = N_KEYPOINTS - 2, 60.0
-    ds = length / n_seg
-    s_mid = (np.arange(n_seg) + 0.5) * ds
-    psi = np.pi + 0.6 * np.sin(phase[:, None] - (2.0 * np.pi / length) * s_mid[None, :])
-    x = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
-    y = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
-    wx = np.zeros((n, N_KEYPOINTS))
-    wy = np.zeros((n, N_KEYPOINTS))
-    wx[:, 1:], wy[:, 1:] = x, y
-    wx[:, 0] = 20.0
-    wander = spectral_series(wx, wy, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-
-    steady_sd = float(steady_series["wave_freq_track_sd_hz"].iloc[0])
-    wander_sd = float(wander["wave_freq_track_sd_hz"].iloc[0])
-    check("steady beat has near-zero track frequency spread", steady_sd < 0.2,
-          f"{steady_sd:.3f} Hz")
-    check("wandering beat has a large track frequency spread", wander_sd > 1.0,
-          f"{wander_sd:.3f} Hz")
-    check("the two have nearly the same mean frequency",
-          abs(float(steady_series["wave_freq_hz"].mean())
-              - float(wander["wave_freq_hz"].mean())) < 1.5,
-          "if these differed, the spread could be read off the mean instead")
-    check("local drift separates them too",
-          float(steady_series["wave_freq_drift_hz"].median()) < 0.2
-          < float(wander["wave_freq_drift_hz"].median()),
-          f"{steady_series['wave_freq_drift_hz'].median():.3f} vs "
-          f"{wander['wave_freq_drift_hz'].median():.3f}")
+# --------------------------------------------------------------------------- #
+# beat stability
+# --------------------------------------------------------------------------- #
+def test_a_wandering_beat_has_a_larger_spread_than_a_steady_one() -> None:
+    steady = spectral_series(*travelling_wave(500, freq_hz=8.0), FPS,
+                             DEFAULT_WINDOW, DEFAULT_HOP)
+    wander = spectral_series(*wandering_wave(500, 9.0, 3.0), FPS,
+                             DEFAULT_WINDOW, DEFAULT_HOP)
+    assert float(steady["wave_freq_track_sd_hz"].iloc[0]) < 0.2
+    assert float(wander["wave_freq_track_sd_hz"].iloc[0]) > 1.0
+    # Same mean frequency, so the spread is not read off the mean.
+    assert abs(float(steady["wave_freq_hz"].mean()) - float(wander["wave_freq_hz"].mean())) < 1.5
+    assert (float(steady["wave_freq_drift_hz"].median()) < 0.2
+            < float(wander["wave_freq_drift_hz"].median()))
 
 
 def test_stability_is_undefined_when_every_window_is_censored() -> None:
-    """A beat that wanders entirely below the floor is unmeasured, not steady.
-
-    Every censored window reports the band edge, and the band edge does not
-    move. Feeding those numbers to the spread makes the wildest cell in the
-    dish the steadiest thing in the table: sd 0.0, drift 0.0, both perfectly
-    confident and both about the estimator rather than the cell.
-    """
-    n, window, hop = 500, 75, DEFAULT_HOP
-    t = np.arange(n) / FPS
-    # 1 to 3 Hz, against a 3 / 0.75 = 4 Hz floor: a real beat, wandering by a
-    # factor of three, with not one window able to resolve it.
-    instantaneous = 2.0 + 1.0 * np.sin(2.0 * np.pi * 0.6 * t)
-    phase = np.cumsum(2.0 * np.pi * instantaneous / FPS)
-    n_seg, length = N_KEYPOINTS - 2, 60.0
-    ds = length / n_seg
-    s_mid = (np.arange(n_seg) + 0.5) * ds
-    psi = np.pi + 0.6 * np.sin(phase[:, None] - (2.0 * np.pi / length) * s_mid[None, :])
-    x = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.cos(psi), axis=1)], axis=1)
-    y = np.concatenate([np.zeros((n, 1)), np.cumsum(ds * np.sin(psi), axis=1)], axis=1)
-    px = np.zeros((n, N_KEYPOINTS))
-    py = np.zeros((n, N_KEYPOINTS))
-    px[:, 1:], py[:, 1:] = x, y
-    px[:, 0] = 20.0
-    series = spectral_series(px, py, FPS, window, hop)
-
+    """A 1 to 3 Hz beat against a 4 Hz floor reports NaN spread and drift, not 0.0."""
+    series = spectral_series(*wandering_wave(500, 2.0, 1.0), FPS, 75, DEFAULT_HOP)
     measured = series["wave_censored"].dropna()
-    check("the sub-floor beat is measured, and every window of it is censored",
-          len(measured) > 0 and bool((measured == 1.0).all()),
-          f"{len(measured)} usable windows, {float(measured.mean()):.3f} censored")
-    check("each of them reports the floor it ran into, not a frequency",
-          np.isclose(float(series["wave_resolvable_hz"].iloc[0]), 4.0)
-          and np.allclose(series["wave_freq_hz"].dropna(), 4.0),
-          f"got {sorted(set(series['wave_freq_hz'].dropna()))}")
-    check("so the track frequency spread is NaN, not a confident 0.0",
-          bool(series["wave_freq_track_sd_hz"].isna().all()),
-          f"got {sorted(set(series['wave_freq_track_sd_hz'].dropna()))}")
-    check("and the local drift is NaN too",
-          bool(series["wave_freq_drift_hz"].isna().all()),
-          f"got {sorted(set(series['wave_freq_drift_hz'].dropna()))}")
+    assert len(measured) > 0 and bool((measured == 1.0).all())
+    assert np.isclose(float(series["wave_resolvable_hz"].iloc[0]), 4.0)
+    assert np.allclose(series["wave_freq_hz"].dropna(), 4.0)
+    assert bool(series["wave_freq_track_sd_hz"].isna().all())
+    assert bool(series["wave_freq_drift_hz"].isna().all())
 
 
-def test_window_values() -> None:
-    """Reading one annotation window out of the series."""
+# --------------------------------------------------------------------------- #
+# window readout
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def noisy_series() -> pd.DataFrame:
     px, py = travelling_wave(400, noise_px=0.3, seed=4)
-    series = spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-    centres = series.index.to_numpy(int)
+    return spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
 
-    f_start, f_end = 200, 225
-    values = window_values(series, f_start, f_end)
-    inside = centres[(centres >= f_start) & (centres < f_end)]
-    check("uses every window centred in [f_start, f_end)",
-          values["n_windows"] == len(inside), f"{values['n_windows']} vs {len(inside)}")
-    check("half-open, so adjacent clips never share a window",
-          window_values(series, 175, 200)["n_windows"] + values["n_windows"]
-          == len(centres[(centres >= 175) & (centres < 225)]))
-    check("direction survives the readout", values["wave_direction"] == 1.0)
-    check("aggregate is the median of the in-range rows",
-          np.isclose(values["wave_wavelength_px"],
-                     float(series.loc[inside, "wave_wavelength_px"].median())))
-    check("every series column is present in the readout",
-          all(c in values for c in SERIES_COLUMNS))
 
-    # The fallback: a range with no window centred in it takes the nearest ONE.
-    early = window_values(series, 0, 5)
-    check("falls back to the nearest single window", early["n_windows"] == 1.0)
-    check("and says how far it had to reach", abs(early["centre_offset"]) > 5.0,
-          f"offset {early['centre_offset']}")
-    check("the fallback still reports a direction", early["wave_direction"] == 1.0)
+def test_window_values_reads_the_windows_centred_in_the_range(noisy_series) -> None:
+    centres = noisy_series.index.to_numpy(int)
+    values = window_values(noisy_series, 200, 225)
+    inside = centres[(centres >= 200) & (centres < 225)]
+    assert values["n_windows"] == len(inside)
+    # Half-open, so adjacent clips never share a window.
+    assert (window_values(noisy_series, 175, 200)["n_windows"] + values["n_windows"]
+            == len(centres[(centres >= 175) & (centres < 225)]))
+    assert values["wave_direction"] == 1.0
+    assert np.isclose(values["wave_wavelength_px"],
+                      float(noisy_series.loc[inside, "wave_wavelength_px"].median()))
+    assert all(c in values for c in SERIES_COLUMNS)
 
-    # An even number of +-1 directions medians to exactly 0.0, which is not a
-    # direction. Deriving it from the median SLOPE instead cannot tie.
-    flipped, flipped_y = travelling_wave(400, flip_at=200, noise_px=0.2, seed=6)
-    straddle = spectral_series(flipped, flipped_y, FPS, 50, 2)
-    at_flip = window_values(straddle, 190, 210)
-    check("a straddling readout still returns +-1, never 0.0",
-          at_flip["wave_direction"] in (1.0, -1.0), f"{at_flip['wave_direction']}")
 
-    # An empty series must not invent numbers.
+def test_window_values_falls_back_to_the_nearest_window(noisy_series) -> None:
+    early = window_values(noisy_series, 0, 5)
+    assert early["n_windows"] == 1.0
+    assert abs(early["centre_offset"]) > 5.0
+    assert early["wave_direction"] == 1.0
+
+
+def test_a_straddling_readout_never_ties_at_zero() -> None:
+    """An even count of +-1 medians to 0.0; the median slope cannot tie."""
+    px, py = travelling_wave(400, flip_at=200, noise_px=0.2, seed=6)
+    at_flip = window_values(spectral_series(px, py, FPS, 50, 2), 190, 210)
+    assert at_flip["wave_direction"] in (1.0, -1.0)
+
+
+def test_an_empty_series_reads_out_as_nan() -> None:
     blank = window_values(spectral_series(np.empty((0, 8)), np.empty((0, 8)), FPS), 0, 25)
-    check("an empty series reads out as NaN, never 0.0",
-          all(np.isnan(blank[c]) for c in SERIES_COLUMNS) and blank["n_windows"] == 0.0)
+    assert all(np.isnan(blank[c]) for c in SERIES_COLUMNS)
+    assert blank["n_windows"] == 0.0
 
 
-def test_guards() -> None:
-    """The guards, each applied per window rather than per track."""
+# --------------------------------------------------------------------------- #
+# guards
+# --------------------------------------------------------------------------- #
+def test_the_interpolation_ceiling_blanks_only_overlapping_windows() -> None:
     px, py = travelling_wave(400, noise_px=0.2, seed=8)
-
-    # -- the interpolation ceiling ------------------------------------------ #
-    holed_x, holed_y = px.copy(), py.copy()
-    holed_x[200:240] = np.nan          # 40 consecutive frames gone
-    holed_y[200:240] = np.nan
-    series = spectral_series(holed_x, holed_y, FPS, 75, 1)
+    px[200:240] = np.nan
+    py[200:240] = np.nan
+    series = spectral_series(px, py, FPS, 75, 1)
     over = series[series["wave_interp_frac"] > 0.20]
     under = series[series["wave_interp_frac"] <= 0.20]
-    check("windows over MAX_INTERP_FRAC are blanked",
-          bool(over["wave_direction"].isna().all()) and len(over) > 0,
-          f"{len(over)} windows over the ceiling")
-    check("windows under it are kept",
-          bool(under["wave_direction"].notna().all()) and len(under) > 0)
-    check("a bad patch costs only the windows that overlap it",
-          len(under) > len(over), f"{len(under)} kept, {len(over)} blanked")
+    assert len(over) > 0 and bool(over["wave_direction"].isna().all())
+    assert len(under) > len(over) and bool(under["wave_direction"].notna().all())
+    # Blanked is NaN everywhere, never 0.0.
+    assert bool(over[["wave_direction", "wave_freq_hz", "wave_wavelength_px",
+                      "wave_length_px", "wave_phase_slope"]].isna().all().all())
 
-    # -- filled, never compacted -------------------------------------------- #
-    # Dropping the missing frames instead of filling them scales the reported
-    # frequency by 1/(surviving fraction). Scatter 12% of frames and the answer
-    # must not move.
-    rng = np.random.default_rng(21)
-    thin_x, thin_y = px.copy(), py.copy()
-    gone = rng.choice(np.arange(400), size=48, replace=False)
-    thin_x[gone] = np.nan
-    thin_y[gone] = np.nan
-    thinned = measurable(spectral_series(thin_x, thin_y, FPS, DEFAULT_WINDOW, DEFAULT_HOP))
-    check("12% missing frames do not scale the frequency",
-          abs(float(thinned["wave_freq_hz"].median()) - 8.0) <= FPS / DEFAULT_WINDOW,
-          f"got {thinned['wave_freq_hz'].median()} (compaction would give ~9.1)")
 
-    # -- band floor and censoring -------------------------------------------- #
-    slow_x, slow_y = travelling_wave(400, freq_hz=2.0)
-    slow = spectral_series(slow_x, slow_y, FPS, 75, 5)      # floor is 4 Hz here
-    # Reported and FLAGGED, not blanked. A beat below the floor is a censored
-    # observation - the true frequency is at or below the edge bin - and a
-    # censored observation is data, so it is emitted with `wave_censored` saying
-    # what it is. Blanking it here would throw away the one thing the window did
-    # establish (an upper bound) and would be indistinguishable downstream from
-    # a track that was never measured at all.
-    check("a beat below the resolvable floor reports the edge bin it ran into",
-          bool(slow["wave_freq_hz"].notna().any())
-          and np.allclose(slow["wave_freq_hz"].dropna(), 4.0),
-          f"got {sorted(set(slow['wave_freq_hz'].dropna()))}")
-    check("and flags every one of those windows as censored",
-          float(slow["wave_censored"].mean()) > 0.9)
-    check("while still reporting the resolvable floor it ran into",
-          np.isclose(float(slow["wave_resolvable_hz"].iloc[0]), 4.0))
-    check("direction is still reported when the frequency is censored",
-          bool(slow["wave_direction"].notna().all()),
-          "direction is a sign, not a magnitude - it must survive the gate")
+def test_missing_frames_are_filled_not_compacted() -> None:
+    """Dropping 12% of frames must not scale the frequency by 1/0.88."""
+    px, py = travelling_wave(400, noise_px=0.2, seed=8)
+    gone = np.random.default_rng(21).choice(np.arange(400), size=48, replace=False)
+    px[gone] = np.nan
+    py[gone] = np.nan
+    thinned = measurable(spectral_series(px, py, FPS, DEFAULT_WINDOW, DEFAULT_HOP))
+    assert abs(float(thinned["wave_freq_hz"].median()) - 8.0) <= FPS / DEFAULT_WINDOW
 
-    # -- noise is not a beat -------------------------------------------------- #
+
+def test_a_beat_below_the_floor_is_reported_and_censored() -> None:
+    """Censored windows report the 4 Hz edge bin and keep their direction."""
+    slow = spectral_series(*travelling_wave(400, freq_hz=2.0), FPS, 75, 5)
+    assert bool(slow["wave_freq_hz"].notna().any())
+    assert np.allclose(slow["wave_freq_hz"].dropna(), 4.0)
+    assert float(slow["wave_censored"].mean()) > 0.9
+    assert np.isclose(float(slow["wave_resolvable_hz"].iloc[0]), 4.0)
+    assert bool(slow["wave_direction"].notna().all())
+
+
+def test_phase_linearity_separates_a_wave_from_a_random_walk() -> None:
+    """Nothing is gated on significance; the rsq column is what tells noise apart."""
     rng = np.random.default_rng(1)
     noise_x = np.cumsum(rng.normal(0, 1.0, (400, N_KEYPOINTS)), axis=0) + np.arange(8) * 8.0
     noise_y = np.cumsum(rng.normal(0, 1.0, (400, N_KEYPOINTS)), axis=0)
     junk = spectral_series(noise_x, noise_y, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-    # A random walk in the KEYPOINT COORDINATES is a very red process by the time
-    # it has been differenced into a tangent angle, and it DOES produce a
-    # spectral peak. Nothing here pretends otherwise: since no significance
-    # threshold gates the output any more, every such window reports a frequency.
-    # That is the deliberate stance - report the measurement, publish its quality
-    # - and it is safe only because the quality column below actually works. The
-    # threshold that used to sit here did not: it passed a measured 24% of these
-    # windows (mean over 30 seeds, max 49%), having been calibrated on red noise
-    # in lateral displacement, a much whiter process than this one.
-    claimed = float(np.isfinite(junk["wave_freq_hz"]).mean())
-    check("a random walk still reports a frequency - nothing is gated away",
-          claimed > 0.9, f"{claimed:.3f} of windows claimed a beat")
+    assert float(np.isfinite(junk["wave_freq_hz"]).mean()) > 0.9
+    px, py = travelling_wave(400, noise_px=0.2, seed=8)
     clean_rsq = float(spectral_series(px, py, FPS)["wave_phase_rsq"].median())
     junk_rsq = float(junk["wave_phase_rsq"].median())
-    check("phase linearity is what separates a wave from a random walk",
-          junk_rsq < 0.7 < clean_rsq, f"noise rsq {junk_rsq:.3f}, wave rsq {clean_rsq:.3f}")
-
-    # -- a motionless flagellum has no beat ----------------------------------- #
-    # The one thing that IS still refused, and the only thing standing between a
-    # dead cell and a real-looking frequency: with no variation at all, whichever
-    # bin the argmax lands in is floating-point noise. A degeneracy test, not a
-    # significance one - the random walk above varies, and is reported.
-    dead_x, dead_y = travelling_wave(400, amplitude=0.0)
-    dead = spectral_series(dead_x, dead_y, FPS, DEFAULT_WINDOW, DEFAULT_HOP)
-    check("a motionless flagellum reports no beat frequency",
-          bool(dead["wave_freq_hz"].isna().all()),
-          f"claimed {sorted(set(dead['wave_freq_hz'].dropna()))}")
-    check("and no shape descriptors fitted to nothing",
-          bool(dead[["wave_amp_mean", "wave_phase_slope",
-                     "wave_direction"]].isna().all().all()))
-
-    # -- NaN means undefined, never 0.0 --------------------------------------- #
-    blanked = series[series["wave_interp_frac"] > 0.20]
-    check("a blanked window is NaN everywhere, never 0.0",
-          bool(blanked[["wave_direction", "wave_freq_hz", "wave_wavelength_px",
-                        "wave_length_px", "wave_phase_slope"]].isna().all().all()))
+    assert junk_rsq < 0.7 < clean_rsq, f"noise {junk_rsq:.3f}, wave {clean_rsq:.3f}"
 
 
-def test_shape_and_edges() -> None:
-    """Index, columns, short tracks and degenerate input."""
+def test_a_motionless_flagellum_has_no_beat() -> None:
+    dead = spectral_series(*travelling_wave(400, amplitude=0.0), FPS,
+                           DEFAULT_WINDOW, DEFAULT_HOP)
+    assert bool(dead["wave_freq_hz"].isna().all())
+    assert bool(dead[["wave_amp_mean", "wave_phase_slope", "wave_direction"]].isna().all().all())
+
+
+# --------------------------------------------------------------------------- #
+# shape and edges
+# --------------------------------------------------------------------------- #
+def test_series_layout() -> None:
     px, py = travelling_wave(300)
     series = spectral_series(px, py, FPS, 75, 5)
-    check("one row per analysis position, indexed by centre frame",
-          series.index.name == "frame" and series.index.is_monotonic_increasing)
-    check("centres are spaced by the hop",
-          bool((np.diff(series.index.to_numpy(int)) == 5).all()))
-    check("every window lies wholly inside the record",
-          int(series.index.min()) - 37 >= 0 and int(series.index.max()) - 37 + 75 <= 300,
-          f"{series.index.min()}..{series.index.max()}")
-    check("all documented columns are emitted",
-          list(series.columns) == list(SERIES_COLUMNS))
-    check("every column is float", bool((series.dtypes == float).all()))
-
-    # A track shorter than the window gets ONE whole-track window rather than
-    # nothing: on this project nine of the 170 labelled clips sit in tracks
-    # shorter than 150 frames, and dropping them loses hand labels.
-    short_x, short_y = travelling_wave(90)
-    short = spectral_series(short_x, short_y, FPS, 150, 5)
-    check("a track shorter than the window still yields one window", len(short) == 1)
-    check("and says what it actually used",
-          float(short["wave_window_frames"].iloc[0]) == 90.0)
-    check("with the honest, coarser resolvable floor",
-          float(short["wave_resolvable_hz"].iloc[0]) > 3.0)
-
-    # A record only a LITTLE longer than the window is the awkward one: its only
-    # legal window starts at 0 or 1, and ShortTimeFFT's slice centres are
-    # multiples of the hop, so the grid offers 35 or 40 where 37 is needed and
-    # the naive answer is an empty series. Every length must yield something.
-    for extra in range(0, 12):
-        n = 75 + extra
-        long_x, long_y = travelling_wave(n)
-        got = spectral_series(long_x, long_y, FPS, 75, 5)
-        check(f"a {n}-frame track with a 75-frame window yields a window",
-              len(got) >= 1 and bool(np.isfinite(got["wave_direction"]).all()),
-              f"{len(got)} rows")
-
-    check("a track shorter than the FFT floor yields nothing",
-          len(spectral_series(px[:5], py[:5], FPS)) == 0)
-    check("too few keypoints yields nothing",
-          len(spectral_series(px[:, :3], py[:, :3], FPS)) == 0)
-    check("mismatched shapes yield nothing",
-          len(spectral_series(px, py[:, :6], FPS)) == 0)
-
-    # A collapsed detection (every keypoint on one pixel) divides by a zero
-    # flagellum length. It must poison its own window and no other.
-    collapsed_x, collapsed_y = px.copy(), py.copy()
-    collapsed_x[150] = 5.0
-    collapsed_y[150] = 5.0
-    survived = spectral_series(collapsed_x, collapsed_y, FPS, 75, 5)
-    check("a collapsed frame does not poison the whole track",
-          bool(np.isfinite(survived["wave_direction"]).sum() > 0.8 * len(survived)),
-          f"{np.isfinite(survived['wave_direction']).mean():.3f} of windows survived")
-    check("and nothing became infinite",
-          bool(np.isfinite(survived.to_numpy()[np.isfinite(survived.to_numpy())]).all()))
+    assert series.index.name == "frame" and series.index.is_monotonic_increasing
+    assert bool((np.diff(series.index.to_numpy(int)) == 5).all())
+    # Every window lies wholly inside the record.
+    assert int(series.index.min()) - 37 >= 0 and int(series.index.max()) - 37 + 75 <= 300
+    assert list(series.columns) == list(SERIES_COLUMNS)
+    assert bool((series.dtypes == float).all())
 
 
-def test_track_helper() -> None:
-    """``track_spectral_series`` lays the rows on the frame grid first."""
+def test_a_track_shorter_than_the_window_yields_one_window() -> None:
+    short = spectral_series(*travelling_wave(90), FPS, 150, 5)
+    assert len(short) == 1
+    assert float(short["wave_window_frames"].iloc[0]) == 90.0
+    assert float(short["wave_resolvable_hz"].iloc[0]) > 3.0
+
+
+@pytest.mark.parametrize("extra", range(12))
+def test_a_track_just_longer_than_the_window_yields_a_window(extra: int) -> None:
+    """The slice grid is in multiples of the hop, so some lengths are awkward."""
+    got = spectral_series(*travelling_wave(75 + extra), FPS, 75, 5)
+    assert len(got) >= 1 and bool(np.isfinite(got["wave_direction"]).all())
+
+
+def test_degenerate_input_yields_nothing() -> None:
+    px, py = travelling_wave(300)
+    assert len(spectral_series(px[:5], py[:5], FPS)) == 0, "shorter than the FFT floor"
+    assert len(spectral_series(px[:, :3], py[:, :3], FPS)) == 0, "too few keypoints"
+    assert len(spectral_series(px, py[:, :6], FPS)) == 0, "mismatched shapes"
+
+
+def test_a_collapsed_detection_poisons_only_its_own_windows() -> None:
+    px, py = travelling_wave(300)
+    px[150] = 5.0
+    py[150] = 5.0
+    survived = spectral_series(px, py, FPS, 75, 5)
+    assert np.isfinite(survived["wave_direction"]).sum() > 0.8 * len(survived)
+    values = survived.to_numpy()
+    assert bool(np.isfinite(values[~np.isnan(values)]).all()), "nothing became infinite"
+
+
+def test_track_helper_lays_rows_on_the_frame_grid() -> None:
+    """Shuffled rows with missing frames give the same answer as the dense array."""
     px, py = travelling_wave(300)
     f_start = 1000
     rows = {"frame": np.arange(300) + f_start}
     for k in range(N_KEYPOINTS):
         rows[f"kp_x_{k}"] = px[:, k]
         rows[f"kp_y_{k}"] = py[:, k]
-    frame = pd.DataFrame(rows)
-    dropped = frame.drop(index=np.arange(40, 55)).sample(frac=1.0, random_state=0)
+    dropped = pd.DataFrame(rows).drop(index=np.arange(40, 55)).sample(frac=1.0, random_state=0)
 
     series = track_spectral_series(dropped, N_KEYPOINTS, FPS, 75, 5)
-    check("the index is in real movie frame numbers",
-          int(series.index.min()) >= f_start and int(series.index.max()) < f_start + 300)
+    assert int(series.index.min()) >= f_start and int(series.index.max()) < f_start + 300
     direct = spectral_series(px, py, FPS, 75, 5)
-    check("shuffled, gappy rows give the same answer as the dense array",
-          bool((series["wave_direction"].dropna() == 1.0).all())
-          and abs(float(series["wave_freq_hz"].median())
-                  - float(direct["wave_freq_hz"].median())) < 1e-6,
-          "missing frames are absent ROWS; handing them to an FFT unfilled "
-          "scales the frequency by 1/(surviving fraction)")
+    assert bool((series["wave_direction"].dropna() == 1.0).all())
+    assert abs(float(series["wave_freq_hz"].median())
+               - float(direct["wave_freq_hz"].median())) < 1e-6
 
 
-def test_speed() -> None:
-    """One transform per track must actually beat one transform per window.
-
-    The per-window loop is the same function handed one window's frames at a
-    time, which is what a caller who wanted a series without this module would
-    have to write. Both sides therefore compute identical numbers (that is
-    ``test_window_placement_is_self_consistent``) and differ only in how many
-    times the per-frame geometry and the FFT planning are paid for.
-    """
+def test_one_transform_per_track_beats_one_per_window() -> None:
     px, py = travelling_wave(500, noise_px=0.5, seed=1)
     window, hop = DEFAULT_WINDOW, DEFAULT_HOP
     series = spectral_series(px, py, FPS, window, hop)          # warm any FFT plans
@@ -802,9 +514,5 @@ def test_speed() -> None:
     per_window = time.perf_counter() - t0
 
     ratio = per_window / max(sliding, 1e-9)
-    print(f"      {len(series)} windows: sliding {sliding * 1e3:.1f} ms, "
-          f"per-window loop {per_window * 1e3:.1f} ms, {ratio:.1f}x")
-    # Measured at 16x on the development machine; asserted well below that so a
-    # loaded or slower box does not turn a performance note into a red suite.
-    check("the sliding series is at least 4x faster than the per-window loop",
-          ratio > 4.0, f"{ratio:.1f}x")
+    # Measured near 16x; asserted well below so a loaded machine stays green.
+    assert ratio > 4.0, f"{ratio:.1f}x"

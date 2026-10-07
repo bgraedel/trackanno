@@ -1,27 +1,8 @@
-"""Checks for the per-frame series and its window reduction.
+"""Tests for the per-frame series and its window reduction.
 
-The point of :mod:`trackanno.measure.trackseries` is that a window's features can be
-obtained by slicing a per-frame series instead of recomputing a clip, so what is
-worth testing is a mixture of KNOWN VALUES and an INVARIANCE:
-
-* the features of a track whose motion is known in closed form - a constant
-  speed, a straight path, a constant turn rate, a fixed box - come out equal to
-  the analytic answer, at every window length and offset;
-* a window's features do not depend on how much track was built around it, which
-  is the property that makes the clip boundary stop being the measurement unit.
-  checked on every clip of the generated fixture project, whose tracks carry
-  gaps, short tracks and clips planned past the last detection;
-* the gaps stay gaps - a series built over a whole track must not bridge a
-  missing frame any more than ``_on_grid`` does.
-
-The analytic cases are deliberately the primary check. Comparing one
-implementation against another only proves they agree; comparing against a
-closed form proves the number means what it says.
-
-Nothing here reads data the repository does not carry: the fixture project is
-generated into a temporary directory and deleted afterwards. Real projects may
-be added as an extra, opt-in check with ``pytest --project-root PATH``; each
-needs a ``config.yaml`` and a prepared ``work/``.
+Closed-form tracks give known feature values; a window's features must not depend
+on the series built around it. Real projects can be added with
+``pytest --project-root PATH``.
 """
 
 from __future__ import annotations
@@ -34,7 +15,6 @@ import numpy as np
 import pandas as pd
 import pytest
 from fixtures import make_project
-from harness import check
 from trackanno.config import load_config
 from trackanno.measure.trackseries import (
     SERIES_COLUMNS, SERIES_SPEC, WINDOW_FUNCTIONALS, aggregate_window, build_series,
@@ -42,17 +22,21 @@ from trackanno.measure.trackseries import (
 )
 
 TOL = 1e-9
+FPS, DT = 100.0, 0.01
+
+# Spectral estimators are out of scope for the series.
+SPECTRAL = ("beat_", "wave_")
 
 
 @pytest.fixture(scope="module")
 def cfg(root):
-    """A generated pose project. Nothing here reads the machine's own data."""
+    """A generated pose project."""
     return load_config(make_project(root / "pose", pose=True))
 
 
 @pytest.fixture(scope="module")
 def detect_cfg(root):
-    """The same, with no keypoints, so the pose columns must come out NaN."""
+    """The same with no keypoints, so the pose columns must come out NaN."""
     return load_config(make_project(root / "detect", pose=False))
 
 
@@ -62,31 +46,13 @@ def roots(cfg, request):
     given = [Path(a).resolve() for a in request.config.getoption("--project-root")]
     return [Path(cfg.paths.work_dir).parent] + given
 
-# Spectral estimators, out of scope for the series (see the trackseries module
-# docstring). `aggregate_window` does not emit them at all; the prefixes are
-# named here so the closing report can say so rather than leave it implied.
-SPECTRAL = ("beat_", "wave_")
-
-# Columns measured from `conf`, which is float32 in tracks.parquet. Both sides of
-# every comparison below are float64 reductions of the same float32 input, so
-# they agree exactly; the entry is kept empty rather than deleted because the
-# reporting machinery below wants somewhere to put a per-column tolerance the
-# day a genuinely float32 column appears.
-FLOAT32_COLUMNS: dict[str, float] = {}
-
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 def synthetic_track(n_frames: int, n_kpts: int, seed: int = 0,
                     drop: tuple[int, ...] = (), f0: int = 0) -> pd.DataFrame:
-    """One track that swims, turns and beats, with named frames missing.
-
-    Deliberately not a straight line: straightness, turn_* and the shape PCA are
-    all degenerate on one, so a bug in any of them would still compare equal.
-    ``drop`` names ABSOLUTE frames, so a track that does not start at frame 0
-    can be tested - which is the case the absolute-frame index exists for.
-    """
+    """One track that swims, turns and beats; ``drop`` names absolute frames to remove."""
     rng = np.random.default_rng(seed)
     f = f0 + np.arange(n_frames)
     t = np.arange(n_frames) / 100.0
@@ -101,8 +67,7 @@ def synthetic_track(n_frames: int, n_kpts: int, seed: int = 0,
         "conf": (0.72 + 0.2 * rng.random(n_frames)).astype(np.float32),
     }
     if n_kpts:
-        # Head trails the body axis, which itself rotates, so body_axis_ang and
-        # tip_ang actually wrap during the track and the unwrap is exercised.
+        # The body axis rotates, so the angle unwraps are exercised.
         heading = np.arctan2(np.gradient(cy), np.gradient(cx))
         s = np.linspace(0.0, 1.0, n_kpts - 1)
         phase = 2 * np.pi * 9.0 * t
@@ -123,17 +88,10 @@ def synthetic_track(n_frames: int, n_kpts: int, seed: int = 0,
 def _pack(cx: np.ndarray, cy: np.ndarray, half_w: float, half_h: float,
           n_kpts: int, f0: int, conf: float = 0.8, kpt_conf: float = 0.9,
           head_ahead: float = 20.0, seg: float = 6.0) -> pd.DataFrame:
-    """Track rows for a given centroid path, with everything else held constant.
+    """Track rows for a centroid path with a rigid, collinear, axis-aligned pose.
 
-    Every stored number is chosen to be exact in float32 (the dtype
-    tracks.parquet uses) so the analytic expectations below are not competing
-    with a rounding error they did not ask for.
-
-    The pose is rigid and axis-aligned: Head sits ``head_ahead`` px along +x from
-    Base and the flagellum runs straight back from Base in equal ``seg`` steps.
-    So body_len is ``head_ahead``, flagellum_len is ``seg * (n_kpts - 2)``, and
-    the whole chain is COLLINEAR - which is what makes the minor axis exactly
-    zero and shape_elongation undefined.
+    Head sits ``head_ahead`` px along +x from Base and the chain runs straight
+    back in ``seg`` steps, so the minor axis is exactly zero.
     """
     n = len(cx)
     data = {
@@ -163,29 +121,17 @@ def straight_track(n_frames: int, n_kpts: int, v: float = 10.0, half_w: float = 
 
 def circular_track(n_frames: int, n_kpts: int, radius: float = 200.0, w: float = 0.05,
                    f0: int = 0) -> pd.DataFrame:
-    """Constant angular rate ``w`` rad/frame around a circle of ``radius``.
-
-    The heading of a chord of a circle advances at exactly the angular rate,
-    whatever the chord's length, so ``turn_abs_mean`` must come out as ``w * fps``
-    rad/s no matter which lag `_heading_lag` happens to pick. That is worth a
-    check of its own: the lag is chosen from the data, so a turn rate that moved
-    with it would be an artefact of the chooser.
-    """
+    """Constant angular rate ``w`` rad/frame; chord headings advance at ``w`` for any lag."""
     i = np.arange(n_frames, dtype=float)
     return _pack(400.0 + radius * np.cos(w * i), 400.0 + radius * np.sin(w * i),
                  12.0, 6.0, n_kpts, f0)
 
 
 def spinning_tip_track(n_frames: int, n_kpts: int, w: float = 0.1, f0: int = 0,
-                       seg: float = 6.0, head_ahead: float = 20.0) -> pd.DataFrame:
-    """The flagellum chain rotating about a fixed Base at ``w`` rad/frame.
-
-    Box, Head and Base are all stationary; only the chain turns. ``tip_ang`` is
-    Base -> most distal node, so it is exactly ``w * i`` and wraps several times
-    over a hundred frames, which is what makes the unwrap load-bearing.
-    """
-    i = np.arange(n_frames, dtype=float)
-    ang = w * i
+                       seg: float = 6.0, head_ahead: float = 20.0,
+                       base_angle: float = 0.0) -> pd.DataFrame:
+    """The flagellum chain rotating about a fixed Base at ``w`` rad/frame."""
+    ang = base_angle + w * np.arange(n_frames, dtype=float)
     cx, cy = 200.0, 200.0
     data = {
         "frame": (f0 + np.arange(n_frames)).astype(np.int32),
@@ -211,13 +157,13 @@ def close(got, expected, tol: float = 1e-6) -> bool:
     return bool(np.isfinite(got)) and abs(float(got) - float(expected)) <= tol
 
 
-def diff_features(ref: dict, got: dict) -> dict[str, float]:
-    """Per-column absolute difference, with NaN==NaN treated as agreement.
+def assert_close(got: dict, expected: dict, tol: float = 1e-6) -> None:
+    bad = {k: (got[k], v) for k, v in expected.items() if not close(got[k], v, tol)}
+    assert not bad, f"got vs expected: {bad}"
 
-    A NaN on one side only is `inf`, not a skip: which features come out NaN is
-    itself a measurement here (see `_heading_lag`), so a version that computed a
-    number where the original abstained has changed the feature.
-    """
+
+def diff_features(ref: dict, got: dict) -> dict[str, float]:
+    """Per-column absolute difference; NaN on both sides agrees, on one side is inf."""
     out: dict[str, float] = {}
     for key, value in ref.items():
         if key.startswith(SPECTRAL):
@@ -250,13 +196,10 @@ def report(stats: dict, n_clips: int, title: str) -> list[str]:
     failed = []
     for key in sorted(stats):
         entry = stats[key]
-        limit = FLOAT32_COLUMNS.get(key, TOL)
         note = ""
-        if entry["max"] > limit:
+        if entry["max"] > TOL:
             failed.append(key)
             note = "   <-- MISMATCH"
-        elif key in FLOAT32_COLUMNS:
-            note = "   float32 in tracks.parquet"
         print(f"  {key:30s} {entry['max']:13.3e} {entry['over']:9d}{note}")
     return failed
 
@@ -276,13 +219,7 @@ def clip_windows(work: Path):
 
 
 def track_series(tdf: pd.DataFrame, man: pd.DataFrame, track_id: int, cfg, fps: float):
-    """Build one series covering the track AND every clip planned from it.
-
-    A clip may start before the track's first detection or end after its last -
-    the manifest window is planned, the detections are found - so the series has
-    to span the union. `aggregate_window` refuses a window it was not built for
-    rather than padding, which is the whole reason this is spelled out.
-    """
+    """One series spanning the track and every clip planned from it."""
     clips = man[man["track_id"] == track_id]
     whole = tdf.sort_values("frame")
     lo = min(int(whole["frame"].min()), int(clips["f_start"].min()))
@@ -293,236 +230,173 @@ def track_series(tdf: pd.DataFrame, man: pd.DataFrame, track_id: int, cfg, fps: 
 # --------------------------------------------------------------------------- #
 # series
 # --------------------------------------------------------------------------- #
-def test_series_shape(cfg) -> None:
-    n_kpts = cfg.n_keypoints
-    gaps = (513, 514, 515, 540)
-    sub = synthetic_track(80, n_kpts, drop=gaps, f0=500)
-    series = build_series(sub, cfg, 100.0, 500, 80)
+GAPS = (513, 514, 515, 540)
 
-    check("series is indexed by absolute frame number",
-          series.index[0] == 500 and series.index[-1] == 579 and len(series) == 80)
-    check("series carries exactly the SERIES_SPEC columns",
-          tuple(series.columns) == SERIES_COLUMNS)
-    check("series is float throughout",
-          all(dt == np.float64 for dt in series.dtypes))
 
+@pytest.fixture(scope="module")
+def gapped_series(cfg):
+    return build_series(synthetic_track(80, cfg.n_keypoints, drop=GAPS, f0=500),
+                        cfg, FPS, 500, 80)
+
+
+def test_series_layout(gapped_series) -> None:
+    series = gapped_series
+    assert series.index[0] == 500 and series.index[-1] == 579 and len(series) == 80
+    assert tuple(series.columns) == SERIES_COLUMNS
+    assert all(dt == np.float64 for dt in series.dtypes)
+
+
+def test_the_series_marks_gaps(gapped_series) -> None:
+    series = gapped_series
     present = series["present"].to_numpy()
-    check("present is 1/0 at every frame and marks the dropped ones",
-          set(np.unique(present)) == {0.0, 1.0}
-          and present.sum() == 76
-          and not present[np.array(gaps) - 500].any(),
-          str(present[10:18]))
-    check("undetected frames are NaN, never zero",
-          bool(series.loc[513:515, "cx"].isna().all()
-               and series.loc[513:515, "body_len"].isna().all()
-               and series.loc[513:515, "speed"].isna().all()))
-
-    # A 3-frame gap must NOT become one big step: the frame after the gap has no
-    # predecessor, so its speed is undefined. This is the inflation _on_grid
-    # exists to prevent, restated for the series.
-    check("a gap does not become a step",
-          bool(np.isnan(series.loc[516, "speed"]) and np.isnan(series.loc[541, "speed"])))
-    check("the first frame has no incoming step",
-          bool(np.isnan(series.loc[500, "speed"])))
-    check("speed is finite on either side of the gap",
-          bool(np.isfinite(series.loc[512, "speed"]) and np.isfinite(series.loc[517, "speed"])))
-
-    if n_kpts >= 3:
-        check("pose columns are populated where the track is present",
-              bool(np.isfinite(series.loc[500:512, "body_len"]).all()
-                   and np.isfinite(series.loc[500:512, "shape_pc1"]).all()
-                   and np.isfinite(series.loc[500:512, "body_axis_ang"]).all()))
-        check("flagellum_complete is 0 where the chain is absent, not NaN",
-              bool(series.loc[513, "flagellum_complete"] == 0.0))
+    assert set(np.unique(present)) == {0.0, 1.0}
+    assert present.sum() == 76
+    assert not present[np.array(GAPS) - 500].any()
+    # Undetected frames are NaN, never zero.
+    assert bool(series.loc[513:515, ["cx", "body_len", "speed"]].isna().all().all())
+    assert bool(series.loc[513, "flagellum_complete"] == 0.0), "0 where absent, not NaN"
+    assert bool(np.isfinite(series.loc[500:512, ["body_len", "shape_pc1",
+                                                 "body_axis_ang"]]).all().all())
 
 
-def test_detect_project(detect_cfg) -> None:
-    """A project with no keypoints must produce NaN, never a confident zero."""
-    sub = synthetic_track(60, 0)
-    series = build_series(sub, detect_cfg, 100.0, 0, 60)
+def test_a_gap_does_not_become_a_step(gapped_series) -> None:
+    speed = gapped_series["speed"]
+    assert np.isnan(speed[516]) and np.isnan(speed[541]), "no predecessor after a gap"
+    assert np.isnan(speed[500]), "the first frame has no incoming step"
+    assert np.isfinite(speed[512]) and np.isfinite(speed[517])
+
+
+def test_a_detect_project_has_nan_pose_columns(detect_cfg) -> None:
+    series = build_series(synthetic_track(60, 0), detect_cfg, FPS, 0, 60)
     pose_cols = ["kpt_conf", "shape_extent", "shape_pc1", "shape_pc2", "shape_elong",
                  "body_len", "flagellum_len", "flagellum_complete", "anchor_x", "anchor_y",
                  "body_speed", "body_axis_ang", "tip_ang"]
-    check("detect project: every pose column is all-NaN",
-          bool(series[pose_cols].isna().all().all()))
-    check("detect project: the box columns still work",
-          bool(np.isfinite(series["cx"]).all() and np.isfinite(series["area"]).all()))
+    assert bool(series[pose_cols].isna().all().all())
+    assert bool(np.isfinite(series["cx"]).all() and np.isfinite(series["area"]).all())
 
-    got = aggregate_window(series, 0, 60, 100.0, detect_cfg)
-    check("detect project: flagellum_complete_frac is NaN, not 0.0",
-          bool(np.isnan(got["flagellum_complete_frac"])))
-    check("detect project: present_frac is still measured",
-          got["present_frac"] == 1.0)
+    got = aggregate_window(series, 0, 60, FPS, detect_cfg)
+    assert np.isnan(got["flagellum_complete_frac"]), "NaN, not 0.0"
+    assert got["present_frac"] == 1.0
 
-    # The box features are all a detect project has, so they had better be right.
-    # A straight track at 10 px/frame over 60 frames, box 24 x 12.
+
+def test_a_detect_project_gets_exact_box_features(detect_cfg) -> None:
     n, v, half_w, half_h = 60, 10.0, 12.0, 6.0
-    plain = build_series(straight_track(n, 0, v, half_w, half_h), detect_cfg, 100.0, 0, n)
-    got = aggregate_window(plain, 0, n, 100.0, detect_cfg)
-    check("detect project: box features equal their analytic values",
-          close(got["speed_mean"], v * 100.0)
-          and close(got["speed_std"], 0.0)
-          and close(got["path_length"], (n - 1) * v)
-          and close(got["net_displacement"], (n - 1) * v)
-          and close(got["straightness"], 1.0)
-          and close(got["area_mean"], (2 * half_w) * (2 * half_h))
-          and close(got["aspect_mean"], half_w / half_h),
-          f"speed {got['speed_mean']}, path {got['path_length']}, "
-          f"area {got['area_mean']}, aspect {got['aspect_mean']}")
+    plain = build_series(straight_track(n, 0, v, half_w, half_h), detect_cfg, FPS, 0, n)
+    got = aggregate_window(plain, 0, n, FPS, detect_cfg)
+    assert_close(got, {
+        "speed_mean": v * 100.0, "speed_std": 0.0, "path_length": (n - 1) * v,
+        "net_displacement": (n - 1) * v, "straightness": 1.0,
+        "area_mean": (2 * half_w) * (2 * half_h), "aspect_mean": half_w / half_h,
+    })
 
 
 # --------------------------------------------------------------------------- #
 # known values
 # --------------------------------------------------------------------------- #
-def test_analytic_values(cfg) -> None:
-    """Closed-form motion in, closed-form features out.
-
-    Every expectation below is derived from the definition of the feature and
-    the geometry of the track, not from another implementation. That is the
-    point: an equivalence check tells you two functions agree, and these tell
-    you what the number means.
-    """
-    n_kpts = cfg.n_keypoints
-    fps, dt = 100.0, 0.01
-
-    # -- a straight line at constant speed ----------------------------------- #
-    n, v, half_w, half_h, head, seg = 60, 10.0, 12.0, 6.0, 20.0, 6.0
-    sub = straight_track(n, n_kpts, v, half_w, half_h)
-    series = build_series(sub, cfg, fps, 0, n)
-    got = aggregate_window(series, 0, n, fps, cfg)
-
-    speed = v / dt                                   # px per second
-    check("straight line: every speed column is the one constant speed",
-          close(got["speed_mean"], speed) and close(got["speed_median"], speed)
-          and close(got["speed_p90"], speed) and close(got["speed_max"], speed)
-          and close(got["speed_std"], 0.0),
-          f"mean {got['speed_mean']} vs {speed}, std {got['speed_std']}")
-    check("straight line: immotile_frac is 0 well above the 50 px/s gate",
-          close(got["immotile_frac"], 0.0), str(got["immotile_frac"]))
-    # n frames -> n-1 steps, and the endpoints span the same distance.
-    check("straight line: path equals net equals (n-1) * v, so straightness is 1",
-          close(got["path_length"], (n - 1) * v)
-          and close(got["net_displacement"], (n - 1) * v)
-          and close(got["straightness"], 1.0),
-          f"path {got['path_length']}, net {got['net_displacement']}")
-    # Points evenly spaced on a line: the radius of gyration is v * sd(0..n-1),
-    # i.e. v * sqrt((n^2 - 1) / 12).
-    check("straight line: radius of gyration matches the closed form",
-          close(got["radius_gyration"], v * np.sqrt((n * n - 1) / 12.0)),
-          f"{got['radius_gyration']} vs {v * np.sqrt((n * n - 1) / 12.0)}")
-    check("straight line: a constant heading gives exactly zero turn",
-          close(got["turn_abs_mean"], 0.0) and close(got["turn_std"], 0.0)
-          and close(got["turn_abs_p90"], 0.0)
-          and close(got["turn_lag_frames"], 1.0)
-          and close(got["turn_n_valid"], float(n - 2)),
-          f"turn_abs_mean {got['turn_abs_mean']}, lag {got['turn_lag_frames']}")
-    check("straight line: the fixed box gives an exact area and aspect",
-          close(got["area_mean"], (2 * half_w) * (2 * half_h))
-          and close(got["area_std"], 0.0)
-          and close(got["aspect_mean"], (2 * half_w) / (2 * half_h))
-          and close(got["aspect_std"], 0.0),
-          f"area {got['area_mean']}, aspect {got['aspect_mean']}")
-    check("straight line: present_frac is 1 on a track with no gaps",
-          close(got["present_frac"], 1.0) and close(got["conf_mean"], 0.8, 1e-6)
-          and close(got["conf_std"], 0.0),
-          f"present {got['present_frac']}, conf {got['conf_mean']}")
-
-    if n_kpts >= 3:
-        arc = seg * (n_kpts - 2)
-        check("straight line: the rigid pose gives exact body and flagellum lengths",
-              close(got["body_len_mean"], head) and close(got["body_len_std"], 0.0)
-              and close(got["flagellum_len_mean"], arc)
-              and close(got["flagellum_len_std"], 0.0)
-              and close(got["flagellum_len_cv"], 0.0)
-              and close(got["flagellum_complete_frac"], 1.0),
-              f"body {got['body_len_mean']} vs {head}, "
-              f"flagellum {got['flagellum_len_mean']} vs {arc}")
-        # The Head-Base midpoint travels with the box, so the body translocation
-        # is the same distance, and net / body_len is (n-1)*v / head.
-        check("straight line: body translocation matches the centroid's",
-              close(got["body_speed_mean"], speed)
-              and close(got["body_path_length"], (n - 1) * v)
-              and close(got["body_net_displacement"], (n - 1) * v)
-              and close(got["body_straightness"], 1.0)
-              and close(got["body_displacement_per_len"], (n - 1) * v / head),
-              f"body_speed {got['body_speed_mean']}, "
-              f"per_len {got['body_displacement_per_len']}")
-        check("straight line: a rigid pose does not rotate or wag its tip",
-              close(got["body_rotation_speed"], 0.0)
-              and close(got["tip_angle_std"], 0.0)
-              and close(got["tip_angular_speed"], 0.0),
-              f"rot {got['body_rotation_speed']}, tip_sd {got['tip_angle_std']}")
-        # Head at +20 and the most distal node at -seg*(n_kpts-2) from the box
-        # centre, all on one line: the extent is the full span and the minor
-        # axis is exactly zero.
-        span = head + seg * (n_kpts - 2)
-        check("straight line: a collinear chain has a known extent and no minor axis",
-              close(got["shape_extent_mean"], span) and close(got["shape_pc1_mean"], span)
-              and close(got["shape_pc2_mean"], 0.0)
-              and bool(np.isnan(got["shape_elongation"])),
-              f"extent {got['shape_extent_mean']} vs {span}, "
-              f"pc2 {got['shape_pc2_mean']}, elong {got['shape_elongation']}")
-
-    # -- a circle at constant angular rate ------------------------------------ #
-    # Chord headings on a circle advance at exactly the angular rate, so the
-    # turn rate is w/dt for ANY lag - which is why it can be asserted without
-    # knowing which lag `_heading_lag` picked.
-    radius, w = 200.0, 0.05
-    circ = build_series(circular_track(n, n_kpts, radius, w), cfg, fps, 0, n)
-    got = aggregate_window(circ, 0, n, fps, cfg)
-    chord = 2.0 * radius * np.sin(w / 2.0)
-    check("circle: the constant turn rate comes back in rad/s",
-          close(got["turn_abs_mean"], w / dt, 1e-3)
-          and close(got["turn_abs_p90"], w / dt, 1e-2)
-          and close(got["turn_std"], 0.0, 1e-2),
-          f"{got['turn_abs_mean']} vs {w / dt}")
-    check("circle: chord speed, arc path and net displacement match the closed form",
-          close(got["speed_mean"], chord / dt, 1e-3)
-          and close(got["path_length"], (n - 1) * chord, 1e-4)
-          and close(got["net_displacement"], 2.0 * radius * np.sin(w * (n - 1) / 2.0), 1e-4),
-          f"speed {got['speed_mean']} vs {chord / dt}, path {got['path_length']}")
-
-    # The turn rate is a RATE, so it must not move with the window length even
-    # though the lag chosen inside each window can.
-    rates = []
-    for length in (12, 25, 40, 60):
-        rates.append(aggregate_window(circ, 0, length, fps, cfg)["turn_abs_mean"])
-    check("circle: the turn rate does not move with the window length",
-          max(abs(r - w / dt) for r in rates) < 1e-2,
-          ", ".join(f"{r:.4f}" for r in rates))
+N, V, HALF_W, HALF_H, HEAD, SEG = 60, 10.0, 12.0, 6.0, 20.0, 6.0
 
 
-def test_analytic_values_at_every_window(cfg) -> None:
-    """The same closed forms, swept over window length and offset.
+@pytest.fixture(scope="module")
+def straight(cfg) -> dict:
+    series = build_series(straight_track(N, cfg.n_keypoints, V, HALF_W, HALF_H), cfg, FPS, 0, N)
+    return aggregate_window(series, 0, N, FPS, cfg)
 
-    A feature that is right over the whole track and wrong over a slice of it is
-    a feature that has quietly read something outside its window. Speed and box
-    area are constant here, so their expected value does not depend on the
-    slice at all; path length and straightness do, in a way that is still exact.
-    """
-    n_kpts = cfg.n_keypoints
-    fps, dt, v = 100.0, 0.01, 10.0
+
+def test_a_straight_line_has_one_constant_speed(straight) -> None:
+    speed = V / DT
+    assert_close(straight, {
+        "speed_mean": speed, "speed_median": speed, "speed_p90": speed,
+        "speed_max": speed, "speed_std": 0.0, "immotile_frac": 0.0,
+    })
+
+
+def test_a_straight_line_has_closed_form_path_features(straight) -> None:
+    # n frames give n-1 steps; evenly spaced points have Rg = v * sqrt((n^2 - 1) / 12).
+    assert_close(straight, {
+        "path_length": (N - 1) * V, "net_displacement": (N - 1) * V, "straightness": 1.0,
+        "radius_gyration": V * np.sqrt((N * N - 1) / 12.0),
+    })
+
+
+def test_a_straight_line_does_not_turn(straight) -> None:
+    assert_close(straight, {
+        "turn_abs_mean": 0.0, "turn_std": 0.0, "turn_abs_p90": 0.0,
+        "turn_lag_frames": 1.0, "turn_n_valid": float(N - 2),
+    })
+
+
+def test_a_fixed_box_has_exact_area_aspect_and_confidence(straight) -> None:
+    assert_close(straight, {
+        "area_mean": (2 * HALF_W) * (2 * HALF_H), "area_std": 0.0,
+        "aspect_mean": HALF_W / HALF_H, "aspect_std": 0.0,
+        "present_frac": 1.0, "conf_mean": 0.8, "conf_std": 0.0,
+    })
+
+
+def test_a_rigid_pose_has_exact_lengths_and_motion(cfg, straight) -> None:
+    arc = SEG * (cfg.n_keypoints - 2)
+    speed = V / DT
+    assert_close(straight, {
+        "body_len_mean": HEAD, "body_len_std": 0.0, "flagellum_len_mean": arc,
+        "flagellum_len_std": 0.0, "flagellum_len_cv": 0.0, "flagellum_complete_frac": 1.0,
+        # The Head-Base midpoint travels with the box.
+        "body_speed_mean": speed, "body_path_length": (N - 1) * V,
+        "body_net_displacement": (N - 1) * V, "body_straightness": 1.0,
+        "body_displacement_per_len": (N - 1) * V / HEAD,
+        "body_rotation_speed": 0.0, "tip_angle_std": 0.0, "tip_angular_speed": 0.0,
+    })
+
+
+def test_a_collinear_chain_has_no_minor_axis(cfg, straight) -> None:
+    span = HEAD + SEG * (cfg.n_keypoints - 2)
+    assert_close(straight, {"shape_extent_mean": span, "shape_pc1_mean": span,
+                            "shape_pc2_mean": 0.0})
+    assert np.isnan(straight["shape_elongation"])
+
+
+RADIUS, W = 200.0, 0.05
+
+
+@pytest.fixture(scope="module")
+def circle(cfg):
+    return build_series(circular_track(N, cfg.n_keypoints, RADIUS, W), cfg, FPS, 0, N)
+
+
+def test_a_circle_has_a_constant_turn_rate(cfg, circle) -> None:
+    got = aggregate_window(circle, 0, N, FPS, cfg)
+    assert close(got["turn_abs_mean"], W / DT, 1e-3), got["turn_abs_mean"]
+    assert close(got["turn_abs_p90"], W / DT, 1e-2)
+    assert close(got["turn_std"], 0.0, 1e-2)
+
+
+def test_a_circle_has_closed_form_speed_and_path(cfg, circle) -> None:
+    got = aggregate_window(circle, 0, N, FPS, cfg)
+    chord = 2.0 * RADIUS * np.sin(W / 2.0)
+    assert close(got["speed_mean"], chord / DT, 1e-3)
+    assert close(got["path_length"], (N - 1) * chord, 1e-4)
+    assert close(got["net_displacement"], 2.0 * RADIUS * np.sin(W * (N - 1) / 2.0), 1e-4)
+
+
+def test_the_turn_rate_does_not_move_with_the_window_length(cfg, circle) -> None:
+    rates = [aggregate_window(circle, 0, length, FPS, cfg)["turn_abs_mean"]
+             for length in (12, 25, 40, 60)]
+    assert max(abs(r - W / DT) for r in rates) < 1e-2, rates
+
+
+def test_closed_forms_hold_at_every_window_length_and_offset(cfg) -> None:
     total = 240
-    sub = straight_track(total, n_kpts, v)
-    series = build_series(sub, cfg, fps, 0, total)
+    series = build_series(straight_track(total, cfg.n_keypoints, V), cfg, FPS, 0, total)
 
     n_windows, worst, worst_note = 0, 0.0, ""
     for length in (12, 25, 50, 120, 240):
         for start in range(0, total - length + 1, max(length // 3, 1)):
-            got = aggregate_window(series, start, start + length, fps, cfg)
-            # A window's first frame has no incoming step, so it holds
-            # length - 1 measurable steps spanning (length - 1) * v px.
+            got = aggregate_window(series, start, start + length, FPS, cfg)
             expected = {
-                "speed_mean": v / dt,
-                "speed_std": 0.0,
-                "path_length": (length - 1) * v,
-                "net_displacement": (length - 1) * v,
-                "straightness": 1.0,
-                "area_mean": 288.0,
-                "aspect_mean": 2.0,
-                "present_frac": 1.0,
-                "turn_abs_mean": 0.0,
-                "radius_gyration": v * np.sqrt((length * length - 1) / 12.0),
+                "speed_mean": V / DT, "speed_std": 0.0,
+                "path_length": (length - 1) * V, "net_displacement": (length - 1) * V,
+                "straightness": 1.0, "area_mean": 288.0, "aspect_mean": 2.0,
+                "present_frac": 1.0, "turn_abs_mean": 0.0,
+                "radius_gyration": V * np.sqrt((length * length - 1) / 12.0),
             }
             for key, want in expected.items():
                 deviation = abs(float(got[key]) - want)
@@ -530,123 +404,81 @@ def test_analytic_values_at_every_window(cfg) -> None:
                     worst, worst_note = deviation, f"{key} at [{start}, {start + length})"
             n_windows += 1
 
-    check("analytic: every window length and offset gives the closed-form answer",
-          worst <= 1e-6, f"worst {worst:.3e} on {worst_note}")
-    check("analytic: the sweep actually covered several window lengths",
-          n_windows >= 40, str(n_windows))
+    assert worst <= 1e-6, f"worst {worst:.3e} on {worst_note}"
+    assert n_windows >= 40
 
 
-def test_tip_rotation_is_not_inflated_by_a_gap(cfg) -> None:
-    """A constant tip rotation reads the same rate across a long gap.
+# --------------------------------------------------------------------------- #
+# tip rotation across gaps
+# --------------------------------------------------------------------------- #
+TIP_N, TIP_W = 100, 0.1
 
-    ``tip_angular_speed`` is a rate, so the frames the tracker lost must cost it
-    samples and nothing else. Compacting the angle before differencing makes the
-    gap one step, the unwrap folds that step into ``(-pi, pi]``, and the rate is
-    read off a rotation that never happened.
-    """
-    if cfg.n_keypoints < 3:
-        return
-    n, w, fps, dt = 100, 0.1, 100.0, 0.01
-    sub = spinning_tip_track(n, cfg.n_keypoints, w)
-    got = aggregate_window(build_series(sub, cfg, fps, 0, n), 0, n, fps, cfg)
-    check("gapless: a constant tip rotation comes back in rad/s",
-          close(got["tip_angular_speed"], w / dt, 1e-4),
-          f"{got['tip_angular_speed']} vs {w / dt}")
+
+@pytest.fixture(scope="module")
+def spinning(cfg):
+    return spinning_tip_track(TIP_N, cfg.n_keypoints, TIP_W)
+
+
+def _tip(cfg, track) -> dict:
+    return aggregate_window(build_series(track, cfg, FPS, 0, TIP_N), 0, TIP_N, FPS, cfg)
+
+
+def test_a_constant_tip_rotation_comes_back(cfg, spinning) -> None:
+    got = _tip(cfg, spinning)
+    assert close(got["tip_angular_speed"], TIP_W / DT, 1e-4)
     # Evenly spaced angles, so the spread is w * sd(0..n-1).
-    check("gapless: the unwrapped tip angle has the closed-form spread",
-          close(got["tip_angle_std"], w * np.std(np.arange(n)), 1e-4),
-          f"{got['tip_angle_std']} vs {w * np.std(np.arange(n))}")
+    assert close(got["tip_angle_std"], TIP_W * np.std(np.arange(TIP_N)), 1e-4)
 
-    gone = np.arange(40, 80)
-    gapped = sub[~sub["frame"].isin(gone)]
-    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
-    # 41 frames of true rotation is 4.1 rad; folded it is 4.1 - 2*pi, and the 59
-    # compacted steps then average to 13.53 rad/s instead of 10.
-    folded = (58 * w + abs(4.1 - 2 * np.pi)) / 59 / dt
-    check("a 40-frame gap does not inflate the tip rotation rate",
-          close(got["tip_angular_speed"], w / dt, 1e-3),
-          f"{got['tip_angular_speed']} vs {w / dt}; a folded bridge gives {folded:.2f}")
 
-    # The spread can only be recovered across a gap that rotates less than pi:
-    # beyond that the unwrap takes the shorter way round.
-    gone = np.arange(40, 60)
-    gapped = sub[~sub["frame"].isin(gone)]
-    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
-    kept = np.concatenate([np.arange(40), np.arange(60, n)])
-    check("and the angle spread is still the one over the frames that were seen",
-          close(got["tip_angle_std"], w * np.std(kept), 1e-4),
-          f"{got['tip_angle_std']} vs {w * np.std(kept)}")
+def test_a_long_gap_does_not_inflate_the_tip_rotation_rate(cfg, spinning) -> None:
+    """Compacting before differencing folds a 4.1 rad gap into one wrapped step."""
+    got = _tip(cfg, spinning[~spinning["frame"].isin(np.arange(40, 80))])
+    assert close(got["tip_angular_speed"], TIP_W / DT, 1e-3), got["tip_angular_speed"]
+
+
+def test_the_tip_angle_spread_is_over_the_frames_seen(cfg, spinning) -> None:
+    """Only recoverable across a gap that rotates less than pi."""
+    got = _tip(cfg, spinning[~spinning["frame"].isin(np.arange(40, 60))])
+    kept = np.concatenate([np.arange(40), np.arange(60, TIP_N)])
+    assert close(got["tip_angle_std"], TIP_W * np.std(kept), 1e-4)
 
 
 def test_tip_angle_spread_survives_a_gap_across_the_branch_cut(cfg) -> None:
-    """A tip pointing near +-pi, lost while it crosses the cut, keeps its spread.
-
-    Interpolating the wrapped angle across the gap bridges +3.1 to -3.1 through
-    zero and leaves the samples after it 2 pi away from those before.
-    """
-    if cfg.n_keypoints < 3:
-        return
-    n, w, fps = 100, 0.002, 100.0
-    sub = spinning_tip_track(n, cfg.n_keypoints, w)
-    # Rotate the chain so the tip angle runs from pi - 0.1 to pi + 0.098.
-    base = np.pi - 0.1
-    for k in range(1, cfg.n_keypoints):
-        r = 6.0 * (k - 1)
-        ang = base + w * np.arange(n)
-        sub[f"kp_x_{k}"] = (200.0 + r * np.cos(ang)).astype(np.float32)
-        sub[f"kp_y_{k}"] = (200.0 + r * np.sin(ang)).astype(np.float32)
-    gapped = sub[~sub["frame"].isin(np.arange(45, 55))]
-    got = aggregate_window(build_series(gapped, cfg, fps, 0, n), 0, n, fps, cfg)
-    kept = np.concatenate([np.arange(45), np.arange(55, n)])
-    check("a gap across +-pi does not add 2 pi to the tip angle spread",
-          close(got["tip_angle_std"], w * np.std(kept), 1e-4),
-          f"{got['tip_angle_std']} vs {w * np.std(kept)}")
+    """A tip near +-pi lost while crossing the cut keeps its spread."""
+    w = 0.002
+    sub = spinning_tip_track(TIP_N, cfg.n_keypoints, w, base_angle=np.pi - 0.1)
+    got = _tip(cfg, sub[~sub["frame"].isin(np.arange(45, 55))])
+    kept = np.concatenate([np.arange(45), np.arange(55, TIP_N)])
+    assert close(got["tip_angle_std"], w * np.std(kept), 1e-4), got["tip_angle_std"]
 
 
+# --------------------------------------------------------------------------- #
+# window independence and guards
+# --------------------------------------------------------------------------- #
 def test_window_is_independent_of_the_series_around_it(cfg) -> None:
-    """The property that makes the clip boundary stop being the measurement unit.
-
-    A window aggregated out of a long series must equal the same window
-    aggregated out of a series built for it alone. Anything that leaked across
-    the window edge - an unwrap, a gap fill, a detrend, a step measured into the
-    window - would show up here and nowhere else.
-    """
-    n_kpts = cfg.n_keypoints
-    sub = synthetic_track(300, n_kpts, seed=2, drop=(90, 91, 150))
-    whole = build_series(sub, cfg, 100.0, 0, 300)
+    sub = synthetic_track(300, cfg.n_keypoints, seed=2, drop=(90, 91, 150))
+    whole = build_series(sub, cfg, FPS, 0, 300)
     worst, worst_key = 0.0, ""
     for start, length in ((0, 50), (25, 50), (75, 40), (140, 60), (250, 50), (12, 7)):
         window = sub[(sub["frame"] >= start) & (sub["frame"] < start + length)]
-        alone = build_series(window, cfg, 100.0, start, length)
-        a = aggregate_window(whole, start, start + length, 100.0, cfg)
-        b = aggregate_window(alone, start, start + length, 100.0, cfg)
+        alone = build_series(window, cfg, FPS, start, length)
+        a = aggregate_window(whole, start, start + length, FPS, cfg)
+        b = aggregate_window(alone, start, start + length, FPS, cfg)
         for key, value in diff_features(a, b).items():
             if value > worst:
                 worst, worst_key = value, key
-    check("a window's features do not depend on the track built around it",
-          worst <= TOL, f"{worst_key} differs by {worst:.3e}")
+    assert worst <= TOL, f"{worst_key} differs by {worst:.3e}"
 
 
-def test_guards(cfg) -> None:
-    """A window the series cannot answer for is refused, never silently padded."""
-    sub = synthetic_track(40, cfg.n_keypoints)
-    series = build_series(sub, cfg, 100.0, 100, 40)
-    for name, args in (("empty window", (100, 100)), ("reversed window", (120, 110)),
-                       ("window before the series", (90, 110)),
-                       ("window past the series", (130, 145))):
-        try:
-            aggregate_window(series, args[0], args[1], 100.0, cfg)
-            refused = False
-        except ValueError:
-            refused = True
-        check(f"{name} is refused rather than silently padded", refused)
+@pytest.mark.parametrize("start,end", [(100, 100), (120, 110), (90, 110), (130, 145)],
+                         ids=["empty", "reversed", "before", "past"])
+def test_a_window_the_series_cannot_answer_is_refused(cfg, start, end) -> None:
+    series = build_series(synthetic_track(40, cfg.n_keypoints), cfg, FPS, 100, 40)
+    with pytest.raises(ValueError):
+        aggregate_window(series, start, end, FPS, cfg)
 
 
-# The feature set, written out. A frozen literal rather than anything derived
-# from the module, so that renaming or dropping a column has to be done here too
-# and cannot pass unnoticed - these names are the contract with every model
-# already fitted, and a column that silently changes name is a silent
-# misalignment rather than an error.
+# The feature names are the contract with every fitted model, so they are written out.
 EXPECTED_FEATURES = frozenset({
     "area_mean", "area_std", "aspect_mean", "aspect_std",
     "speed_mean", "speed_median", "speed_p90", "speed_std", "speed_max",
@@ -666,41 +498,21 @@ EXPECTED_FEATURES = frozenset({
 
 
 def test_spec_covers_every_column(cfg) -> None:
-    sub = synthetic_track(60, cfg.n_keypoints)
-    series = build_series(sub, cfg, 100.0, 0, 60)
-    got = aggregate_window(series, 0, 60, 100.0, cfg)
-    check("aggregate_window emits exactly the declared feature set",
-          set(got) == set(EXPECTED_FEATURES), str(set(got) ^ set(EXPECTED_FEATURES)))
-    check("and no spectral column leaks into it",
-          not any(k.startswith(SPECTRAL) for k in got),
-          str([k for k in got if k.startswith(SPECTRAL)]))
-    check("feature_names() is the schema aggregate_window actually produces",
-          set(feature_names()) == set(got) and len(feature_names()) == len(got),
-          str(set(feature_names()) ^ set(got)))
-    reduced = len(feature_names()) - len(WINDOW_FUNCTIONALS)
-    check("most features are declared in SERIES_SPEC rather than hand-written",
-          reduced > len(WINDOW_FUNCTIONALS), f"{reduced} declared vs {len(WINDOW_FUNCTIONALS)}")
-    check("every SERIES_SPEC column exists in the series",
-          set(SERIES_SPEC) == set(series.columns))
+    series = build_series(synthetic_track(60, cfg.n_keypoints), cfg, FPS, 0, 60)
+    got = aggregate_window(series, 0, 60, FPS, cfg)
+    assert set(got) == set(EXPECTED_FEATURES), set(got) ^ set(EXPECTED_FEATURES)
+    assert not any(k.startswith(SPECTRAL) for k in got)
+    assert set(feature_names()) == set(got) and len(feature_names()) == len(got)
+    # Most features are declared in SERIES_SPEC rather than hand-written.
+    assert len(feature_names()) - len(WINDOW_FUNCTIONALS) > len(WINDOW_FUNCTIONALS)
+    assert set(SERIES_SPEC) == set(series.columns)
 
 
 # --------------------------------------------------------------------------- #
 # real data
 # --------------------------------------------------------------------------- #
 def regress_project(root: Path) -> tuple[int, dict] | None:
-    """Window-independence on every clip of a prepared project.
-
-    For each clip, the features aggregated out of a series covering the WHOLE
-    track are compared against the features aggregated out of a series built for
-    that clip alone. They must be identical: a window's features are a property
-    of the window.
-
-    Run over a whole manifest rather than one hand-made track, because that is
-    where the awkward cases are - gaps, short tracks, clips planned past the
-    last detection, near-degenerate poses. Anything that leaked across a window
-    edge (an unwrap, a gap fill, a step measured in from the frame before, a lag
-    chosen from the surrounding track) shows up here and almost nowhere else.
-    """
+    """Whole-track versus clip-alone features for every clip of a prepared project."""
     config = root / "config.yaml"
     if not config.exists():
         return None
@@ -741,8 +553,7 @@ def test_real_projects(roots: list[Path]) -> None:
             continue
         n, stats = result
         failed = report(stats, n, str(root))
-        check(f"{root.name}: every clip's features depend on the window alone",
-              not failed, str(failed))
+        assert not failed, f"{root.name}: columns depend on the surrounding track: {failed}"
         total += n
         for key, entry in stats.items():
             merged = pooled.setdefault(key, {"max": 0.0, "over": 0})
@@ -750,79 +561,46 @@ def test_real_projects(roots: list[Path]) -> None:
             merged["over"] += entry["over"]
     if total:
         failed = report(pooled, total, "POOLED over every project")
-        check("pooled over every real clip: no column depends on the surrounding track",
-              not failed, str(failed))
+        assert not failed, f"pooled: {failed}"
 
 
 # --------------------------------------------------------------------------- #
 # cost
 # --------------------------------------------------------------------------- #
-def test_faster_than_recomputing(cfg) -> None:
-    """One series plus N slices against one series PER window.
-
-    Per-window construction is what the module replaced: measuring a clip used
-    to mean walking that clip's frames from scratch, so overlapping clips paid
-    for the same frames repeatedly. Building a series per window reproduces that
-    cost exactly, in code that still exists, and the comparison is the honest
-    one - both sides compute the same features by the same arithmetic and differ
-    only in how often the per-frame work is done.
-
-    Measured on non-overlapping AND overlapping windows, because that is where
-    the asymptotics live. With stride == length the two do the same per-frame
-    work and the shared series only saves fixed overhead; every increment of
-    overlap is work the per-window path repeats and this one does not, so the
-    ratio grows with it.
-    """
-    n_frames = 500
-    sub = synthetic_track(n_frames, cfg.n_keypoints, seed=3, drop=(101, 102, 300))
-
-    def per_window(windows) -> None:
-        for start, end in windows:
-            window = sub[(sub["frame"] >= start) & (sub["frame"] < end)]
-            series = build_series(window, cfg, 100.0, start, end - start)
-            aggregate_window(series, start, end, 100.0, cfg)
-
-    def shared(windows) -> None:
-        series = build_series(sub, cfg, 100.0, 0, n_frames)
-        for start, end in windows:
-            aggregate_window(series, start, end, 100.0, cfg)
-
-    def slicing_only(windows) -> None:
-        for start, end in windows:
-            aggregate_window(whole, start, end, 100.0, cfg)
-
-    def best(fn, windows, repeats: int = 5) -> float:
-        fn(windows)                            # warm the import-time lazy paths
-        return min(_time(lambda: fn(windows)) for _ in range(repeats))
-
-    whole = build_series(sub, cfg, 100.0, 0, n_frames)
-
-    for label, length, stride in (("no overlap", 50, 50), ("stride 25", 50, 25),
-                                  ("stride 10", 50, 10)):
-        windows = [(s, s + length) for s in range(0, n_frames - length + 1, stride)]
-        t_each = best(per_window, windows)
-        t_shared = best(shared, windows)
-        t_slice = best(slicing_only, windows)
-        print(f"\n  {n_frames}-frame track, {len(windows)} windows of {length}, {label}")
-        print(f"    {len(windows):3d}x build_series + aggregate {t_each * 1e3:8.2f} ms")
-        print(f"    build_series + {len(windows):3d} windows     {t_shared * 1e3:8.2f} ms"
-              f"   (slicing ~{t_slice * 1e3:.2f} ms of that)")
-        print(f"    {t_each / t_shared:5.2f}x overall,  slicing is "
-              f"{t_slice / t_shared:.0%} of the shared path")
-        check(f"{label}: one series + N slices beats a series per window",
-              t_each / t_shared > 1.0, f"{t_each / t_shared:.2f}x")
-        # The structural claim underneath the timing: slicing is the cheap half,
-        # which is why amortising the construction is what buys the speed-up. If
-        # this ever inverted, the module would not be worth its complexity.
-        check(f"{label}: slicing is cheaper than building the series it slices",
-              t_slice < t_shared, f"slicing {t_slice * 1e3:.2f} ms of "
-              f"{t_shared * 1e3:.2f} ms")
-
-
 def _time(fn) -> float:
     start = time.perf_counter()
     fn()
     return time.perf_counter() - start
 
 
-# --------------------------------------------------------------------------- #
+# With no overlap both do the same work, so only "not slower" is asserted there.
+@pytest.mark.parametrize("length,stride,floor", [(50, 50, 0.8), (50, 25, 1.0), (50, 10, 1.0)])
+def test_one_series_plus_slices_beats_a_series_per_window(cfg, length, stride, floor) -> None:
+    n_frames = 500
+    sub = synthetic_track(n_frames, cfg.n_keypoints, seed=3, drop=(101, 102, 300))
+    whole = build_series(sub, cfg, FPS, 0, n_frames)
+    windows = [(s, s + length) for s in range(0, n_frames - length + 1, stride)]
+
+    def per_window() -> None:
+        for start, end in windows:
+            window = sub[(sub["frame"] >= start) & (sub["frame"] < end)]
+            aggregate_window(build_series(window, cfg, FPS, start, end - start),
+                             start, end, FPS, cfg)
+
+    def shared() -> None:
+        series = build_series(sub, cfg, FPS, 0, n_frames)
+        for start, end in windows:
+            aggregate_window(series, start, end, FPS, cfg)
+
+    def slicing_only() -> None:
+        for start, end in windows:
+            aggregate_window(whole, start, end, FPS, cfg)
+
+    def best(fn, repeats: int = 5) -> float:
+        fn()
+        return min(_time(fn) for _ in range(repeats))
+
+    t_each, t_shared, t_slice = best(per_window), best(shared), best(slicing_only)
+    assert t_each / t_shared > floor, f"{t_each / t_shared:.2f}x"
+    # Slicing is the cheap half, which is why amortising construction pays.
+    assert t_slice < t_shared, f"slicing {t_slice * 1e3:.2f} ms of {t_shared * 1e3:.2f} ms"

@@ -18,11 +18,7 @@ __all__ = ["BoutTimeline", "axis_ticks"]
 
 
 class BoutTimeline(QWidget):
-    """One lane per predicted group on a shared frame axis.
-
-    Painting and hit-testing only visit the segments in view, so cost does not
-    grow with track length.
-    """
+    """One lane per predicted group on a shared frame axis; paints only what is in view."""
 
     LANE = 52
     BAR = 34
@@ -175,9 +171,7 @@ class BoutTimeline(QWidget):
     def _nothing_here(self) -> str:
         return (
             f"No predicted bouts for track {self.track.track_id} of "
-            f"{self.track.movie_id}.\n\n"
-            "That is normal, not an error: a track with no featurisable window "
-            "gets no row."
+            f"{self.track.movie_id} (no window could be scored)."
         )
 
     def _bar(self, y: float, gutter: float) -> QRectF:
@@ -292,8 +286,7 @@ class BoutTimeline(QWidget):
             f"frames {segment.f_start}-{segment.f_end} ({segment.n_frames} frames)",
         ]
         if np.isfinite(segment.conf):
-            lines.append(f"confidence {segment.conf:.3f}: the MEAN posterior over "
-                         "the bout, not its peak")
+            lines.append(f"confidence {segment.conf:.3f} (mean posterior over the bout)")
         if segment.skip_reason:
             lines.append(segment.skip_reason)
         return "\n".join(lines)

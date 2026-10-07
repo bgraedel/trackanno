@@ -14,8 +14,7 @@ __all__ = ["Segment", "TrackPredictions", "PredictionReader"]
 
 @dataclass(frozen=True)
 class Segment:
-    """One decoded bout. ``label`` is ``""`` for an unscored stretch, ``conf``
-    is NaN where the file has none."""
+    """One decoded bout; ``label`` is ``""`` and ``conf`` NaN where unscored."""
 
     f_start: int
     f_end: int
@@ -77,8 +76,8 @@ class PredictionReader:
             self.problem = str(exc)
             return
         if "bout_id" not in self.frame.columns:
-            self.problem = ("these predictions are not decoded bouts; label every "
-                            "clip with the model again")
+            self.problem = ("these predictions are not decoded bouts: run 'Label all "
+                            "clips with the model' again")
             return
         self.stale = staleness(cfg)
         self.groups = sorted(

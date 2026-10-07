@@ -1,11 +1,6 @@
-"""One place that decides what the application looks like.
+"""Design tokens and the one application stylesheet built from them.
 
-A small set of design tokens, one stylesheet generated from them, applied once
-to the ``QApplication``. Widgets ask for a *role* (``muted``, ``danger``,
-``heading``) rather than a colour, so a theme change is a token change and
-nothing else; never give a widget an inline ``setStyleSheet`` with hardcoded
-hex. ``ui.theme`` picks ``dark`` (default), ``light``, or ``system``, which
-follows the desktop's own preference.
+Widgets ask for a *role* (``muted``, ``danger``, ``heading``), not a colour.
 """
 
 from __future__ import annotations
@@ -71,8 +66,7 @@ _active_name = "dark"
 
 
 def tokens() -> dict:
-    """The palette currently in force. Underscore keys are generated assets
-    (arrow images), not colours."""
+    """The active palette (underscore keys are generated arrow image paths)."""
     return _active
 
 
@@ -81,7 +75,7 @@ def current() -> str:
 
 
 def role(name: str) -> str:
-    """A token by name, for the few places that still need a literal colour."""
+    """A token colour by name, for places that need a literal colour."""
     return _active.get(name, _active["text"])
 
 
@@ -117,9 +111,7 @@ QLabel[role="subheading"] {{
 }}
 
 /* -- cards ------------------------------------------------------------- */
-/* The title sits INSIDE the card. With the Qt default (subcontrol-origin:
-   margin) it is drawn above the border, which on a filled card reads as a
-   stray label floating over the page rather than as the card's header. */
+/* Title inside the card, not above its border. */
 QGroupBox {{
     background: {t['surface']};
     border: 1px solid {t['border']};
@@ -170,8 +162,7 @@ QPushButton:default:hover, QPushButton[accent="true"]:hover {{
 QPushButton[accent="true"]:disabled {{
     background: {t['surface']}; color: {t['faint']}; border-color: {t['border']};
 }}
-/* Small square buttons. The default 14px horizontal padding is wider than the
-   whole control on a 26px button, which leaves the label no room to draw. */
+/* Small square buttons: no padding, so the label fits. */
 QPushButton[compact="true"] {{
     padding: 0;
     font-weight: 700;
@@ -202,10 +193,7 @@ QLineEdit[invalid="true"], QSpinBox[invalid="true"],
 QDoubleSpinBox[invalid="true"], QComboBox[invalid="true"] {{
     border: 1px solid {t['warning']};
 }}
-/* Real images, not CSS border triangles: the subcontrol keeps a non-zero
-   content box, and once any subcontrol is styled Qt stops painting the native
-   arrow, so leaving them unstyled is not an option either. Painted once
-   per theme by _arrow_images(). */
+/* Arrow images painted per theme by _arrow_images(). */
 QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
     background: transparent;
@@ -306,9 +294,7 @@ QListWidget::item:hover {{ background: {t['raised']}; }}
 QListWidget::item:selected {{ background: {t['accent_soft']}; color: {t['text']}; }}
 QListWidget::item:disabled {{ color: {t['faint']}; }}
 QTableWidget {{ gridline-color: {t['border']}; }}
-/* Horizontal only. Vertical item padding is taken out of the cell rect, so a
-   cell WIDGET (a combo in the skeleton table) gets squeezed below its own
-   sizeHint and has its descenders clipped. */
+/* Horizontal only: vertical padding would squeeze cell widgets. */
 QTableWidget::item {{ padding: 0 6px; }}
 QTableWidget::item:selected {{ background: {t['accent_soft']}; color: {t['text']}; }}
 QHeaderView::section {{
@@ -381,9 +367,7 @@ QMenu::item:selected {{ background: {t['accent']}; color: {t['on_accent']}; }}
 
 
 def _arrow_images(t: dict) -> None:
-    """Paint the spin/combo arrows to PNGs, once per theme, and record their
-    paths in the tokens. Qt's stylesheet ``image:`` takes only a URL, so an
-    arrow that follows the palette has to be a file."""
+    """Paint the spin/combo arrows to PNG files (QSS ``image:`` needs a URL)."""
     import tempfile
 
     from qtpy.QtCore import QPointF
@@ -488,7 +472,7 @@ def apply_theme(app: QApplication, name: str = "dark") -> str:
     try:
         app.setWindowIcon(app_icon())
     except Exception:
-        pass          # an icon is never worth failing to start over
+        pass          # a missing icon is not fatal
     return name
 
 
@@ -496,10 +480,7 @@ def apply_theme(app: QApplication, name: str = "dark") -> str:
 # small shared widgets
 # --------------------------------------------------------------------------- #
 def show_help(parent, title: str, html: str) -> None:
-    """Open ``html`` in a window that can be read, scrolled and closed.
-
-    Not a QMessageBox, which cannot scroll a paragraph.
-    """
+    """Open ``html`` in a scrollable help dialog."""
     from qtpy.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
 
     dialog = QDialog(parent)
@@ -517,12 +498,8 @@ def show_help(parent, title: str, html: str) -> None:
 
 
 def help_button(parent, title: str, html, size: int = 26):
-    """A `?` that opens the long form of whatever it sits beside.
-
-    ``html`` may be a callable, for text that depends on what is on screen when
-    the button is pressed.
-    """
-    button = compact_button("?", size, "what this page is showing")
+    """A `?` button that opens ``html`` (a string or a callable returning one)."""
+    button = compact_button("?", size, "Show help for this page.")
     button.clicked.connect(
         lambda: show_help(parent, title, html() if callable(html) else html)
     )
@@ -530,7 +507,7 @@ def help_button(parent, title: str, html, size: int = 26):
 
 
 class Heading(QWidget):
-    """A page title, its one-line explanation, and a `?` for the long form."""
+    """A page title, a one-line subtitle and an optional `?` help button."""
 
     def __init__(self, title: str, subtitle: str = "", parent=None, help: str = ""):
         super().__init__(parent)
@@ -559,9 +536,7 @@ class Heading(QWidget):
 
 
 def app_icon() -> "QIcon":
-    """The application icon: the corner reticle, painted at every size rather
-    than shipped as a file and scaled. The ground stays dark in both themes,
-    since a taskbar has its own colour scheme."""
+    """The application icon: the corner reticle on a dark ground, painted per size."""
     from qtpy.QtCore import QLineF, QRectF
     from qtpy.QtGui import QIcon, QPainter, QPixmap
 
@@ -574,16 +549,13 @@ def app_icon() -> "QIcon":
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Dark rounded ground, so the amber reads on any taskbar.
         pad = size * 0.06
         ground = QRectF(pad, pad, size - 2 * pad, size - 2 * pad)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#15171C"))
         painter.drawRoundedRect(ground, size * 0.22, size * 0.22)
 
-        # Float coordinates: rounding to whole pixels at 16px moves a corner by
-        # up to half an arm. At small sizes the arms are pushed out and
-        # shortened so the corners do not close into a ring.
+        # Small sizes get shorter arms so the corners stay apart.
         small = size <= 24
         inset = size * (0.23 if small else 0.29)
         arm = size * (0.14 if small else 0.16)
@@ -605,9 +577,7 @@ def app_icon() -> "QIcon":
 
 def compact_button(label: str = "", size: int = 28, tooltip: str = "",
                    danger: bool = False):
-    """A small square button whose label actually fits. Use this rather than
-    QPushButton + setFixedWidth, where the themed padding is wider than the
-    button and the text silently vanishes."""
+    """A small square button whose label fits (themed padding removed)."""
     from qtpy.QtWidgets import QPushButton
 
     button = QPushButton(label)

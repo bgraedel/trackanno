@@ -1,20 +1,4 @@
-"""Multi-object tracking over merged full-frame detections.
-
-``model.track()`` from ultralytics cannot be used here: it owns the inference
-stream, so with tiling it would track *tiles* rather than frames. Detection runs
-separately (see :mod:`trackanno.detect.tiling`) and the tracker takes the merged
-full-frame boxes.
-
-Backends: any bundled ultralytics tracker, fed through a small results shim, or
-``greedy`` nearest-centroid matching with a distance gate, which is adequate at
-100 fps where per-frame motion is ~1 px.
-
-``tracktrack`` is the default, being built for crowded scenes with frequent
-occlusion, which is what ~50 organisms in one field of view produce.
-``bytetrack`` is the conservative alternative, and the only backend with
-built-in defaults here, so it is also the one that survives a missing or
-unreadable tracker yaml.
-"""
+"""Tracking of merged full-frame detections: ultralytics trackers, or greedy nearest-centroid."""
 
 from __future__ import annotations
 
@@ -33,10 +17,7 @@ __all__ = ["Tracker", "build_tracker"]
 
 
 def _as_boxes(dets: Detections, shape: tuple[int, int]):
-    """Wrap detections in ultralytics' own ``Boxes`` type.
-
-    ``BYTETracker._split_detections`` slices it with a boolean mask and expects a
-    ``Boxes`` back, so a ``.conf``/``.xywh``/``.cls`` shim is not enough."""
+    """Wrap detections in ultralytics' ``Boxes``, which its trackers slice by mask."""
     from ultralytics.engine.results import Boxes
 
     data = np.concatenate(
@@ -68,8 +49,7 @@ _BYTETRACK_DEFAULTS = {
     "fuse_score": True,
 }
 
-# name -> (ultralytics class, bundled config). All take __init__(args) and
-# update(results, img=None).
+# name -> (ultralytics class, bundled config).
 TRACKERS = {
     "bytetrack": ("BYTETracker", "bytetrack.yaml"),
     "tracktrack": ("TRACKTRACK", "tracktrack.yaml"),
@@ -81,9 +61,7 @@ TRACKERS = {
 
 
 def _load_tracker_yaml(name: str) -> dict:
-    """Read a tracker YAML by path, or by name from ultralytics' bundled configs.
-
-    Not via ultralytics' own yaml helpers, which move between releases."""
+    """Read a tracker YAML by path, or by name from ultralytics' bundled configs."""
     import yaml
 
     path = Path(name)
@@ -116,9 +94,7 @@ def _tracker_args(cfg: Config, fps: float):
         )
         params = dict(_BYTETRACK_DEFAULTS)
 
-    # ultralytics takes track_buffer verbatim, in frames. Scale it by fps/30, the
-    # rate its bundled yamls are written for, so the lost-track tolerance stays
-    # the same DURATION whatever the acquisition rate.
+    # Bundled yamls assume 30 fps; scale track_buffer so it keeps the same duration.
     if "track_buffer" in params:
         params["track_buffer"] = int(round(params["track_buffer"] * max(1.0, fps) / 30.0))
 
@@ -150,8 +126,7 @@ class UltralyticsTracker(Tracker):
         self.shape = shape
         self._impl = self._make()
 
-        # Prove the path before a long run commits: a silent downgrade fragments
-        # every track and only shows up as an odd track count.
+        # Probe with one detection so an API change fails here, not mid-run.
         probe = Detections(
             xyxy=np.array([[10, 10, 30, 30]], np.float32),
             conf=np.array([0.9], np.float32),
@@ -168,8 +143,7 @@ class UltralyticsTracker(Tracker):
 
     def reset(self) -> None:
         self._impl = self._make()
-        # Track ids come from a process-wide counter and go into clip_ids, so every
-        # movie (and the construction probe) must start it from zero.
+        # Track ids are a process-wide counter used in clip_ids; restart it per movie.
         reset_id = getattr(self._impl, "reset_id", None)
         if callable(reset_id):
             reset_id()
@@ -188,8 +162,7 @@ class UltralyticsTracker(Tracker):
     def update(self, dets: Detections, img: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         empty = (np.zeros((0,), np.int64), np.zeros((0,), np.int64))
         boxes = _as_boxes(dets, self.shape)
-        # Call update even on empty frames so lost-track ages advance. Trackers
-        # with camera-motion compensation want the frame; the rest ignore it.
+        # Update on empty frames too, so lost-track ages advance.
         try:
             out = np.asarray(self._impl.update(boxes, img))
         except TypeError:
@@ -202,7 +175,7 @@ class UltralyticsTracker(Tracker):
             # [x1, y1, x2, y2, id, score, cls, det_idx]
             det_idx = np.clip(out[:, 7].astype(np.int64), 0, max(len(dets) - 1, 0))
         else:
-            # Older builds omit the index: recover it by matching boxes back.
+            # No index column: recover it by matching boxes.
             from .tiling import _iou_matrix
 
             det_idx = _iou_matrix(out[:, :4].astype(np.float32), dets.xyxy).argmax(axis=1)
@@ -279,12 +252,7 @@ def build_tracker(cfg: Config, fps: float, shape: tuple[int, int] = (0, 0)) -> T
     try:
         return UltralyticsTracker(cfg, fps, shape)
     except Exception as exc:
-        # Loud, not a warning: the greedy fallback fragments tracks, and shows it
-        # only long after a multi-minute run has finished.
         raise RuntimeError(
-            f"tracker {cfg.tracking.backend!r} could not be initialised: "
-            f"{type(exc).__name__}: {exc}\n"
-            "This usually means the installed ultralytics changed its tracker API.\n"
-            "Set `tracking.backend: greedy` in config.yaml to use the fallback "
-            "deliberately (it is adequate at 100 fps, but fragments tracks more)."
+            f"tracker {cfg.tracking.backend!r} could not be initialised "
+            f"({type(exc).__name__}: {exc}); try tracking.backend: greedy"
         ) from exc

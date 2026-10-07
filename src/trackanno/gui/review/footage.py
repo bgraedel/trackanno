@@ -19,8 +19,7 @@ from .decode import (
 __all__ = ["CHUNKS_KEPT", "REVIEW_FOLLOW", "ChunkCache", "TrackFootage"]
 
 CHUNKS_KEPT = 6
-# A bout runs for hundreds of frames, so the review re-centres every frame
-# rather than following ui.follow.
+# Bouts are long, so review always re-centres per frame.
 REVIEW_FOLLOW = "locked"
 
 
@@ -60,10 +59,9 @@ class ChunkCache:
 
 
 class TrackFootage(QWidget):
-    """The frames of the track under review, cut from the movie off the UI thread.
+    """Footage of the track under review, decoded off the UI thread.
 
-    One decoder per open track. Switching track stops the old decoder without
-    waiting and bumps a generation token so its late replies are dropped.
+    A generation token drops late replies after a track switch.
     """
 
     positionChanged = Signal(int)         # movie frame now on screen
@@ -72,7 +70,7 @@ class TrackFootage(QWidget):
     def __init__(self, cfg: Config | None = None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
-        # The annotation window's view toggles, per user.
+        # View toggles shared with the annotation window.
         self.prefs = load_view()
         self.viewer = SimpleViewer(fps=self._fps(), loop=True)
         self.viewer.frame_changed.connect(self._on_viewer_frame)
@@ -87,7 +85,7 @@ class TrackFootage(QWidget):
         self.follow_combo = follow_combo(REVIEW_FOLLOW)
         self.follow_combo.currentIndexChanged.connect(lambda _: self._refresh_view())
         self.marker_box = QCheckBox("marker")
-        self.marker_box.setToolTip("outline the animal this track is about")
+        self.marker_box.setToolTip("Outline the animal this track follows.")
         self.marker_box.setChecked(bool(self.prefs["show_overlay"]))
         self.marker_box.setFocusPolicy(Qt.NoFocus)
         self.marker_box.toggled.connect(lambda _: self._refresh_view())
@@ -108,8 +106,7 @@ class TrackFootage(QWidget):
         layout.addWidget(self.controls)
         layout.addWidget(self.source)
 
-        # Coalesces set_track calls made before the event loop runs, so only
-        # the last track selected is ever opened.
+        # Coalesces rapid set_track calls so only the last track is opened.
         self._kick = QTimer(self)
         self._kick.setSingleShot(True)
         self._kick.setInterval(0)
@@ -162,7 +159,7 @@ class TrackFootage(QWidget):
         return self._crop
 
     def _measure_crop(self) -> None:
-        """Measure the session crop on a worker; the UI thread never reads the manifests."""
+        """Measure the session crop on a worker thread."""
         if self._measuring or self.cfg is None:
             return
         self._measuring = True
@@ -218,9 +215,7 @@ class TrackFootage(QWidget):
 
     # -- one track ----------------------------------------------------------- #
     def set_track(self, movie_id: str, track_id: int, f_lo: int, f_hi: int) -> None:
-        """Show ``f_lo`` of this track. Decoding starts on the next event-loop
-        turn, so a burst of switches opens only the last track. Another track
-        of the same movie keeps the decoder and its open movie."""
+        """Show ``f_lo`` of this track; decoding starts on the next event-loop turn."""
         self.viewer.pause()
         key = (str(movie_id), int(track_id))
         if key[0] != self._movie_id or self._decoder is None:
@@ -325,8 +320,7 @@ class TrackFootage(QWidget):
         return self._decoder
 
     def make_cutter(self, movie_id: str, track_id: int, source=None) -> TrackCutter:
-        """A cutter for one track, on the decoder's shared movie. Called on the
-        worker; tests replace it with a fake."""
+        """A cutter for one track on the decoder's shared movie (worker thread)."""
         return TrackCutter(self.cfg, movie_id, track_id, self._crop, REVIEW_CHUNK,
                            source=source)
 
@@ -375,7 +369,7 @@ class TrackFootage(QWidget):
         arrived = offset >= self._length - 1
         looped = offset == 0 and was >= self._length - 1 and self._length > 1
         if arrived or looped:
-            # Queued: replacing the clip inside the viewer's own signal re-enters.
+            # Queued to avoid re-entering the viewer's signal.
             QTimer.singleShot(0, self._roll_on)
 
     def _roll_on(self) -> None:
@@ -410,8 +404,7 @@ class TrackFootage(QWidget):
         if gen != self._gen:
             return
         if fatal:
-            # The track cannot be opened; remembered until the track changes,
-            # so a scrub does not reopen a dead share per mouse move.
+            # Remembered until the track changes, so scrubbing does not retry.
             self._wanted = None
             self._problem = f"{self._movie_id} could not be read ({message})"
             self._no_video(self._problem)

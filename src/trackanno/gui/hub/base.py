@@ -33,9 +33,7 @@ PAGE_HINTS = [
 
 
 def _heading(text: str, subtitle: str = "", help: str = "") -> QWidget:
-    """A page title, one line saying what the page is for, and a `?` for the
-    rest. The subtitle is permanent, so anything longer goes behind the
-    button."""
+    """A page title, a one-line subtitle, and a `?` button for longer help."""
     return Heading(text, subtitle, help=help)
 
 
@@ -77,11 +75,9 @@ class _Job:
 
 
 class Jobs:
-    """Background jobs for one owner, tagged with the project they started for.
+    """Background jobs tagged with their project; results land on the UI thread.
 
-    A result is delivered on the UI thread, and dropped when its project is no
-    longer open or a newer job of the same name has started. ``dropped`` runs
-    when a job is cancelled or its project closes, not when it is superseded.
+    Stale or superseded results are dropped; ``dropped`` runs on cancel or project change.
     """
 
     def __init__(self, project: Callable[[], object]):
@@ -158,8 +154,7 @@ class Jobs:
                 self._drop(job)
 
     def shutdown(self, timeout: float = 5.0) -> None:
-        """Cancel everything and wait up to ``timeout`` in total. A job that
-        will not stop is a daemon thread and is left behind."""
+        """Cancel everything and wait up to ``timeout`` seconds in total."""
         self._closed = True
         jobs = list(self._live.values())
         self.cancel()
@@ -201,8 +196,7 @@ class Page(QWidget):
         return "" if self.cfg is not None else "no project open"
 
     def refresh_gate(self) -> None:
-        """Re-evaluate this page's blocker cheaply. Runs after every annotation,
-        so it may only flip enabled states - never re-read a CSV or rebuild."""
+        """Re-check the blocker cheaply after each annotation (no file reads, no rebuild)."""
 
     def shutdown(self) -> None:
         pass

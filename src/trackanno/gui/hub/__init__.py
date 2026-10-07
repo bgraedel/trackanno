@@ -1,15 +1,6 @@
-"""The whole pipeline in one window.
+"""The hub: one window with a page per pipeline step, in the order the work happens.
 
-    trackanno
-
-Pages down the left, in the order the work happens: pick a project,
-configure it, run detection, annotate, train the suggester, look inside a label
-for sub-behaviours, check the labels, export overlay movies. Each page states
-its own prerequisites rather than failing when you press the button, so the
-sidebar doubles as a progress readout.
-
-The CLI entry points call the same ``prepare_all`` / ``train`` / ``render_all``
-functions, so the two paths cannot drift apart.
+Each page shows what it still needs, so the sidebar doubles as a progress readout.
 """
 
 from .annotate import AnnotatePage

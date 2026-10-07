@@ -6,8 +6,7 @@ import importlib
 import sys
 from pathlib import Path
 
-# name -> (module, one-line description). Imported only when run, so the GUI
-# start does not pay for torch and friends.
+# name -> (module, description); imported lazily so the GUI starts fast.
 COMMANDS: dict[str, tuple[str, str]] = {
     "prepare": ("trackanno.detect.prepare", "detect, track and build the clip cache"),
     "suggest": ("trackanno.learn.suggest", "train the annotation-suggestion model"),

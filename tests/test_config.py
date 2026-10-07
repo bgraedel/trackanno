@@ -208,3 +208,61 @@ def test_view_toggles_are_per_user_settings(app) -> None:
     view = load_view()
     assert view["show_overlay"] is False and view["view_zoom"] == 2.5
     assert view["follow"] == "locked"
+
+
+def _one_option(name: str, kind: str = "single", key: str = "1") -> dict:
+    return {"name": name, "type": kind, "required": kind == "single",
+            "options": [{"name": f"o{key}", "key": key, "color": "#4C9F70"}]}
+
+
+@pytest.mark.parametrize("bad", ["notes", "clip_id", "annotator"])
+def test_a_group_named_after_a_csv_column_is_refused(tmp_path: Path, bad) -> None:
+    path = create_project(tmp_path / "reserved")
+    with pytest.raises(ConfigError, match="(?i)collides"):
+        write_config(path, {}, categories=[_one_option(bad)])
+    assert load_config(path) is not None, "the project still loads"
+
+
+def test_two_groups_with_one_name_are_refused(tmp_path: Path) -> None:
+    path = create_project(tmp_path / "dup")
+    with pytest.raises(ConfigError, match="named"):
+        write_config(path, {}, categories=[_one_option("dup"),
+                                           _one_option("dup", "multi", "2")])
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_a_stride_below_one_is_refused(tmp_path: Path, bad) -> None:
+    """clips.stride is the window loop's increment, so 0 would never end."""
+    path = create_project(tmp_path / "stride")
+    with pytest.raises(ConfigError, match="at least 1"):
+        write_config(path, {"clips.stride": bad})
+    assert load_config(path).clips.stride >= 1
+
+
+def test_repeated_saves_do_not_grow_the_file(tmp_path: Path) -> None:
+    path = create_project(tmp_path / "grow")
+    cats = [{"name": "state", "type": "single", "required": True,
+             "options": [{"name": "a", "key": "1", "color": "#4C9F70"}]}]
+    sizes = []
+    for i in range(6):
+        write_config(path, {"clips.pad": 1.0 + i / 10}, categories=cats,
+                     keypoints={"nodes": [], "edges": []})
+        sizes.append(len(path.read_text(encoding="utf-8").splitlines()))
+    text = path.read_text(encoding="utf-8")
+    assert len(set(sizes[1:])) == 1, sizes
+    assert text.count("#") > 40, "the comments are still there"
+    assert yaml.safe_load(text)["categories"] == cats
+
+
+def test_a_new_project_selects_nothing(tmp_path: Path) -> None:
+    """No rule ranks the queue, so the labelled set stays a random sample."""
+    cfg = load_config(create_project(tmp_path / "queue"))
+    assert cfg.suggest.select_rule == "off"
+    assert 0.0 < cfg.suggest.audit_fraction < 1.0, "a holdout exists to estimate against"
+
+
+def test_the_shipped_template_loads_without_a_warning(tmp_path: Path) -> None:
+    path = create_project(tmp_path / "quiet")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert load_config(path) is not None

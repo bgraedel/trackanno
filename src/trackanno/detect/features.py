@@ -1,14 +1,4 @@
-"""Per-detection CNN features from the SAME forward pass as detection.
-
-A ``forward_pre_hook`` on the YOLO head captures the three feature maps it
-consumes (P3/P4/P5 at strides 8/16/32), so pose, localisation and appearance all
-come out of one pass. Each detection's box is then ROI-aligned onto those maps
-and pooled to a vector.
-
-These vectors encode *identity* very well, and identity is not behaviour, so
-anything trained on them must be validated with cross-validation grouped by
-track (see :mod:`trackanno.learn.suggest`).
-"""
+"""Per-detection embeddings, ROI-pooled from the YOLO head's P3/P4/P5 input maps."""
 
 from __future__ import annotations
 
@@ -44,12 +34,7 @@ class InstanceFeatures:
             self._maps = None
 
     def reset(self) -> None:
-        """Drop captured maps before a predict.
-
-        Without this, a forward pass that never reaches the head leaves
-        ``pooled()`` returning the PREVIOUS frame's features - correctly shaped
-        and row-aligned, so nothing downstream would notice.
-        """
+        """Drop captured maps before a predict, so a pass that misses the head returns None."""
         self._maps = None
 
     def close(self) -> None:
@@ -68,14 +53,9 @@ class InstanceFeatures:
         self, boxes_xyxy: np.ndarray, batch_index: int, tile_size: tuple[int, int],
         imgsz: int | None = None, stride: int = 32,
     ) -> np.ndarray | None:
-        """ROI-pool ``boxes_xyxy`` (tile-local pixels) from the captured maps.
+        """ROI-pool tile-local ``boxes_xyxy`` of tile ``batch_index`` to ``(N, D)``, or None.
 
-        ``batch_index`` selects the tile within the batch the hook just saw.
-        Given ``imgsz``, the size the predictor was asked for, the letterbox
-        transform is reproduced exactly rather than inferred from the map shape,
-        which cannot recover ``r`` once rounded. ``(N, D)``, or None if no maps
-        were captured.
-        """
+        ``imgsz`` is the requested predictor size, used to reproduce the letterbox."""
         if self._maps is None or boxes_xyxy.shape[0] == 0:
             return None
 
@@ -83,29 +63,18 @@ class InstanceFeatures:
         from torchvision.ops import roi_align
 
         maps = self._maps
-        # The two lines below assume maps[0] is P3 at stride 8, and `self.levels`
-        # indexes P3/P4/P5. A pyramid of a different shape would mislabel the
-        # levels while the ROIs still landed correctly, so refuse rather than
-        # guess.
+        # Below assumes maps[0] is P3 at stride 8.
         if len(maps) != len(LEVEL_NAMES):
             raise RuntimeError(
                 f"the detection head received {len(maps)} feature maps, not "
-                f"{len(LEVEL_NAMES)}. features.levels names P3/P4/P5 at strides "
-                "8/16/32; this model's pyramid is a different shape, so the "
-                "levels would be mislabelled. Set features.enabled: false."
+                f"{len(LEVEL_NAMES)}; set features.enabled: false for this model"
             )
         net_h = int(maps[0].shape[-2]) * 8
         net_w = int(maps[0].shape[-1]) * 8
         tile_h, tile_w = tile_size
 
-        # Reproduce ultralytics' LetterBox arithmetic exactly: it resizes to
-        # INTEGER `round(dim * r)` per axis and pads by INTEGER
-        # `round(pad - 0.1)`, so a float scale plus a float half-pad is off by up
-        # to one network pixel on a non-square tile. `r` comes from the REQUESTED
-        # imgsz, not the delivered map: once extents are rounded and padding
-        # reduced to a stride multiple, net/tile no longer inverts to r. Whether
-        # the predictor padded min-rectangle (`auto=True`) or square is decided by
-        # which reproduces the captured map size.
+        # Reproduce ultralytics' integer LetterBox rounding; r comes from the requested
+        # imgsz, and min-rectangle vs square padding is whichever matches the map size.
         target = int(imgsz) if imgsz else max(net_h, net_w)
         r = min(target / max(tile_h, 1), target / max(tile_w, 1))
         unpad_w, unpad_h = int(round(tile_w * r)), int(round(tile_h * r))
@@ -117,16 +86,15 @@ class InstanceFeatures:
                 break
         else:
             raise RuntimeError(
-                f"cannot reconstruct the letterbox transform: tile {tile_w}x{tile_h} "
-                f"at imgsz {target} -> net {net_w}x{net_h} (r={r:.4f}). "
-                "Feature ROIs would be misaligned."
+                f"cannot reconstruct the letterbox for tile {tile_w}x{tile_h} at imgsz "
+                f"{target} (net {net_w}x{net_h}); set features.enabled: false"
             )
         # LetterBox splits the padding with this exact rounding.
         pad_x = int(round(dw / 2.0 - 0.1))
         pad_y = int(round(dh / 2.0 - 0.1))
 
         device = maps[0].device
-        # Per-axis scale, because the two rounded extents need not share one.
+        # Per-axis scale: the rounded extents need not share one.
         scale_x, scale_y = unpad_w / max(tile_w, 1), unpad_h / max(tile_h, 1)
         boxes = torch.as_tensor(boxes_xyxy, dtype=torch.float32, device=device)
         boxes[:, [0, 2]] = boxes[:, [0, 2]] * scale_x + pad_x

@@ -1,14 +1,7 @@
-"""What the renderer refuses to paint, and what it is happy to paint over.
+"""What the renderer refuses to paint, and what it paints over.
 
-``build_frame_marks`` collapses rows spanning frames into one mark per (frame,
-track), so anything that lands on a frame twice has to have a rule:
-
-* two BOUTS on one frame is a broken upstream invariant and raises - a decode
-  cuts a track's frames into disjoint runs, so no setting can ask for it;
-* a hand label on a frame a prediction claims is what ``--source both`` IS, and
-  must keep working;
-* two ANNOTATION rows on one frame is an overlapping clip grid, and must keep
-  working too.
+Two bouts on one frame is a broken decode and raises; a hand label over a
+prediction (``--source both``) and overlapping hand labels are allowed.
 """
 
 from __future__ import annotations
@@ -18,7 +11,6 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from harness import check
 
 GROUP = "behaviour"
 MOVIE = "MOVIE_A"
@@ -46,58 +38,29 @@ def _label(track_id: int, f_start: int, f_end: int, value: str):
 
 
 def test_two_decoded_bouts_on_one_frame_stop_the_render(cfg) -> None:
-    """Painting one of the two would hide the fact that they exist.
-
-    Whichever row pandas hands over last wins a plain dict assignment, so the
-    exported colour of an overlapped frame comes from row order in the parquet
-    rather than from the model - and the movie that comes out looks entirely
-    normal. The only visible symptom is the one this guard makes.
-
-    A BOUT is where that reasoning holds: a decode cuts each track's frames into
-    runs between inferred boundaries, so two of them meeting is not a setting
-    anyone can choose, it is the decode or the file being wrong.
-    """
+    """Painting one of the two would hide that they exist."""
     from trackanno.view.render import build_frame_marks
 
     predictions = pd.DataFrame([
         _bout(3, 800, 850, "immotile"),
         _bout(3, 812, 862, "swimming"),
     ])
-    try:
+    with pytest.raises(ValueError) as caught:
         build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
-        check("overlapping bouts are refused", False, "it painted them")
-    except ValueError as exc:
-        message = str(exc)
-        check("overlapping bouts are refused", True)
-        check("...naming the frame they met on", "frame 812" in message, message)
-        check("...naming the track", "track 3" in message, message)
-        check("...and BOTH competing values, not just the loser",
-              "'immotile'" in message and "'swimming'" in message, message)
-        check("...with the two rows' spans, so a duplicate row reads differently "
-              "from an overlapping one",
-              "[800, 850)" in message and "[812, 862)" in message, message)
-        check("...and calls them bouts, since that is the only row this can be",
-              "bout" in message.lower(), message)
+    message = str(caught.value)
+    assert "frame 812" in message, message
+    assert "track 3" in message, message
+    assert "'immotile'" in message and "'swimming'" in message, message
+    assert "[800, 850)" in message and "[812, 862)" in message, message
+    assert "bout" in message.lower(), message
 
-    # And through the 'both' path as well, where the labels pass would otherwise
-    # paint over the evidence before anyone saw it.
-    try:
-        build_frame_marks(
-            pd.DataFrame([_label(3, 800, 862, "swimming")]),
-            predictions, cfg, GROUP, "both",
-        )
-        check("...on the 'both' path too", False, "it painted them")
-    except ValueError:
-        check("...on the 'both' path too", True)
+    with pytest.raises(ValueError):
+        build_frame_marks(pd.DataFrame([_label(3, 800, 862, "swimming")]),
+                          predictions, cfg, GROUP, "both")
 
 
 def test_disjoint_bouts_paint_without_complaint(cfg) -> None:
-    """The guard defends disjointness, not equal length.
-
-    Decoded bouts are variable-length runs between inferred boundaries - the
-    whole point of the feature - so a suite that only ever fed the renderer a
-    tiling grid would let a guard that secretly required one through.
-    """
+    """The guard defends disjointness, not equal length."""
     from trackanno.view.render import build_frame_marks
 
     predictions = pd.DataFrame([
@@ -108,24 +71,18 @@ def test_disjoint_bouts_paint_without_complaint(cfg) -> None:
     ])
     marks = build_frame_marks(pd.DataFrame(), predictions, cfg, GROUP, "predictions")
 
-    check("bouts that only touch at their boundary paint fine", len(marks) == 412)
-    check("the frame before the boundary is the earlier bout",
-          marks[136][3].text.startswith("~swimming"), marks[136][3].text)
-    check("the boundary frame itself is the later bout",
-          marks[137][3].text.startswith("~immotile"), marks[137][3].text)
-    check("a half-open f_end paints nothing at f_end", 412 not in marks)
-    check("two tracks sharing a frame are not a collision",
-          marks[200][4].text.startswith("~unclear"), marks[200][4].text)
+    assert len(marks) == 412, "bouts that only touch at their boundary paint fine"
+    assert marks[136][3].text.startswith("~swimming"), (
+        f"the frame before the boundary is the earlier bout: {marks[136][3].text}")
+    assert marks[137][3].text.startswith("~immotile"), (
+        f"the boundary frame itself is the later bout: {marks[137][3].text}")
+    assert 412 not in marks, "a half-open f_end paints nothing at f_end"
+    assert marks[200][4].text.startswith("~unclear"), (
+        f"two tracks sharing a frame are not a collision: {marks[200][4].text}")
 
 
 def test_a_hand_label_over_a_prediction_is_not_a_collision(cfg) -> None:
-    """It is the entire point of ``--source both``.
-
-    The labels pass writes into the same dict the predictions pass filled, so it
-    is one line away from being caught by the same guard. It must not be: the
-    hand label is meant to take the box and leave the model's answer in the
-    caption.
-    """
+    """The label takes the box and the model's answer stays in the caption."""
     from trackanno.view.render import build_frame_marks
 
     labels = pd.DataFrame([_label(3, 100, 150, "swimming")])
@@ -133,19 +90,13 @@ def test_a_hand_label_over_a_prediction_is_not_a_collision(cfg) -> None:
 
     marks = build_frame_marks(labels, predictions, cfg, GROUP, "both")
     mark = marks[120][3]
-    check("a label on a predicted frame paints rather than raising", not mark.predicted)
-    check("...taking the box for itself", "swimming" in mark.text, mark.text)
-    check("...and keeping the model's answer visible",
-          "~immotile" in mark.text, mark.text)
+    assert not mark.predicted, "a label on a predicted frame paints rather than raising"
+    assert "swimming" in mark.text, f"taking the box for itself: {mark.text}"
+    assert "~immotile" in mark.text, f"keeping the model's answer visible: {mark.text}"
 
 
 def test_overlapping_annotations_are_a_configuration_not_a_fault(cfg) -> None:
-    """``clips.stride`` below ``clips.frames`` cuts overlapping clips on purpose.
-
-    Somebody annotating a grid like that has two legitimate rows covering one
-    frame, and the last one wins - arbitrary, but a pre-existing and deliberate
-    arbitrariness about hand labels, not the invariant this module guards.
-    """
+    """``clips.stride`` below ``clips.frames`` overlaps clips on purpose; the later row wins."""
     from trackanno.view.render import build_frame_marks
 
     labels = pd.DataFrame([
@@ -153,45 +104,73 @@ def test_overlapping_annotations_are_a_configuration_not_a_fault(cfg) -> None:
         _label(3, 125, 175, "immotile"),
     ])
     marks = build_frame_marks(labels, None, cfg, GROUP, "labels")
-    check("overlapping hand labels still render", len(marks) == 75)
-    check("...with the later row winning the shared frames",
-          marks[130][3].text == "immotile", marks[130][3].text)
+    assert len(marks) == 75, "overlapping hand labels still render"
+    assert marks[130][3].text == "immotile", (
+        f"with the later row winning the shared frames: {marks[130][3].text}")
 
 
-def test_hide_unlabelled_argument_overrides_the_config(root: Path, monkeypatch) -> None:
-    """An explicit False must turn off ``render.hide_unlabelled``; None follows it."""
+@pytest.fixture
+def hidden(tmp_path: Path, monkeypatch):
+    """A config with ``render.hide_unlabelled`` on and one labelled movie."""
     from trackanno.annotate.clips import TRACKS_FILE
     from trackanno.config import load_config
     from trackanno.project import create_project
     from trackanno.view import render
 
-    cfg = load_config(create_project(Path(root) / "render_hide"))
+    cfg = load_config(create_project(tmp_path / "render_hide"))
     cfg.render.hide_unlabelled = True
     cfg.paths.csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([_label(3, 0, 10, "swimming")]).to_csv(cfg.paths.csv, index=False)
     cfg.movie_dir(MOVIE).mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"track_id": [3]}).to_parquet(cfg.movie_dir(MOVIE) / TRACKS_FILE)
 
-    seen: list = []
-
     class _Movie:
         def close(self) -> None:
             pass
 
     monkeypatch.setattr(render, "open_movie", lambda *a, **k: _Movie())
+    return cfg
+
+
+def test_hide_unlabelled_argument_overrides_the_config(hidden, monkeypatch) -> None:
+    """None follows ``render.hide_unlabelled``; an explicit value wins."""
+    from trackanno.view import render
+
+    seen: list = []
     monkeypatch.setattr(render, "render_movie",
                         lambda *a, **k: seen.append(k["hide_unlabelled"]))
     for given in (None, False, True):
-        render.render_all(cfg, [MOVIE], GROUP, hide_unlabelled=given)
-    check("None follows the config, an explicit value wins",
-          seen == [True, False, True], str(seen))
+        render.render_all(hidden, [MOVIE], GROUP, hide_unlabelled=given)
+    assert seen == [True, False, True]
 
-    # The CLI: no flag means the config value.
+
+def test_the_cli_passes_none_without_a_flag(hidden, monkeypatch) -> None:
+    from trackanno.view import render
+
     args: list = []
-    monkeypatch.setattr(render, "load_config", lambda _path: cfg)
+    monkeypatch.setattr(render, "load_config", lambda _path: hidden)
     monkeypatch.setattr(render, "render_all",
                         lambda *a, **k: args.append(k["hide_unlabelled"]))
     for argv in ([], ["--no-hide-unlabelled"], ["--hide-unlabelled"]):
         render.main(argv)
-    check("the CLI passes None when the flag is absent",
-          args == [None, False, True], str(args))
+    assert args == [None, False, True]
+
+
+def test_a_malformed_csv_is_reported_not_raised(root: Path) -> None:
+    """A stray comma in the CSV must not stop the project opening."""
+    import warnings
+
+    from trackanno.config import load_config
+    from trackanno.project import create_project
+    from trackanno.view.render import annotated_movies
+
+    cfg = load_config(create_project(Path(root) / "badcsv"))
+    cfg.paths.csv.write_text(
+        "clip_id,movie_id,behaviour\na,m,swim\nb,m,swim,EXTRA,COLUMNS\n",
+        encoding="utf-8")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = annotated_movies(cfg)
+    assert isinstance(result, dict)
+    assert any("could not read" in str(m.message) for m in caught), (
+        [str(m.message) for m in caught])

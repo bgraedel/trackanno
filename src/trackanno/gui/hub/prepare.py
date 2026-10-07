@@ -34,8 +34,7 @@ class PreparePage(Page):
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
         self._scanned_for: Path | None = None
-        # Last known per-movie state, and a guard so refilling the list does not
-        # re-enter the handler through its own setText/setCheckState calls.
+        # Per-movie state; _filling stops the list refill re-entering the toggle handler.
         self._states: dict[str, str] = {}
         self._stale: dict[str, list[str]] = {}
         self._filling = False
@@ -55,8 +54,7 @@ class PreparePage(Page):
         self.scan_state.setProperty("role", "muted")
         self.scan_state.setWordWrap(True)
 
-        # A blocked page that only complains is a dead end; this jumps to the fix.
-        self.fix_button = QPushButton("Fix this in step 2 - Configure")
+        self.fix_button = QPushButton("Fix this on the Configure page")
         self.fix_button.setProperty("accent", "true")
         self.fix_button.setVisible(False)
         self.fix_button.clicked.connect(lambda: self.hub.go_to(1))
@@ -73,8 +71,7 @@ class PreparePage(Page):
         self.limit_frames.setRange(0, 1_000_000)
         self.limit_frames.setSpecialValueText("all frames")
         self.limit_frames.setToolTip(
-            "Stop after this many frames per movie. Useful for a smoke test "
-            "before committing to a full run."
+            "Stop after this many frames per movie, for a quick test run."
         )
         options = QFormLayout()
         options.addRow(self.force)
@@ -90,8 +87,6 @@ class PreparePage(Page):
         movies_box = QGroupBox("Movies")
         movies_layout = QVBoxLayout(movies_box)
         movies_layout.addLayout(movie_bar)
-        # Under the buttons, not beside them: what is wrong is usually a whole
-        # sentence and needs the width.
         movies_layout.addWidget(self.scan_state)
         movies_layout.addWidget(self.movies)
 
@@ -110,47 +105,40 @@ class PreparePage(Page):
             "Detect & crop",
             "Find the animals and cut them into clips.",
             help="""
-<p>Runs the detector over every frame, tracks the detections across frames, and
-cuts the per-track clips.</p>
+<p>Detects the animals in every frame, tracks them, and cuts one clip per track
+window.</p>
 
-<p>The <b>slow, GPU-bound step</b>, minutes to hours. It is <b>resumable</b>:
-each movie is committed on its own and a finished one is skipped next run, so a
-killed run costs at most the movie in progress.</p>
+<p>The <b>slow, GPU-bound step</b>. It is <b>resumable</b>: finished movies are
+skipped on the next run.</p>
 
-<p>It runs in two halves, and only the first needs a GPU. A movie marked
-<b>[detected]</b> already has its tracks, from this machine or from a GPU box
-whose <code>work/</code> folder was copied here, and only its clips remain. That
-half needs no model, so this page opens without one.</p>
+<p>Only detection needs a GPU and the model. A movie marked <b>[detected]</b>
+already has its tracks (from here or a copied <code>work/</code> folder) and only
+needs its clips cut.</p>
 
-<p>Cancel takes effect at the next frame. The frame in flight would leave a
-half-written cache behind.</p>
+<p>Cancel stops at the next frame.</p>
 """,
         ))
         layout.addWidget(splitter, 1)
 
     def blocker(self) -> str:
         if self.cfg is None or self.hub.status is None:
-            return "Open or create a project first (step 1)."
+            return "Open or create a project first."
         status = self.hub.status
         if not status.video_dir_ok:
             return (
-                "The movie folder does not exist yet. Set it on the Configure page "
-                f"(step 2, \"video folder\").\nCurrently: {self.cfg.paths.video_dir}"
+                f"Movie folder not found ({self.cfg.paths.video_dir}). "
+                "Set \"video folder\" on the Configure page."
             )
-        # Cutting clips needs no model, so a project whose detections arrived from
-        # a GPU box opens here without one. Ticking a movie that DOES need
-        # detecting then stops the run with the missing-model error before any
-        # work starts, which is the honest place to find out.
+        # Cutting clips needs no model, so detections from elsewhere suffice.
         if not status.model_ok and not status.n_detected:
             return (
-                "The detection model file was not found. Set it on the Configure "
-                f"page (step 2, \"detection model\").\nCurrently: {self.cfg.paths.model}"
+                f"Detection model not found ({self.cfg.paths.model}). "
+                "Set \"detection model\" on the Configure page."
             )
         if status.n_videos == 0:
             return (
-                f"No movies in {self.cfg.paths.video_dir}.\nIt holds no files matching "
-                f"{cfg_patterns(self.cfg)} - either point at a different folder or "
-                "widen \"file patterns\" on the Configure page (step 2)."
+                f"No files matching {cfg_patterns(self.cfg)} in {self.cfg.paths.video_dir}. "
+                "Change the folder or \"file patterns\" on the Configure page."
             )
         return ""
 
@@ -167,18 +155,16 @@ half-written cache behind.</p>
         set_role(self.scan_state, "muted")
         if self._scanned_for != self.cfg.path:
             self.movies.clear()
-            self.scan_state.setText("not scanned yet - press Scan to list the movies")
+            self.scan_state.setText("not scanned yet: press Scan to list the movies")
             self._scanned_for = None
             return
-        # Same project: keep the list; rescanning a share is the page's slowest act.
+        # Same project: keep the list, rescanning a share is slow.
         self._mark_prepared()
 
     # -- scanning ----------------------------------------------------------- #
     def _on_run_finished(self, ok: bool) -> None:
         self.hub.set_cache_job(False)
-        # A run just created the markers this page reads, and a "not there" verdict
-        # is cached for half a minute. Without this the movie that finished keeps
-        # reading as unprepared until the cache ages out.
+        # Drop cached "missing" verdicts so new markers show at once.
         forget_path_probes()
         self.hub.reload_project()
 
@@ -237,8 +223,7 @@ half-written cache behind.</p>
                     f"  @ {movie['fps']:g} fps"
                 )
                 item.setToolTip("\n".join(self._stale.get(movie["movie_id"], [])))
-                # A detected movie is ticked like a new one: it still has work
-                # left, just less of it. A stale one only changes under redo.
+                # Tick new and detected movies; stale ones only rebuild under redo.
                 if select_new:
                     item.setCheckState(
                         Qt.Unchecked if state in ("prepared", "stale") else Qt.Checked
@@ -260,17 +245,13 @@ half-written cache behind.</p>
             )
 
     def _on_item_toggled(self, _item) -> None:
-        """Ticking a movie changes what the run will do, so it changes the button."""
+        """Update the run button label after a tick."""
         if self._filling:
             return
         self._update_run_label(self._states)
 
     def _only_cutting(self, states: dict | None = None) -> bool:
-        """Whether every ticked movie already has its detections.
-
-        The button's label and the stage the run is given both come from here,
-        so a run that says "Cut clips" cannot be one that detects.
-        """
+        """Whether every ticked movie only needs clips cut (drives label and stage)."""
         states = self._states if states is None else states
         pending = [
             self.movies.item(i).data(Qt.UserRole)
@@ -281,24 +262,20 @@ half-written cache behind.</p>
         def cut_only(movie_id) -> bool:
             state = states.get(movie_id, "new")
             if state == "stale":
-                # Only clip settings changed: the redo re-cuts, it does not detect.
+                # Only clip settings changed: re-cut, do not detect.
                 return all(r.startswith("clip") for r in self._stale.get(movie_id, [""]))
             return state == "detected"
 
         return bool(pending) and all(cut_only(m) for m in pending)
 
     def _update_run_label(self, states: dict) -> None:
-        """Say what the button will actually do, which is not always detection."""
+        """Label the run button "Cut clips" or "Run detection"."""
         self.tasks.set_run_label(
             "Cut clips" if self._only_cutting(states) else "Run detection"
         )
 
     def _movie_states(self) -> dict[str, str]:
-        """movie_id -> "prepared" | "detected" | "stale" | "new", from the cache.
-
-        "detected" is tracks but no clips: detection ran, here or elsewhere.
-        "stale" is detections or clips that no longer match the config.
-        """
+        """movie_id -> "prepared" | "detected" (tracks, no clips) | "stale" | "new"."""
         from ...annotate.clips import DETECT_FILE, DONE_FILE
         from ...detect.prepare import stale_reasons
 
@@ -307,7 +284,7 @@ half-written cache behind.</p>
         if self.cfg is None:
             return {}
         work = self.cfg.paths.work_dir
-        # Guarded: a work_dir on a share blocks here once per movie directory.
+        # Timeout-guarded: a share can block per directory.
         if not _exists(work, "dir"):
             return {}
         try:
@@ -365,12 +342,7 @@ half-written cache behind.</p>
         movie_ids = self._selected()
         force = self.force.isChecked()
         limit = self.limit_frames.value() or None
-        # A cut-only run is given the clip stage, so it cannot reach for a
-        # detector at all. Under 'all' a handoff that no longer matches this
-        # config sends the machine off to detect again - hours of GPU work
-        # behind a button that says "Cut clips", or a missing-model error on a
-        # laptop that never needed one. The clip stage says which setting
-        # changed instead, per movie, and cuts the rest.
+        # A cut-only run gets the clip stage so it can never start detection.
         stage = "clips" if self._only_cutting() else "all"
 
         def work(reporter):

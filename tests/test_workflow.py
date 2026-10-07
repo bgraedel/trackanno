@@ -1,15 +1,8 @@
-"""Checks for the GUI-only workflow: projects, config editing, background jobs.
-
-Nothing here needs a GPU, a movie or a display - the window is built offscreen.
-Every part that needs a prepared clip cache builds its own; nothing here
-reads the repository's project or any real data.
-"""
+"""Projects, config editing, prepare stages, background jobs and the workflow window."""
 
 from __future__ import annotations
 
-import atexit
 import shutil
-import tempfile
 import time
 from pathlib import Path
 
@@ -17,73 +10,15 @@ import numpy as np
 import pytest
 import yaml
 from qtpy.QtCore import Qt
-from fixtures import make_project
-from harness import check
+from fixtures import (
+    PREPARE_CONFIG, StubDetector, make_project, no_detector, prep_project, pump,
+)
 
-# Every GUI test below runs against a project this suite GENERATES: config,
-# synthetic movie, real clip cache. It used to load the repository's own
-# config.yaml behind a try/except that printed "skipped" - which meant the
-# tests passed without running on any machine that lacked that data, and broke
-# on the one that had it whenever its network share went away.
-FIXTURES = Path(tempfile.mkdtemp(prefix="trackanno-fixtures-"))
-atexit.register(shutil.rmtree, FIXTURES, True)
+# Generated GUI fixture projects live here for the whole run.
 
 
-def pump(app, predicate, timeout: float = 30.0) -> bool:
-    """Spin the event loop until a worker thread's signals have landed."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        app.processEvents()
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
-
-
-# --------------------------------------------------------------------------- #
-def test_yamledit() -> None:
-    from trackanno.project import DEFAULT_CONFIG
-    from trackanno.yamledit import replace_section, set_values
-
-    before = yaml.safe_load(DEFAULT_CONFIG)
-    text = set_values(DEFAULT_CONFIG, {
-        "clips.frames": 33,
-        "ui.view_zoom": 2.5,
-        "ui.show_context_tracks": True,
-        "paths.model": "D:/weights/best.pt",
-        "normalize.percentiles": [1.0, 99.0],
-        "ui.a_brand_new_key": "hello",
-        "an_entirely_new_section.key": 7,
-    })
-    after = yaml.safe_load(text)
-    check("scalar edits land", after["clips"]["frames"] == 33 and after["ui"]["view_zoom"] == 2.5)
-    check("a path with a colon survives quoting", after["paths"]["model"] == "D:/weights/best.pt")
-    check("list edits land", after["normalize"]["percentiles"] == [1.0, 99.0])
-    check("new keys are appended to their section", after["ui"]["a_brand_new_key"] == "hello")
-    check("new sections are appended", after["an_entirely_new_section"]["key"] == 7)
-    check("untouched values are untouched",
-          after["tracking"] == before["tracking"] and after["keys"] == before["keys"])
-    check("comments survive an edit",
-          text.count("#") >= DEFAULT_CONFIG.count("#"),
-          f"{text.count('#')} vs {DEFAULT_CONFIG.count('#')}")
-    check("trailing comments stay separated from their value",
-          "33#" not in text and "33 #" in text or "frames: 33" in text)
-
-    groups = [{"name": "state", "type": "single", "required": True,
-               "options": [{"name": "a", "key": "1", "color": "#4C9F70"}]}]
-    replaced = yaml.safe_load(replace_section(text, "categories", groups))
-    check("a whole block can be replaced", replaced["categories"] == groups)
-    check("replacing a block leaves its neighbours alone",
-          replaced["ui"]["view_zoom"] == 2.5 and replaced["render"] == before["render"])
-
-
-@pytest.fixture(scope="module")
-def project_config(root):
-    """A project created and then edited, the way the GUI leaves one.
-
-    Shared with the hub tests below on purpose: the workflow window has to open
-    a project that has been through an edit, not only a freshly created one.
-    """
+def _create_edited_project(root: Path) -> Path:
+    """A project with two movies, a model and one edited category group."""
     from trackanno.project import create_project, write_config
 
     videos = root / "movies"
@@ -102,248 +37,259 @@ def project_config(root):
     return path
 
 
-def test_the_default_config_is_a_shipped_yaml_file(root) -> None:
-    """It is data, so it lives in a file rather than in a string in project.py.
+@pytest.fixture(scope="module")
+def project_config(root):
+    """An edited project shared by the read-only tests."""
+    return _create_edited_project(root)
 
-    Read through importlib.resources so an installed wheel finds it the same way
-    a checkout does. If it goes missing the failure has to name the file, not
-    surface as a project created with no settings.
-    """
+
+@pytest.fixture
+def hub(app, tmp_path):
+    """A workflow window on a fresh edited project, closed afterwards."""
+    from trackanno.gui.hub import Hub
+
+    window = Hub(str(_create_edited_project(tmp_path)))
+    window.show()
+    app.processEvents()
+    yield window
+    window.close()
+    app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# yamledit and the shipped config
+# --------------------------------------------------------------------------- #
+EDITS = {
+    "clips.frames": 33,
+    "ui.view_zoom": 2.5,
+    "ui.show_context_tracks": True,
+    "paths.model": "D:/weights/best.pt",
+    "normalize.percentiles": [1.0, 99.0],
+    "ui.a_brand_new_key": "hello",
+    "an_entirely_new_section.key": 7,
+}
+
+
+def _edited_default() -> tuple[str, dict, dict]:
+    from trackanno.project import DEFAULT_CONFIG
+    from trackanno.yamledit import set_values
+
+    text = set_values(DEFAULT_CONFIG, EDITS)
+    return text, yaml.safe_load(DEFAULT_CONFIG), yaml.safe_load(text)
+
+
+def test_set_values_lands_every_kind_of_edit() -> None:
+    _, _, after = _edited_default()
+    assert after["clips"]["frames"] == 33 and after["ui"]["view_zoom"] == 2.5
+    assert after["paths"]["model"] == "D:/weights/best.pt", "a path with a colon survives quoting"
+    assert after["normalize"]["percentiles"] == [1.0, 99.0]
+    assert after["ui"]["a_brand_new_key"] == "hello", "new keys go into their section"
+    assert after["an_entirely_new_section"]["key"] == 7, "new sections are appended"
+
+
+def test_set_values_leaves_the_rest_and_the_comments() -> None:
+    from trackanno.project import DEFAULT_CONFIG
+
+    text, before, after = _edited_default()
+    assert after["tracking"] == before["tracking"] and after["keys"] == before["keys"]
+    assert text.count("#") >= DEFAULT_CONFIG.count("#"), "comments survive an edit"
+    assert "33#" not in text and "33 #" in text or "frames: 33" in text, (
+        "trailing comments stay separated from their value")
+
+
+def test_replace_section_swaps_one_block() -> None:
+    from trackanno.yamledit import replace_section
+
+    text, before, _ = _edited_default()
+    groups = [{"name": "state", "type": "single", "required": True,
+               "options": [{"name": "a", "key": "1", "color": "#4C9F70"}]}]
+    replaced = yaml.safe_load(replace_section(text, "categories", groups))
+    assert replaced["categories"] == groups
+    assert replaced["ui"]["view_zoom"] == 2.5 and replaced["render"] == before["render"], (
+        "neighbouring blocks are untouched")
+
+
+def test_the_default_config_is_a_shipped_yaml_file() -> None:
+    """The package carries it as a yaml file read through importlib.resources."""
     from importlib import resources
 
-    import yaml
-
-    from trackanno.project import (
-        DEFAULT_CONFIG, DEFAULT_CONFIG_FILE, create_project,
-    )
+    from trackanno.project import DEFAULT_CONFIG, DEFAULT_CONFIG_FILE
 
     shipped = resources.files("trackanno").joinpath(DEFAULT_CONFIG_FILE)
-    check("the package carries the file", shipped.is_file(), str(shipped))
-    check("...and it is the yaml, not a python string",
-          str(shipped).endswith(".yaml"), str(shipped))
-    check("what the module exposes is what the file holds",
-          DEFAULT_CONFIG == shipped.read_text(encoding="utf-8"))
+    assert shipped.is_file(), str(shipped)
+    assert str(shipped).endswith(".yaml"), str(shipped)
+    assert DEFAULT_CONFIG == shipped.read_text(encoding="utf-8")
 
     parsed = yaml.safe_load(DEFAULT_CONFIG)
-    check("it parses as a mapping of sections", isinstance(parsed, dict)
-          and "paths" in parsed and "clips" in parsed, str(type(parsed)))
-    check("and it is commented, which is the point of shipping the text",
-          DEFAULT_CONFIG.count("#") > 50, str(DEFAULT_CONFIG.count("#")))
+    assert isinstance(parsed, dict) and "paths" in parsed and "clips" in parsed
+    assert DEFAULT_CONFIG.count("#") > 50, "the shipped text is commented"
+    assert "\t" not in DEFAULT_CONFIG and "\x0c" not in DEFAULT_CONFIG, (
+        "no stray tab or control character")
+
+
+def test_a_new_project_starts_from_the_shipped_text(root) -> None:
+    from trackanno.project import DEFAULT_CONFIG, create_project
 
     written = Path(create_project(root / "from-the-file")).read_text(encoding="utf-8")
-    check("a new project starts from it, comments and all",
-          written.count("#") == DEFAULT_CONFIG.count("#"),
-          f"{written.count('#')} vs {DEFAULT_CONFIG.count('#')}")
-
-    # A backslash in a python string is an escape; in the file it is a
-    # backslash. Nothing in here needs one today, and this is what says so if
-    # somebody pastes a Windows path in.
-    check("no stray tab or control character got in",
-          "\t" not in DEFAULT_CONFIG and "\x0c" not in DEFAULT_CONFIG,
-          repr(DEFAULT_CONFIG[:0]))
+    assert written.count("#") == DEFAULT_CONFIG.count("#"), "comments and all"
 
 
-def test_project(root, project_config) -> None:
-    """Creation, the status readout, and an edit that must never reach disk."""
+# --------------------------------------------------------------------------- #
+# projects
+# --------------------------------------------------------------------------- #
+def test_a_created_project_loads_with_its_edits(root, project_config) -> None:
     from trackanno.config import load_config
-    from trackanno.project import project_status, write_config
 
-    videos = root / "movies"
     path = project_config
-    check("create_project writes a config", path.exists())
+    assert path.exists()
     cfg = load_config(path)
-    check("the generated config loads", cfg.paths.video_dir == videos.resolve())
-    check("work_dir defaults inside the project",
-          cfg.paths.work_dir == (root / "proj" / "work").resolve())
-    check("the generated config is documented", path.read_text(encoding="utf-8").count("#") > 40)
-
-    status = project_status(cfg)
-    check("status counts only matching files", status.n_videos == 2, str(status.n_videos))
-    check("status sees the model", status.model_ok)
-    check("status knows nothing is prepared",
-          status.n_prepared == 0 and status.n_clips == 0 and not status.can_annotate)
-    check("status says preparation is possible", status.can_prepare)
-
-    edited = load_config(path)
-    check("edits round-trip through the loader",
-          edited.clips.frames == 25 and edited.ui.fps == 12)
-    check("category edits round-trip",
-          [g.name for g in edited.categories] == ["state"]
-          and [o.name for o in edited.categories[0].options] == ["a", "b"])
-
-    # An incoherent edit must be refused BEFORE it reaches disk. Autosave relies
-    # on this: writing first and rolling back would leave the project briefly
-    # unopenable, and a crash in that window would leave it broken for good.
-    good = path.read_text(encoding="utf-8")
-    from trackanno.config import ConfigError
-
-    try:
-        write_config(path, {"clips.min_clip_frames": 999})
-    except ConfigError as exc:
-        check("an incoherent edit is refused with an explanation",
-              "min_clip_frames" in str(exc) and "no window could ever qualify" in str(exc))
-    else:
-        check("an incoherent edit is refused with an explanation", False)
-    check("the refused edit never touched the file",
-          path.read_text(encoding="utf-8") == good)
-    check("the project still loads", load_config(path).clips.frames == 25)
-    check("no temp file was left behind",
-          not list(path.parent.glob("*.tmp")), str(list(path.parent.glob("*.tmp"))))
+    assert cfg.paths.video_dir == (root / "movies").resolve()
+    assert cfg.paths.work_dir == (root / "proj" / "work").resolve(), (
+        "work_dir resolves inside the project")
+    assert path.read_text(encoding="utf-8").count("#") > 40, "the config is documented"
+    assert cfg.clips.frames == 25 and cfg.ui.fps == 12
+    assert [g.name for g in cfg.categories] == ["state"]
+    assert [o.name for o in cfg.categories[0].options] == ["a", "b"]
 
 
-def test_pose_is_resolvable(root: Path) -> None:
-    """`task: pose` with no keypoints listed must be fixable, not fatal.
+def test_the_status_of_an_unprepared_project(project_config) -> None:
+    from trackanno.config import load_config
+    from trackanno.project import project_status
 
-    It used to raise in load_config, which meant the project would no longer
-    open - so switching the task to 'pose' from the GUI was impossible, and
-    hand-editing it bricked the project until you edited the YAML back.
-    """
+    status = project_status(load_config(project_config))
+    assert status.n_videos == 2, "only matching files are counted"
+    assert status.model_ok
+    assert status.n_prepared == 0 and status.n_clips == 0 and not status.can_annotate
+    assert status.can_prepare
+
+
+def test_an_incoherent_edit_never_reaches_disk(project_config) -> None:
+    from trackanno.config import ConfigError, load_config
+    from trackanno.project import write_config
+
+    good = project_config.read_text(encoding="utf-8")
+    with pytest.raises(ConfigError, match="min_clip_frames") as exc:
+        write_config(project_config, {"clips.min_clip_frames": 999})
+    assert "no window could ever qualify" in str(exc.value)
+    assert project_config.read_text(encoding="utf-8") == good
+    assert load_config(project_config).clips.frames == 25
+    assert not list(project_config.parent.glob("*.tmp")), "no temp file is left behind"
+
+
+def test_pose_without_keypoints_loads_and_is_resolvable(root: Path) -> None:
+    """`task: pose` with no keypoints listed loads and asks for them."""
     from trackanno.config import load_config
     from trackanno.project import create_project, write_config
-    from trackanno.detect.tiling import default_node_names, read_keypoint_count
 
-    project = root / "pose"
-    path = create_project(project)
+    path = create_project(root / "pose")
     write_config(path, {"detection.task": "pose"})
-
     cfg = load_config(path)
-    check("a pose config with no keypoints still loads", cfg.is_pose)
-    check("...and says so", cfg.needs_keypoints and cfg.n_keypoints == 0)
+    assert cfg.is_pose
+    assert cfg.needs_keypoints and cfg.n_keypoints == 0
 
-    check("generated names are one per keypoint", default_node_names(4) == ["kp0", "kp1", "kp2", "kp3"])
-
-    # Writing the names resolves it, and the count is what has to match.
     write_config(path, {"keypoints.nodes": ["nose", "tail"]})
     resolved = load_config(path)
-    check("naming the keypoints resolves it",
-          not resolved.needs_keypoints and resolved.n_keypoints == 2)
+    assert not resolved.needs_keypoints and resolved.n_keypoints == 2
+
+
+def test_generated_keypoint_names() -> None:
+    from trackanno.detect.tiling import default_node_names
+
+    assert default_node_names(4) == ["kp0", "kp1", "kp2", "kp3"]
+
+
+def test_an_unreadable_model_has_no_keypoint_count(root: Path) -> None:
+    from trackanno.detect.tiling import read_keypoint_count
 
     fake = root / "not-a-model.pt"
     fake.write_bytes(b"not a checkpoint")
-    try:
+    with pytest.raises(RuntimeError, match="could not read"):
         read_keypoint_count(fake)
-    except RuntimeError as exc:
-        check("an unreadable model fails with a clear message", "could not read" in str(exc))
-    else:
-        check("an unreadable model fails with a clear message", False)
 
 
-def test_keypoint_table(app) -> None:
-    """The count comes from the model; the names are typed into a table."""
+# --------------------------------------------------------------------------- #
+# keypoint editor
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def keypoints(app):
     from trackanno.gui.configform import KeypointEditor
 
     editor = KeypointEditor()
     editor.load(["Head", "Base", "Tip"], [["Head", "Base"], ["Base", "Tip"]])
-    check("the table loads one row per keypoint", editor.table.rowCount() == 3)
-    check("the count follows the names", editor.count.value() == 3)
-    check("the position column is not editable",
-          not (editor.table.item(0, 0).flags() & Qt.ItemIsEditable))
-    check("links load too", editor.edges.rowCount() == 2)
+    return editor
 
-    # Reading the count from a model must not throw away names already typed.
-    editor.set_count(5, "5 from model.pt")
-    check("growing keeps the names you typed", editor.names()[:3] == ["Head", "Base", "Tip"])
-    check("new rows get placeholders", editor.names()[3:] == ["kp3", "kp4"])
-    check("the source is shown", "model.pt" in editor.state.text())
 
-    editor.set_count(2)
-    check("shrinking drops from the end", editor.names() == ["Head", "Base"])
+def test_the_keypoint_table_loads(keypoints) -> None:
+    assert keypoints.table.rowCount() == 3
+    assert keypoints.count.value() == 3, "the count follows the names"
+    assert not (keypoints.table.item(0, 0).flags() & Qt.ItemIsEditable), (
+        "the position column is read-only")
+    assert keypoints.edges.rowCount() == 2
 
-    editor.set_count(4)
-    editor._chain()
-    check("connect in order chains them", editor.values()["edges"] ==
-          [["Head", "Base"], ["Base", "kp2"], ["kp2", "kp3"]])
 
-    # Renaming a keypoint must follow through into the links, not orphan them.
-    editor.table.item(2, 1).setText("Middle")
+def test_a_model_count_resizes_the_names(keypoints) -> None:
+    keypoints.set_count(5, "5 from model.pt")
+    assert keypoints.names()[:3] == ["Head", "Base", "Tip"], "typed names are kept"
+    assert keypoints.names()[3:] == ["kp3", "kp4"], "new rows get placeholders"
+    assert "model.pt" in keypoints.state.text(), "the source is shown"
+    keypoints.set_count(2)
+    assert keypoints.names() == ["Head", "Base"], "shrinking drops from the end"
+
+
+def test_chained_links_follow_a_rename(app, keypoints) -> None:
+    keypoints.set_count(2)
+    keypoints.set_count(4)
+    keypoints._chain()
+    assert keypoints.values()["edges"] == [["Head", "Base"], ["Base", "kp2"], ["kp2", "kp3"]]
+    keypoints.table.item(2, 1).setText("Middle")
     app.processEvents()
-    check("renaming updates the links",
-          editor.values()["edges"][1] == ["Base", "Middle"], str(editor.values()["edges"]))
+    assert keypoints.values()["edges"][1] == ["Base", "Middle"], keypoints.values()["edges"]
 
-    check("a clean layout has no problems", editor.problems() == [])
-    editor.table.item(1, 1).setText("Head")
+
+def test_bad_keypoint_names_are_problems(app, keypoints) -> None:
+    assert keypoints.problems() == []
+    keypoints.table.item(1, 1).setText("Head")
     app.processEvents()
-    check("duplicate names are caught",
-          any("duplicate" in p for p in editor.problems()), str(editor.problems()))
-    editor.table.item(1, 1).setText("")
+    assert any("duplicate" in p for p in keypoints.problems()), keypoints.problems()
+    keypoints.table.item(1, 1).setText("")
     app.processEvents()
-    check("empty names are caught",
-          any("needs a name" in p for p in editor.problems()), str(editor.problems()))
+    assert any("needs a name" in p for p in keypoints.problems()), keypoints.problems()
 
 
-def test_cache_is_released_before_detection(app) -> None:
-    """Detection must be able to overwrite a cache the window has been reading.
-
-    Windows refuses to overwrite a memory-mapped file, so annotating a movie and
-    then re-running detection on it failed with a bare
-    ``OSError: [Errno 22] Invalid argument`` on clip_origins.npy - and only for
-    the movies that had actually been on screen, which made it look random.
-    """
-    from trackanno.config import load_config
-    from trackanno.gui.hub import ExportPage, Hub
-
-    config_path = make_project(FIXTURES)
-    repo = config_path.parent
-    cfg = load_config(config_path)
-
-    hub = Hub(str(config_path))
-    hub.show()
-    hub.go_to(3)
-    app.processEvents()
-    panel = hub.pages[3].panel
-    check("the annotation panel opened on the generated cache", panel is not None)
-
-    movie = str(panel.store.meta(panel.order[panel.position])["movie_id"])
-    origins = cfg.paths.work_dir / movie / "clip_origins.npy"
-    check("the store maps the movie being annotated", movie in panel.store._origins)
-
-    def writable() -> bool:
-        try:
-            np.save(origins, np.load(origins))
-            return True
-        except OSError:
-            return False
-
-    check("a mapped cache cannot be overwritten", not writable())
-    hub.release_caches()
-    app.processEvents()
-    check("release_caches lets detection rewrite it", writable())
-    check("...and drops every map", not panel.store._origins and not panel.store._mm)
-
-    hub.close()
-    app.processEvents()
-
-
-def test_theme(app) -> None:
-    """Both themes apply cleanly and every widget picks up the palette."""
+# --------------------------------------------------------------------------- #
+# theme and progress
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("name", ["dark", "light"])
+def test_a_theme_applies_completely(app, name) -> None:
     from trackanno.gui.theme import THEMES, apply_theme, current, tokens
 
-    for name in ("dark", "light"):
-        used = apply_theme(app, name)
-        check(f"{name} theme applies", used == name and current() == name)
+    try:
+        assert apply_theme(app, name) == name and current() == name
         sheet = app.styleSheet()
-        check(f"{name} sheet is substantial", len(sheet) > 2000, str(len(sheet)))
-        check(f"{name} sheet has no unresolved tokens",
-              "{t[" not in sheet and "None" not in sheet.split("QToolTip")[0][:200])
+        assert len(sheet) > 2000, len(sheet)
+        assert "{t[" not in sheet and "None" not in sheet.split("QToolTip")[0][:200], (
+            "no unresolved tokens")
         colours = {k for k in tokens() if not k.startswith("_")}
-        check(f"{name} defines every colour the other does",
-              colours == set(THEMES["dark"]), str(set(THEMES["dark"]) ^ colours))
+        assert colours == set(THEMES["dark"]), set(THEMES["dark"]) ^ colours
         assets = [Path(v) for k, v in tokens().items() if k.startswith("_arrow")]
-        check(f"{name} generated its arrow images",
-              len(assets) == 3 and all(p.is_file() and p.stat().st_size for p in assets),
-              str([(p.name, p.exists()) for p in assets]))
-        check(f"{name} sheet points at the arrows it generated",
-              all(str(p).replace("\\", "/") in sheet for p in assets))
+        assert len(assets) == 3 and all(p.is_file() and p.stat().st_size for p in assets), (
+            f"arrow images generated: {[(p.name, p.exists()) for p in assets]}")
+        assert all(str(p).replace("\\", "/") in sheet for p in assets), (
+            "the sheet points at the generated arrows")
+    finally:
+        apply_theme(app, "dark")
 
-    applied = apply_theme(app, "system")
-    check("system resolves to a real theme", applied in ("dark", "light"))
-    check("an unknown theme falls back rather than crashing",
-          apply_theme(app, "chartreuse") == "dark")
+
+def test_system_and_unknown_themes_resolve(app) -> None:
+    from trackanno.gui.theme import apply_theme
+
+    assert apply_theme(app, "system") in ("dark", "light")
+    assert apply_theme(app, "chartreuse") == "dark", "an unknown theme falls back"
     apply_theme(app, "dark")
 
 
-def test_progress() -> None:
-    from trackanno.progress import CallbackReporter, Cancelled
+def test_a_reporter_tracks_a_loop() -> None:
+    from trackanno.progress import CallbackReporter
 
     seen: list = []
     reporter = CallbackReporter(
@@ -351,126 +297,25 @@ def test_progress() -> None:
         on_stage=lambda label, total: seen.append(("stage", label, total)),
         on_progress=lambda done, total: seen.append(("progress", done, total)),
     )
-    out = list(reporter.track(range(5), "counting", 5))
-    check("track yields everything", out == [0, 1, 2, 3, 4])
-    check("track announces its stage", ("stage", "counting", 5) in seen)
-    check("track reports progress", ("progress", 5, 5) in seen)
-
-    reporter.cancel()
-    try:
-        list(reporter.track(range(5), "counting", 5))
-    except Cancelled:
-        check("a cancelled reporter stops the loop", True)
-    else:
-        check("a cancelled reporter stops the loop", False)
+    assert list(reporter.track(range(5), "counting", 5)) == [0, 1, 2, 3, 4]
+    assert ("stage", "counting", 5) in seen
+    assert ("progress", 5, 5) in seen
 
 
-PREPARE_CONFIG = """
-paths:  {video_dir: ./videos, model: ./model.pt, work_dir: ./work, csv: ./annotations.csv}
-tiff:   {fps: 100}
-detection: {task: detect, device: cpu}
-features: {enabled: false}
-clips:  {frames: 50, stride: 50, window_mode: first, follow: smooth, pad: 1.6,
-         crop_size: 96, min_clip_frames: 40}
-normalize: {mode: fixed}
-tracking: {backend: greedy, min_track_length: 40}
-categories:
-  - name: behaviour
-    type: single
-    required: true
-    options: [{name: swimming, key: "1", color: "#4C9F70"}]
-ui: {annotator: tester}
-"""
-
-
-class StubDetector:
-    """Replays a synthetic movie's ground truth. No GPU, no weights, no torch.
-
-    ``prepare`` calls ``detect`` once per frame in order, so counting calls is
-    enough to know which frame is being asked for.
-    """
-
-    def __init__(self, by_frame: dict, n_frames: int):
-        self.by_frame, self.n_frames, self.calls = by_frame, n_frames, 0
-
-    def is_tiled(self, height, width):
-        return False
-
-    def tiles_for(self, height, width):
-        return [(0, 0, width, height)]
-
-    def detect(self, frame_rgb):
-        from trackanno.detect.tiling import Detections
-
-        xyxy, conf = self.by_frame[self.calls % self.n_frames]
-        self.calls += 1
-        return Detections(
-            xyxy=xyxy, conf=conf, cls=np.zeros(len(conf), np.int32), kpts=None
-        )
-
-
-def test_prepare_reports_and_cancels(root: Path) -> None:
-    """The whole detect->track->cut path, driven the way the GUI drives it."""
-    from test_pipeline import SyntheticMovie
-
-    from trackanno.config import load_config
-    from trackanno.detect.prepare import prepare_movie
+def test_a_cancelled_reporter_stops_the_loop() -> None:
     from trackanno.progress import CallbackReporter, Cancelled
 
-    project = root / "prep"
-    project.mkdir()
-    (project / "config.yaml").write_text(PREPARE_CONFIG, encoding="utf-8")
-    cfg = load_config(project / "config.yaml")
-
-    movie = SyntheticMovie()
-    truth = movie.tracks()
-    by_frame = {
-        int(f): (df[["x1", "y1", "x2", "y2"]].to_numpy(np.float32),
-                 df["conf"].to_numpy(np.float32))
-        for f, df in truth.groupby("frame")
-    }
-
-    stages, progress, logs = [], [], []
-    reporter = CallbackReporter(
-        on_log=lambda m, l: logs.append(m),
-        on_stage=lambda label, total: stages.append((label, total)),
-        on_progress=lambda done, total: progress.append(done),
-    )
-    info = prepare_movie(movie, StubDetector(by_frame, movie.n_frames), cfg, limit_frames=60, reporter=reporter)
-
-    check("prepare produced clips", info["n_clips"] > 0, str(info))
-    check("prepare reported named stages",
-          any("detect + track" in s for s, _ in stages) and any("cutting clips" in s for s, _ in stages),
-          str([s for s, _ in stages]))
-    check("prepare reported a total to count against",
-          any(total for _, total in stages), str(stages))
-    check("prepare reported per-frame progress", max(progress) > 1, str(max(progress or [0])))
-    check("prepare wrote a resume marker", (cfg.movie_dir(movie.id) / "prepare_done.json").exists())
-
-    from trackanno.annotate.clips import ClipStore
-
-    store = ClipStore(cfg.paths.work_dir)
-    check("the cache it wrote is readable", len(store) == info["n_clips"])
-    check("the clips it wrote carry overlay geometry", len(store.clip_boxes(0)) > 0)
-
-    # And the same call must be interruptible partway through, not only between
-    # movies - a forty-minute movie is otherwise uncancellable.
-    stopper = CallbackReporter(on_progress=lambda done, total: None)
-    stopper.cancel()
-    try:
-        prepare_movie(
-            movie, StubDetector(by_frame, movie.n_frames), cfg,
-            force=True, limit_frames=60, reporter=stopper,
-        )
-    except Cancelled:
-        check("a cancelled prepare stops inside the movie", True)
-    else:
-        check("a cancelled prepare stops inside the movie", False)
+    reporter = CallbackReporter()
+    reporter.cancel()
+    with pytest.raises(Cancelled):
+        list(reporter.track(range(5), "counting", 5))
 
 
 # --------------------------------------------------------------------------- #
-# the two prepare stages
+# prepare
 # --------------------------------------------------------------------------- #
+
+
 POSE_PREPARE_CONFIG = PREPARE_CONFIG.replace(
     "detection: {task: detect, device: cpu}",
     "detection: {task: pose, device: cpu}\n"
@@ -479,7 +324,7 @@ POSE_PREPARE_CONFIG = PREPARE_CONFIG.replace(
 
 
 class PoseStubDetector(StubDetector):
-    """As StubDetector, but hangs two keypoints off every box like a pose model."""
+    """As StubDetector, with two keypoints on every box."""
 
     def detect(self, frame_rgb):
         from trackanno.detect.tiling import Detections
@@ -497,161 +342,150 @@ class PoseStubDetector(StubDetector):
         )
 
 
-def _prep_project(root: Path, name: str, config: str = PREPARE_CONFIG):
-    """A project folder, a synthetic movie and its ground truth, ready to run."""
-    from test_pipeline import SyntheticMovie
+def test_prepare_reports_its_stages_and_progress(root: Path) -> None:
+    """The whole detect, track and cut path, driven the way the GUI drives it."""
+    from trackanno.annotate.clips import ClipStore
+    from trackanno.detect.prepare import prepare_movie
+    from trackanno.progress import CallbackReporter
 
-    from trackanno.config import load_config
+    cfg, movie, frames = prep_project(root, "prep")
+    stages, progress = [], []
+    reporter = CallbackReporter(
+        on_stage=lambda label, total: stages.append((label, total)),
+        on_progress=lambda done, total: progress.append(done),
+    )
+    info = prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg,
+                         limit_frames=60, reporter=reporter)
 
-    project = root / name
-    project.mkdir()
-    (project / "config.yaml").write_text(config, encoding="utf-8")
-    cfg = load_config(project / "config.yaml")
-    movie = SyntheticMovie()
-    by_frame = {
-        int(f): (df[["x1", "y1", "x2", "y2"]].to_numpy(np.float32),
-                 df["conf"].to_numpy(np.float32))
-        for f, df in movie.tracks().groupby("frame")
-    }
-    return cfg, movie, by_frame
+    assert info["n_clips"] > 0, info
+    names = [s for s, _ in stages]
+    assert any("detect + track" in s for s in names), names
+    assert any("cutting clips" in s for s in names), names
+    assert any(total for _, total in stages), f"a total to count against: {stages}"
+    assert max(progress) > 1, "per-frame progress"
+    assert (cfg.movie_dir(movie.id) / "prepare_done.json").exists(), "a resume marker"
+
+    store = ClipStore(cfg.paths.work_dir)
+    assert len(store) == info["n_clips"]
+    assert len(store.clip_boxes(0)) > 0, "the clips carry overlay geometry"
 
 
-def _no_detector():
-    raise AssertionError("the clip stage built a detector, which needs the weights")
+def test_a_cancelled_prepare_stops_inside_the_movie(root: Path) -> None:
+    from trackanno.detect.prepare import prepare_movie
+    from trackanno.progress import CallbackReporter, Cancelled
+
+    cfg, movie, frames = prep_project(root, "prep-cancel")
+    stopper = CallbackReporter(on_progress=lambda done, total: None)
+    stopper.cancel()
+    with pytest.raises(Cancelled):
+        prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg,
+                      force=True, limit_frames=60, reporter=stopper)
 
 
 def test_the_two_stages_match_one_pass(root: Path) -> None:
-    """Detecting and cutting separately must give the same cache as doing both at
-    once, or "detect there, cut here" quietly means something else."""
+    """Detecting and cutting separately gives the same cache as one pass."""
     from trackanno.annotate.clips import ClipStore
     from trackanno.detect.prepare import cut_movie, detect_movie, prepare_movie
 
-    one, movie, frames = _prep_project(root, "one-pass")
+    one, movie, frames = prep_project(root, "one-pass")
     whole = prepare_movie(movie, StubDetector(frames, movie.n_frames), one, limit_frames=60)
 
-    split, movie2, frames2 = _prep_project(root, "split")
+    split, movie2, frames2 = prep_project(root, "split")
     handoff = detect_movie(
         movie2, StubDetector(frames2, movie2.n_frames), split, limit_frames=60
     )
     out = split.movie_dir(movie2.id)
-    check("stage 1 leaves a handoff", (out / "detect_done.json").exists())
-    check("stage 1 does NOT report the movie as prepared",
-          not (out / "prepare_done.json").exists())
-    check("stage 1 wrote the tracks and the intensity mapping",
-          (out / "tracks.parquet").exists() and (out / "norm.json").exists())
-    check("stage 1 wrote no clip pixels", not (out / "clips.dat").exists())
-    check("the handoff carries what stage 2 cannot work out for itself",
-          {"keypoint_nodes", "tiled", "n_tiles", "feature_dim", "n_frames",
-           "config_fingerprint"} <= set(handoff), str(sorted(handoff)))
+    assert (out / "detect_done.json").exists(), "stage 1 leaves a handoff"
+    assert not (out / "prepare_done.json").exists(), "stage 1 does not mark the movie prepared"
+    assert (out / "tracks.parquet").exists() and (out / "norm.json").exists()
+    assert not (out / "clips.dat").exists(), "stage 1 writes no clip pixels"
+    assert {"keypoint_nodes", "tiled", "n_tiles", "feature_dim", "n_frames",
+            "config_fingerprint"} <= set(handoff), sorted(handoff)
 
     part = cut_movie(movie2, split)
     for field in ("n_clips", "crop_size", "n_tracks", "n_detections", "tiled", "n_tiles"):
-        check(f"both routes agree on {field}", part[field] == whole[field],
-              f"{part[field]} vs {whole[field]}")
+        assert part[field] == whole[field], f"{field}: {part[field]} vs {whole[field]}"
 
     a, b = ClipStore(one.paths.work_dir), ClipStore(split.paths.work_dir)
-    check("both caches hold the same clips", len(a) == len(b) and len(a) > 0)
-    check("and the same overlay geometry", len(a.clip_boxes(0)) == len(b.clip_boxes(0)))
+    assert len(a) == len(b) and len(a) > 0
+    assert len(a.clip_boxes(0)) == len(b.clip_boxes(0)), "the same overlay geometry"
 
 
 def test_a_run_started_elsewhere_is_finished_not_repeated(root: Path) -> None:
-    """The workflow window calls prepare_movie with no stage of any kind. Given a
-    movie detected on a GPU box, it must cut the clips and never reach for a
-    model this machine does not have."""
+    """A movie detected elsewhere is cut without ever building a detector."""
     from trackanno.detect.prepare import detect_movie, prepare_movie
     from trackanno.project import forget_path_probes, project_status
 
-    cfg, movie, frames = _prep_project(root, "from-gpu-box")
+    cfg, movie, frames = prep_project(root, "from-gpu-box")
     detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
 
     status = project_status(cfg)
-    check("a detected movie is not counted as prepared", status.n_prepared == 0)
-    check("and contributes no clips", status.n_clips == 0)
-    check("but is counted as detected", status.n_detected == 1)
+    assert status.n_prepared == 0, "a detected movie is not prepared"
+    assert status.n_clips == 0
+    assert status.n_detected == 1
 
-    info = prepare_movie(movie, _no_detector, cfg)
-    check("the clips were cut anyway", info["n_clips"] > 0)
-    check("using the tiling the detection stage recorded", info["n_tiles"] == 1)
+    info = prepare_movie(movie, no_detector, cfg)
+    assert info["n_clips"] > 0
+    assert info["n_tiles"] == 1, "the recorded tiling is used"
 
-    # What PreparePage._on_run_finished does, and must: the status above cached a
-    # "no prepare_done.json here" verdict for the next half minute.
+    # The status above cached a "no prepare_done.json" verdict.
     forget_path_probes()
     after = project_status(cfg)
-    check("and now it is prepared", after.n_prepared == 1, str(after))
-    check("with its clips counted", after.n_clips == info["n_clips"])
+    assert after.n_prepared == 1, after
+    assert after.n_clips == info["n_clips"]
 
 
 def test_pose_keypoint_names_survive_the_handoff(root: Path) -> None:
-    """The names come from the checkpoint, not config.yaml. A machine that never
-    loads the checkpoint would otherwise cut a box table with no keypoints in it
-    and say nothing at all."""
+    """A machine that never loads the checkpoint gets the names from the handoff."""
     import pandas as pd
 
     from trackanno.config import load_config
     from trackanno.detect.prepare import cut_movie, detect_movie
 
-    cfg, movie, frames = _prep_project(root, "pose-handoff", POSE_PREPARE_CONFIG)
+    cfg, movie, frames = prep_project(root, "pose-handoff", POSE_PREPARE_CONFIG)
     handoff = detect_movie(
         movie, PoseStubDetector(frames, movie.n_frames), cfg, limit_frames=60
     )
-    check("the handoff records the resolved names",
-          handoff["keypoint_nodes"] == ["head", "base"])
+    assert handoff["keypoint_nodes"] == ["head", "base"]
 
-    # What the annotating machine looks like: same project, but its config never
-    # learned the names because it never loaded the weights.
     laptop = load_config(cfg.path)
     laptop.keypoints.nodes = []
-    check("it starts out knowing no keypoints", laptop.n_keypoints == 0)
+    assert laptop.n_keypoints == 0
 
     cut_movie(movie, laptop)
-    check("the names came back from the handoff",
-          list(laptop.keypoints.nodes) == ["head", "base"])
+    assert list(laptop.keypoints.nodes) == ["head", "base"], "names come from the handoff"
     boxes = pd.read_parquet(cfg.movie_dir(movie.id) / "clip_boxes.parquet")
-    check("so the box table carries its keypoint columns",
-          {"kp_x_0", "kp_y_0", "kp_x_1", "kp_y_1"} <= set(boxes.columns),
-          str(sorted(c for c in boxes.columns if c.startswith("kp_"))))
+    assert {"kp_x_0", "kp_y_0", "kp_x_1", "kp_y_1"} <= set(boxes.columns), (
+        sorted(c for c in boxes.columns if c.startswith("kp_")))
 
 
 def test_detections_from_a_different_config_are_refused(root: Path) -> None:
-    """Settings that decide what the detector found may not change underneath the
-    clips cut from it. Naming the section is the whole value of the message."""
+    """A changed detection setting makes the handoff stale and names the section."""
     from trackanno.detect.prepare import (
         cut_movie, detect_movie, handoff_is_fresh, read_handoff,
     )
 
-    cfg, movie, frames = _prep_project(root, "stale")
+    cfg, movie, frames = prep_project(root, "stale")
     detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
-    check("a fresh handoff reads as fresh", handoff_is_fresh(cfg, movie.id))
+    assert handoff_is_fresh(cfg, movie.id)
 
-    # Where the work ran is not what it found, so this must NOT invalidate it.
     cfg.detection.device = "cuda:0"
     cfg.detection.batch = 32
-    check("the device and batch size do not invalidate detections",
-          handoff_is_fresh(cfg, movie.id))
+    assert handoff_is_fresh(cfg, movie.id), "device and batch size do not invalidate it"
 
     cfg.detection.conf = 0.9
-    check("a changed confidence threshold does", not handoff_is_fresh(cfg, movie.id))
-    try:
+    assert not handoff_is_fresh(cfg, movie.id), "a changed confidence threshold does"
+    with pytest.raises(ValueError, match="detection"):
         read_handoff(cfg, movie.id)
-    except ValueError as exc:
-        check("and the refusal names the section that changed", "detection" in str(exc), str(exc))
-    else:
-        check("and the refusal names the section that changed", False)
 
     for force in (False, True):
         info = cut_movie(movie, cfg, force=force)
-        check(f"cutting clips from stale detections is skipped (force={force})",
-              info.get("skipped") is True
-              and not (cfg.movie_dir(movie.id) / "prepare_done.json").exists(), str(info))
+        assert info.get("skipped") is True, f"force={force}: {info}"
+        assert not (cfg.movie_dir(movie.id) / "prepare_done.json").exists()
 
 
 def test_border_exclusions_are_reported_by_the_planner(root: Path) -> None:
-    """The warning names the tracks plan_clips actually excluded frames from.
-
-    It used to be produced by re-running the border test over a hand-copy of
-    plan_clips' own min_track_length filter, so the two could count different
-    sets. The planner reports them instead.
-    """
+    """The warning names the tracks plan_clips excluded frames from."""
     from trackanno.detect.prepare import prepare_movie
     from trackanno.progress import CallbackReporter
 
@@ -661,115 +495,82 @@ def test_border_exclusions_are_reported_by_the_planner(root: Path) -> None:
         "tracking: {backend: greedy, min_track_length: 40,\n"
         "           border_margin_px: 70}",
     )
-    cfg, movie, frames = _prep_project(root, "border", config)
-    check("the margin reached the config", cfg.tracking.border_margin_px == 70)
+    cfg, movie, frames = prep_project(root, "border", config)
+    assert cfg.tracking.border_margin_px == 70
 
     logs: list[str] = []
     info = prepare_movie(
         movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60,
         reporter=CallbackReporter(on_log=lambda m, level: logs.append(m)),
     )
-    warned = [m for m in logs if "reach within" in m]
-    check("the exclusion is reported once", len(warned) == 1, str(logs))
-    check("...naming how many tracks reached the edge",
-          warned and warned[0].startswith("1 track(s)"), warned[0] if warned else "")
-    check("the track that stayed clear still became clips", info["n_clips"] > 0)
+    warned = [m for m in logs if "come within" in m]
+    assert len(warned) == 1, logs
+    assert warned[0].startswith("1 track(s)"), warned[0]
+    assert info["n_clips"] > 0, "the track that stayed clear still became clips"
 
 
-def test_the_model_report_shows_what_the_model_leans_on(app) -> None:
-    """Which measurement carries a decision is the first thing to look at when
-    two classes keep being confused, and the window never showed it."""
-    from trackanno.gui.hub import _format_report
-
-    features = [{"feature": f"feat_{i}", "importance": round(20.0 - i, 2)}
-                for i in range(15)]
-    html = _format_report({"behaviour": {
-        "reliable": True, "n_labels": 240, "n_classes": 3, "macro_f1": 0.52,
-        "kappa": 0.33, "kappa_lower": 0.29, "accuracy": 0.57,
-        "baseline_accuracy": 0.45, "scope": "leave-movie-out over 2 movies",
-        "top_features": features,
-    }})
-    check("the report names the strongest feature", "feat_0" in html)
-    check("...and stops at ten", "feat_9" in html and "feat_10" not in html)
-    check("...with the importance beside it", "20.00" in html, html[-400:])
-    check("a report with no importances says nothing about them",
-          "top" not in _format_report({"behaviour": {"top_features": []}}).lower())
-
-
-def test_asking_for_one_movie_does_not_open_the_others(root: Path) -> None:
-    """Discovery is the first thing a run does and it is minutes on a share.
-
-    Every id is its file's stem (plus an ND2 position), so a named movie can be
-    found without opening the rest of the folder - which the GUI does once per
-    run and once per minimap.
-    """
-    import warnings as W
-
+@pytest.fixture
+def two_movie_folder(tmp_path: Path):
+    """A folder with one readable TIFF and one file that is not a TIFF."""
     import tifffile
 
-    from trackanno.video.movies import discover_movies
-
-    cfg, movie, _ = _prep_project(root, "one-of-many")
+    cfg, movie, _ = prep_project(tmp_path, "one-of-many")
     cfg.paths.video_dir.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(str(cfg.paths.video_dir / "wanted.tif"),
                      np.stack([movie.frame(i) for i in range(4)]),
                      photometric="minisblack")
-    # Not a TIFF at all, so anything that opens it warns and says so.
     (cfg.paths.video_dir / "unreadable.tif").write_text("not a tiff", encoding="utf-8")
+    return cfg
+
+
+def test_asking_for_one_movie_does_not_open_the_others(two_movie_folder) -> None:
+    import warnings as W
+
+    from trackanno.video.movies import discover_movies
 
     with W.catch_warnings(record=True) as caught:
         W.simplefilter("always")
-        picked = discover_movies(cfg, only=["wanted"])
+        picked = discover_movies(two_movie_folder, only=["wanted"])
     for source in picked:
         source.close()
-    check("the named movie comes back", [s.id for s in picked] == ["wanted"],
-          str([s.id for s in picked]))
-    check("...without the rest of the folder being opened",
-          not [w for w in caught if "unreadable" in str(w.message)],
-          str([str(w.message) for w in caught]))
+    assert [s.id for s in picked] == ["wanted"]
+    assert not [w for w in caught if "unreadable" in str(w.message)], (
+        f"the rest of the folder was opened: {[str(w.message) for w in caught]}")
 
-    # The shortcut is only a shortcut: an id no file name could hold still gets
-    # the whole folder looked at, so the refusal names what is really there.
+
+def test_an_unknown_movie_id_lists_what_is_there(two_movie_folder) -> None:
+    import warnings as W
+
+    from trackanno.video.movies import discover_movies
+
     with W.catch_warnings(record=True):
         W.simplefilter("always")
-        try:
-            discover_movies(cfg, only=["typo"])
-            raised = ""
-        except ValueError as exc:
-            raised = str(exc)
-    check("an unknown id is refused, and the message lists what there is",
-          "typo" in raised and "wanted" in raised, raised or "nothing raised")
+        with pytest.raises(ValueError, match="typo") as exc:
+            discover_movies(two_movie_folder, only=["typo"])
+    assert "wanted" in str(exc.value)
 
 
 def test_a_cut_only_run_is_given_the_clip_stage(app, root: Path, monkeypatch) -> None:
-    """The button says "Cut clips", so the run must be one that cuts clips.
-
-    It used to be given stage "all" whatever the button said, and "all" asks
-    every ticked movie whether it needs detecting. A handoff that no longer
-    matches this config answers yes, so the annotating machine loaded the model
-    and started detecting again - hours of work behind a button that promised
-    minutes - or, with no weights on it at all, died on a missing model file it
-    never needed. Both arrive as "cutting the clips does nothing in the GUI".
-    """
+    """A "Cut clips" run must not ask detected movies whether they need detecting."""
     import tifffile
     from qtpy.QtWidgets import QListWidgetItem
 
+    from trackanno.annotate.clips import DONE_FILE
     from trackanno.detect import prepare as prepare_module
     from trackanno.detect.prepare import detect_movie
     from trackanno.gui.hub import PreparePage
     from trackanno.progress import NullReporter
     from trackanno.project import project_status
 
-    cfg, movie, frames = _prep_project(root, "cut-only")
-    # A real file to be discovered, and deliberately no model.pt beside it: the
-    # weights live on the GPU box, and only the clip stage can run without them.
+    cfg, movie, frames = prep_project(root, "cut-only")
+    # A real movie file and deliberately no model.pt.
     cfg.paths.video_dir.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(
         str(cfg.paths.video_dir / f"{movie.id}.tif"),
         np.stack([movie.frame(i) for i in range(60)]),
     )
     detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
-    check("the model this project names is not here", not cfg.paths.model.exists())
+    assert not cfg.paths.model.exists()
 
     class StubHub:
         def __init__(self):
@@ -779,8 +580,7 @@ def test_a_cut_only_run_is_given_the_clip_stage(app, root: Path, monkeypatch) ->
             pass
 
     page = PreparePage(StubHub())
-    check("a project with detections and no model can still open the page",
-          page.blocker() == "", page.blocker())
+    assert page.blocker() == "", "detections without a model can open the page"
 
     def listed(movie_id: str, state: str) -> None:
         item = QListWidgetItem()
@@ -796,7 +596,7 @@ def test_a_cut_only_run_is_given_the_clip_stage(app, root: Path, monkeypatch) ->
 
     listed(movie.id, "detected")
     page._update_run_label(page._states)
-    check("the button offers to cut", page.tasks.run_button.text() == "Cut clips")
+    assert page.tasks.run_button.text() == "Cut clips"
 
     seen: dict = {}
     monkeypatch.setattr(
@@ -805,89 +605,92 @@ def test_a_cut_only_run_is_given_the_clip_stage(app, root: Path, monkeypatch) ->
         reporter=None, stage="all": seen.update(stage=stage, ids=ids) or [],
     )
     page._build_work()(NullReporter())
-    check("a cut-only run is given the clip stage", seen.get("stage") == "clips",
-          str(seen))
+    assert seen.get("stage") == "clips", seen
 
-    # One movie that still needs detecting puts the whole run back to 'all',
-    # because that one does need a detector.
+    # One movie that still needs detecting puts the run back to 'all'.
     listed("undetected", "new")
     page._update_run_label(page._states)
-    check("a run with anything undetected offers detection",
-          page.tasks.run_button.text() == "Run detection")
+    assert page.tasks.run_button.text() == "Run detection"
     page._build_work()(NullReporter())
-    check("...and is given the stage that can detect", seen.get("stage") == "all",
-          str(seen))
+    assert seen.get("stage") == "all", seen
 
-    # And the promise itself: with no weights anywhere, the clip stage cuts.
+    # With no weights anywhere, the clip stage still cuts.
     monkeypatch.undo()
     page.movies.takeItem(1)
-    from trackanno.annotate.clips import DONE_FILE
-
     page._build_work()(NullReporter())
-    check("the cut-only run wrote the clips it promised",
-          (cfg.movie_dir(movie.id) / DONE_FILE).exists())
+    assert (cfg.movie_dir(movie.id) / DONE_FILE).exists()
 
 
-def test_a_handoff_that_cannot_account_for_itself_is_refused(root: Path) -> None:
-    """A record with no fingerprint cannot say which settings produced it, which
-    is the one thing the check exists to establish."""
+@pytest.mark.parametrize("record", [{}, {"detection": "x"}], ids=["none", "partial"])
+def test_a_handoff_without_a_full_fingerprint_is_refused(root: Path, record) -> None:
     import json
 
     from trackanno.detect.prepare import detect_movie, handoff_is_fresh, read_handoff
 
-    cfg, movie, frames = _prep_project(root, "no-fingerprint")
+    cfg, movie, frames = prep_project(root, f"no-fingerprint-{len(record)}")
     detect_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
 
     path = cfg.movie_dir(movie.id) / "detect_done.json"
-    for dropped, name in (({}, "no fingerprint at all"), ({"detection": "x"}, "only some sections")):
-        info = json.loads(path.read_text(encoding="utf-8"))
-        info["config_fingerprint"] = dropped
-        path.write_text(json.dumps(info), encoding="utf-8")
-        check(f"a handoff with {name} is not fresh", not handoff_is_fresh(cfg, movie.id))
-        try:
-            read_handoff(cfg, movie.id)
-        except ValueError:
-            check(f"and reading it is refused ({name})", True)
-        else:
-            check(f"and reading it is refused ({name})", False)
+    info = json.loads(path.read_text(encoding="utf-8"))
+    info["config_fingerprint"] = record
+    path.write_text(json.dumps(info), encoding="utf-8")
+    assert not handoff_is_fresh(cfg, movie.id)
+    with pytest.raises(ValueError):
+        read_handoff(cfg, movie.id)
 
 
 def test_a_prepared_movie_never_asks_for_the_model(root: Path) -> None:
-    """A project prepared before the split has no handoff at all. Re-running must
-    not load the weights only to skip every movie."""
+    """A movie with clips but no handoff does not need detection."""
     from trackanno.detect.prepare import (
         _needs_detection, handoff_is_fresh, prepare_movie,
     )
 
-    cfg, movie, frames = _prep_project(root, "old-project")
+    cfg, movie, frames = prep_project(root, "old-project")
     prepare_movie(movie, StubDetector(frames, movie.n_frames), cfg, limit_frames=60)
 
-    # What an old cache looks like: clips and a prepared marker, no handoff.
     (cfg.movie_dir(movie.id) / "detect_done.json").unlink()
-    check("a prepared movie needs no detection", not _needs_detection(cfg, movie.id))
-    check("even though it has no handoff to be fresh",
-          not handoff_is_fresh(cfg, movie.id))
-    check("but --force means it does", _needs_detection(cfg, movie.id, force=True))
-    check("and a movie with neither does too",
-          _needs_detection(_prep_project(root, "untouched")[0], "synthetic"))
+    assert not _needs_detection(cfg, movie.id)
+    assert not handoff_is_fresh(cfg, movie.id), "even though it has no handoff"
+    assert _needs_detection(cfg, movie.id, force=True), "--force means it does"
+    assert _needs_detection(prep_project(root, "untouched")[0], "synthetic"), (
+        "a movie with neither needs detection")
 
 
 def test_cutting_without_detections_says_what_to_do(root: Path) -> None:
-    """The one error a split workflow will actually hit."""
     from trackanno.detect.prepare import cut_movie, handoff_is_fresh
 
-    cfg, movie, _ = _prep_project(root, "no-handoff")
-    check("nothing is fresh before detection runs", not handoff_is_fresh(cfg, movie.id))
-    try:
+    cfg, movie, _ = prep_project(root, "no-handoff")
+    assert not handoff_is_fresh(cfg, movie.id)
+    with pytest.raises(FileNotFoundError, match="detect_done.json") as exc:
         cut_movie(movie, cfg)
-    except FileNotFoundError as exc:
-        check("it names the missing file and the way out",
-              "detect_done.json" in str(exc) and "copy" in str(exc), str(exc))
-    else:
-        check("it names the missing file and the way out", False)
+    assert "copy" in str(exc.value), "the message names the way out"
 
 
-def test_task_panel(app) -> None:
+# --------------------------------------------------------------------------- #
+# background jobs
+# --------------------------------------------------------------------------- #
+def _slow(reporter):
+    for _ in reporter.track(range(100000), "grinding", 100000):
+        time.sleep(0.001)
+    return "should not happen"
+
+
+def _last_line_colour(panel) -> tuple[str, str]:
+    from qtpy.QtGui import QTextFormat
+
+    document = panel.log.document()
+    last = document.findBlockByNumber(document.blockCount() - 1)
+    fragment = last.begin()
+    fmt = None if fragment.atEnd() else fragment.fragment().charFormat()
+    colour = (
+        fmt.foreground().color().name().upper()
+        if fmt is not None and fmt.hasProperty(QTextFormat.ForegroundBrush)
+        else "plain"
+    )
+    return last.text(), colour
+
+
+def test_a_task_panel_job_finishes(app) -> None:
     from trackanno.gui.tasks import TaskPanel
 
     panel = TaskPanel("Go")
@@ -901,108 +704,38 @@ def test_task_panel(app) -> None:
 
     panel.finished.connect(lambda ok: results.append(ok))
     panel.start(work, throttle=1)
-    check("a finished job reports success", pump(app, lambda: results) and results[0] is True)
-    check("the log kept the job's output", "starting" in panel.log.toPlainText())
-
-    # And it must be stoppable, not merely have a button that says Cancel.
-    results.clear()
-    stopped: list = []
-
-    def slow(reporter):
-        for _ in reporter.track(range(100000), "grinding", 100000):
-            time.sleep(0.001)
-        stopped.append("ran to completion")
-        return "should not happen"
-
-    panel.start(slow, throttle=1)
-    pump(app, lambda: panel.bar.value() > 2, timeout=10)
-    panel.cancel()
-    check("cancel actually stops the worker",
-          pump(app, lambda: results) and results[0] is False and not stopped)
+    assert pump(app, lambda: results) and results[0] is True
+    assert "starting" in panel.log.toPlainText(), "the log keeps the job's output"
     panel.shutdown()
 
 
-def test_no_page_keeps_a_paragraph_on_screen(app, project_config) -> None:
-    """Long explanation goes behind a `?`, not under the thing it explains.
+def test_a_cancelled_job_stops_and_is_not_a_failure(app) -> None:
+    """Cancel stops the worker and the last line is amber, not red."""
+    from trackanno.gui.tasks import TaskPanel
+    from trackanno.gui.theme import tokens
 
-    A subtitle is permanent: read once and then always there, a paragraph at the
-    top of a page is height taken from the work below it on every visit. One
-    sentence stays, the rest goes in the help window - which can be opened when
-    it is wanted and closed when it is not.
+    panel = TaskPanel("Go")
+    results: list = []
+    stopped: list = []
 
-    Measured over the real pages rather than asserted per string, so a paragraph
-    added to a new page fails here rather than being noticed by somebody
-    scrolling past it.
-    """
-    from qtpy.QtWidgets import QLabel
+    def slow(reporter):
+        _slow(reporter)
+        stopped.append("ran to completion")
 
-    from trackanno.gui.hub import PAGES, Hub
-    from trackanno.gui.theme import Heading
+    panel.finished.connect(lambda ok: results.append(ok))
+    panel.start(slow, throttle=1)
+    pump(app, lambda: panel.bar.value() > 2, timeout=10)
+    panel.cancel()
+    assert pump(app, lambda: results) and results[0] is False and not stopped
 
-    hub = Hub(str(project_config))
-    hub.show()
-    app.processEvents()
-    try:
-        long_ones, helped = [], 0
-        for name, page in zip(PAGES, hub.pages):
-            for heading in page.findChildren(Heading):
-                subtitle = heading.subtitle.text()
-                if len(subtitle) > 110:
-                    long_ones.append((name, len(subtitle), subtitle))
-                if heading.help is not None:
-                    helped += 1
-        check("every page heading is one line, not a paragraph",
-              not long_ones, str(long_ones))
-        check("and the long form is behind a button on most of them",
-              helped >= 4, f"{helped} heading(s) carry a ?")
-
-        # The one place a wall of text is right is inside the help itself.
-        review = hub.page(type(hub.pages[PAGES.index("Review")]))
-        check("the Review page reaches its own long form", review is not None)
-    finally:
-        for page in hub.pages:
-            page.shutdown()
-        hub.close()
-        app.processEvents()
-
-
-def test_the_help_button_opens_and_closes(app) -> None:
-    """A `?` is only an improvement if what is behind it can be read and shut."""
-    from qtpy.QtCore import QTimer
-    from qtpy.QtWidgets import QDialog, QTextBrowser
-
-    from trackanno.gui.theme import help_button
-
-    opened: list = []
-
-    def close_it():
-        for widget in app.topLevelWidgets():
-            if isinstance(widget, QDialog) and widget.isVisible():
-                body = widget.findChild(QTextBrowser)
-                opened.append("" if body is None else body.toPlainText())
-                widget.reject()
-
-    button = help_button(None, "Help", "<h3>A heading</h3><p>and a paragraph.</p>")
-    QTimer.singleShot(0, close_it)
-    button.click()
-    app.processEvents()
-
-    check("the button opened something", opened, "nothing opened")
-    check("...with the text in it, rendered rather than escaped",
-          "A heading" in opened[0] and "and a paragraph." in opened[0]
-          and "<h3>" not in opened[0], opened[0] if opened else "")
-    check("...and it closed", not [w for w in app.topLevelWidgets()
-                                   if isinstance(w, QDialog) and w.isVisible()])
+    text, colour = _last_line_colour(panel)
+    assert text == "cancelled"
+    assert colour == tokens()["warning"].upper() != tokens()["danger"].upper(), colour
+    panel.shutdown()
 
 
 def test_a_colour_in_the_log_belongs_to_one_line(app) -> None:
-    """A colour has to mean something, which it cannot if it spreads.
-
-    ``appendHtml`` and ``appendPlainText`` both take their character format from
-    the visible cursor, which sits at the end of the last line written. One
-    amber warning therefore left every later line amber, and a reader could not
-    tell which line the colour was about.
-    """
+    """A warning or error colour does not spread to the lines after it."""
     from qtpy.QtGui import QTextFormat
 
     from trackanno.gui.tasks import TaskPanel
@@ -1035,191 +768,238 @@ def test_a_colour_in_the_log_belongs_to_one_line(app) -> None:
         ))
     by_line = dict(colours)
 
-    check("every message reached the log", len(colours) == 7, str(colours))
-    check("a warning is amber",
-          by_line["something worth knowing"] == palette["warning"].upper(),
-          str(colours))
-    check("the line after it is not",
-          by_line["more ordinary progress"] == "plain", str(colours))
-    check("an error is red",
-          by_line["it broke"] == palette["danger"].upper(), str(colours))
-    check("...all the way down a traceback",
-          by_line["with a second line"] == palette["danger"].upper(), str(colours))
-    check("and the line after that is plain again",
-          by_line["still ordinary"] == "plain", str(colours))
-    check("the finishing line is green",
-          by_line["finished"] == palette["success"].upper(), str(colours))
+    assert len(colours) == 7, colours
+    assert by_line["something worth knowing"] == palette["warning"].upper(), colours
+    assert by_line["more ordinary progress"] == "plain", colours
+    assert by_line["it broke"] == palette["danger"].upper(), colours
+    assert by_line["with a second line"] == palette["danger"].upper(), (
+        f"all the way down a traceback: {colours}")
+    assert by_line["still ordinary"] == "plain", colours
+    assert by_line["finished"] == palette["success"].upper(), colours
     panel.shutdown()
 
 
-def test_a_cancelled_job_is_not_reported_as_a_failure(app) -> None:
-    """Stopping a job is something the user did, not something that went wrong,
-    and red is the colour that says a run failed."""
-    from qtpy.QtGui import QTextFormat
+# --------------------------------------------------------------------------- #
+# the workflow window
+# --------------------------------------------------------------------------- #
+def test_the_model_report_lists_the_top_features(app) -> None:
+    from trackanno.gui.hub import _format_report
 
-    from trackanno.gui.tasks import TaskPanel
-    from trackanno.gui.theme import tokens
-
-    panel = TaskPanel("Go")
-    results: list = []
-    panel.finished.connect(lambda ok: results.append(ok))
-
-    def slow(reporter):
-        for _ in reporter.track(range(100000), "grinding", 100000):
-            time.sleep(0.001)
-        return "should not happen"
-
-    panel.start(slow, throttle=1)
-    pump(app, lambda: panel.bar.value() > 2, timeout=10)
-    panel.cancel()
-    check("the job stopped", pump(app, lambda: results) and results[0] is False)
-
-    document = panel.log.document()
-    last = document.findBlockByNumber(document.blockCount() - 1)
-    fragment = last.begin()
-    fmt = None if fragment.atEnd() else fragment.fragment().charFormat()
-    colour = (
-        fmt.foreground().color().name().upper()
-        if fmt is not None and fmt.hasProperty(QTextFormat.ForegroundBrush)
-        else "plain"
-    )
-    check("it says so on the last line", last.text() == "cancelled", last.text())
-    check("in amber, not the red that means the run failed",
-          colour == tokens()["warning"].upper()
-          and colour != tokens()["danger"].upper(), colour)
-    panel.shutdown()
+    features = [{"feature": f"feat_{i}", "importance": round(20.0 - i, 2)}
+                for i in range(15)]
+    html = _format_report({"behaviour": {
+        "reliable": True, "n_labels": 240, "n_classes": 3, "macro_f1": 0.52,
+        "kappa": 0.33, "kappa_lower": 0.29, "accuracy": 0.57,
+        "baseline_accuracy": 0.45, "scope": "leave-movie-out over 2 movies",
+        "top_features": features,
+    }})
+    assert "feat_0" in html
+    assert "feat_9" in html and "feat_10" not in html, "stops at ten"
+    assert "20.00" in html, "with the importance beside it"
+    assert "top" not in _format_report({"behaviour": {"top_features": []}}).lower(), (
+        "no importances, no mention")
 
 
-def test_hub(app, project_config: Path) -> None:
-    from trackanno.gui.hub import PAGES, ConfigPage, ExportPage, Hub, ModelPage
+def test_cache_is_released_before_detection(app) -> None:
+    """Windows refuses to overwrite a memory-mapped cache file, so the hub unmaps it."""
+    from trackanno.config import load_config
+    from trackanno.gui.hub import Hub
+
+    config_path = make_project()
+    cfg = load_config(config_path)
+
+    hub = Hub(str(config_path))
+    hub.show()
+    hub.go_to(3)
+    app.processEvents()
+    panel = hub.pages[3].panel
+    assert panel is not None
+
+    movie = str(panel.store.meta(panel.order[panel.position])["movie_id"])
+    origins = cfg.paths.work_dir / movie / "clip_origins.npy"
+    assert movie in panel.store._origins, "the store maps the movie being annotated"
+
+    def writable() -> bool:
+        try:
+            np.save(origins, np.load(origins))
+            return True
+        except OSError:
+            return False
+
+    assert not writable(), "a mapped cache cannot be overwritten"
+    hub.release_caches()
+    app.processEvents()
+    assert writable()
+    assert not panel.store._origins and not panel.store._mm, "every map is dropped"
+
+    hub.close()
+    app.processEvents()
+
+
+def test_no_page_keeps_a_paragraph_on_screen(app, project_config) -> None:
+    """Page headings are one line; the long form is behind a `?`."""
+    from trackanno.gui.hub import PAGES, Hub
+    from trackanno.gui.theme import Heading
 
     hub = Hub(str(project_config))
     hub.show()
     app.processEvents()
-    check("the hub opens a project", hub.cfg is not None and hub.cfg.path == project_config)
-    check("the hub has every page", len(hub.pages) == len(PAGES))
+    try:
+        long_ones, helped = [], 0
+        for name, page in zip(PAGES, hub.pages):
+            for heading in page.findChildren(Heading):
+                subtitle = heading.subtitle.text()
+                if len(subtitle) > 110:
+                    long_ones.append((name, len(subtitle), subtitle))
+                if heading.help is not None:
+                    helped += 1
+        assert not long_ones, long_ones
+        assert helped >= 4, f"{helped} heading(s) carry a ?"
+    finally:
+        for page in hub.pages:
+            page.shutdown()
+        hub.close()
+        app.processEvents()
+
+
+def test_the_help_button_opens_and_closes(app) -> None:
+    from qtpy.QtCore import QTimer
+    from qtpy.QtWidgets import QDialog, QTextBrowser
+
+    from trackanno.gui.theme import help_button
+
+    opened: list = []
+
+    def close_it():
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, QDialog) and widget.isVisible():
+                body = widget.findChild(QTextBrowser)
+                opened.append("" if body is None else body.toPlainText())
+                widget.reject()
+
+    button = help_button(None, "Help", "<h3>A heading</h3><p>and a paragraph.</p>")
+    QTimer.singleShot(0, close_it)
+    button.click()
+    app.processEvents()
+
+    assert opened, "nothing opened"
+    assert "A heading" in opened[0] and "and a paragraph." in opened[0], opened[0]
+    assert "<h3>" not in opened[0], "the text is rendered, not escaped"
+    assert not [w for w in app.topLevelWidgets()
+                if isinstance(w, QDialog) and w.isVisible()], "it closed"
+
+
+def test_the_hub_opens_a_project_on_every_page(app, hub) -> None:
+    from trackanno.gui.hub import PAGES, ExportPage, ModelPage
+
+    assert hub.cfg is not None and hub.cfg.path.name == "config.yaml"
+    assert len(hub.pages) == len(PAGES)
 
     advice, page, _ = hub.next_step()
-    check("an empty project is told to run detection", page == 2, f"page {page}: {advice}")
+    assert page == 2, f"an empty project is told to run detection: {advice}"
 
     for index in range(len(PAGES)):
         hub.go_to(index)
         app.processEvents()
-    check("every page builds", True)
 
-    check("annotate is blocked without a cache",
-          "no clips" in hub.pages[3].blocker(), hub.pages[3].blocker())
-    check("model is blocked without labels",
-          "nothing labelled" in hub.pages[4].blocker(), hub.pages[4].blocker())
-    export = hub.page(ExportPage)
-    check("export is blocked without annotations",
-          "no annotations" in export.blocker(), export.blocker())
-    check("distribution is blocked without annotations",
-          "no annotations" in hub.page(ModelPage).distribution.blocker(),
-          hub.page(ModelPage).distribution.blocker())
+    assert "no clips" in hub.pages[3].blocker(), hub.pages[3].blocker()
+    assert "nothing labelled" in hub.pages[4].blocker(), hub.pages[4].blocker()
+    assert "no annotations" in hub.page(ExportPage).blocker()
+    assert "no annotations" in hub.page(ModelPage).distribution.blocker()
 
-    # The config page is a real editor: change a value, save, and the file
-    # must both change and still load.
+
+@pytest.fixture
+def config_page(app, hub):
     hub.go_to(1)
     app.processEvents()
-    config_page = hub.pages[1]
-    check("basics tab is a short list",
-          5 < len(config_page.form.current()) < 25, str(len(config_page.form.current())))
-    check("advanced tab holds the rest",
-          len(config_page.advanced.current()) > len(config_page.form.current()))
-    check("no setting appears on both tabs",
-          not (set(config_page.form.current()) & set(config_page.advanced.current())))
+    return hub.pages[1]
 
+
+def test_configure_splits_basics_from_advanced(config_page) -> None:
+    basics, advanced = config_page.form.current(), config_page.advanced.current()
+    assert 5 < len(basics) < 25, len(basics)
+    assert len(advanced) > len(basics), "advanced holds the rest"
+    assert not (set(basics) & set(advanced)), "no setting appears on both tabs"
+
+
+def test_configure_saves_edits_from_both_tabs(app, hub, config_page) -> None:
     config_page.form._widgets["clips.pad"].setValue(2.75)
-    # ...and one from the OTHER tab, which an earlier version silently dropped.
     config_page.advanced._widgets["detection.conf"].setValue(0.4)
     app.processEvents()
-    check("editing marks the page unsaved",
-          config_page._dirty and config_page.save_button.isEnabled()
-          and config_page.heading.title.text().endswith("*"))
-    check("Save writes it", config_page.save() and not config_page._dirty)
-    check("the edit reached the file", abs(hub.cfg.clips.pad - 2.75) < 1e-9, str(hub.cfg.clips.pad))
-    check("an advanced-tab edit is saved too",
-          abs(hub.cfg.detection.conf - 0.4) < 1e-9, str(hub.cfg.detection.conf))
-    check("saving keeps the comments",
-          project_config.read_text(encoding="utf-8").count("#") > 40)
-    check("saving does not wipe the form", config_page.form.current()["clips.pad"] == 2.75)
+    assert config_page._dirty and config_page.save_button.isEnabled()
+    assert config_page.heading.title.text().endswith("*"), "the title marks unsaved edits"
+    assert config_page.save() and not config_page._dirty
+    assert abs(hub.cfg.clips.pad - 2.75) < 1e-9, hub.cfg.clips.pad
+    assert abs(hub.cfg.detection.conf - 0.4) < 1e-9, hub.cfg.detection.conf
+    assert hub.cfg.path.read_text(encoding="utf-8").count("#") > 40, "comments are kept"
+    assert config_page.form.current()["clips.pad"] == 2.75, "the form is not wiped"
+    assert not config_page.save_button.isEnabled()
 
-    check("a save leaves nothing unsaved", not config_page.save_button.isEnabled())
 
-    # An unusable label set must fail LOUDLY and leave the file alone.
-    good_text = project_config.read_text(encoding="utf-8")
+def test_configure_refuses_an_unusable_label_set(app, hub, config_page) -> None:
+    good_text = hub.cfg.path.read_text(encoding="utf-8")
     name_field = config_page.categories._groups[0].name
     name_field.setText("")
     app.processEvents()
-    check("Save refuses an unusable label set",
-          not config_page.save() and config_page.banner.isVisible())
-    check("the refusal says why",
-          "no name" in config_page.banner.text(), config_page.banner.text()[:120])
-    check("the refused save left the file alone",
-          project_config.read_text(encoding="utf-8") == good_text)
+    assert not config_page.save() and config_page.banner.isVisible()
+    assert "no name" in config_page.banner.text(), config_page.banner.text()[:120]
+    assert hub.cfg.path.read_text(encoding="utf-8") == good_text
+
     name_field.setText("state")
     app.processEvents()
-    check("fixing it saves again", config_page.save() and not config_page._dirty)
-    check("the error banner clears", not config_page.banner.isVisible())
+    assert config_page.save() and not config_page._dirty
+    assert not config_page.banner.isVisible(), "the error banner clears"
 
-    # A path that points at nothing is a WARNING, not a blocked save: a model on
-    # an offline share must not stop you editing anything else.
-    config_page.form._widgets["paths.model"].set_value(str(project_config.parent / "nope.pt"))
+
+def test_configure_saves_a_missing_path_with_a_warning(app, hub, config_page) -> None:
+    """A model on an offline share must not block editing anything else."""
+    config_page.form._widgets["paths.model"].set_value(str(hub.cfg.path.parent / "nope.pt"))
     app.processEvents()
-    check("a missing path still saves", config_page.save() and not config_page._dirty)
-    check("but it is flagged", "paths.model" in config_page._show_warnings())
-    check("and it is not an error banner", not config_page.banner.isVisible())
+    assert config_page.save() and not config_page._dirty
+    assert "paths.model" in config_page._show_warnings()
+    assert not config_page.banner.isVisible()
 
-    # Leaving the page with unsaved edits asks; Save writes them on the way out.
+
+def test_leaving_configure_with_unsaved_edits_asks(app, hub, config_page) -> None:
     config_page.form._widgets["clips.pad"].setValue(3.0)
     asked: list[str] = []
     config_page._ask_unsaved = lambda: (asked.append("asked"), "save")[1]
     hub.go_to(0)
     app.processEvents()
     del config_page._ask_unsaved
-    check("navigating away asks, and Save writes",
-          asked == ["asked"] and not config_page._dirty
-          and abs(hub.cfg.clips.pad - 3.0) < 1e-9)
+    assert asked == ["asked"]
+    assert not config_page._dirty and abs(hub.cfg.clips.pad - 3.0) < 1e-9, "Save writes them"
 
-    # Downloading a shared model is the usual way to get one, so its button sits
-    # in the detection model row rather than off in a corner.
+
+def test_the_model_row_offers_a_shared_model(app, hub, config_page) -> None:
     from qtpy.QtWidgets import QPushButton
+
+    from trackanno.gui.hub import ConfigPage
+    from trackanno.project import write_config
 
     row = config_page.form._widgets["paths.model"].row
     labels = [row.itemAt(i).widget().text() for i in range(row.count())
               if isinstance(row.itemAt(i).widget(), QPushButton)]
-    check("the shared-model button leads the detection model row",
-          labels == ["Choose shared model...", "Browse"], str(labels))
-    check("and says what it does rather than where it comes from",
-          "shared model" in labels[0].lower())
+    assert labels == ["Choose shared model...", "Browse"], labels
 
-    # A project running a downloaded model still has a file path in
-    # paths.model, so the field on its own reads as the wrong answer.
     field = config_page.form._widgets["paths.model"]
-    # isHidden, not isVisible: the page itself may not be the one on screen.
-    check("nothing is claimed while the project uses a local file",
-          field.status.isHidden() and not field.status.text(), field.status.text())
+    # isHidden, not isVisible: the page may not be the one on screen.
+    assert field.status.isHidden() and not field.status.text(), (
+        "nothing is claimed for a local file")
 
-    from trackanno.project import write_config as _write
-
-    _write(project_config, {"model.source": "some-model", "model.version": "v3"})
-    hub.open_project(project_config)
+    write_config(hub.cfg.path, {"model.source": "some-model", "model.version": "v3"})
+    hub.open_project(hub.cfg.path)
     app.processEvents()
-    field = next(p for p in hub.pages if isinstance(p, ConfigPage)).form._widgets["paths.model"]
-    check("with a shared model it names the one in use",
-          "some-model v3" in field.status.text(), field.status.text())
-    check("and says the path is not what runs",
-          "not used" in field.status.text() and not field.status.isHidden())
-    check("the path is greyed out, since nothing reads it", not field.edit.isEnabled())
-    check("and carries no amber outline for pointing at nothing",
-          "paths.model" not in (config_page._show_warnings() or {}))
-    _write(project_config, {"model.source": ""})
-    hub.open_project(project_config)
-    app.processEvents()
+    page = next(p for p in hub.pages if isinstance(p, ConfigPage))
+    field = page.form._widgets["paths.model"]
+    assert "some-model v3" in field.status.text(), field.status.text()
+    assert "not used" in field.status.text() and not field.status.isHidden()
+    assert not field.edit.isEnabled(), "the unused path is greyed out"
+    assert "paths.model" not in (page._show_warnings() or {}), (
+        "no amber outline for an unused path")
 
-    # What is wrong on Detect & crop is a sentence, so it goes under the
-    # buttons rather than into the strip left over beside them.
+
+def test_the_scan_message_sits_below_the_buttons(hub) -> None:
     from trackanno.gui.hub import PreparePage
 
     prepare_page = next(p for p in hub.pages if isinstance(p, PreparePage))
@@ -1228,90 +1008,71 @@ def test_hub(app, project_config: Path) -> None:
     button_row = next(i for i, it in enumerate(rows) if it.layout() is not None)
     label_row = next(i for i, it in enumerate(rows)
                      if it.widget() is prepare_page.scan_state)
-    check("the scan message sits below the button row, not in it",
-          label_row == button_row + 1, f"buttons at {button_row}, message at {label_row}")
-    check("and wraps rather than being clipped", prepare_page.scan_state.wordWrap())
+    assert label_row == button_row + 1, f"buttons at {button_row}, message at {label_row}"
+    assert prepare_page.scan_state.wordWrap()
 
-    hub.close()
+
+@pytest.fixture
+def cache_hub(app):
+    """A hub on the generated clip cache, open on the Annotate page."""
+    from trackanno.gui.hub import Hub
+
+    window = Hub(str(make_project()))
+    window.show()
+    window.go_to(3)
+    app.processEvents()
+    yield window
+    window.close()
     app.processEvents()
 
 
-def test_hub_with_cache(app) -> None:
-    """The annotate page inside the hub, against a generated clip cache."""
-    from trackanno.config import load_config
-    from trackanno.gui.hub import ExportPage, Hub
+def test_annotate_keeps_its_panel_across_navigation(app, cache_hub) -> None:
+    panel = cache_hub.pages[3].panel
+    assert panel is not None
+    assert len(panel.order) == cache_hub.status.n_clips, "the whole cache is loaded"
 
-    repo_config = make_project(FIXTURES)
-    cfg = load_config(repo_config)
-
-    hub = Hub(str(repo_config))
-    hub.show()
-    hub.go_to(3)
-    app.processEvents()
-    panel = hub.pages[3].panel
-    check("the annotate page builds inside the hub", panel is not None)
-    check("it loaded the whole cache", len(panel.order) == hub.status.n_clips,
-          f"{len(panel.order)} vs {hub.status.n_clips}")
-
-    # Leaving the page and coming back must not lose the position or leak a panel.
     position = panel.position
-    hub.go_to(0)
+    cache_hub.go_to(0)
     app.processEvents()
-    hub.go_to(3)
+    cache_hub.go_to(3)
     app.processEvents()
-    check("returning to annotate keeps the same panel", hub.pages[3].panel is panel)
-    check("returning keeps the position", hub.pages[3].panel.position == position)
+    assert cache_hub.pages[3].panel is panel
+    assert cache_hub.pages[3].panel.position == position
 
-    # Autosave reloads the project every few seconds while you edit settings.
-    # That must not throw away the clip you were looking at.
+
+def test_a_config_reload_keeps_the_annotation_panel(app, cache_hub) -> None:
+    panel = cache_hub.pages[3].panel
     panel.position = min(3, len(panel.order) - 1)
     panel._load()
     at = panel.position
-    hub.reload_project()
+    cache_hub.reload_project()
     app.processEvents()
-    check("an unrelated config reload keeps the annotation panel",
-          hub.pages[3].panel is panel)
-    check("...and keeps the clip you were on", hub.pages[3].panel.position == at)
-
-    hub.close()
-    app.processEvents()
+    assert cache_hub.pages[3].panel is panel
+    assert cache_hub.pages[3].panel.position == at, "the current clip is kept"
 
 
-def test_later_steps_unlock(app) -> None:
-    """Model and Export must unlock as you annotate, not only on reopen.
-
-    They gate on the annotation count, but the per-clip update deliberately
-    skips the full project refresh (it would tear the annotation panel down), so
-    nothing re-checked them: the buttons stayed greyed out for the whole session
-    however much you labelled.
-    """
-    import shutil as _shutil
-
+def test_later_steps_unlock_while_annotating(app, tmp_path) -> None:
+    """Model and Export unlock as labels arrive, without a project reopen."""
     from trackanno.config import load_config
     from trackanno.gui.hub import ExportPage, Hub, ModelPage
     from trackanno.project import write_config
 
-    config_path = make_project(FIXTURES)
-    repo = config_path.parent
+    config_path = make_project()
     cfg = load_config(config_path)
-
-    scratch = Path(tempfile.mkdtemp(prefix="trackanno-unlock-"))
+    project = tmp_path / "p"
+    project.mkdir()
+    shutil.copy(config_path, project / "config.yaml")
+    # Same clip cache, empty CSV.
+    write_config(project / "config.yaml", {
+        "paths.work_dir": str(cfg.paths.work_dir).replace("\\", "/"),
+        "paths.csv": str(project / "fresh.csv").replace("\\", "/"),
+    })
+    hub = Hub(str(project / "config.yaml"))
+    hub.show()
+    app.processEvents()
     try:
-        project = scratch / "p"
-        project.mkdir()
-        _shutil.copy(config_path, project / "config.yaml")
-        # Same clip cache, but a CSV that starts empty.
-        write_config(project / "config.yaml", {
-            "paths.work_dir": str(cfg.paths.work_dir).replace("\\", "/"),
-            "paths.csv": str(project / "fresh.csv").replace("\\", "/"),
-        })
-        hub = Hub(str(project / "config.yaml"))
-        hub.show()
-        app.processEvents()
-        check("Model starts locked with no labels",
-              not hub.pages[4].tasks.run_button.isEnabled())
-        check("Export starts locked with no labels",
-              not hub.page(ExportPage).tasks.run_button.isEnabled())
+        assert not hub.pages[4].tasks.run_button.isEnabled(), "Model starts locked"
+        assert not hub.page(ExportPage).tasks.run_button.isEnabled(), "Export starts locked"
 
         hub.go_to(3)
         app.processEvents()
@@ -1321,56 +1082,37 @@ def test_later_steps_unlock(app) -> None:
             panel.categories.toggle(group.name, group.options[0].name)
             app.processEvents()
 
-        check("labels reached the CSV", len(panel.annotations) == 3)
-        check("the project-wide count is used, not the filtered one",
-              hub.status.n_annotated == len(panel.annotations))
-        check("Model unlocks while still on the Annotate page",
-              hub.pages[4].tasks.run_button.isEnabled())
-        check("Export unlocks too",
-              hub.page(ExportPage).tasks.run_button.isEnabled())
+        assert len(panel.annotations) == 3
+        assert hub.status.n_annotated == len(panel.annotations), "the project-wide count"
+        assert hub.pages[4].tasks.run_button.isEnabled(), "Model unlocks on the Annotate page"
+        assert hub.page(ExportPage).tasks.run_button.isEnabled()
 
         hub.go_to(hub.pages.index(hub.page(ExportPage)))
         app.processEvents()
-        check("Export lists the movies it can render",
-              hub.page(ExportPage).movies.count() > 0)
+        assert hub.page(ExportPage).movies.count() > 0, "Export lists movies to render"
 
-        # The Model page's distribution tab reads the same CSV.
         hub.go_to(hub.pages.index(hub.page(ModelPage)))
         app.processEvents()
         dist = hub.page(ModelPage).distribution
-        check("Distribution charts every category group",
-              len(dist._charts) == len(hub.cfg.categories), repr(list(dist._charts)))
+        assert len(dist._charts) == len(hub.cfg.categories), list(dist._charts)
         counted = sum(b.count for b in dist._charts[group.name].tally.bars
                       if b.name == group.options[0].name)
-        check("and counts what was actually labelled", counted == 3, str(counted))
+        assert counted == 3, counted
+    finally:
         hub.close()
         app.processEvents()
-    finally:
-        _shutil.rmtree(scratch, ignore_errors=True)
-
-    hub.close()
-    app.processEvents()
 
 
 # --------------------------------------------------------------------------- #
 # config templates
 # --------------------------------------------------------------------------- #
-def test_a_template_carries_settings_but_not_paths(root) -> None:
-    """The point of a template: keep the tuning, drop the project it came from.
-
-    Tuning the detector, the crop geometry and the category buttons is most of
-    the setup work for a dataset, and the next dataset wants the same answers.
-    What it must NOT bring is the previous project's movie folder or clip cache.
-    """
-    from trackanno.config import load_config
+def _tuned_source(root: Path) -> tuple[Path, Path]:
     from trackanno.project import create_project, write_config
-    from trackanno.templates import list_templates, save_template
 
     videos = root / "tpl-videos"
     videos.mkdir()
     weights = root / "tpl-model.pt"
     weights.write_bytes(b"")
-
     source = create_project(root / "tpl-a", video_dir=videos, model=weights)
     write_config(source, {
         "clips.frames": 33, "clips.min_clip_frames": 25, "clips.crop_size": 128,
@@ -1379,47 +1121,47 @@ def test_a_template_carries_settings_but_not_paths(root) -> None:
     }, categories=[{"name": "state", "type": "single", "required": True,
                     "options": [{"name": "swimming", "key": "1", "color": "#4C9F70"},
                                 {"name": "stuck", "key": "2", "color": "#D95F02"}]}])
+    return source, weights
 
+
+def test_a_template_carries_settings_but_not_paths(tmp_path) -> None:
+    """A template keeps the tuning and the model, not the folders or the annotator."""
+    from trackanno.config import load_config
+    from trackanno.project import create_project
+    from trackanno.templates import delete_template, list_templates, save_template
+
+    source, weights = _tuned_source(tmp_path)
     template = save_template("Trypanosome 100 fps", source)
-    check("the typed name is kept, punctuation and all",
-          template.name == "Trypanosome 100 fps", template.name)
-    check("the file name is a slug of it",
-          template.path.name == "trypanosome-100-fps.yaml", template.path.name)
-    names = [t.name for t in list_templates()]
-    check("it appears in the picker after the built-in and the shipped presets",
-          names[0] == "default" and names[-1] == "Trypanosome 100 fps", str(names))
+    try:
+        assert template.name == "Trypanosome 100 fps", "the typed name is kept"
+        assert template.path.name == "trypanosome-100-fps.yaml", "the file name is a slug"
+        names = [t.name for t in list_templates()]
+        assert names[0] == "default" and names[-1] == "Trypanosome 100 fps", (
+            f"listed after the built-in and the shipped presets: {names}")
 
-    other = root / "tpl-videos-2"
-    other.mkdir()
-    made = create_project(root / "tpl-b", video_dir=other, template="Trypanosome 100 fps")
-    cfg = load_config(made)
+        other = tmp_path / "tpl-videos-2"
+        other.mkdir()
+        made = create_project(tmp_path / "tpl-b", video_dir=other,
+                              template="Trypanosome 100 fps")
+        cfg = load_config(made)
+        assert (cfg.clips.frames, cfg.tiling.tile, cfg.tracking.backend) == (33, 1280, "botsort")
+        assert [g.name for g in cfg.categories] == ["state"]
+        assert [o.name for o in cfg.categories[0].options] == ["swimming", "stuck"]
+        assert cfg.paths.model == weights.resolve(), "the model comes across"
+        assert cfg.paths.video_dir == other.resolve(), "the movie folder does not"
+        assert cfg.paths.work_dir == (tmp_path / "tpl-b" / "work").resolve()
+        assert cfg.paths.csv == (tmp_path / "tpl-b" / "annotations.csv").resolve()
+        assert cfg.ui.annotator == "", "a template is a protocol, not a person"
 
-    check("the tuning came across",
-          (cfg.clips.frames, cfg.tiling.tile, cfg.tracking.backend)
-          == (33, 1280, "botsort"),
-          f"{cfg.clips.frames}, {cfg.tiling.tile}, {cfg.tracking.backend}")
-    check("so did the category buttons",
-          [g.name for g in cfg.categories] == ["state"]
-          and [o.name for o in cfg.categories[0].options] == ["swimming", "stuck"])
-    check("the model came across, since weights are reused between projects",
-          cfg.paths.model == weights.resolve(), str(cfg.paths.model))
-    check("the movie folder did NOT: this project has its own",
-          cfg.paths.video_dir == other.resolve(), str(cfg.paths.video_dir))
-    check("nor did the clip cache",
-          cfg.paths.work_dir == (root / "tpl-b" / "work").resolve(), str(cfg.paths.work_dir))
-    check("nor did the annotation log",
-          cfg.paths.csv == (root / "tpl-b" / "annotations.csv").resolve(), str(cfg.paths.csv))
-    check("nor the annotator: a template is a protocol, not a person",
-          cfg.ui.annotator == "", repr(cfg.ui.annotator))
-
-    text = made.read_text(encoding="utf-8")
-    check("the comments that document every setting survived", text.count("#") > 40)
-    check("and the template's own header line did not leak into the project",
-          not text.startswith("# trackanno template:"), text.splitlines()[0][:40])
+        text = made.read_text(encoding="utf-8")
+        assert text.count("#") > 40, "the documenting comments survive"
+        assert not text.startswith("# trackanno template:"), (
+            "the template header does not leak into the project")
+    finally:
+        delete_template("Trypanosome 100 fps")
 
 
 def test_a_template_can_be_found_however_it_is_named(root) -> None:
-    """The typed name, its slug and the file name all mean the same template."""
     from trackanno.config import load_config
     from trackanno.project import create_project
     from trackanno.templates import delete_template, find_template, save_template
@@ -1428,20 +1170,17 @@ def test_a_template_can_be_found_however_it_is_named(root) -> None:
     save_template("Wide Field 20x", source)
     for spelling in ("Wide Field 20x", "wide field 20x", "wide-field-20x"):
         found = find_template(spelling)
-        check(f"{spelling!r} finds it", found is not None and found.name == "Wide Field 20x")
-    check("an unknown name finds nothing", find_template("no such thing") is None)
-    check("and creating from it falls back to the built-in rather than failing",
-          load_config(create_project(root / "tpl-d", template="no such thing")).clips.frames
-          == 50)
+        assert found is not None and found.name == "Wide Field 20x", spelling
+    assert find_template("no such thing") is None
+    made = create_project(root / "tpl-d", template="no such thing")
+    assert load_config(made).clips.frames == 50, "an unknown template falls back to the built-in"
 
-    check("the built-in cannot be deleted", not delete_template("default"))
-    check("a saved one can", delete_template("Wide Field 20x"))
-    check("and is then gone", find_template("Wide Field 20x") is None)
-
+    assert not delete_template("default"), "the built-in cannot be deleted"
+    assert delete_template("Wide Field 20x")
+    assert find_template("Wide Field 20x") is None
 
 
 def test_a_template_that_would_not_load_is_refused(root) -> None:
-    """Storing a broken template only moves the failure to project creation."""
     from trackanno.project import create_project
     from trackanno.templates import find_template, save_template
 
@@ -1449,35 +1188,26 @@ def test_a_template_that_would_not_load_is_refused(root) -> None:
     text = source.read_text(encoding="utf-8")
     source.write_text(text.replace("frames: 50", "frames: not-a-number"), encoding="utf-8")
 
-    try:
+    with pytest.raises(Exception):
         save_template("broken", source)
-        refused = False
-    except Exception:
-        refused = True
-    check("a template that cannot be parsed is refused at save time", refused)
-    check("and nothing was stored", find_template("broken") is None)
+    assert find_template("broken") is None, "nothing was stored"
 
 
 def test_saving_a_template_twice_needs_permission(root) -> None:
-    """Overwriting somebody's tuned settings is a decision, not a default."""
     from trackanno.project import create_project
     from trackanno.templates import delete_template, save_template
 
     source = create_project(root / "tpl-f")
     save_template("dup", source)
     try:
-        save_template("dup", source)
-        refused = False
-    except FileExistsError:
-        refused = True
-    check("a second save under the same name is refused", refused)
-    check("unless overwrite is asked for",
-          save_template("dup", source, overwrite=True).name == "dup")
-    delete_template("dup")
+        with pytest.raises(FileExistsError):
+            save_template("dup", source)
+        assert save_template("dup", source, overwrite=True).name == "dup"
+    finally:
+        delete_template("dup")
 
 
 def test_the_new_project_dialog_offers_the_templates(app, root) -> None:
-    """The picker is the only place most people will meet this."""
     from trackanno.gui.hub import NewProjectDialog
     from trackanno.project import create_project
     from trackanno.templates import BUILTIN_NAME, delete_template, save_template
@@ -1486,27 +1216,28 @@ def test_the_new_project_dialog_offers_the_templates(app, root) -> None:
     save_template("from the dialog", source)
 
     dialog = NewProjectDialog()
-    items = [dialog.template.itemText(i) for i in range(dialog.template.count())]
-    check("the built-in is offered first and marked as such",
-          items[0] == "default (built in)", str(items))
-    check("the saved one is offered too", "from the dialog" in items, str(items))
-    check("the shipped presets are offered between them",
-          "annotator (preset)" in items and items.index("annotator (preset)")
-          < items.index("from the dialog"), str(items))
-    check("the default selection is the built-in",
-          dialog.values()["template"] == BUILTIN_NAME)
-    check("the built-in cannot be forgotten", not dialog.forget_btn.isEnabled())
+    try:
+        items = [dialog.template.itemText(i) for i in range(dialog.template.count())]
+        assert items[0] == "default (built in)", items
+        assert "from the dialog" in items, items
+        assert "annotator (preset)" in items, items
+        assert items.index("annotator (preset)") < items.index("from the dialog"), (
+            "shipped presets come before saved templates")
+        assert dialog.values()["template"] == BUILTIN_NAME
+        assert not dialog.forget_btn.isEnabled(), "the built-in cannot be forgotten"
 
-    dialog.template.setCurrentIndex(items.index("from the dialog"))
-    check("a saved one can be", dialog.forget_btn.isEnabled())
-    check("and choosing it is what create_project is handed",
-          dialog.values()["template"] == "from the dialog")
-    dialog.close()
-    delete_template("from the dialog")
+        dialog.template.setCurrentIndex(items.index("from the dialog"))
+        assert dialog.forget_btn.isEnabled()
+        assert dialog.values()["template"] == "from the dialog"
+    finally:
+        dialog.close()
+        delete_template("from the dialog")
 
 
+# --------------------------------------------------------------------------- #
+# export and shared models
+# --------------------------------------------------------------------------- #
 def test_export_can_open_the_project_folder(app, root, monkeypatch) -> None:
-    """The rendered movies are files somebody then does something else with."""
     from trackanno.gui import hub as H
     from trackanno.gui.hub import ExportPage, Hub
 
@@ -1514,36 +1245,29 @@ def test_export_can_open_the_project_folder(app, root, monkeypatch) -> None:
     window = Hub(str(project))
     try:
         page = next(p for p in window.pages if isinstance(p, ExportPage))
-        check("the button is on the Export page", page.open_folder.text() == "Open project folder")
+        assert page.open_folder.text() == "Open project folder"
 
         opened: list = []
         monkeypatch.setattr(H.export.os, "startfile", opened.append, raising=False)
         monkeypatch.setattr("sys.platform", "win32")
         page._open_project_folder()
-        check("it opens the folder the config lives in",
-              opened == [str(project.parent)], str(opened))
+        assert opened == [str(project.parent)], opened
 
-        check("a folder that is not there is reported, not raised",
-              "does not exist" in H._reveal(root / "gone"))
+        assert "does not exist" in H._reveal(root / "gone"), "a missing folder is reported"
     finally:
         window.close()
         app.processEvents()
 
 
 def test_browsing_to_a_file_stops_using_the_shared_model(app, root) -> None:
-    """paths.model is what you see; model.source is what runs.
-
-    Picking a local .pt while a downloaded model is configured used to change
-    only the visible half: the field showed the file, the project kept running
-    the shared weights, and the page kept saying so.
-    """
+    """Picking a local .pt drops model.source and its pin."""
     from trackanno.config import load_config
     from trackanno.gui.hub import ConfigPage, Hub
-    from trackanno.project import write_config as _write
+    from trackanno.project import write_config
 
     project = make_project(root / "swap")
-    _write(project, {"model.source": "some-model", "model.version": "v3",
-                     "model.sha256": "ab" * 32})
+    write_config(project, {"model.source": "some-model", "model.version": "v3",
+                           "model.sha256": "ab" * 32})
     local = project.parent / "small.pt"
     local.write_bytes(b"not really weights")
 
@@ -1551,45 +1275,35 @@ def test_browsing_to_a_file_stops_using_the_shared_model(app, root) -> None:
     try:
         page = next(p for p in window.pages if isinstance(p, ConfigPage))
         field = page.form._widgets["paths.model"]
-        check("the shared model is in use to begin with", not field.edit.isEnabled())
+        assert not field.edit.isEnabled(), "the shared model is in use to begin with"
 
-        # Exactly what the Browse dialog does once a file has been chosen.
+        # What the Browse dialog does once a file has been chosen.
         field.edit.setText(str(local).replace("\\", "/"))
         field.picked.emit(str(local).replace("\\", "/"))
-        check("the page waits for Save", page._dirty and "Save" in field.status.text(),
-              field.status.text())
-        check("the save lands", page.save() and not page._dirty)
+        assert page._dirty and "Save" in field.status.text(), field.status.text()
+        assert page.save() and not page._dirty
 
         after = load_config(project)
-        check("the shared model is dropped", not after.model.is_remote,
-              repr(after.model.source))
-        check("its pin goes with it", not after.model.version and not after.model.sha256)
-        check("and the picked file is what the project runs",
-              after.paths.model.name == "small.pt", str(after.paths.model))
-        check("the page stops claiming a shared model", not field.status.text(),
-              field.status.text())
-        check("and the path is editable again", field.edit.isEnabled())
+        assert not after.model.is_remote, after.model.source
+        assert not after.model.version and not after.model.sha256, "the pin goes with it"
+        assert after.paths.model.name == "small.pt", after.paths.model
+        assert not field.status.text(), field.status.text()
+        assert field.edit.isEnabled()
     finally:
         window.close()
         app.processEvents()
 
 
+class _Entry:
+    id, version, sha256 = "shared-pose", "v2", "cd" * 32
+    label = "shared-pose v2"
+
 
 def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> None:
-    """The registry is where a first model usually comes from.
-
-    Offering it only on the Configure page sends a new user straight back out of
-    the dialog they came to for exactly this. Nothing is downloaded while the
-    dialog is open, though: it can still be cancelled, and a cancelled dialog
-    that had already written 200 MB into the cache is a surprise.
-    """
+    """The dialog records the choice; nothing is downloaded while it is open."""
     from trackanno.gui import hub as H
 
-    class Entry:
-        id, version, sha256 = "shared-pose", "v2", "cd" * 32
-        label = "shared-pose v2"
-
-    entry = Entry()
+    entry = _Entry()
 
     class StubRegistry:
         def __init__(self, parent=None):
@@ -1608,15 +1322,11 @@ def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> 
         dialog.location.edit.setText(str(root))
         dialog._pick_shared_model()
 
-        check("the chosen model is what create_project must NOT be handed",
-              dialog.values()["model"] is None, str(dialog.values()["model"]))
-        check("...since it is not a file on this disk yet",
-              dialog.chosen_model() is entry)
-        check("the path field stops looking editable, as on the Configure page",
-              not dialog.model.edit.isEnabled())
-        check("and the row says which model, and that the path is dead",
-              "shared-pose v2" in dialog.model_note.text()
-              and "not used" in dialog.model_note.text(), dialog.model_note.text())
+        assert dialog.values()["model"] is None, "create_project is not handed the model"
+        assert dialog.chosen_model() is entry
+        assert not dialog.model.edit.isEnabled()
+        assert "shared-pose v2" in dialog.model_note.text(), dialog.model_note.text()
+        assert "not used" in dialog.model_note.text(), dialog.model_note.text()
 
         asked: list[str] = []
         monkeypatch.setattr(
@@ -1624,37 +1334,24 @@ def test_a_new_project_can_start_from_a_shared_model(app, root, monkeypatch) -> 
             lambda *a, **k: (asked.append(str(a[2])), H.project.QMessageBox.No)[1],
         )
         dialog._accept()
-        check("creating is not held up over a model that HAS been chosen",
-              not any("no detection model" in text for text in asked), str(asked))
+        assert not any("no detection model" in text for text in asked), (
+            f"a chosen shared model counts as a model: {asked}")
 
         picked = str(root / "small.pt")
         dialog.model.edit.setText(picked)
         dialog.model.picked.emit(picked)
-        check("browsing to a file drops the shared model, as Browse does elsewhere",
-              dialog.chosen_model() is None)
-        check("the path is editable again", dialog.model.edit.isEnabled())
-        check("and the file is what create_project is handed",
-              dialog.values()["model"] == picked, str(dialog.values()["model"]))
+        assert dialog.chosen_model() is None, "browsing to a file drops the shared model"
+        assert dialog.model.edit.isEnabled()
+        assert dialog.values()["model"] == picked
     finally:
         dialog.close()
 
 
 def test_the_shared_model_is_fetched_after_the_project_is_written(app, root, monkeypatch) -> None:
-    """Create first, download second, against the config just created.
-
-    The order is the point. The download is the slow half, and a project that
-    exists on disk can be configured, cancelled or reopened while it runs; a
-    fetch that had to finish first would make the New Project button a progress
-    bar. `_install_shared_model` is the same routine the Configure page uses, so
-    what a manifest may decide cannot differ between the two screens.
-    """
+    """Create first, then download into the config just created."""
     from trackanno.gui import hub as H
 
-    class Entry:
-        id, version, sha256 = "shared-pose", "v2", "cd" * 32
-        label = "shared-pose v2"
-
-    entry = Entry()
+    entry = _Entry()
     target = root / "fetched"
 
     class StubDialog:
@@ -1681,45 +1378,31 @@ def test_the_shared_model_is_fetched_after_the_project_is_written(app, root, mon
         page = next(p for p in window.pages if isinstance(p, H.ProjectPage))
         page._new_project()
 
-        check("the project is on disk before anything is downloaded",
-              (target / "config.yaml").exists())
-        check("the fetch is aimed at the config just written",
-              installed == [(entry, target / "config.yaml")], str(installed))
-        check("and the new project is the one open",
-              window.cfg is not None
-              and window.cfg.path == (target / "config.yaml").resolve(),
-              str(window.cfg.path if window.cfg else None))
+        assert (target / "config.yaml").exists()
+        assert installed == [(entry, target / "config.yaml")], installed
+        assert window.cfg is not None
+        assert window.cfg.path == (target / "config.yaml").resolve(), window.cfg.path
     finally:
         window.close()
         app.processEvents()
 
-def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
-    """One probe answers both, or the page shows one thing and the run does another.
 
-    The list counted CUDA devices while ``resolve_device`` only asked whether
-    CUDA was available at all and then assumed device 0. Those two questions are
-    answered by different layers of torch and are allowed to differ - so the
-    Configure page could offer no GPU while ``auto`` picked one regardless, which
-    is a run landing somewhere nobody was ever shown.
-    """
+def test_the_device_list_and_the_resolver_cannot_disagree() -> None:
+    """``auto`` only resolves to a device the list offers."""
     from trackanno.detect import tiling
 
     indices = tiling.cuda_devices()
     resolved = tiling.resolve_device("auto")
-    check("auto only ever resolves to a usable device",
-          resolved in {str(i) for i in indices} | {"cpu", "mps"}, f"auto -> {resolved}")
+    assert resolved in {str(i) for i in indices} | {"cpu", "mps"}, resolved
     if indices:
-        check("auto takes the first usable GPU", resolved == str(indices[0]), resolved)
+        assert resolved == str(indices[0]), f"auto takes the first usable GPU: {resolved}"
     else:
-        check("auto falls back rather than assuming device 0",
-              resolved != "0", resolved)
+        assert resolved != "0", f"auto does not assume device 0: {resolved}"
 
-    check("an index nobody offered is refused, not handed to ultralytics",
-          tiling.resolve_device("99") == "cpu", tiling.resolve_device("99"))
+    assert tiling.resolve_device("99") == "cpu", "an index nobody offered is refused"
 
     usable, why = tiling.cuda_status()
-    check("a refusal always carries a reason", usable or bool(why), repr((usable, why)))
-    check("and a working GPU carries none", not usable or not why, repr(why))
-    check("a device is named the way a log line reads it",
-          tiling.device_label("cpu") == "the CPU" and "mps" in tiling.device_label("mps"),
-          tiling.device_label("mps"))
+    assert usable or bool(why), "a refusal carries a reason"
+    assert not usable or not why, f"a working GPU carries none: {why!r}"
+    assert tiling.device_label("cpu") == "the CPU"
+    assert "mps" in tiling.device_label("mps")

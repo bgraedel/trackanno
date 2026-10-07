@@ -40,12 +40,10 @@ class Hub(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(1280, 860)
         self.cfg = None
-        # The config.yaml last opened, whether or not it loaded. A page that has
-        # to explain a refusal needs the file, and `cfg` is None exactly then.
+        # Last config.yaml opened, even if it failed to load.
         self.config_path: Path | None = None
         self.status = None
-        # Set while a job is rewriting the clip cache: release_caches() runs once,
-        # before the worker, so this is what stops Annotate re-mapping those files.
+        # True while a job rewrites the clip cache; keeps Annotate from re-mapping it.
         self.cache_job_running = False
         # Bumped whenever a different project (or none) is opened; tags jobs.
         self.project_gen = 0
@@ -75,7 +73,7 @@ class Hub(QMainWindow):
             )
             self.stack.addWidget(page)
 
-        # A permanent "what now" line, on every page.
+        # The "Next:" line under every page.
         self.hint = QLabel("")
         self.hint.setWordWrap(True)
         self.hint.setTextFormat(Qt.RichText)
@@ -123,7 +121,7 @@ class Hub(QMainWindow):
 
         opened = config_path or (recent_projects()[0] if recent_projects() else None)
         if not (opened and self.open_project(opened, quiet=True)):
-            # Nothing opened: the sidebar, pages and hint bar need a first paint.
+            # Nothing opened: paint the empty state.
             self.refresh_status(quiet=True)
 
     # -- project ------------------------------------------------------------ #
@@ -139,8 +137,7 @@ class Hub(QMainWindow):
         except Exception as exc:  # a broken config must not take the window down
             self.cfg = None
             self._switch_to(None)
-            # Tell every page the project went away: returning early leaves a
-            # live annotation panel writing into the previous project's CSV.
+            # Tell every page, so no panel keeps writing to the old project.
             self.status = None
             self.setWindowTitle("trackanno")
             self.refresh_status(quiet=True)
@@ -165,8 +162,7 @@ class Hub(QMainWindow):
             page._jobs.cancel()
 
     def page(self, kind):
-        """The page of a given class. Never by index: that shifts when a step is
-        inserted."""
+        """The page of a given class."""
         return next((p for p in self.pages if isinstance(p, kind)), None)
 
     def reload_project(self) -> None:
@@ -195,7 +191,7 @@ class Hub(QMainWindow):
         self._paint_hint()
 
     def _rebuild(self, page: Page) -> None:
-        """Run a page's on_project; one page's I/O must not take the window down."""
+        """Run a page's on_project, reporting rather than raising its errors."""
         page.rebuild_pending = False
         try:
             page.on_project()
@@ -204,8 +200,7 @@ class Hub(QMainWindow):
             self.statusBar().showMessage(f"{type(page).__name__}: {exc}", 10000)
 
     def release_caches(self) -> None:
-        """Let go of every clip-cache memory map this window holds. Anything that
-        rewrites the cache has to call this first on Windows."""
+        """Release every clip-cache memory map (needed before a rewrite on Windows)."""
         for page in self.pages:
             if isinstance(page, AnnotatePage):
                 page._teardown()
@@ -245,7 +240,7 @@ class Hub(QMainWindow):
                 f"{self.cfg.path}   |   {self.status.n_clips} clips, "
                 f"{self.status.n_annotated} annotated"
             )
-        # on_project tore the annotation page down; rebuild it if it is on screen.
+        # Rebuild the annotation panel if it is on screen.
         current = self.pages[self.sidebar.currentRow()] if self.sidebar.currentRow() >= 0 else None
         if isinstance(current, AnnotatePage):
             current.ensure_loaded()
@@ -266,16 +261,13 @@ class Hub(QMainWindow):
             page.refresh_gate()
         self._paint_sidebar()
         if not running:
-            # Bring the page back by itself, without waiting for a navigation.
             row = self.sidebar.currentRow()
             current = self.pages[row] if 0 <= row < len(self.pages) else None
             if isinstance(current, AnnotatePage):
                 current.ensure_loaded()
 
     def note_progress(self, n_annotated: int) -> None:
-        """Cheap counter update from the annotation panel, once per clip. Not
-        ``refresh_status``, which rebuilds every page - but the gates must still
-        be re-evaluated: Model and Export unlock on the first label."""
+        """Update the label count and page gates without rebuilding any page."""
         if self.status is not None:
             self.status.n_annotated = n_annotated
         for page in self.pages:
@@ -284,14 +276,13 @@ class Hub(QMainWindow):
         self._paint_hint()
 
     def next_step(self) -> tuple[str, int, str]:
-        """(advice, page index, button label) - what this project needs next."""
+        """(advice, page index, button label) for what this project needs next."""
         if self.cfg is None:
             return ("Open or create a project to begin.", 0, "")
         status = self.status
         if not status.work_known:
-            return ("The work folder is slow to answer; still counting what is "
-                    "prepared.", 0, "")
-        # Missing paths only block the NEXT detection run.
+            return ("The work folder is slow to answer; still counting.", 0, "")
+        # Missing paths only block the next detection run.
         if status.n_clips == 0 and (not status.video_dir_ok or not status.model_ok):
             missing = []
             if not status.video_dir_ok:
@@ -299,20 +290,18 @@ class Hub(QMainWindow):
             if not status.model_ok:
                 missing.append(f"model <code>{self.cfg.paths.model}</code>")
             return (
-                "Point the project at its data: " + " and ".join(missing) + " not found.",
+                "Not found: " + " and ".join(missing) + ". Set it on the Configure page.",
                 1, "Go to Configure",
             )
         if status.n_clips == 0:
             return (
-                f"{status.videos_text} movie(s) found and nothing prepared yet. "
-                "Run detection to build the clip cache.",
+                f"{status.videos_text} movie(s) found, none prepared. Run detection.",
                 2, "Go to Detect & crop",
             )
         if status.n_annotated < status.n_clips:
             note = (
                 "" if status.video_dir_ok and status.model_ok
-                else "<br><i>(the video folder or model is missing, so no further "
-                "movies can be prepared until that is fixed)</i>"
+                else "<br><i>(video folder or model missing: no more movies can be prepared)</i>"
             )
             return (
                 f"{status.n_annotated} of {status.n_clips} clips labelled. "
@@ -321,8 +310,7 @@ class Hub(QMainWindow):
             )
         target = PAGES.index("Model")
         return (
-            "Every clip is labelled. Check how they came out, train the "
-            "suggester on them, or export the overlay movies.",
+            "Every clip is labelled. Train the model or export overlay movies.",
             target, f"Go to {PAGES[target]}",
         )
 
@@ -360,7 +348,7 @@ class Hub(QMainWindow):
             self.statusBar().showMessage(blocker)
 
     def _step_states(self) -> list[tuple[str, str]]:
-        """(glyph, note) per step - a checklist, not six equal buttons."""
+        """(glyph, note) per sidebar step."""
         if self.cfg is None:
             return [(">", "start here")] + [("", "needs a project")] * (len(PAGES) - 1)
         s = self.status
@@ -403,7 +391,7 @@ class Hub(QMainWindow):
                 return
         for page in self.pages:
             page.shutdown()
-        # One shared budget: a job that will not stop is a daemon and is left.
+        # One shared 5 s budget for all jobs.
         deadline = time.monotonic() + 5.0
         for jobs in [self._jobs] + [page._jobs for page in self.pages]:
             jobs.shutdown(max(0.0, deadline - time.monotonic()))
@@ -411,8 +399,7 @@ class Hub(QMainWindow):
 
 
 def install_excepthook(window) -> None:
-    """Log an uncaught exception and show it in ``window``'s status bar instead
-    of letting PyQt abort the process."""
+    """Log uncaught exceptions to the terminal and status bar instead of aborting."""
     def hook(kind, value, tb):
         if issubclass(kind, KeyboardInterrupt):
             sys.__excepthook__(kind, value, tb)
@@ -448,8 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    # Before any widget exists: a stylesheet applied later has to re-polish the
-    # whole tree, and some widgets keep the old metrics.
+    # Theme before any widget exists.
     apply_theme(app, _preferred_theme(args.project))
     window = Hub(args.project)
     install_excepthook(window)

@@ -1,12 +1,4 @@
-"""Where a long job sends its progress, and how it is told to stop.
-
-A :class:`Reporter` is the seam that keeps ``print`` and ``tqdm`` out of the slow
-jobs (``prepare``, ``suggest``) and lets the GUI drive them: the CLI passes
-:class:`ConsoleReporter`, the GUI a :class:`CallbackReporter` whose callbacks
-marshal onto the Qt thread. Cancellation lives here because it must be checked
-wherever progress is emitted: a job that only checks between movies cannot be
-stopped inside one.
-"""
+"""Progress reporting and cancellation for long jobs, for the CLI and the GUI."""
 
 from __future__ import annotations
 
@@ -28,7 +20,7 @@ class Reporter:
         pass
 
     def overall(self, done: int, total: int, label: str = "") -> None:
-        """Progress across the whole run - movies finished, say."""
+        """Progress across the whole run, such as movies finished."""
 
     def stage(self, label: str, total: int | None = None) -> None:
         """Start a new sub-job with a known length."""
@@ -45,9 +37,7 @@ class Reporter:
 
     def track(self, iterable: Iterable, label: str | None = None,
               total: int | None = None) -> Iterator:
-        """Iterate, advancing the current stage and honouring cancellation. The
-        check lives in the same loop as the progress tick, so anything long
-        enough to need a progress bar is also interruptible."""
+        """Iterate, advancing the current stage and checking for cancellation."""
         if label is not None:
             if total is None:
                 try:
@@ -66,7 +56,7 @@ class NullReporter(Reporter):
 
 
 class ConsoleReporter(Reporter):
-    """tqdm + stdout: what the CLI has always done."""
+    """Reports to tqdm and stdout, for the CLI."""
 
     def __init__(self, quiet: bool = False):
         self.quiet = quiet
@@ -107,9 +97,7 @@ class ConsoleReporter(Reporter):
 
 
 class CallbackReporter(Reporter):
-    """Forwards to plain callables, and polls a threading.Event to cancel. Used
-    by the GUI worker thread; the callbacks emit Qt signals, the only thread-safe
-    way to touch widgets from off the UI thread."""
+    """Forwards to callables and polls a threading.Event to cancel; used by GUI workers."""
 
     def __init__(
         self,
@@ -125,8 +113,7 @@ class CallbackReporter(Reporter):
         self._on_progress = on_progress
         self._on_overall = on_overall
         self._stop = stop or threading.Event()
-        # A signal per frame at 100 fps floods the event loop and stops the UI
-        # repainting.
+        # Throttle so per-frame signals do not flood the Qt event loop.
         self._throttle = max(1, throttle)
         self._done = 0
         self._total: int | None = None

@@ -1,15 +1,6 @@
-"""Entry point 3: burn labelled boxes back onto the original movie.
+"""``trackanno render``: draw labelled or predicted boxes onto the original movie.
 
-    trackanno render --movie <movie_id> [--group behaviour] [--source both]
-
-Reads the tracks table (original full-frame coordinates) and the annotation CSV,
-colours each track by the category of the clip covering that frame, and writes an
-mp4; a partially annotated CSV is fine. Drawing is shared with the GUI.
-
-``--source`` picks what colours the boxes: your labels (default), the model's
-``predictions.parquet``, or both. A prediction is ALWAYS drawn dashed and
-captioned with its confidence and a ``~``, so an exported movie can never pass
-the model's output off as a hand label.
+Predictions are drawn dashed and captioned ``~value confidence``.
 """
 
 from __future__ import annotations
@@ -57,9 +48,7 @@ def default_group(cfg: Config) -> str:
 def build_frame_labels(
     annotations: pd.DataFrame, cfg: Config, group_name: str
 ) -> dict[int, dict[int, tuple[tuple[int, int, int], str]]]:
-    """frame -> {track_id: (rgb, label)} from the annotation rows: a view over
-    :func:`build_frame_marks`, never a second implementation of "which colour
-    does this cell mean"."""
+    """frame -> {track_id: (rgb, label)} from the annotation rows."""
     marks = build_frame_marks(annotations, None, cfg, group_name, "labels")
     return {
         frame: {tid: (mark.color, mark.text) for tid, mark in entries.items()}
@@ -73,7 +62,7 @@ class Mark:
 
     color: tuple[int, int, int]
     text: str
-    predicted: bool          # drawn dashed, so it can never read as a hand label
+    predicted: bool          # drawn dashed
 
 
 def build_frame_marks(
@@ -83,18 +72,10 @@ def build_frame_marks(
     group_name: str,
     source: str = "labels",
 ) -> dict[int, dict[int, Mark]]:
-    """frame -> {track_id: Mark}, from the labels, the predictions, or both.
+    """frame -> {track_id: Mark} from the labels, the predictions, or both.
 
-    With ``both`` a hand label always wins the box - drawn solid, the model's
-    opinion appended to the caption; untouched tracks keep the dashed mark.
-
-    TWO BOUTS MAY NOT COVER THE SAME FRAME OF THE SAME TRACK, and this function
-    raises if they do: within one group bouts are disjoint by construction, so a
-    collision means the decode or the file is wrong.
-
-    A hand label landing on a frame a prediction already claimed is NOT a
-    collision: it is what ``--source both`` is for, and the labels pass below
-    overwrites the dashed mark while keeping the model's answer in the caption.
+    With ``both`` a hand label wins and keeps the model's answer in its caption.
+    Raises ValueError if two predicted bouts cover one frame of one track.
     """
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {list(SOURCES)}")
@@ -112,8 +93,6 @@ def build_frame_marks(
     out: dict[int, dict[int, Mark]] = {}
     if source in ("predictions", "both") and predictions is not None:
         column, conf_column = f"{group_name}_pred", f"{group_name}_conf"
-        # One entry per painted ROW, not per painted frame, so the guard below can
-        # name the row it collided with without carrying a second frame-sized dict.
         claimed: dict[int, list[tuple[int, int, str]]] = {}
         for row in predictions.to_dict("records"):
             value = _clean(row.get(column))
@@ -141,17 +120,14 @@ def build_frame_marks(
                 f"the annotation CSV has no column {group_name!r}; "
                 f"available: {[c for c in annotations.columns]}"
             )
-        # By column name, not itertuples: itertuples renames any group whose name
-        # is not a Python identifier ("cell state" -> "_5").
+        # Not itertuples: it renames columns that are not identifiers.
         for row in annotations.to_dict("records"):
             value = _clean(row.get(group_name))
             if not value:
                 continue
             mark = Mark(colour_of(value), value, False)
             track_id = int(row["track_id"])
-            # No overlap guard on this pass: a hand label overwriting a
-            # prediction is what 'both' means, and two annotation rows
-            # overlapping is what `clips.stride` below `clips.frames` asks for.
+            # No overlap guard: overlapping hand labels are allowed.
             for frame in range(int(row["f_start"]), int(row["f_end"])):
                 existing = out.get(frame, {}).get(track_id)
                 text = value
@@ -169,37 +145,20 @@ def _overlap_message(
     f_end: int,
     value: str,
 ) -> str:
-    """Why two BOUTS meeting on one frame is fatal, in terms of the rows.
-
-    Names the frame, the track and BOTH spans, taken from the rows themselves,
-    so a duplicated row and a genuinely overlapping pair - which want different
-    fixes - do not read alike. Only reachable for rows carrying ``bout_id``;
-    overlapping WINDOW rows are a legitimate geometry and are painted, see
-    :func:`build_frame_marks`.
-    """
+    """The error for two predicted bouts covering one frame, naming both spans."""
     earlier = next(
         (f"[{s}, {e}) says {v!r}" for s, e, v in claimed.get(track_id, [])
          if s <= frame < e),
         "an earlier row says something else",
     )
     return (
-        f"frame {frame}, track {track_id}: two decoded bouts both cover it - "
-        f"{earlier} and [{f_start}, {f_end}) says {value!r}. A decode cuts a "
-        "track's frames into runs between inferred boundaries, so within one "
-        "group its bouts are disjoint by construction and two of them meeting is "
-        "not something a setting can ask for. The colour this frame would be "
-        "exported with comes from the order the rows happen to sit in the file "
-        "rather than from the model, so the movie would look entirely normal and "
-        "be wrong. Either predictions.parquet was edited or concatenated from "
-        "two runs, or the decode itself is broken - re-run `trackanno predict` and, if it "
-        "happens again, report it. Do not render this file as it stands"
+        f"frame {frame}, track {track_id}: two decoded bouts overlap ({earlier}; "
+        f"[{f_start}, {f_end}) says {value!r}); re-run `trackanno predict`"
     )
 
 
 def _clean(value) -> str:
-    """A category cell as a usable string, or "" if there is nothing there: an
-    empty cell reads back from pandas as float NaN, whose str() is a truthy
-    "nan"."""
+    """A category cell as a stripped string, or "" for empty or NaN."""
     text = "" if value is None else str(value).strip()
     return "" if not text or text.lower() == "nan" else text
 
@@ -229,8 +188,7 @@ def render_movie(
         Normalizer.load(norm_path) if norm_path.exists()
         else Normalizer.from_movie(movie, cfg.normalize)
     )
-    # A curve built with `trackanno prepare --limit-frames N` covers only N frames;
-    # clamping past its end reuses frame N-1's mapping and jumps the brightness.
+    # A curve from `prepare --limit-frames N` covers only N frames.
     if not normalizer.covers(n_frames):
         reporter.log(
             f"intensity curve covers only {normalizer.length} of {n_frames} frames "
@@ -297,12 +255,10 @@ def render_movie(
 
 
 # --------------------------------------------------------------------------- #
-# batch driver - shared by the CLI and the GUI
+# batch driver, shared by the CLI and the GUI
 # --------------------------------------------------------------------------- #
 def annotated_movies(cfg: Config) -> dict[str, int]:
-    """{movie_id: annotated clip count}, straight from the CSV. Never raises: a
-    throw on the GUI's project-open path, which startup repeats, would lock the
-    window out for good. A broken CSV is reported and treated as empty."""
+    """{movie_id: annotated clip count} from the CSV; a broken CSV warns and counts as empty."""
     if not cfg.paths.csv.exists():
         return {}
     try:
@@ -326,12 +282,7 @@ def render_all(
     reporter=None,
     source: str = "labels",
 ) -> list[Path]:
-    """Draw labelled boxes onto every requested movie.
-
-    ``source`` is ``labels`` (the CSV, default), ``predictions`` or ``both``; a
-    missing predictions file raises rather than rendering an empty overlay,
-    which looks exactly like "the model had no opinion". ``hide_unlabelled``
-    None means ``cfg.render.hide_unlabelled``."""
+    """Draw labelled or predicted boxes onto every requested movie; returns the written paths."""
     if hide_unlabelled is None:
         hide_unlabelled = cfg.render.hide_unlabelled
     from ..progress import Cancelled, NullReporter
@@ -356,9 +307,7 @@ def render_all(
         predictions = load_predictions(cfg, group_name)
         stale = staleness(cfg)
         if stale:
-            # Not fatal, but say it out loud: nothing in the rendered movie
-            # reveals which model drew the dashed boxes.
-            reporter.log(f"the predictions may be out of date - {stale}", "warning")
+            reporter.log(f"the predictions may be out of date: {stale}", "warning")
 
     if source == "labels":
         available = sorted(annotations["movie_id"].astype(str).unique())
@@ -375,7 +324,7 @@ def render_all(
         raise ValueError(f"no annotations for {unknown}. Annotated movies: {available}")
 
     suffix = ".mp4"
-    # Provenance in the name: never overwrite or impersonate a hand-coloured one.
+    # Predicted renders get a suffix so they never overwrite a labels render.
     tag = "" if source == "labels" else f"__{source}"
     written: list[Path] = []
 
@@ -415,7 +364,7 @@ def render_all(
         except Cancelled:
             raise
         except Exception as exc:
-            reporter.log(f"{movie_id}: FAILED - {type(exc).__name__}: {exc}", "error")
+            reporter.log(f"{movie_id}: FAILED: {type(exc).__name__}: {exc}", "error")
         finally:
             movie.close()
     reporter.overall(len(wanted), len(wanted), "done")

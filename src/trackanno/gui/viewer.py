@@ -1,10 +1,6 @@
-"""Clip viewers behind one small interface.
+"""The clip player: grayscale frames with a vector marker on top.
 
-``SimpleViewer`` is a self-contained player: canvas, QTimer and slider. The
-overlay is never rasterised, so the cached clip stays grayscale and the marker
-is vector graphics one hairline wide at any zoom. Centring and zoom are
-display-time transforms of a :class:`~trackanno.view.overlay.ClipView`, unclamped, so
-a clip cropped at the movie border still shows the animal dead centre.
+Centring and zoom are display-time transforms of a :class:`~trackanno.view.overlay.ClipView`.
 """
 
 from __future__ import annotations
@@ -24,37 +20,27 @@ __all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas", "follow_combo"]
 
 
 def follow_combo(mode: str = "centred") -> QComboBox:
-    """The selector for what the view follows, built once for every window.
-
-    Both the annotation window and the review window offer this choice, and a
-    mode has to mean the same thing in each: the same names, the same wording,
-    the same order to cycle through.
-    """
+    """The shared "view follows" selector for the annotation and review screens."""
     combo = QComboBox()
     for i, name in enumerate(FOLLOW_MODES):
         combo.addItem(name, name)
         combo.setItemData(i, FOLLOW_LABELS[name], Qt.ToolTipRole)
     combo.setCurrentIndex(FOLLOW_MODES.index(mode) if mode in FOLLOW_MODES else 0)
-    # Sized to its content: a fixed width below minimumSizeHint gets crushed.
     combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
     combo.setFocusPolicy(Qt.NoFocus)
-    combo.setToolTip(
-        "\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES)
-        + "\n\nBoth read the same cached pixels, so switching is free."
-    )
+    combo.setToolTip("\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES))
     return combo
 
 
 def _background() -> QColor:
-    """Deliberately darker than the window: the crop should read as film, not
-    as another panel."""
+    """Canvas background, darker than the window."""
     return QColor(tokens()["canvas"])
 
 
 def _to_qimage(frame: np.ndarray) -> QImage:
     frame = np.ascontiguousarray(frame)
     if not frame.flags.writeable:
-        # QImage wants a writable buffer; clip-cache views are read-only memmaps.
+        # QImage needs a writable buffer; cache views are read-only.
         frame = frame.copy()
     if frame.ndim == 2:
         h, w = frame.shape
@@ -64,7 +50,7 @@ def _to_qimage(frame: np.ndarray) -> QImage:
 
 
 class ClipViewer(QWidget):
-    """Interface implemented by both backends."""
+    """Viewer interface."""
 
     frame_changed = Signal(int)
 
@@ -102,7 +88,7 @@ class ClipCanvas(QWidget):
         self.setMinimumSize(320, 320)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAutoFillBackground(False)
-        # Clicking the video is how keyboard control comes back after a note.
+        # Clicking the video returns keyboard focus after typing a note.
         self.setFocusPolicy(Qt.ClickFocus)
 
         self._array: np.ndarray | None = None
@@ -131,10 +117,7 @@ class ClipCanvas(QWidget):
 
     # -- geometry ----------------------------------------------------------- #
     def _mapping(self):
-        """(origin_x, origin_y, k, source_x, source_y) for the current frame.
-
-        ``k`` is display px per cache px. The source square may hang off the
-        cached crop; the caller clips and the outside stays background."""
+        """(origin_x, origin_y, k, source_x, source_y); ``k`` is display px per cache px."""
         if self._array is None:
             return None
         size = float(self._array.shape[1])
@@ -155,8 +138,7 @@ class ClipCanvas(QWidget):
             return None
         pix = self._pixmaps[t]
         if pix is None:
-            # Unscaled, so the cache survives zoom, resize and re-centre; the
-            # painter applies the scale at blit time.
+            # Cached unscaled; scaling happens at draw time.
             pix = QPixmap.fromImage(_to_qimage(self._array[t]))
             self._pixmaps[t] = pix
         return pix
@@ -178,8 +160,7 @@ class ClipCanvas(QWidget):
 
         extent = min(self.width(), self.height()) - 4
         painter.setClipRect(QRectF(ox, oy, extent, extent))
-        # Nearest neighbour on purpose: these are 100-250 px crops, and
-        # smoothing invents detail an annotator would read as real.
+        # Nearest neighbour: smoothing would invent detail.
         painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
         painter.drawPixmap(
             QRectF(ox - sx * k, oy - sy * k, pix.width() * k, pix.height() * k),
@@ -217,8 +198,7 @@ class ClipCanvas(QWidget):
             self._paint_skeleton(painter, view.kpts[t], to_screen, dim)
 
     def _paint_reticle(self, painter, rect: QRectF, dim: bool) -> None:
-        """Four corner brackets plus a faint box, in screen space: the pen stays
-        1.6 px at any zoom, so the marker never grows into the animal."""
+        """Corner brackets and a faint box, drawn in screen space at a fixed pen width."""
         arm = max(5.0, min(rect.width(), rect.height()) * 0.26)
         x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
         corners = [
@@ -234,8 +214,7 @@ class ClipCanvas(QWidget):
                 painter.drawLine(QPointF(cx, cy), QPointF(cx + dx, cy))
                 painter.drawLine(QPointF(cx, cy), QPointF(cx, cy + dy))
 
-        # Dark halo first: the crop is bright where the animal is and near-black
-        # around it, so a single-colour marker vanishes on one or the other.
+        # Dark halo first, so the marker shows on bright and dark pixels.
         halo = QPen(QColor(0, 0, 0, 140), 4.0)
         halo.setCapStyle(Qt.RoundCap)
         strokes(halo)
@@ -281,9 +260,6 @@ class SimpleViewer(ClipViewer):
 
         self.canvas = ClipCanvas()
 
-        # A fresh viewer is not playing. The annotation window starts it when
-        # ui.autoplay says so and the label follows; the review window never
-        # does, and a "Pause" button over a still picture reads as a stall.
         self._play_btn = QPushButton("Play")
         self._play_btn.setFixedWidth(70)
         self._play_btn.clicked.connect(self.toggle_play)
@@ -315,11 +291,7 @@ class SimpleViewer(ClipViewer):
     # -- interface ---------------------------------------------------------- #
     def set_clip(self, array: np.ndarray, view: ClipView | None = None,
                  frame: int = 0) -> None:
-        """Show ``array``, starting on ``frame``.
-
-        Set here rather than by a seek afterwards, which would paint frame 0
-        first.
-        """
+        """Show ``array``, starting on ``frame``."""
         self._array = array
         self.canvas.set_clip(array, view)
         n = int(array.shape[0])
@@ -333,11 +305,7 @@ class SimpleViewer(ClipViewer):
         self._counter.setText(f"{frame + 1} / {n}")
 
     def set_scrubber(self, visible: bool) -> None:
-        """Show or hide the slider and counter under the picture.
-
-        The review window hides them: it has a frame axis of its own, and this
-        slider spans only the frames decoded so far.
-        """
+        """Show or hide the slider and counter under the picture."""
         self._slider.setVisible(bool(visible))
         self._counter.setVisible(bool(visible))
 
@@ -379,8 +347,7 @@ class SimpleViewer(ClipViewer):
         return self._timer.isActive()
 
     def seek(self, frame: int) -> None:
-        """Jump to a frame. Drives the slider, not ``_frame``, which is what
-        keeps the counter and ``frame_changed`` consistent."""
+        """Jump to a frame (via the slider, so the counter and signal follow)."""
         if self._array is None:
             return
         self._slider.setValue(max(0, min(int(frame), self._array.shape[0] - 1)))

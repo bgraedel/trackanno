@@ -1,30 +1,6 @@
-"""Detection weights fetched from a release, cached on disk, and self-describing.
+"""Model registry: detection weights from GitHub releases, sha256-checked and cached by digest.
 
-A model is named in ``config.yaml`` (``model.source``) rather than being a file
-somebody had to copy onto this machine. The first run downloads it into a
-content-addressed cache under the state directory; every run after that is a
-cache hit and never touches the network.
-
-Hosting is GitHub Releases: the index lives at a release asset, so
-``https://github.com/<owner>/<repo>/releases/latest/download/index.json`` always
-names the current set, while each entry's ``url`` points at one release's asset
-and is therefore immutable.
-
-Three rules, all about not running the wrong code:
-
-* **The registry URL is a machine setting, never a project one.** It lives in the
-  state directory. Loading weights runs the pickle inside them, so a
-  ``config.yaml`` somebody sends you may name a model id but may not decide which
-  server it comes from.
-* **https only, and the digest is checked.** A download whose sha256 does not
-  match its manifest is deleted rather than cached, and ``model.sha256`` is
-  written back into the project on the first success.
-* **A cache hit never reaches the network.** A miss with no connection fails
-  naming the id, the digest and the directory it looked in.
-
-The manifest carries what a checkpoint cannot: the keypoint NAMES, the skeleton
-``edges``, the ``imgsz`` the model was validated at and a sensible tile size.
-:func:`apply_manifest` writes them into the project and returns what it changed.
+The registry URL and token are machine settings, never project ones: loading weights runs code.
 """
 
 from __future__ import annotations
@@ -53,19 +29,16 @@ ENV_REGISTRY = "TRACKANNO_MODEL_REGISTRY"
 CHUNK = 1 << 20
 TIMEOUT = 30.0
 
-# What this tool can load and drive. A registry may list anything else too -
-# segmentation and fluorescence models are useful to publish beside these - and
-# such an entry stays listed and downloadable, with the reason given.
+# What trackanno can run; other registry entries stay listed and downloadable.
 RUNNABLE_FRAMEWORKS = ("ultralytics",)
 RUNNABLE_TASKS = ("detect", "pose")
 
 
 class RegistryError(RuntimeError):
-    """Anything that stops a model being resolved, phrased for the person."""
+    """A model that cannot be resolved, with a readable message."""
 
 
-# Loopback is the exception to the https rule: a connection that never leaves
-# the machine cannot be tampered with in transit.
+# Plain http is allowed only to this machine.
 _LOOPBACK = ("http://127.0.0.1", "http://localhost", "http://[::1]")
 
 
@@ -77,7 +50,7 @@ def is_trusted_url(url: str) -> bool:
 
 @dataclass(frozen=True)
 class ModelEntry:
-    """One model in the registry, and everything known about it."""
+    """One model entry in the registry index."""
 
     id: str
     url: str
@@ -112,7 +85,7 @@ class ModelEntry:
 
     @property
     def trained_at(self) -> str:
-        """What acquisition this model saw, for choosing between two of them."""
+        """The frame rate and pixel size the model was trained at."""
         from_ = self.assumes or {}
         bits = [describe_span(from_.get("fps"), "fps"),
                 describe_span(from_.get("pixel_size_um"), "um/px")]
@@ -126,8 +99,7 @@ class ModelEntry:
         runs = f"{'/'.join(RUNNABLE_FRAMEWORKS)} {' and '.join(RUNNABLE_TASKS)} models"
         is_a = " ".join(b for b in (self.framework or "an unstated framework",
                                     self.task) if b)
-        return (f"trackanno runs {runs}; {self.id} is {is_a}. It can be found and "
-                "downloaded here, and something else has to run it.")
+        return f"trackanno runs {runs}; {self.id} is {is_a}, so it can only be downloaded"
 
     @property
     def name(self) -> str:
@@ -141,17 +113,10 @@ class ModelEntry:
         if not str(d.get("id", "")).strip():
             raise RegistryError("a registry entry is missing 'id'")
         if not (str(d.get("url", "")).strip() or str(d.get("asset", "")).strip()):
-            raise RegistryError(
-                f"{d['id']}: an entry needs either a 'url' or an 'asset' naming a "
-                "file in the same release"
-            )
+            raise RegistryError(f"{d['id']}: an entry needs a 'url' or an 'asset'")
         url = str(d.get("url", "") or "").strip()
         if url and not is_trusted_url(url):
-            raise RegistryError(
-                f"{d['id']}: model urls must be https, got {url!r}. Weights are "
-                "executed when they are loaded, so they are not fetched over a "
-                "channel that can be rewritten in transit."
-            )
+            raise RegistryError(f"{d['id']}: model urls must be https, got {url!r}")
         return cls(
             id=str(d["id"]).strip(),
             url=url,
@@ -192,11 +157,7 @@ def registry_url() -> str:
 
 
 def set_registry_url(url: str) -> None:
-    """Point this machine at a registry. Empty clears it.
-
-    Takes ``github://owner/repo[@tag]``, which goes through the API and so works
-    on a private repository, or a plain https URL to an index.json.
-    """
+    """Set this machine's registry (``github://owner/repo[@tag]`` or an https URL); empty clears."""
     url = str(url or "").strip()
     if url and _github_source(url) is None and not is_trusted_url(url):
         raise RegistryError(
@@ -217,12 +178,7 @@ def cache_dir() -> Path:
 # the index
 # --------------------------------------------------------------------------- #
 def token() -> str:
-    """The GitHub token, from the environment or the state file. "" if none.
-
-    Kept beside the registry URL and never in ``config.yaml``, for the same
-    reason: a project someone sends you may name a model, and must not be able
-    to make your credentials fetch from somewhere else.
-    """
+    """The GitHub token from the environment or the state file, or ""."""
     for name in ("TRACKANNO_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         value = os.environ.get(name, "").strip()
         if value:
@@ -239,12 +195,7 @@ def _settings() -> dict:
 
 
 def _get(url: str, timeout: float = TIMEOUT, accept: str = ""):
-    """One GET, with the token attached only when talking to GitHub.
-
-    Scoped deliberately: a token sent to whatever host an index happens to name
-    would leak it to that host. Anything outside api.github.com is fetched
-    anonymously, which is all a public release needs.
-    """
+    """One GET; the token is sent only to GitHub's API hosts."""
     headers = {"User-Agent": "trackanno"}
     if accept:
         headers["Accept"] = accept
@@ -261,12 +212,7 @@ def _get(url: str, timeout: float = TIMEOUT, accept: str = ""):
 # GitHub releases
 # --------------------------------------------------------------------------- #
 def _github_source(url: str) -> tuple[str, str, str] | None:
-    """``github://owner/repo[@tag]`` -> (owner, repo, tag). None for anything else.
-
-    A private repository has no anonymous download URL, so its assets have to be
-    fetched through the API. Naming the repository rather than an asset URL also
-    survives re-uploading a release, since assets are resolved by name each time.
-    """
+    """``github://owner/repo[@tag]`` to (owner, repo, tag); None for other URLs."""
     text = str(url or "").strip()
     if not text.lower().startswith("github://"):
         return None
@@ -286,23 +232,18 @@ def _release(owner: str, repo: str, tag: str = "") -> dict:
         with _get(url, accept="application/vnd.github+json") as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception as exc:
-        hint = "" if token() else (
-            "\nNo GitHub token is set on this machine, which a private "
-            "repository needs. Set one with `trackanno.video.models.set_token(...)` or "
-            "the GH_TOKEN environment variable."
-        )
+        hint = "" if token() else "; a private repository needs GH_TOKEN or set_token()"
         raise RegistryError(f"could not read the release at {url}: {exc}{hint}") from exc
 
 
 def _asset_url(release: dict, name: str) -> str:
-    """The API URL of a named asset, which is what works on a private repo."""
+    """The API URL of a named release asset (works for private repos)."""
     for asset in release.get("assets") or []:
         if str(asset.get("name", "")) == name:
             return str(asset.get("url", ""))
     offered = ", ".join(str(a.get("name")) for a in release.get("assets") or []) or "none"
     raise RegistryError(
-        f"the release {release.get('tag_name', '?')!r} has no asset named {name!r}. "
-        f"It offers: {offered}"
+        f"release {release.get('tag_name', '?')!r} has no asset {name!r}; it offers: {offered}"
     )
 
 
@@ -316,12 +257,9 @@ def set_token(value: str) -> None:
 
 
 def list_models(refresh: bool = False) -> list[ModelEntry]:
-    """Every model the registry offers, newest index first.
+    """Every model the registry offers, from the cached index unless ``refresh``.
 
-    The index is cached, so the picker still fills in offline. ``refresh`` goes
-    to the network and falls back to the cached copy if that fails, since a
-    registry being unreachable should not empty a list that was fine yesterday.
-    """
+    A failed refresh falls back to the cached copy."""
     url = registry_url()
     if not url:
         return []
@@ -345,10 +283,7 @@ def list_models(refresh: bool = False) -> list[ModelEntry]:
         raise RegistryError(f"the registry index at {url} is not valid JSON: {exc}") from exc
     entries = data.get("models") if isinstance(data, dict) else data
     if not isinstance(entries, list):
-        raise RegistryError(
-            f"the registry index at {url} should be a list of models, or an object "
-            "with a 'models' list"
-        )
+        raise RegistryError(f"the registry index at {url} must be a list or have a 'models' list")
     return [ModelEntry.parse(e) for e in entries]
 
 
@@ -365,19 +300,13 @@ def _read_index(url: str) -> str:
 
 
 def download_url(entry: "ModelEntry") -> str:
-    """Where ``entry``'s weights actually come from.
-
-    An absolute ``url`` is used as given. An ``asset`` name is looked up in the
-    registry's own release, which is what lets a PRIVATE repository work: its
-    assets have no anonymous download URL and must go through the API.
-    """
+    """The download URL for ``entry``: its ``url``, or its ``asset`` in the registry's release."""
     if entry.url:
         return entry.url
     source = _github_source(registry_url())
     if source is None:
         raise RegistryError(
-            f"{entry.id} names the asset {entry.asset!r}, but the registry is not a "
-            "github://owner/repo source, so there is no release to look it up in"
+            f"{entry.id} names asset {entry.asset!r}, which needs a github://owner/repo registry"
         )
     owner, repo, tag = source
     return _asset_url(_release(owner, repo, tag), entry.asset)
@@ -392,9 +321,7 @@ def find_model(model_id: str, version: str = "") -> ModelEntry | None:
     if version:
         exact = [m for m in matches if m.version.lower() == str(version).strip().lower()]
         return exact[0] if exact else None
-    # No version asked for: the newest. An index keeps one entry per (id,
-    # version) in that order, so an id can offer several and a project that
-    # pinned an older one keeps getting it.
+    # No version asked for: the last (newest) entry.
     return matches[-1] if matches else None
 
 
@@ -410,8 +337,7 @@ def _digest(path: Path) -> str:
 
 
 def cached_path(sha256: str, name: str = "") -> Path | None:
-    """The cached file for a digest, if it is there. Content-addressed, so two
-    ids naming the same weights share one copy."""
+    """The cached file for a digest, or None."""
     if not sha256:
         return None
     directory = cache_dir() / sha256[:16]
@@ -428,13 +354,7 @@ def cached_path(sha256: str, name: str = "") -> Path | None:
 
 
 def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
-    """Return a local path to ``entry``'s weights, downloading them if needed.
-
-    The digest decides the cache location, so a re-download of the same weights
-    is a no-op and a changed file cannot overwrite a good one. ``expect_sha256``
-    is the project's pin: when it disagrees with what arrives, nothing is cached
-    and the mismatch is reported.
-    """
+    """A local path to ``entry``'s weights, downloaded and checked against the pinned digest."""
     from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
@@ -469,21 +389,15 @@ def fetch(entry: ModelEntry, reporter=None, expect_sha256: str = "") -> Path:
     except Exception as exc:
         staged.unlink(missing_ok=True)
         raise RegistryError(
-            f"could not download {entry.id} ({entry.url or entry.asset}): {exc}\n"
-            f"The cache is {directory}; a model already there is used without "
-            "any network access."
+            f"could not download {entry.id} ({entry.url or entry.asset}): {exc}"
         ) from exc
 
     got = sha.hexdigest()
     if wanted and got != wanted:
         staged.unlink(missing_ok=True)
         raise RegistryError(
-            f"{entry.id} downloaded from {entry.url or entry.asset} has sha256 "
-            f"{got}, but "
-            f"{wanted} was expected. Nothing was cached. Either the release was "
-            "changed after this project pinned it, or the download is not what "
-            "it claims to be; weights are executed when loaded, so this is "
-            "refused rather than warned about."
+            f"{entry.id} from {entry.url or entry.asset} has sha256 {got}, expected "
+            f"{wanted}; not cached"
         )
 
     target_dir = directory / got[:16]
@@ -518,13 +432,7 @@ def prune_cache(keep: set[str] | None = None) -> int:
 # resolution
 # --------------------------------------------------------------------------- #
 def local_model_path(cfg) -> Path:
-    """The weights already on this disk, without downloading anything.
-
-    For the status readout and the checkpoint probe, which run on every project
-    open and must never start a 200 MB transfer. Falls back to ``paths.model``,
-    so a project that has not fetched its model yet reads as "not there" rather
-    than as an error.
-    """
+    """The local weights path without downloading; falls back to ``paths.model``."""
     try:
         return resolve_model(cfg, allow_download=False)
     except Exception:
@@ -532,13 +440,7 @@ def local_model_path(cfg) -> Path:
 
 
 def resolve_model(cfg, reporter=None, allow_download: bool = True) -> Path:
-    """The weights this config means, as a local file.
-
-    ``model.source`` empty gives ``paths.model`` unchanged, which is what a
-    project built around a local checkpoint uses. Otherwise the id or URL is
-    resolved against the cache, downloading once. Everything downstream is
-    handed a path and never learns that a network was involved.
-    """
+    """The config's weights as a local file: ``paths.model``, or ``model.source`` via the cache."""
     spec = getattr(cfg, "model", None)
     if spec is None or not spec.is_remote:
         return cfg.paths.model
@@ -552,10 +454,9 @@ def resolve_model(cfg, reporter=None, allow_download: bool = True) -> Path:
             known = ", ".join(m.id for m in list_models()) or "none"
             where = registry_url() or "no registry is configured on this machine"
             raise RegistryError(
-                f"model.source is {spec.source!r}"
+                f"the registry ({where}) does not offer model.source {spec.source!r}"
                 + (f" version {spec.version!r}" if spec.version else "")
-                + f", which the registry does not offer.\nRegistry: {where}\n"
-                f"Available: {known}"
+                + f"; available: {known}"
             )
 
     pinned = spec.sha256 or entry.sha256
@@ -563,29 +464,19 @@ def resolve_model(cfg, reporter=None, allow_download: bool = True) -> Path:
     if hit is not None:
         return hit
     if not allow_download:
-        raise RegistryError(
-            f"{entry.id} is not in the cache ({cache_dir()}) and downloading is "
-            "switched off for this call"
-        )
+        raise RegistryError(f"{entry.id} is not in the cache ({cache_dir()})")
     return fetch(entry, reporter, expect_sha256=spec.sha256)
 
 
 # --------------------------------------------------------------------------- #
 # what the manifest configures
 # --------------------------------------------------------------------------- #
-# `config` is keyed by consumer: trackanno reads the sections below and ignores
-# the rest, so `config.cellpose` reaches a cellpose runner untouched. Only these
-# sections may be set from a manifest - a model may say how it should be run, but
-# not point the project at different movies, work directory or annotation log.
+# Config sections a manifest may set; paths and the rest are never touched.
 _ALLOWED_SECTIONS = ("detection", "tiling", "tracking", "clips", "spectral")
 
 
 def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str]:
-    """Write the manifest's settings into the project. Returns what changed.
-
-    Returned rather than logged, so the Configure page can report what a model
-    decided in the same breath as applying it.
-    """
+    """Write the manifest's settings into the project; returns one line per change or refusal."""
     from ..config import load_config, schema_keys
     from ..project import write_config
 
@@ -612,9 +503,7 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
                 updates[f"{section}.{key}"] = value
                 told.append(f"{section}.{key} {value}")
 
-    # A task this tool cannot drive is reported rather than written: setting
-    # detection.task to something the loader rejects would fail the whole apply
-    # with a config error, which says nothing about what actually went wrong.
+    # Report an unsupported task instead of writing it.
     if entry.task and not entry.runnable:
         told.append(f"NOT applied: {entry.unsupported_reason}")
     elif entry.task and before.detection.task != entry.task:
@@ -637,9 +526,7 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
     if digest or entry.sha256:
         updates["model.sha256"] = (digest or entry.sha256).lower()
 
-    # A value the loader rejects must cost that value, not the whole apply. A
-    # manifest is written elsewhere, so one bad number should not stop a model
-    # configuring the rest of the project.
+    # On failure, apply key by key so one bad value skips only itself.
     try:
         write_config(config_path, updates, keypoints=keypoints)
     except Exception:
@@ -660,12 +547,7 @@ def apply_manifest(config_path, entry: ModelEntry, digest: str = "") -> list[str
 
 
 def span(value) -> tuple[float, float] | None:
-    """What a range in ``assumes`` covers, as ``(low, high)``. None if absent.
-
-    Accepts a scalar for a model trained at one scale and a list for one trained
-    across several; a list is read as its min and max either way, the only
-    question asked being whether an acquisition falls inside what the model saw.
-    """
+    """``(low, high)`` of a scalar or list in ``assumes``; None if absent."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -678,7 +560,7 @@ def span(value) -> tuple[float, float] | None:
 
 
 def describe_span(value, unit: str) -> str:
-    """``0.325 um`` or ``0.2 to 0.65 um``, for a person choosing a model."""
+    """``0.325 um`` or ``0.2 to 0.65 um``."""
     bounds = span(value)
     if bounds is None:
         return ""
@@ -689,11 +571,7 @@ def describe_span(value, unit: str) -> str:
 
 
 def _outside(measured, value) -> bool:
-    """Whether a measured acquisition falls outside what the model was trained on.
-
-    A tolerance of 1% absorbs the difference between a nominal magnification and
-    what the metadata actually reports, which is not a mismatch worth a warning.
-    """
+    """Whether ``measured`` falls outside the trained span, with 1% tolerance."""
     bounds = span(value)
     if bounds is None or measured is None:
         return False
@@ -703,17 +581,7 @@ def _outside(measured, value) -> bool:
 
 
 def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
-    """Where a project disagrees with what the model was trained on.
-
-    Reported, never corrected: only the person knows whether a mismatch is the
-    experiment or a mistake. Silent when they agree or when nothing can be
-    compared.
-
-    A project carries no pixel size of its own, it being a property of each movie
-    (ND2 records it, TIFF does not), so pass ``pixel_size_um`` when one has been
-    read. Without it, a model trained at a SINGLE scale still gets a line; a
-    multi-scale one gets nothing, having no constraint to state.
-    """
+    """Warnings where the frame rate or ``pixel_size_um`` differ from the model's training data."""
     out: list[str] = []
     assumes = entry.assumes or {}
 
@@ -722,9 +590,7 @@ def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
     if _outside(project_fps, fps):
         out.append(
             f"{entry.id} was trained at {describe_span(fps, 'fps')}; this project "
-            f"reads TIFFs at {project_fps} fps. Every rate reported is per second, "
-            "so the features stay comparable, but the beat may fall outside what a "
-            "clip of this length can resolve."
+            f"reads TIFFs at {project_fps} fps"
         )
 
     pixels = assumes.get("pixel_size_um")
@@ -733,14 +599,11 @@ def mismatch_warnings(cfg, entry: ModelEntry, pixel_size_um=None) -> list[str]:
         if _outside(pixel_size_um, pixels):
             out.append(
                 f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels; "
-                f"these movies are {float(pixel_size_um):g} um. Magnification "
-                "changes the apparent size of everything it detects, so check the "
-                "first few detections before running the whole batch."
+                f"these movies are {float(pixel_size_um):g} um, so check the first detections"
             )
         elif pixel_size_um is None and bounds[0] == bounds[1]:
             out.append(
-                f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels "
-                "only. At a different magnification, scale tiling.tile with it, "
-                "or retrain."
+                f"{entry.id} was trained on {describe_span(pixels, 'um')} pixels only; "
+                "at another magnification scale tiling.tile with it"
             )
     return out

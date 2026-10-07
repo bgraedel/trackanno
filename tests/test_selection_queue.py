@@ -1,17 +1,4 @@
-"""What the annotation queue does once a selector starts choosing clips.
-
-A separate suite from ``test_gui_headless``, which is deliberately one long
-scenario whose every step depends on the state the step before it left. These
-claims are orthogonal to that: they need a stubbed ``Suggester.selection_batch``
-and a fresh CSV per scenario, and threading them through the existing narrative
-would make both harder to read than either is now.
-
-The stub is the point rather than a shortcut. ``selection_batch`` is built
-separately and needs a trained model to say anything, so stubbing it is what
-makes these tests statements about the QUEUE - where a batch lands relative to a
-forward-only cursor, and whose reason ends up in the CSV - instead of statements
-about a classifier.
-"""
+"""The annotation queue with a stubbed selector: batch placement and CSV provenance."""
 
 from __future__ import annotations
 
@@ -20,7 +7,6 @@ import random
 
 import pytest
 
-from harness import check
 from trackanno.annotate.clips import ClipStore
 from trackanno.config import load_config
 from trackanno.gui.app import SELECT_BATCH_SIZE
@@ -31,25 +17,17 @@ from trackanno.annotate.store import (
 
 @pytest.fixture(scope="module")
 def cfg(root):
-    """A generated project, never the repository's own."""
     from fixtures import make_project
 
     config = load_config(make_project(root))
-    # How many labels a scenario may write before a background refit would fire
-    # and make the queue depend on a real model. Nothing here writes five.
+    # No scenario writes five labels, so no background refit fires.
     config.suggest.retrain_every = 5
     return config
 
 
 @pytest.fixture(scope="module")
 def store(cfg):
-    """The clip cache, closed on the way out.
-
-    `make_project` hands every suite the same generated project, so the memory
-    maps opened here are maps of the file a later suite re-runs detection over -
-    and on Windows a mapped file cannot be overwritten at all. Dropping the
-    reference and leaving it to the collector makes that a matter of GC timing.
-    """
+    """The clip cache, closed explicitly so Windows releases the memory maps."""
     store = ClipStore(cfg.paths.work_dir)
     yield store
     store.close()
@@ -96,21 +74,39 @@ class StubSuggester:
 
 
 def shuffled_baseline(cfg, store) -> list[int]:
-    """The order the GUI has always produced: the seeded shuffle of the manifest."""
+    """The seeded shuffle of the manifest that the GUI serves without a selector."""
     order = list(store.manifest.index)
     if cfg.ui.shuffle:
         random.Random(0).shuffle(order)
     return order
 
 
-def build(cfg, store, root, name: str):
-    """A real widget over a CSV of its own."""
+@pytest.fixture
+def build(app, cfg, store, root):
+    """Factory for a real widget over a CSV of its own; shut down after the test."""
     from trackanno.gui.app import AnnotationWidget
 
-    path = root / f"{name}.csv"
-    path.unlink(missing_ok=True)
-    annotations = AnnotationStore(path, cfg)
-    return AnnotationWidget(cfg, store, annotations), annotations, path
+    made = []
+
+    def make(name: str):
+        path = root / f"{name}.csv"
+        path.unlink(missing_ok=True)
+        annotations = AnnotationStore(path, cfg)
+        widget = AnnotationWidget(cfg, store, annotations)
+        made.append((widget, path))
+        app.processEvents()
+        return widget, annotations, path
+
+    yield make
+    for widget, path in made:
+        widget.shutdown()
+        path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def stubbed(monkeypatch):
+    """Replace the real Suggester with ``StubSuggester`` for widgets built afterwards."""
+    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
 
 
 def rows_of(path) -> dict[str, dict]:
@@ -129,98 +125,72 @@ def label(widget, app, option: int = 0) -> str:
 
 # --------------------------------------------------------------------------- #
 def test_the_default_config_leaves_the_queue_and_the_csv_exactly_as_they_were(
-    app, cfg, store, root
+    app, cfg, store, build
 ) -> None:
-    """No selection configured must be indistinguishable from no selector at all.
+    """With no selection configured the queue is the shuffle and ``selected_by`` stays empty."""
+    widget, annotations, path = build("default")
 
-    Both halves matter. A queue that differs by one position has re-randomised
-    somebody's session for no reason, and a `selected_by` cell that is anything
-    but empty claims a sample was drawn a way it was not - the store spells the
-    empty cell as NOT RECORDED precisely so that nothing has to guess.
-    """
-    widget, annotations, path = build(cfg, store, root, "default")
-    app.processEvents()
-
-    check("the real suggester is in place", type(widget.suggester).__name__ == "Suggester")
-    check("selection is off out of the box", not cfg.suggest.selection_on,
-          cfg.suggest.select_rule)
-    check("no model is trained in this project", not widget.suggester.ready)
-    check("so the selector has nothing to say",
-          widget.suggester.selection_batch(store.manifest, set(), 5) == [])
-    check("the queue is the seeded shuffle, unchanged",
-          widget.order == shuffled_baseline(cfg, store),
-          f"{widget.order[:6]} vs {shuffled_baseline(cfg, store)[:6]}")
-    check("nothing has been served", widget._served == {})
+    assert type(widget.suggester).__name__ == "Suggester", "the real suggester is in place"
+    assert not cfg.suggest.selection_on, (
+        f"selection is off out of the box: {cfg.suggest.select_rule}")
+    assert not widget.suggester.ready, "no model is trained in this project"
+    assert widget.suggester.selection_batch(store.manifest, set(), 5) == [], (
+        "the selector has nothing to say")
+    assert widget.order == shuffled_baseline(cfg, store), (
+        f"the queue is the seeded shuffle, unchanged: {widget.order[:6]} vs {shuffled_baseline(cfg, store)[:6]}")
+    assert widget._served == {}, "nothing has been served"
 
     clip_id = label(widget, app)
-    check("the label was written", annotations.is_done(clip_id))
+    assert annotations.is_done(clip_id), "the label was written"
     row = rows_of(path)[clip_id]
-    check("the provenance column exists", PROVENANCE_COLUMN in row)
-    check("and it says NOT RECORDED, not 'chosen at random'",
-          row[PROVENANCE_COLUMN] == "", repr(row[PROVENANCE_COLUMN]))
-    check("which decodes to the empty answer",
-          decode_provenance(row[PROVENANCE_COLUMN]) == {})
-
-    widget.shutdown()
-    path.unlink(missing_ok=True)
+    assert PROVENANCE_COLUMN in row, "the provenance column exists"
+    assert row[PROVENANCE_COLUMN] == "", (
+        f"it says NOT RECORDED, not 'chosen at random': {row[PROVENANCE_COLUMN]!r}")
+    assert decode_provenance(row[PROVENANCE_COLUMN]) == {}, (
+        "which decodes to the empty answer")
 
 
 def test_a_batch_leads_the_queue_and_leaves_everything_else_in_place(
-    app, cfg, store, root, monkeypatch
+    app, cfg, store, build, stubbed
 ) -> None:
-    """The picks open the session; the rest of the shuffle keeps its own order.
-
-    The second half is what stops a batch from re-randomising the queue: a clip
-    the selector said nothing about must be exactly where the shuffle left it
-    relative to its neighbours, or every filter change becomes a reshuffle.
-    """
-    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
-    widget, annotations, path = build(cfg, store, root, "leads")
-    app.processEvents()
+    """The picks open the session; the rest of the shuffle keeps its own order."""
+    widget, annotations, path = build("leads")
 
     baseline = list(widget.order)
-    check("an empty batch leaves the shuffle alone",
-          baseline == shuffled_baseline(cfg, store))
+    assert baseline == shuffled_baseline(cfg, store), (
+        "an empty batch leaves the shuffle alone")
 
-    # The LAST two clips of the shuffle, in reverse, so leading the queue is a
-    # real move and a hook that quietly did nothing would fail this.
+    # The last two clips of the shuffle, reversed, so leading the queue is a real move.
     picked = [baseline[-1], baseline[-2]]
-    check("the picks are not where the shuffle already put them",
-          baseline[:2] != picked)
+    assert baseline[:2] != picked, "the picks are not where the shuffle already put them"
     widget.suggester.batch = [
         selection(widget._clip_ids[i], rank) for rank, i in enumerate(picked)
     ]
     widget._apply_filters(initial=True)
     app.processEvents()
 
-    check("the picks lead the queue, in rank order",
-          widget.order[:2] == picked, f"{widget.order[:2]} vs {picked}")
-    check("the cursor opens on the top-ranked pick", widget.position == 0)
-    check("every clip is still in the queue exactly once",
-          sorted(widget.order) == sorted(baseline))
-    check("everything else keeps its relative order",
-          [i for i in widget.order if i not in picked]
-          == [i for i in baseline if i not in picked])
-    check("each pick's reason was kept",
-          all(widget._clip_ids[i] in widget._served for i in picked))
+    assert widget.order[:2] == picked, (
+        f"the picks lead the queue, in rank order: {widget.order[:2]} vs {picked}")
+    assert widget.position == 0, "the cursor opens on the top-ranked pick"
+    assert sorted(widget.order) == sorted(baseline), (
+        "every clip is still in the queue exactly once")
+    assert ([i for i in widget.order if i not in picked]
+            == [i for i in baseline if i not in picked]), (
+        "everything else keeps its relative order")
+    assert all(widget._clip_ids[i] in widget._served for i in picked), (
+        "each pick's reason was kept")
 
-    check("the selector was offered the reachable clips and only those",
-          widget.suggester.pools[-1] == [widget._clip_ids[i] for i in baseline])
-    check("and asked for the configured batch size",
-          widget.suggester.sizes[-1] == SELECT_BATCH_SIZE,
-          str(widget.suggester.sizes[-1]))
-
-    widget.shutdown()
-    path.unlink(missing_ok=True)
+    assert widget.suggester.pools[-1] == [widget._clip_ids[i] for i in baseline], (
+        "the selector was offered the reachable clips and only those")
+    assert widget.suggester.sizes[-1] == SELECT_BATCH_SIZE, (
+        f"asked for the configured batch size: {widget.suggester.sizes[-1]}")
 
 
 def test_the_csv_separates_the_selector_s_picks_from_the_annotator_s_own_detours(
-    app, cfg, store, root, monkeypatch
+    app, cfg, store, build, stubbed
 ) -> None:
     """A pick records the rule and score that chose it; any other clip records nothing."""
-    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
-    widget, annotations, path = build(cfg, store, root, "provenance")
-    app.processEvents()
+    widget, annotations, path = build("provenance")
 
     baseline = list(widget.order)
     picked = [baseline[-1], baseline[-2]]
@@ -235,41 +205,27 @@ def test_the_csv_separates_the_selector_s_picks_from_the_annotator_s_own_detours
     second_id = label(widget, app)
     manual_id = label(widget, app)
 
-    check("all three were written", all(annotations.is_done(c) for c in
-                                        (ranked_id, second_id, manual_id)))
-    check("the third clip was not one of the picks",
-          manual_id not in {widget._clip_ids[i] for i in picked})
+    assert all(annotations.is_done(c) for c in (ranked_id, second_id, manual_id))
+    assert manual_id not in {widget._clip_ids[i] for i in picked}, (
+        "the third clip was not one of the picks")
 
     rows = rows_of(path)
     ranked = decode_provenance(rows[ranked_id][PROVENANCE_COLUMN])
-    check("a pick records the rule that chose it", ranked["rule"] == "margin",
-          repr(ranked))
-    check("and the score that earned it", ranked["score"] == pytest.approx(0.83))
-    check("and its rank in the batch", ranked["rank"] == 0)
-    check("and the pool it was chosen from", ranked["pool_size"] == 120)
-    check("the second pick records its own rank",
-          decode_provenance(rows[second_id][PROVENANCE_COLUMN])["rank"] == 1)
-    check("a clip the selector did not pick records nothing",
-          rows[manual_id][PROVENANCE_COLUMN] == "", repr(rows[manual_id]))
-
-    widget.shutdown()
-    path.unlink(missing_ok=True)
+    assert ranked["rule"] == "margin", f"a pick records the rule that chose it: {ranked!r}"
+    assert ranked["score"] == pytest.approx(0.83), "the score that earned it"
+    assert ranked["rank"] == 0, "its rank in the batch"
+    assert ranked["pool_size"] == 120, "the pool it was chosen from"
+    assert decode_provenance(rows[second_id][PROVENANCE_COLUMN])["rank"] == 1, (
+        "the second pick records its own rank")
+    assert rows[manual_id][PROVENANCE_COLUMN] == "", (
+        f"a clip the selector did not pick records nothing: {rows[manual_id]!r}")
 
 
 def test_a_refresh_re_queues_behind_the_cursor_and_never_under_it(
-    app, cfg, store, root, monkeypatch
+    app, cfg, store, build, stubbed
 ) -> None:
-    """A refit landing mid-session must not move the clip being judged.
-
-    Navigation is forward-only, so the two failures are symmetric: a pick placed
-    BEFORE the cursor is unreachable forever, and a queue rebuilt AROUND the
-    cursor yanks away the clip somebody is halfway through reading. The picks
-    therefore go immediately after the clip on screen, which is the earliest slot
-    that is both reachable and not the one in use.
-    """
-    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
-    widget, annotations, path = build(cfg, store, root, "refresh")
-    app.processEvents()
+    """A refit mid-session queues fresh picks right after the clip on screen."""
+    widget, annotations, path = build("refresh")
 
     baseline = list(widget.order)
     first = [baseline[-1], baseline[-2]]
@@ -282,72 +238,52 @@ def test_a_refresh_re_queues_behind_the_cursor_and_never_under_it(
 
     widget.next_clip()
     app.processEvents()
-    check("the cursor walked into the batch", widget.position == 1)
+    assert widget.position == 1, "the cursor walked into the batch"
 
-    # The next batch deliberately re-picks a clip the cursor has already passed
-    # and one further down. The first is the unreachable case, and it is only
-    # unreachable because navigation never goes backwards on its own. Neither is
-    # the clip that will be on screen - that one is tested separately below.
+    # Re-pick one clip the cursor has passed and one further down.
     behind, ahead = queued[0], queued[3]
     widget.suggester.batch = [
         selection(widget._clip_ids[behind], 0, score=0.95),
         selection(widget._clip_ids[ahead], 1, score=0.91),
     ]
     labelled = label(widget, app)
-    check("a label alone does not re-rank the queue", widget.order == queued,
-          f"{widget.order} vs {queued}")
-    check("the label was still written", annotations.is_done(labelled))
-    check("and auto-advance left the cursor one further on", widget.position == 2)
+    assert widget.order == queued, (
+        f"a label alone does not re-rank the queue: {widget.order} vs {queued}")
+    assert annotations.is_done(labelled), "the label was still written"
+    assert widget.position == 2, "auto-advance left the cursor one further on"
 
     on_screen = widget._clip_ids[widget.order[widget.position]]
     widget.model_refreshed.emit()
     app.processEvents()
 
-    check("the clip on screen is the same clip",
-          widget._clip_ids[widget.order[widget.position]] == on_screen,
-          f"{widget._clip_ids[widget.order[widget.position]]} vs {on_screen}")
-    check("the fresh picks sit immediately after it",
-          widget.order[widget.position + 1:widget.position + 3] == [behind, ahead],
-          f"{widget.order} at {widget.position}")
-    check("a pick the cursor had passed was brought back within reach",
-          widget.order.index(behind) > widget.position)
-    check("no clip was lost or duplicated by the re-queue",
-          sorted(widget.order) == sorted(baseline))
+    assert widget._clip_ids[widget.order[widget.position]] == on_screen, (
+        "the clip on screen did not move")
+    assert widget.order[widget.position + 1:widget.position + 3] == [behind, ahead], (
+        f"the fresh picks sit immediately after it: {widget.order} at {widget.position}")
+    assert widget.order.index(behind) > widget.position, (
+        "a pick the cursor had passed was brought back within reach")
+    assert sorted(widget.order) == sorted(baseline), (
+        "no clip was lost or duplicated by the re-queue")
 
-    # And forward-only navigation really does reach them.
     widget.next_clip()
     app.processEvents()
-    check("next lands on the top fresh pick",
-          widget.order[widget.position] == behind)
+    assert widget.order[widget.position] == behind, "next lands on the top fresh pick"
     requeued_id = label(widget, app)
-    check("which records the reason from the batch that re-queued it",
-          decode_provenance(rows_of(path)[requeued_id][PROVENANCE_COLUMN])["score"]
-          == pytest.approx(0.95))
-
-    widget.shutdown()
-    path.unlink(missing_ok=True)
+    requeued = decode_provenance(rows_of(path)[requeued_id][PROVENANCE_COLUMN])
+    assert requeued["score"] == pytest.approx(0.95), "the re-queuing batch's reason is kept"
 
 
 def test_the_clip_already_on_screen_is_never_claimed_by_the_selector(
-    app, cfg, store, root, monkeypatch
+    app, cfg, store, build, stubbed
 ) -> None:
-    """A pick the annotator was already looking at is not the selector's doing.
-
-    The selector scores every unlabelled clip, so the one on screen is a
-    candidate like any other and a refit can perfectly well name it. But it was
-    put there by the queue that came before, not by this batch, and writing this
-    batch's rule on it would claim the row entered the labelled set because the
-    model asked for it. The weaker claim is the true one.
-    """
-    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
-    widget, annotations, path = build(cfg, store, root, "anchor")
-    app.processEvents()
+    """A pick that is already on screen does not get the selector's reason."""
+    widget, annotations, path = build("anchor")
 
     baseline = list(widget.order)
     anchor = widget.order[widget.position]
     on_screen = widget._clip_ids[anchor]
     other = baseline[-1]
-    check("the two are different clips", other != anchor)
+    assert other != anchor, "the two are different clips"
 
     widget.suggester.batch = [
         selection(on_screen, 0, score=0.99),
@@ -356,36 +292,24 @@ def test_the_clip_already_on_screen_is_never_claimed_by_the_selector(
     widget.model_refreshed.emit()
     app.processEvents()
 
-    check("the clip on screen stayed on screen",
-          widget.order[widget.position] == anchor)
-    check("and was not also queued a second time",
-          widget.order.count(anchor) == 1)
-    check("the other pick landed immediately after it",
-          widget.order[widget.position + 1] == other, str(widget.order))
-    check("a batch really was served", widget._served != {})
-    check("but the selector's reason was not attached to the anchor",
-          on_screen not in widget._served)
+    assert widget.order[widget.position] == anchor, "the clip on screen stayed on screen"
+    assert widget.order.count(anchor) == 1, "was not also queued a second time"
+    assert widget.order[widget.position + 1] == other, (
+        f"the other pick landed immediately after it: {widget.order}")
+    assert widget._served != {}, "a batch really was served"
+    assert on_screen not in widget._served, (
+        "the selector's reason was not attached to the anchor")
 
-    check("labelling it labels the same clip", label(widget, app) == on_screen)
+    assert label(widget, app) == on_screen, "labelling it labels the same clip"
     recorded = rows_of(path)[on_screen][PROVENANCE_COLUMN]
-    check("and records no selector reason", recorded == "", repr(recorded))
-
-    widget.shutdown()
-    path.unlink(missing_ok=True)
+    assert recorded == "", f"records no selector reason: {recorded!r}"
 
 
 def test_a_selector_that_raises_is_reported_and_the_shuffle_carries_on(
-    app, cfg, store, root, monkeypatch
+    app, cfg, store, build, stubbed
 ) -> None:
-    """A broken selector costs the ranking, never the ability to annotate.
-
-    Said out loud, because a selector that silently stops selecting is one nobody
-    ever fixes - and every row written afterwards would carry a reason that had
-    quietly stopped being true.
-    """
-    monkeypatch.setattr("trackanno.gui.app.Suggester", StubSuggester)
-    widget, annotations, path = build(cfg, store, root, "broken")
-    app.processEvents()
+    """A broken selector is reported and the shuffle carries on."""
+    widget, annotations, path = build("broken")
     baseline = list(widget.order)
 
     said: list[str] = []
@@ -398,10 +322,8 @@ def test_a_selector_that_raises_is_reported_and_the_shuffle_carries_on(
     widget._apply_filters(initial=True)
     app.processEvents()
 
-    check("the queue falls back to the shuffle", widget.order == baseline)
-    check("and the annotator is told why",
-          any("clip selection is off" in m for m in said), repr(said))
-    check("nothing was served", widget._served == {})
+    assert widget.order == baseline, "the queue falls back to the shuffle"
+    assert any("clip selection is off" in m for m in said), (
+        f"the annotator is told why: {said!r}")
+    assert widget._served == {}, "nothing was served"
 
-    widget.shutdown()
-    path.unlink(missing_ok=True)

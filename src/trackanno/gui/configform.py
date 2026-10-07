@@ -1,8 +1,6 @@
-"""config.yaml as a form.
+"""config.yaml as a form; help, choices and ranges come from the config schema.
 
-Saving goes through :func:`trackanno.project.write_config`, which keeps the
-file's comments. Tooltips, choices and ranges come from the config schema
-(:mod:`trackanno.config`). Only keys the user changed since loading are written.
+Only keys changed since loading are written, via :func:`trackanno.project.write_config`.
 """
 
 from __future__ import annotations
@@ -120,8 +118,7 @@ NEEDS_REPREPARE = _reprepare_keys()
 
 
 class ConfigForm(QScrollArea):
-    """Scalar settings, grouped by purpose. ``scope`` is ``basic``,
-    ``advanced`` (everything else) or ``all``."""
+    """Scalar settings grouped by purpose; ``scope`` is ``basic``, ``advanced`` or ``all``."""
 
     changed = Signal()
 
@@ -133,10 +130,9 @@ class ConfigForm(QScrollArea):
         self._kinds: dict[str, str] = {}
         self._status: dict[str, QLabel] = {}
         self._rows: dict[str, QHBoxLayout] = {}
-        # What the form showed straight after loading; values() writes only
-        # what differs from it.
+        # Values at load; values() returns only what differs.
         self._at_load: dict[str, Any] = {}
-        # A field's own tooltip while mark() shows a warning in its place.
+        # Original tooltips while mark() shows a warning instead.
         self._tips: dict[str, str] = {}
 
         body = QWidget()
@@ -161,7 +157,7 @@ class ConfigForm(QScrollArea):
             for dotted, kind, label, extra in chosen:
                 tip = f"{dotted}: {help_for(dotted)}"
                 if dotted in NEEDS_REPREPARE:
-                    tip += "\nChanging this means running Detect & crop again."
+                    tip += "\nChanging this needs Detect & crop re-run."
                 widget = self._make_widget(dotted, kind, extra)
                 widget.setToolTip(tip)
                 name = QLabel(label + ("  *" if dotted in NEEDS_REPREPARE else ""))
@@ -214,7 +210,7 @@ class ConfigForm(QScrollArea):
         return getattr(widget, "row", None) or self._rows.get(dotted)
 
     def set_status(self, dotted: str, text: str) -> None:
-        """Say something under a field that its value cannot say for itself."""
+        """Show a note under a field."""
         widget = self._widgets.get(dotted)
         if widget is not None and hasattr(widget, "set_status"):
             widget.set_status(text)
@@ -300,7 +296,7 @@ class ConfigForm(QScrollArea):
             widget.blockSignals(False)
 
     def show_resolved(self, values: dict) -> None:
-        """Say what each 'auto' stands for, from the whole file's dotted values."""
+        """Show what each 'auto' resolves to, given all dotted values."""
         from ..config import Clips, Predict
 
         def number(key: str, default):
@@ -314,7 +310,7 @@ class ConfigForm(QScrollArea):
         clips = Clips(frames=frames, stride=stride)
         predict = Predict(window_stride=values.get("predict.window_stride", "auto"))
         self._resolve("predict.window_stride", predict.resolved_stride(clips))
-        # crop_size resolves from the movies, which nothing here has read.
+        # crop_size depends on the movies, so no value is shown.
         self._resolve("clips.crop_size", None)
 
         if stride == frames:
@@ -335,7 +331,7 @@ class ConfigForm(QScrollArea):
 
     # -- validation --------------------------------------------------------- #
     def warnings(self, root: Path | None = None) -> dict[str, str]:
-        """Paths that point at nothing. Warnings only: they never block a save."""
+        """Paths that point at nothing (warnings, never blocking a save)."""
         out: dict[str, str] = {}
         values = self.current()
 
@@ -353,7 +349,7 @@ class ConfigForm(QScrollArea):
                 continue
             if must is None:
                 continue
-            # The bounded probe: a bare is_dir() on a dropped share blocks.
+            # Timeout-guarded: is_dir() on a dropped share can block.
             target = resolve(text)
             if must == "folder" and not _exists(target, "dir"):
                 out[key] = "this folder does not exist"
@@ -385,14 +381,12 @@ class ConfigForm(QScrollArea):
                 target.setToolTip(self._tips.pop(dotted))
 
     def values(self) -> dict[str, Any]:
-        """Dotted-key updates for :func:`trackanno.project.write_config`: only
-        the fields changed since :meth:`load` or :meth:`saved`, so an untouched value is never
-        rewritten (e.g. rounded by a spin box)."""
+        """Dotted-key updates for fields changed since :meth:`load` or :meth:`saved`."""
         return {key: value for key, value in self.current().items()
                 if key not in self._at_load or value != self._at_load[key]}
 
     def saved(self) -> None:
-        """The values on screen are now the file's; later edits are measured from here."""
+        """Mark the values on screen as saved."""
         self._at_load = self.current()
 
     def current(self) -> dict[str, Any]:
@@ -411,21 +405,13 @@ class ConfigForm(QScrollArea):
             elif kind in ("dir", "file", "groups", "autonum"):
                 out[dotted] = widget.value()
             else:
-                # A name stays text: an annotator called 2024 is a name, and an
-                # empty box is "", not null.
+                # Always text: "2024" stays a string and empty stays "".
                 out[dotted] = widget.text().strip()
         return out
 
 
 class _AutoField(QWidget):
-    """A setting that is either a number or the word ``auto``.
-
-    Free text hid two things at once: that ``auto`` is one of exactly two
-    shapes, and what ``auto`` stands for on THIS project. The tick says which
-    shape; its label carries the number, filled in by
-    :meth:`ConfigForm.show_resolved` from the rest of the file. Leaving auto
-    starts from that number rather than from nothing.
-    """
+    """A number or ``auto``; the tick's label shows what ``auto`` resolves to."""
 
     def __init__(self, extra: dict, changed_signal):
         super().__init__()
@@ -462,9 +448,9 @@ class _AutoField(QWidget):
             self._changed.emit()
 
     def set_resolved(self, value, note: str = "") -> None:
-        """Say what 'auto' means here: ``auto (50)``, or why there is no answer."""
+        """Label the tick ``auto (50)``, or ``auto: <note>``."""
         if note:
-            self.auto.setText(f"auto - {note}")
+            self.auto.setText(f"auto: {note}")
         elif value is None:
             self.auto.setText("auto")
         else:
@@ -500,8 +486,7 @@ class _AutoField(QWidget):
 
 
 class _GroupPicker(QWidget):
-    """Which feature families the model may use, with the ones this project
-    cannot compute disabled and labelled with the reason."""
+    """Feature group checkboxes; groups this project cannot compute are disabled."""
 
     def __init__(self, changed_signal):
         super().__init__()
@@ -517,9 +502,8 @@ class _GroupPicker(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         for name, spec in FEATURE_GROUPS.items():
-            box = QCheckBox(f"{name}  -  {spec['label']}")
-            # Checked by default, matching Suggest.feature_groups: starting empty
-            # would silently propose "no inputs at all" on the next save.
+            box = QCheckBox(f"{name}: {spec['label']}")
+            # Checked by default, matching Suggest.feature_groups.
             box.setChecked(True)
             box.setToolTip(spec["about"])
             box.toggled.connect(self._on_toggled)
@@ -533,9 +517,7 @@ class _GroupPicker(QWidget):
         layout.addWidget(self.note)
 
     def _on_toggled(self, _checked: bool) -> None:
-        """Hold the "at least one group" rule here, where it can be explained.
-        The config loader rejects an empty list, so unticking the last box would
-        fail the next save."""
+        """Refuse to untick the last group (the loader rejects an empty list)."""
         if self._guard:
             return
         box = self.sender()
@@ -544,8 +526,7 @@ class _GroupPicker(QWidget):
             box.setChecked(True)
             self._guard = False
             self.note.setText(
-                "The model needs at least one feature group. Tick the one you "
-                "want before unticking the last one."
+                "At least one feature group is needed. Tick another one first."
             )
             self.note.setVisible(True)
             return
@@ -553,16 +534,14 @@ class _GroupPicker(QWidget):
         self._changed.emit()
 
     def _refresh_note(self) -> None:
-        """Warn when everything ticked is something this project cannot compute.
-        The config only checks the list is non-empty, so that combination passes
-        validation and fails at training time instead."""
+        """Warn when no ticked group can be computed for this project."""
         chosen = self.value()
         usable = [g for g in chosen if not self._available.get(g)]
         if chosen and not usable and self._available:
             self.note.setText(
                 "None of the ticked groups can be computed for this project: "
                 + "; ".join(f"{g} {self._available[g]}" for g in chosen)
-                + ". Training would have no inputs."
+                + ". Tick a group that can."
             )
             self.note.setVisible(True)
         else:
@@ -574,13 +553,11 @@ class _GroupPicker(QWidget):
         self._available = dict(availability)
         for name, box in self._boxes.items():
             why = availability.get(name, "")
-            # Left checked, not unchecked: the tick records what you WANT, so a
-            # project temporarily on 'detect' gets its keypoint features back on
-            # returning to 'pose'.
+            # Ticks are kept, so switching back to 'pose' restores them.
             box.setEnabled(not why)
             base = FEATURE_GROUPS[name]["about"]
-            box.setToolTip(("UNAVAILABLE: " + why + "\n\n" + base) if why else base)
-            label = f"{name}  -  {FEATURE_GROUPS[name]['label']}"
+            box.setToolTip(f"Unavailable ({why}). {base}" if why else base)
+            label = f"{name}: {FEATURE_GROUPS[name]['label']}"
             box.setText(f"{label}   ({why})" if why else label)
         self._refresh_note()
 
@@ -603,10 +580,9 @@ class _GroupPicker(QWidget):
 
 
 class _PathField(QWidget):
-    """Line edit plus a Browse button that knows what it is picking."""
+    """Line edit plus a Browse button, with an optional note underneath."""
 
-    # Browsing is a deliberate choice of THIS file, which is more than a text
-    # change: paths.model may be shadowed by a shared model.
+    # Emitted on Browse only, not on typing.
     picked = Signal(str)
 
     def __init__(self, kind: str, extra: dict, changed_signal):
@@ -618,8 +594,6 @@ class _PathField(QWidget):
         button = QPushButton("Browse")
         button.setFixedWidth(70)
         button.clicked.connect(self._browse)
-        # A second line under the row, for a field whose value is not the whole
-        # story: paths.model reads as a file even when a downloaded model runs.
         self.status = QLabel("")
         self.status.setProperty("role", "muted")
         self.status.setWordWrap(True)
@@ -682,7 +656,7 @@ DEFAULT_COLOURS = [
 
 
 class CategoryEditor(QWidget):
-    """The buttons the annotator will press, and the keys that press them."""
+    """Editor for the label groups, their options, keys and colours."""
 
     changed = Signal()
 
@@ -701,13 +675,8 @@ class CategoryEditor(QWidget):
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
         hint.setToolTip(
-            "A single group is a set of mutually exclusive choices, and picking "
-            "one commits the clip and moves on once every required group is "
-            "filled. A multi group is checkboxes, and ticking one never yanks "
-            "the clip away.\n\n"
-            "Shortcut keys must be unique, and must not collide with the "
-            "navigation keys: arrows, Tab, Space, o, s, c, u, n, m, 0, + and -. "
-            "The config refuses to start if one does."
+            "Keys must be unique and not navigation keys (arrows, Tab, Space, "
+            "o, s, c, u, n, m, 0, + and -)."
         )
 
         layout = QVBoxLayout(self)
@@ -744,7 +713,7 @@ class CategoryEditor(QWidget):
         return [g.value() for g in self._groups]
 
     def problems(self) -> list[str]:
-        """What the config loader would refuse, said before it is written."""
+        """What the config loader would refuse."""
         from ..config import RESERVED_GROUP_NAMES
 
         issues, seen_keys, seen_names = [], {}, set()
@@ -757,7 +726,7 @@ class CategoryEditor(QWidget):
             elif name in seen_names:
                 issues.append(f"two groups are both called {name!r}")
             elif name in RESERVED_GROUP_NAMES:
-                # Each group becomes a CSV column and would overwrite a built-in.
+                # Groups become CSV columns.
                 issues.append(
                     f"{name!r} is a column the annotation CSV already uses; "
                     "pick another name"
@@ -799,7 +768,7 @@ class _GroupEditor(QGroupBox):
         self.type.currentTextChanged.connect(self.changed)
 
         self.required = QCheckBox("required")
-        self.required.setToolTip("auto-advance waits until every required group is set")
+        self.required.setToolTip("Auto-advance waits until every required group is set.")
         self.required.setChecked(bool(data.get("required", False)))
         self.required.stateChanged.connect(self.changed)
 
@@ -891,7 +860,7 @@ class _OptionRow(QWidget):
         self.colour_btn.clicked.connect(self._pick_colour)
         self._paint()
 
-        self.remove_btn = compact_button("x", 26, "remove this option", danger=True)
+        self.remove_btn = compact_button("x", 26, "Remove this option.", danger=True)
         self.remove_btn.clicked.connect(self.removed)
 
     def attach(self, grid: QGridLayout, row: int) -> None:
@@ -930,20 +899,16 @@ class _OptionRow(QWidget):
 # keypoints
 # --------------------------------------------------------------------------- #
 def _row_height() -> int:
-    """A table row tall enough for a themed combo box, measured not guessed: the
-    stylesheet's padding and border make an input taller than Qt's default."""
+    """Row height that fits a themed combo box, measured."""
     probe = QComboBox()
     probe.addItem("Head")
     return max(30, probe.sizeHint().height() + 8)
 
 
 class KeypointEditor(QWidget):
-    """The keypoint layout: a count you do not type, and names you fill in.
+    """Keypoint count (read from the model), names and skeleton links.
 
-    The count comes from the checkpoint; the names do not, since no ultralytics
-    checkpoint carries them. The ORDER is a contract: ``clipfeatures`` addresses
-    keypoints by position - 0 the head, 1 the base and body-frame origin, 1..end
-    the flagellum chain.
+    Order matters: 0 is the head, 1 the base, 1 onwards the flagellum chain.
     """
 
     changed = Signal()
@@ -961,8 +926,7 @@ class KeypointEditor(QWidget):
         self.read_button = QPushButton("Read from model file")
         self.read_button.setProperty("accent", "true")
         self.read_button.setToolTip(
-            "Read the number of keypoints from the checkpoint. The names are yours "
-            "to choose."
+            "Read the keypoint count from the checkpoint; you choose the names."
         )
         self.read_button.clicked.connect(self.count_requested)
 
@@ -992,14 +956,7 @@ class KeypointEditor(QWidget):
         )
         order_note.setWordWrap(True)
         order_note.setProperty("role", "muted")
-        order_note.setToolTip(
-            "The pose features read keypoints by POSITION, not by name. 0 is "
-            "the head, 1 is the base and the body-frame origin, and 1 onwards "
-            "is the flagellum chain.\n\n"
-            "A model that predicts the same points in another order still "
-            "produces body-length and beat numbers. They mean nothing, and "
-            "nothing downstream can tell."
-        )
+        order_note.setToolTip("Pose features read keypoints by position, not by name.")
 
         # -- skeleton --
         self.edges = QTableWidget(0, 3)
@@ -1007,7 +964,6 @@ class KeypointEditor(QWidget):
         self.edges.verticalHeader().setVisible(False)
         self.edges.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.edges.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        # Fixed, not ResizeToContents: a scrollbar pushes the last column off-edge.
         self.edges.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
         self.edges.setColumnWidth(2, 44)
         self.edges.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1017,7 +973,7 @@ class KeypointEditor(QWidget):
         add_edge = QPushButton("+ add link")
         add_edge.clicked.connect(lambda: self._add_edge_row())
         chain = QPushButton("connect in order")
-        chain.setToolTip("Link 0-1, 1-2, ... which is what a flagellum chain looks like.")
+        chain.setToolTip("Link 0-1, 1-2, and so on along the chain.")
         chain.clicked.connect(self._chain)
         clear = QPushButton("clear")
         clear.clicked.connect(lambda: self._set_edges([]))
@@ -1030,10 +986,7 @@ class KeypointEditor(QWidget):
 
         skeleton_box = QGroupBox("Skeleton (optional)")
         skeleton_layout = QVBoxLayout(skeleton_box)
-        hint = QLabel(
-            "Only drawn on screen. It does not affect detection, tracking or "
-            "the features."
-        )
+        hint = QLabel("Display only; it does not affect detection or features.")
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
         skeleton_layout.addWidget(hint)
@@ -1086,8 +1039,7 @@ class KeypointEditor(QWidget):
 
     @staticmethod
     def _fit(table: QTableWidget, max_rows: int = 12) -> None:
-        """Size a table to its rows so nothing is clipped. Both tables live in a
-        scroll area, so the page scrolls rather than the table."""
+        """Size a table to its rows; the page scrolls, not the table."""
         rows = table.rowCount()
         row_height = table.rowHeight(0) if rows else table.verticalHeader().defaultSectionSize()
         header = table.horizontalHeader().height()
@@ -1154,9 +1106,7 @@ class KeypointEditor(QWidget):
         self._set_edges([[a, b] for a, b in zip(names, names[1:])])
 
     def _refresh_edge_choices(self) -> None:
-        """Keep the link dropdowns in step with renamed keypoints, tracked by
-        POSITION and never by name: a rename would leave a link looking for text
-        that no longer exists."""
+        """Refresh the link dropdowns after a rename, keeping each by position."""
         names = self.names()
         for row in range(self.edges.rowCount()):
             for column in (0, 1):
@@ -1203,7 +1153,7 @@ class KeypointEditor(QWidget):
         return {"nodes": self.names(), "edges": edges}
 
     def problems(self) -> list[str]:
-        """What load_config would refuse, said before it is written."""
+        """What the config loader would refuse."""
         names = self.names()
         issues = []
         if any(not n for n in names):

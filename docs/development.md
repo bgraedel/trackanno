@@ -1,80 +1,71 @@
-# Tests and packaging
+# Development
+
+## Tests
 
 ```bash
-uv run pytest
-uv run pytest tests/test_kymograph.py -v
-uv run pytest -k "prediction or orphan"
+uv sync                                   # installs pytest with the dev group
+uv run pytest -q                          # full suite, about 5 minutes
+uv run pytest tests/test_config.py -v
+uv run pytest -k "predict or bouts"
+uv run pytest --project-root PATH         # also check a real prepared project
 ```
 
-35 suites, 447 tests, 3066 named checks. `uv sync` installs pytest. Nothing is
-skipped, and no test reads data this repository does not carry: every suite that
-needs a project generates one (config, synthetic movie, real clip cache) into a
-temporary directory and deletes it afterwards (`tests/fixtures.py`). Real
-projects can be added with `pytest --project-root PATH`, which runs the
-window-independence checks over every clip of a prepared `work/`.
+Tests need no external data: suites that need a project generate one (config,
+synthetic movie, clip cache) in a temporary directory (`tests/fixtures.py`).
+`tests/conftest.py` puts `src/` on the path, runs Qt offscreen and points
+`TRACKANNO_STATE_DIR` at a temporary folder, so a run never touches the real
+profile.
 
-Checks are named claims (`tests/harness.py`) because a suite is typically one
-scenario making a dozen related statements, and a failure reports the claim
-rather than the expression. A run therefore reports checks as well as tests.
-
-| suite | coverage |
-|---|---|
-| `test_pipeline.py` | clip planning, crop geometry, cache round-trip, box table, `window_mode` |
-| `test_nd2.py` | ND2 axis, position, channel and z index arithmetic, against a mock `ND2File` |
-| `test_gui_headless.py` | the annotation window built offscreen and driven with real input |
-| `test_workflow.py` | projects, config editing, background jobs, the workflow window, the two prepare stages |
-| `test_regressions.py` | one test per defect found by adversarial review |
-| `test_trackseries.py` | the per-frame series against closed-form motion, at every window |
-| `test_wavespectra.py` | the sliding beat spectrum against a wave of known f, lambda, direction |
-| `test_kymograph.py` | curvature against shapes with analytically known curvature |
-| `test_predict.py` | provenance of a prediction at every stage |
-| `test_render.py` | which rows the overlay may paint over, and the one it refuses |
-| `test_reassociate.py` | label repair, largely the cases where it must decline |
-| `test_models.py` | the model registry, largely the cases where a fetch must be refused |
-| `test_defaults_lock.py` | every knob this branch added is off in a project a new user makes |
-| `test_presets.py` | the shipped presets: every key still exists, every one loads clean, and each rung's claim |
-| `test_selection_wiring.py` | the candidate pool a selector ranks, and what must stay out of it |
-| `test_selection_queue.py` | which clip the annotator is handed, and what the CSV records about why |
-| `test_audit_stability.py` | the holdout is the same clips tomorrow that it is today |
-| `test_bout_review.py` | reading decoded bouts back |
-| `test_review_mode.py` | reading a labelling session back: the queue, the provenance that must survive an edit |
-| `test_agreement.py` | which annotation windows the folds contradicted, and that this is the confusion matrix's own off-diagonal |
-| `test_transitions.py` | transitions, dwell times and the fitted chain, against planted bouts |
-| `test_bouts.py` | frame posteriors and the min_bout decoder, against closed forms |
-| `test_dense_grid.py` | the window grid at every stride, and the frames a plan must reach |
-| `test_select.py` | which clip to annotate next, and what the audit draw must ignore |
-| `test_feature_choice.py` | choosing the model's columns by name, and the ways two of the three cuts contradict each other |
-| `test_store_provenance.py` | why a clip was chosen, surviving the CSV and its repairs |
-| `test_suggest_window.py` | the window length a model was trained at, and the skew it closes |
-
-`test_pipeline.py` asserts the reassociation contract directly, mapping cached
-clip coordinates back through `crop_x0 + cache_x / scale` and comparing against
-ground truth. `test_gui_headless.py` renders the canvas into a pixmap and counts
-amber pixels, so the marker is measured where it reaches the screen.
-`test_trackseries.py` and `test_wavespectra.py` compare against closed forms (a
-constant-speed track, a circle of known angular rate, a travelling wave of known
-frequency and wavelength), since agreement between two implementations
-establishes only that they agree.
-
-To compare the tiled path against a whole-frame run:
+To compare tiled and whole-frame detection on a real movie:
 
 ```bash
 trackanno prepare --self-test --tile 320 --movies <id>
 ```
 
-# Notes
+## Layout of `src/trackanno`
 
-* `requires-python >=3.10,<3.13`; `.python-version` pins 3.12, since torch has no
-  3.13 wheels. `uv` fetches the interpreter.
-* `uv sync --extra cuda` and `--extra cpu` are declared as conflicting extras,
-  so the lockfile carries a separate torch resolution for each. On a small GPU,
-  lower `detection.batch` and `tiling.tile` first.
-* The CUDA index is pinned to `cu128` rather than the newest, because CUDA 12.8
-  runs on an older driver than CUDA 13 does. Bump it when the GPU boxes are
-  current. Do not go back to `cu124`: that channel stopped at torch 2.6.0 while
-  PyPI is many versions past it, so pinning it freezes the whole install.
+| path | contents |
+|---|---|
+| `cli.py` | the `trackanno` command and its subcommand table |
+| `config.py` | the config schema (one dataclass per section), `FIXED_SETTINGS`, `VIEW_SETTINGS` |
+| `default_config.yaml`, `presets/` | the project template and the presets applied to it |
+| `project.py`, `templates.py`, `yamledit.py` | projects, templates, comment-preserving config edits |
+| `progress.py` | progress reporting and cancellation for long jobs |
+| `video/` | movie reading (TIFF, ND2) and the shared model registry (`models.py`) |
+| `detect/` | `prepare.py` (the `prepare` command), tiling, tracker backends, detector embeddings |
+| `annotate/` | clip planning and cache (`clips.py`), the annotation CSV (`store.py`), `reassociate.py` (`repair-links`) |
+| `measure/` | per-frame track series, beat spectra, kymograph, clip features, embeddings |
+| `learn/` | `suggest.py` (the `suggest` command), `select.py` (margin selection) |
+| `infer/` | dense windows, bout decoding, `predict.py`, `transitions.py`, `figures.py`, CV agreement |
+| `view/` | overlay drawing and `render.py` (the `render` command) |
+| `gui/hub/` | the workflow window: `window.py`, `base.py` (page base, background jobs), one module per page |
+| `gui/review/` | the Review page: prediction reader, bout lanes, footage decoder |
+| `gui/app.py` | the annotation screen |
+| `gui/configform.py` | the Configure form, category and keypoint editors |
+| `gui/viewprefs.py` | per-user view toggles in QSettings |
+| `gui/` (other) | viewer, kymograph panel, distribution chart, task panel, prefetch, theme |
+
+`notebooks/` holds the downstream-analysis notebook and `motifs.py`.
+
+## Conventions
+
+* The GUI and the CLI call the same functions; a pipeline step is never
+  implemented twice.
+* A new setting is a field in `config.py` with its default, help line and
+  allowed values, plus a commented line in `default_config.yaml`. A setting
+  nobody needs to change belongs in `FIXED_SETTINGS`.
+* Hub pages run slow work through `Page.run_bg()`, never on the UI thread.
+* Files other processes read (CSV, caches, `predictions.parquet`) are written
+  beside their final name and renamed into place.
+* Commits: short imperative subject, 1-3 sentence body, no trailers.
+* Prose (docstrings, docs, GUI text): brief, no history, no em-dashes.
+
+## Packaging notes
+
+* `requires-python >=3.10,<3.13`; `.python-version` pins 3.12.
+* The `cuda` and `cpu` extras are declared as conflicting, so the lockfile holds
+  a torch resolution for each. The Windows CUDA index is pinned to `cu128`.
 * `opencv-python` is overridden out of the resolution in favour of
-  `opencv-python-headless`. ultralytics pulls the former, which ships its own Qt
-  plugins and conflicts with PyQt at startup.
+  `opencv-python-headless`, which does not clash with PyQt's Qt plugins.
 * Project data is gitignored: `work/`, `annotations.csv`, `predictions.parquet`
-  and `config.yaml`, which carries absolute paths to the recordings.
+  and `config.yaml`.

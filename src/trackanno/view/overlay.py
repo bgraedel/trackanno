@@ -1,16 +1,4 @@
-"""Shared overlay geometry and drawing.
-
-Two consumers, two jobs:
-
-* The **GUI** draws no pixels. ``build_clip_view`` turns a clip's box table into
-  a :class:`ClipView` and the Qt canvas paints the marker as vector graphics, so
-  the reticle stays one hairline wide at 8x zoom.
-* ``trackanno render`` burns the category-labelled overlay onto the full-resolution
-  movie.
-
-``render_clip_rgb`` rasterises the same geometry for a caller that wants pixels.
-Everything that returns pixels returns RGB, which is what imageio and Qt want.
-"""
+"""Overlay geometry for the GUI clip view and overlay drawing for rendered movies (RGB)."""
 
 from __future__ import annotations
 
@@ -36,11 +24,9 @@ __all__ = [
 TARGET_RGB = (255, 196, 0)     # the track you are annotating
 CONTEXT_RGB = (0, 168, 255)    # other tracks that happen to be in the crop
 
-# How the view centre is derived from the target's trajectory. Cycled with "s".
+# How the view centre follows the target; cycled with "s".
 FOLLOW_MODES = ("centred", "locked")
 
-# What each mode does, beside the modes themselves: every window that offers the
-# choice says the same thing about it. Short in a combo, long in a tooltip.
 FOLLOW_LABELS = {
     "centred": "centred - one view on the track's median position, all motion visible",
     "locked": "locked - re-centred every frame: best for shape, hides translation",
@@ -55,11 +41,7 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 
 def gray_to_rgb(img: np.ndarray) -> np.ndarray:
-    """Grayscale -> RGB for a single (H, W) frame or a whole (T, H, W) stack.
-
-    Always writable - the caller draws into it and the clip cache hands out
-    read-only memmaps.
-    """
+    """Grayscale to RGB for an (H, W) frame or a (T, H, W) stack; always a writable copy."""
     import cv2
 
     if img.ndim >= 3 and img.shape[-1] == 3:
@@ -95,11 +77,7 @@ def _draw_box(img, x1, y1, x2, y2, color, thickness=1, label=None, font_scale=0.
 
 def _draw_dashed_box(img, x1, y1, x2, y2, color, thickness=1, label=None, font_scale=0.35,
                      dash=7, gap=5):
-    """A box drawn in dashes: the mark for a model value nobody has confirmed.
-
-    The categories already own the colours, so the outline is what separates a
-    prediction from something a person decided.
-    """
+    """Draw a dashed box, the mark for an unconfirmed model value."""
     import cv2
 
     if not all(np.isfinite([x1, y1, x2, y2])):
@@ -130,9 +108,7 @@ def _draw_dashed_box(img, x1, y1, x2, y2, color, thickness=1, label=None, font_s
 
 
 def _draw_reticle(img, x1, y1, x2, y2, color, thickness=1, halo=True):
-    """Four corner brackets instead of a closed box, so the silhouette stays
-    clear where the flagellum is; the halo keeps them readable on cell and
-    background alike."""
+    """Draw four corner brackets with a dark halo, leaving the silhouette clear."""
     import cv2
 
     if not all(np.isfinite([x1, y1, x2, y2])):
@@ -178,8 +154,7 @@ def _kpts_from_row(row, n_kpts: int) -> np.ndarray:
 
 
 def _kpt_columns(frame, n_kpts: int) -> np.ndarray | None:
-    """(N, K, 2) keypoint array pulled from the DataFrame in one shot, rather
-    than by per-row lookup."""
+    """Return the (N, K, 2) keypoint array of a box table, or None."""
     if n_kpts <= 0:
         return None
     xcols = [f"kp_x_{k}" for k in range(n_kpts)]
@@ -212,7 +187,6 @@ def render_clip_rgb(
     n_kpts = cfg.n_keypoints
     draw_skeleton = show_skeleton and cfg.is_pose and n_kpts > 0
 
-    # Columns out as numpy once; the per-row Python work is what costs here.
     t_col = boxes["t"].to_numpy(dtype=np.int32)
     target_col = boxes["is_target"].to_numpy(dtype=bool)
     xyxy = boxes[["x1", "y1", "x2", "y2"]].to_numpy(dtype=np.float32)
@@ -246,12 +220,7 @@ def render_clip_rgb(
 # --------------------------------------------------------------------------- #
 @dataclass
 class ClipView:
-    """Where to look, and what to mark, for every frame of one clip.
-
-    Coordinates are cache pixels. The viewer maps ``(centre[t] - side/2, side)``
-    onto its canvas, so centring and zoom are display-time decisions: no pixel is
-    resampled and one cached array serves every mode.
-    """
+    """Per-frame view centre and markers for one clip, in cache pixels."""
 
     size: int                       # cache side length, px
     n_frames: int
@@ -271,11 +240,7 @@ class ClipView:
         return None if not np.isfinite(b).all() else b
 
     def held_box(self, t: int) -> np.ndarray | None:
-        """The box to draw on a frame with no detection, or None.
-
-        Drawn dimmed rather than dropped: a marker that vanishes strobes at
-        playback speed and reads as an event in the animal, not a missed frame.
-        """
+        """The held box to draw dimmed on a frame with no detection, or None."""
         if self.held is None or not 0 <= t < self.n_frames:
             return None
         b = self.held[t]
@@ -294,9 +259,7 @@ class ClipView:
 
 
 def _hold_fill_rows(values: np.ndarray) -> np.ndarray:
-    """Fill all-NaN rows from the nearest row that has data, or a track that
-    drops out loses stabilisation for exactly those frames and the animal jumps
-    sideways and back."""
+    """Fill all-NaN rows from the nearest row that has data."""
     present = np.isfinite(values).all(axis=1)
     if present.all() or not present.any():
         return values
@@ -321,14 +284,7 @@ def build_clip_view(
 ) -> ClipView:
     """Turn a clip's box table into per-frame view geometry.
 
-    ``mode`` decides what the view follows:
-
-    ``centred``  one fixed view on the *median of the track's own path*, not the
-                 crop centre, so a border clip's animal is not parked in a corner.
-    ``locked``   re-centred every frame - translation invisible by construction.
-
-    ``zoom`` > 1 shrinks the visible square around that centre. Nothing is
-    clamped to the cached crop; the viewer pads outside it.
+    ``centred`` fixes the view on the track's median position; ``locked`` re-centres every frame.
     """
     target = np.full((n_frames, 4), np.nan, dtype=np.float64)
     context = np.zeros((0, 5), dtype=np.float32)
@@ -393,11 +349,7 @@ def draw_detections(
     show_skeleton: bool = False,
     dashed: set | None = None,
 ) -> np.ndarray:
-    """Draw one frame's tracked boxes onto a full-resolution RGB frame, in place.
-
-    ``dashed`` holds the track ids whose value came from the model rather than a
-    person; those are outlined in dashes so the two are never confused.
-    """
+    """Draw one frame's tracked boxes in place; track ids in ``dashed`` get dashed outlines."""
     edges = cfg.keypoints.edge_idx if cfg.is_pose else []
     n_kpts = cfg.n_keypoints
     dashed = dashed or set()
