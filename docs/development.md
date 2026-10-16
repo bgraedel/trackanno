@@ -16,6 +16,13 @@ synthetic movie, clip cache) in a temporary directory (`tests/fixtures.py`).
 `TRACKANNO_STATE_DIR` at a temporary folder, so a run never touches the real
 profile.
 
+To check the measurements against the synthetic Leishmania simulator (about 7 minutes; see
+[measurements.md](measurements.md)):
+
+```bash
+uv run python validation/run.py --simulator PATH/synthetic_leishmania.py --out OUT
+```
+
 To compare tiled and whole-frame detection on a real movie:
 
 ```bash

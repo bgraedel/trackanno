@@ -1,6 +1,9 @@
-"""Sliding-window tangent-angle wave spectra per track, after Geyer, Howard and Sartori (2022).
+"""Beat measurements per sliding window, computed as the flagella-analysis-pipeline computes them.
 
-Frequencies in Hz, lengths in px; ``wave_direction`` +1 means the wave travels Base to Tip.
+Each window goes through ``processFile.m`` of Fochler et al. (2025) with the smoothing tolerance in
+pixels (the spatialScale^2 fix): the flagellum is a spline through Base, Flag1..Flag5 and Tip, smoothed,
+put in the body frame, resampled to 200 points over 0.9 L and Fourier transformed in time. Lengths are
+in px, frequencies in Hz. ``wave_direction`` +1 means the wave travels Base to Tip.
 """
 
 from __future__ import annotations
@@ -9,16 +12,14 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.signal import ShortTimeFFT, detrend
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
-from .clipfeatures import (
-    BEAT_F_MIN_HZ, BEAT_MIN_CYCLES, MAX_INTERP_FRAC,
-    _interp_nan, _on_grid, _shifted_legendre, _safe,
-)
+from .clipfeatures import BEAT_F_MIN_HZ, BEAT_MIN_CYCLES, _interp_nan, _on_grid, _safe
 
 __all__ = [
     "spectral_series", "window_values", "WindowSource", "track_spectral_series",
-    "flow_series",
+    "flow_series", "segment_arcs", "smooth_rows", "frame_curves", "body_frame_curves",
+    "analyse_window",
     "SERIES_COLUMNS", "DEFAULT_WINDOW", "DEFAULT_HOP", "DEFAULT_FLOW_FRAMES",
 ]
 
@@ -26,75 +27,116 @@ __all__ = [
 DEFAULT_WINDOW = 75
 # 50 ms at 100 fps.
 DEFAULT_HOP = 5
-
-# Below this the transform has fewer bins than the band it is searched over.
-MIN_WINDOW_FRAMES = 8
-# An order-2 Legendre fit needs at least three segments.
-MIN_SEGMENTS = 3
-
 # Frames one flow estimate is read over.
 DEFAULT_FLOW_FRAMES = 5
+MIN_WINDOW_FRAMES = 8
+
+# processFile.m and batchProcess.m.
+N_SAMPLES = 200                  # points along the analysed flagellum
+LENGTH_SHARE = 0.9               # analysed share of the length; shorter frames are bad
+BAND_HZ = 1.0                    # amplitude is summed over +-1 Hz of the peak
+XY_TOLERANCE = 0.2               # spaps tolerance per px of length, in px^2
+ANGLE_TOLERANCE = 0.01           # spaps tolerance of the angle profile, per sample spacing
+MIN_GOOD_FRAMES = 30
+BRIDGE_FRAMES = 2                # bad frames bridged when good frames lie this close on both sides
+MAX_BRIDGED = 0.2                # more bridged frames than this marks a bad window
+# Points the spline through the keypoints is smoothed on (the tracer gives about one per px).
+DENSE_POINTS = 128
 
 SERIES_COLUMNS = (
-    # -- the beat -----------------------------------------------------------
-    "wave_freq_hz", "wave_resolvable_hz", "wave_excess", "wave_fundamental_frac",
-    "wave_censored",
-    # -- amplitude profile --------------------------------------------------
-    "wave_amp_mean", "wave_amp_asym", "wave_amp_para",
-    # -- phase profile, i.e. the direction ----------------------------------
-    "wave_phase_slope", "wave_phase_rsq", "wave_phase_asym", "wave_phase_para",
-    "wave_wavelength_px", "wave_wavelength_ratio", "wave_direction",
-    "wave_speed_px_s",
-    # -- the same direction, read without a spectrum -------------------------
+    # -- as the pipeline writes them -------------------------------------------
+    "wave_freq_hz", "wave_freq_proximal_hz", "wave_freq_central_hz", "wave_freq_distal_hz",
+    "wave_amp_mean", "wave_amp_asym", "wave_amp_para", "wave_amp_integral",
+    "wave_phase_asym", "wave_phase_para", "wave_phase_rsq", "wave_phase_cycles",
+    "wave_static_mean", "wave_freq_dominance", "wave_fit_error", "wave_xy_fit_error",
+    "wave_disp_amp_max", "wave_angular_amp", "wave_length_px", "wave_bad_window",
+    # -- read off the same analysis --------------------------------------------
+    "wave_phase_slope", "wave_wavelength_px", "wave_wavelength_ratio", "wave_direction",
+    "wave_speed_px_s", "wave_static_asym", "wave_static_para", "wave_disp_amp_mean",
+    "wave_disp_amp_tip", "wave_excess", "wave_censored", "wave_resolvable_hz",
+    "wave_interp_frac", "wave_window_frames",
+    # -- direction without a spectrum, from the keypoint chords ---------------
     "wave_flow", "wave_flow_coherence", "wave_flow_direction",
-    # -- static (time-averaged) shape ---------------------------------------
-    "wave_static_cos", "wave_static_sin", "wave_static_asym", "wave_static_para",
-    # -- geometry and quality ------------------------------------------------
-    "wave_length_px", "wave_interp_frac", "wave_window_frames",
-    # -- stability across windows ----------------------------------------------
+    # -- stability across windows ------------------------------------------------
     "wave_freq_drift_hz", "wave_freq_track_sd_hz",
 )
 
 # Aggregated by mean (a share) rather than median.
-_FRACTION_COLUMNS = ("wave_censored",)
+_FRACTION_COLUMNS = ("wave_censored", "wave_bad_window")
 
 
 # --------------------------------------------------------------------------- #
-# sliding aggregates
+# smoothing: the spaps family, solved for many rows at once
 # --------------------------------------------------------------------------- #
-def _sliding_sum(values: np.ndarray, m: int, starts: np.ndarray) -> np.ndarray:
-    """Sum of ``values[c : c + m]`` for every start ``c``, via a cumulative sum."""
-    csum = np.concatenate([np.zeros((1,) + values.shape[1:], values.dtype),
-                           np.cumsum(values, axis=0)])
-    return csum[starts + m] - csum[starts]
+_BASIS: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
-def _sliding_mean(values: np.ndarray, m: int, starts: np.ndarray) -> np.ndarray:
-    """Mean of ``values[c : c + m]`` for every start ``c``. See :func:`_sliding_sum`."""
-    return _sliding_sum(values, m, starts) / float(m)
+def _basis(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Eigen-decomposition of spaps' problem on n unit-spaced sites.
 
-
-def _detrend_coeffs(
-    signal: np.ndarray, m: int, starts: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-window OLS intercept and slope against the local tick, from sliding sums.
-
-    Keep float64: the sliding-sum subtraction loses about ``log10(n / m)`` digits.
+    The cubic smoothing spline minimises sum w (y - f)^2 + lam f' K f with K = Q R^-1 Q' (Reinsch)
+    and trapezoid weights w; in z = sqrt(w) f it diagonalises once for every row.
     """
-    n = signal.shape[0]
-    tick = np.arange(n, dtype=float)[:, None]
-    s_x = _sliding_sum(signal, m, starts)
-    s_tx = _sliding_sum(tick * signal, m, starts) - starts[:, None].astype(float) * s_x
-    t_bar = (m - 1) / 2.0
-    s_tt = m * (m * m - 1) / 12.0            # sum (t - t_bar)^2 for t = 0..m-1
-    beta = (s_tx - t_bar * s_x) / s_tt
-    return s_x / float(m) - beta * t_bar, beta
+    if n not in _BASIS:
+        q = np.zeros((n, n - 2))
+        r = np.zeros((n - 2, n - 2))
+        for j in range(n - 2):
+            q[j, j], q[j + 1, j], q[j + 2, j] = 1.0, -2.0, 1.0
+            r[j, j] = 2.0 / 3.0
+            if j + 1 < n - 2:
+                r[j, j + 1] = r[j + 1, j] = 1.0 / 6.0
+        k = q @ np.linalg.solve(r, q.T)
+        w = np.ones(n)
+        w[0] = w[-1] = 0.5
+        root = np.sqrt(w)
+        lam, vec = np.linalg.eigh(k / root[:, None] / root[None, :])
+        # The constant and linear modes are free; round-off leaves them slightly off zero.
+        _BASIS[n] = (np.where(lam > 1e-10 * lam.max(), lam, 0.0), vec, root)
+    return _BASIS[n]
 
 
-def _slice_starts(n: int, m: int, hop: int, mid: int) -> np.ndarray:
-    """Start frames of the fully interior slices on :class:`ShortTimeFFT`'s grid."""
-    p_first = -(-mid // hop)                    # ceil(mid / hop)
-    p_last = (n - m + mid) // hop               # last p with start + m <= n
+def smooth_rows(values: np.ndarray, budget) -> np.ndarray:
+    """spaps(x, y, tol) for rows sampled at unit spacing: the smoothest cubic spline values whose
+    trapezoid-weighted squared residual equals ``budget``, or the weighted line if that is within it.
+    """
+    values = np.asarray(values, dtype=float)
+    rows, n = values.shape
+    if n < 3 or rows == 0:
+        return values.copy()
+    lam, vec, root = _basis(n)
+    coef = (values * root) @ vec
+    power = coef ** 2
+    budget = np.broadcast_to(np.asarray(budget, dtype=float), (rows,))
+    # The residual rises with log mu to the line fit; rows within budget of the line take it.
+    # Otherwise safeguarded Newton on log mu inside a bracket that always holds the root.
+    line = (power * (lam > 0)).sum(axis=1)
+    lo, hi = np.full(rows, -60.0), np.full(rows, 60.0)
+    t = np.zeros(rows)
+    log_lam = np.log(np.where(lam > 0, lam, 1.0))[None, :]
+    for _ in range(40):
+        g = 1.0 / (1.0 + np.exp(np.clip(-(t[:, None] + log_lam), -700.0, 700.0)))
+        g = np.where(lam[None, :] > 0, g, 0.0)
+        resid = (g * g * power).sum(axis=1) - budget
+        lo = np.where(resid < 0, t, lo)
+        hi = np.where(resid >= 0, t, hi)
+        slope = (2.0 * g * g * (1.0 - g) * power).sum(axis=1)
+        newton = t - resid / np.where(slope > 1e-300, slope, np.nan)
+        inside = np.isfinite(newton) & (newton > lo) & (newton < hi)
+        t = np.where(inside, newton, 0.5 * (lo + hi))
+    mu = np.where((line <= budget)[:, None], np.inf, np.exp(t)[:, None] * lam[None, :])
+    with np.errstate(invalid="ignore"):
+        shrink = np.where(lam[None, :] > 0, 1.0 / (1.0 + mu), 1.0)
+    return ((coef * shrink) @ vec.T) / root
+
+
+# --------------------------------------------------------------------------- #
+# helpers shared with the flow readout and trackseries
+# --------------------------------------------------------------------------- #
+def _slice_starts(n: int, m: int, hop: int) -> np.ndarray:
+    """Starts of the windows lying wholly inside ``n`` frames whose centres are multiples of ``hop``."""
+    mid = m // 2
+    p_first = -(-mid // hop)
+    p_last = (n - m + mid) // hop
     if p_last < p_first:
         return np.empty(0, dtype=int)
     return np.arange(p_first, p_last + 1, dtype=int) * hop - mid
@@ -111,10 +153,46 @@ def _centred_sum(values: np.ndarray, half: int) -> np.ndarray:
     return cumulative[hi] - cumulative[lo]
 
 
+def segment_arcs(chords: np.ndarray, angles: np.ndarray) -> np.ndarray:
+    """Arc length of each segment, taking it as a circular arc through its two nodes.
+
+    A segment turns by the mean of the chord-angle changes at its ends; a chord of turning tau
+    spans an arc ``(tau / 2) / sin(tau / 2)`` times longer.
+    """
+    chords = np.asarray(chords, dtype=float)
+    if chords.shape[-1] < 2:
+        return chords.copy()
+    turn = np.diff(angles, axis=-1)
+    tau = np.empty_like(chords)
+    tau[..., 1:-1] = 0.5 * (turn[..., :-1] + turn[..., 1:])
+    tau[..., 0], tau[..., -1] = turn[..., 0], turn[..., -1]
+    half = np.minimum(np.abs(tau) / 2.0, 3.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        gain = np.where(half > 1e-9, half / np.sin(np.where(half > 1e-9, half, 1.0)), 1.0)
+    return chords * gain
+
+
+def _chord_angles(px: np.ndarray, py: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Chord tangent angles of Base..Tip against Head to Base, continuous in time at the base."""
+    ox, oy = px[:, 1], py[:, 1]
+    axis = np.arctan2(oy - py[:, 0], ox - px[:, 0])
+    c, s = np.cos(-axis)[:, None], np.sin(-axis)[:, None]
+    rx, ry = px[:, 1:] - ox[:, None], py[:, 1:] - oy[:, None]
+    fx, fy = rx * c - ry * s, rx * s + ry * c
+    dx, dy = np.diff(fx, axis=1), np.diff(fy, axis=1)
+    raw = np.arctan2(dy, dx)
+    base = raw[:, :1].copy()
+    finite = np.isfinite(base[:, 0])
+    if finite.sum() >= 2:
+        base[finite, 0] = np.unwrap(base[finite, 0])
+    steps = np.angle(np.exp(1j * np.diff(raw, axis=1)))
+    psi = np.concatenate([base, base + np.cumsum(steps, axis=1)], axis=1)
+    seg = segment_arcs(np.hypot(dx, dy), psi)
+    return psi, np.cumsum(seg, axis=1) - seg / 2.0
+
+
 def flow_series(
-    psi: np.ndarray,
-    arc_px: np.ndarray,
-    complete: np.ndarray,
+    psi: np.ndarray, arc_px: np.ndarray, complete: np.ndarray,
     frames: int = DEFAULT_FLOW_FRAMES,
 ) -> np.ndarray:
     """Per-frame wave direction as the correlation ``-<psi_t psi_s>`` in [-1, 1].
@@ -127,42 +205,30 @@ def flow_series(
     half = max(1, int(frames) // 2)
     if psi.ndim != 2 or n < 2 * half + 1 or psi.shape[1] < 2:
         return out
-
-    # Remove the local static bend before d/ds; d/dt ignores it anyway.
     finite = np.isfinite(psi)
     filled = np.where(finite, psi, 0.0)
     seen = _centred_sum(finite.astype(float), half)
     with np.errstate(invalid="ignore", divide="ignore"):
         static = np.where(seen > 0, _centred_sum(filled, half) / np.maximum(seen, 1), np.nan)
-
     psi_t = np.gradient(psi, axis=0)
     step = np.diff(arc_px, axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
         psi_s = np.diff(psi - static, axis=1) / np.where(np.abs(step) > 1e-9, step, np.nan)
-    # onto the grid the arclength difference lives on
     psi_t = 0.5 * (psi_t[:, :-1] + psi_t[:, 1:])
-
     good = np.isfinite(psi_t) & np.isfinite(psi_s)
     a, b = np.where(good, psi_t, 0.0), np.where(good, psi_s, 0.0)
     cross = _centred_sum((a * b).sum(axis=1), half)
     aa = _centred_sum((a * a).sum(axis=1), half)
     bb = _centred_sum((b * b).sum(axis=1), half)
     pairs = _centred_sum(good.sum(axis=1).astype(float), half)
-
-    # Interpolation is judged over the stencil, not the spectral window.
     detected = _centred_sum(np.asarray(complete, dtype=float), half)
     span = _centred_sum(np.ones(n), half)
     with np.errstate(invalid="ignore", divide="ignore"):
         local_fill = 1.0 - detected / np.maximum(span, 1.0)
         denominator = np.sqrt(aa * bb)
-        out = np.where(
-            (denominator > 1e-12) & (pairs >= 4) & (local_fill <= MAX_INTERP_FRAC),
-            -cross / np.where(denominator > 0, denominator, np.nan),
-            np.nan,
-        )
-    # Clip rounding past +-1.
+        out = np.where((denominator > 1e-12) & (pairs >= 4) & (local_fill <= MAX_BRIDGED),
+                       -cross / np.where(denominator > 0, denominator, np.nan), np.nan)
     out = np.clip(out, -1.0, 1.0)
-    # Partial stencils at the ends are a different measurement.
     out[:half] = np.nan
     out[n - half:] = np.nan
     return out
@@ -174,80 +240,11 @@ def _read_at(values: np.ndarray, centres: np.ndarray, reach: int) -> np.ndarray:
     n = values.shape[0]
     for i, centre in enumerate(centres):
         lo, hi = max(0, int(centre) - reach), min(n, int(centre) + reach + 1)
-        if hi <= lo:
-            continue
         block = values[lo:hi]
         block = block[np.isfinite(block)]
         if block.size:
             out[i] = float(np.median(block))
     return out
-
-
-def _direct_spectrum(
-    signal: np.ndarray, m: int, starts: np.ndarray, fps: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The sliding transform computed directly for explicit window starts."""
-    block = np.stack([signal[c:c + m] for c in starts])          # (n_win, m, n_node)
-    block = detrend(block, axis=1, type="linear") * np.hanning(m)[:, None]
-    freqs = np.fft.rfftfreq(m, d=1.0 / max(fps, 1e-6))
-    return freqs, np.moveaxis(np.fft.rfft(block, axis=1), 0, -1), np.asarray(starts, dtype=int)
-
-
-def _sliding_spectrum(
-    signal: np.ndarray, m: int, hop: int, fps: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """One STFT for the whole record: ``(freqs, S, starts)``, S of shape (n_freq, n_node, n_window).
-
-    Equals a per-slice ``rfft(detrended * hanning)``; the linear detrend is applied analytically.
-    """
-    n = signal.shape[0]
-    m = min(m, n)
-    win = np.hanning(m)
-    sft = ShortTimeFFT(win, hop=hop, fs=max(fps, 1e-6),
-                       fft_mode="onesided", phase_shift=None)
-    starts = _slice_starts(n, m, hop, sft.m_num_mid)
-    if starts.size == 0:
-        # No legal slice centre: centre one window by hand.
-        return _direct_spectrum(signal, m, np.array([(n - m) // 2]), fps)
-    p0 = int((starts[0] + sft.m_num_mid) // hop)
-    spectrum = sft.stft(signal, p0=p0, p1=p0 + starts.size, axis=0)
-    alpha, beta = _detrend_coeffs(signal, m, starts)             # (n_win, n_node)
-    w_0 = np.fft.rfft(win)
-    w_t = np.fft.rfft(win * np.arange(m, dtype=float))
-    spectrum = (spectrum
-                - w_0[:, None, None] * alpha.T[None, :, :]
-                - w_t[:, None, None] * beta.T[None, :, :])
-    return sft.f, spectrum, starts
-
-
-def _legendre_batch(profiles: np.ndarray, s: np.ndarray, order: int = 2) -> np.ndarray:
-    """Least-squares fit of ``(n_window, n_segment)`` profiles to shifted Legendre polynomials."""
-    basis = np.moveaxis(_shifted_legendre(s, order), 0, -1)   # (n_win, n_seg, order+1)
-    good = np.isfinite(profiles)
-    filled = np.where(good, profiles, 0.0)
-    gram = np.einsum("wsk,wsl->wkl", basis, basis)
-    rhs = np.einsum("wsk,ws->wk", basis, filled)
-    coeffs = np.einsum("wkl,wl->wk", np.linalg.pinv(gram), rhs)
-    # A profile with holes gets no fit.
-    coeffs[~good.all(axis=1)] = np.nan
-    return coeffs
-
-
-def _line_fit(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Row-wise least-squares slope and R^2 (``phaseLinearityRsq``) of ``y`` against ``x``."""
-    n = x.shape[1]
-    xm, ym = x.mean(axis=1, keepdims=True), y.mean(axis=1, keepdims=True)
-    dx, dy = x - xm, y - ym
-    sxx = (dx * dx).sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        slope = np.where(sxx > 1e-12, (dx * dy).sum(axis=1) / np.where(sxx > 1e-12, sxx, 1.0),
-                         np.nan)
-        resid = dy - slope[:, None] * dx
-        ss_res = (resid ** 2).sum(axis=1)
-        ss_tot = (dy * dy).sum(axis=1)
-        rsq = np.where(ss_tot > 1e-12, 1.0 - ss_res / np.where(ss_tot > 1e-12, ss_tot, 1.0),
-                       np.nan)
-    return slope, rsq
 
 
 def _local_spread(values: np.ndarray, radius: int) -> np.ndarray:
@@ -256,26 +253,333 @@ def _local_spread(values: np.ndarray, radius: int) -> np.ndarray:
     block = np.lib.stride_tricks.sliding_window_view(
         np.concatenate([pad, values, pad]), 2 * int(radius) + 1)
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN rows are expected
+        warnings.simplefilter("ignore", RuntimeWarning)
         median = np.nanmedian(block, axis=1)
         mad = np.nanmedian(np.abs(block - median[:, None]), axis=1)
     return np.where(np.isfinite(block).sum(axis=1) >= 3, 1.4826 * mad, np.nan)
 
 
 # --------------------------------------------------------------------------- #
+# per frame: the smoothed flagellum in the body frame (processFile.m lines 37-73)
+# --------------------------------------------------------------------------- #
+def frame_curves(px: np.ndarray, py: np.ndarray) -> dict[str, np.ndarray]:
+    """Smoothed flagellum per frame in the body frame: x, y, arc (frames, DENSE_POINTS) and lengths.
+
+    The flagellum is a cubic spline through Base..Tip by node index; the body centre is the
+    Head-Base midpoint.
+    """
+    n_frames = px.shape[0]
+    n = DENSE_POINTS
+    xs = np.full((n_frames, n), np.nan)
+    ys = np.full((n_frames, n), np.nan)
+    valid = np.isfinite(px).all(axis=1) & np.isfinite(py).all(axis=1)
+    rows = np.flatnonzero(valid)
+    if rows.size:
+        # One spline for every frame, by node index: the nodes sit about evenly along the flagellum.
+        k = px.shape[1] - 1
+        u = np.arange(k, dtype=float)
+        fine = np.linspace(0.0, k - 1.0, 4 * n)
+        cx = CubicSpline(u, px[rows, 1:], axis=1)(fine)
+        cy = CubicSpline(u, py[rows, 1:], axis=1)(fine)
+        # Resampled evenly in arclength, as the tracer's pixels are.
+        arc = np.concatenate([np.zeros((rows.size, 1)),
+                              np.cumsum(np.hypot(np.diff(cx, axis=1), np.diff(cy, axis=1)), axis=1)], 1)
+        target = arc[:, -1:] * np.linspace(0.0, 1.0, n)[None, :]
+        for j, r in enumerate(rows):
+            xs[r] = np.interp(target[j], arc[j], cx[j])
+            ys[r] = np.interp(target[j], arc[j], cy[j])
+        degenerate = arc[:, -1] <= 1e-9
+        valid[rows[degenerate]] = False
+        rows = rows[~degenerate]
+    out = {"x": np.full((n_frames, n), np.nan), "y": np.full((n_frames, n), np.nan),
+           "arc": np.full((n_frames, n), np.nan), "length": np.full(n_frames, np.nan),
+           "overall": np.full(n_frames, np.nan)}
+    if rows.size == 0:
+        return out
+    framed = body_frame_curves(xs[rows], ys[rows], 0.5 * (px[rows, 0] + px[rows, 1]),
+                               0.5 * (py[rows, 0] + py[rows, 1]))
+    for key in ("x", "y", "arc", "length"):
+        out[key][rows] = framed[key]
+    body = np.hypot(px[rows, 0] - px[rows, 1], py[rows, 0] - py[rows, 1])
+    chain = np.hypot(np.diff(px[rows, 1:], axis=1), np.diff(py[rows, 1:], axis=1)).sum(axis=1)
+    out["overall"][rows] = body + chain
+    return out
+
+
+def body_frame_curves(x: np.ndarray, y: np.ndarray, centre_x: np.ndarray,
+                      centre_y: np.ndarray) -> dict[str, np.ndarray]:
+    """Flagella (frames, points; base to tip, even in arclength, px) smoothed and in the body frame.
+
+    Smoothed as spaps with tolerance 0.2 L px^2, then moved so the smoothed base is the origin and
+    the axis from the body centre to it is +x.
+    """
+    n = x.shape[1]
+    # spaps tolerance 0.2 L (px) with trapezoid weights of spacing L / (n - 1): 0.2 (n - 1) per unit.
+    smoothed = smooth_rows(np.vstack([x, y]), XY_TOLERANCE * (n - 1))
+    sx, sy = smoothed[:x.shape[0]], smoothed[x.shape[0]:]
+    bx, by = sx[:, :1], sy[:, :1]
+    ang = np.arctan2(by[:, 0] - centre_y, bx[:, 0] - centre_x)
+    c, s = np.cos(-ang)[:, None], np.sin(-ang)[:, None]
+    rx, ry = sx - bx, sy - by
+    fx, fy = c * rx - s * ry, s * rx + c * ry
+    arc = np.concatenate([np.zeros((x.shape[0], 1)),
+                          np.cumsum(np.hypot(np.diff(fx, axis=1), np.diff(fy, axis=1)), axis=1)], 1)
+    return {"x": fx, "y": fy, "arc": arc, "length": arc[:, -1]}
+
+
+# --------------------------------------------------------------------------- #
+# per window: the Fourier analysis (processFile.m from line 74)
+# --------------------------------------------------------------------------- #
+def _movmean_omitnan(v: np.ndarray, k: int) -> np.ndarray:
+    """MATLAB movmean(v, k, 'omitnan'): an even k looks one further back than ahead."""
+    n = v.size
+    before, after = k // 2, (k - 1) // 2
+    finite = np.isfinite(v)
+    csum = np.concatenate([[0.0], np.cumsum(np.where(finite, v, 0.0))])
+    ccnt = np.concatenate([[0], np.cumsum(finite)])
+    idx = np.arange(n)
+    lo, hi = np.clip(idx - before, 0, n), np.clip(idx + after + 1, 0, n)
+    count = ccnt[hi] - ccnt[lo]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(count > 0, (csum[hi] - csum[lo]) / np.maximum(count, 1), np.nan)
+
+
+def _good_frame_range(bad: np.ndarray) -> tuple[np.ndarray, int, bool]:
+    """computeGoodFrameRange.m: the largest block of good or bridged frames, bridged count, bad flag."""
+    good = ~bad
+    n = good.size
+    left = np.array([good[max(0, i - BRIDGE_FRAMES): i + 1].any() for i in range(n)])
+    right = np.array([good[i: min(n, i + BRIDGE_FRAMES + 1)].any() for i in range(n)])
+    allowable = left & right
+    added = good ^ allowable
+    good = good | allowable
+    padded = np.concatenate([[0], good.astype(int), [0]])
+    zeros = np.flatnonzero(padded == 0)
+    block = int(np.argmax(np.diff(zeros)))
+    frames = np.arange(zeros[block], zeros[block + 1] - 1)
+    if frames.size == 0:
+        return frames, 0, True
+    bridged = int(added[frames].sum())
+    return frames, bridged, bridged > MAX_BRIDGED * frames.size
+
+
+def _fill_pchip(v: np.ndarray, bad: np.ndarray) -> np.ndarray:
+    """fillmissing(v, 'pchip', 1) over the bad rows, extrapolating at the ends."""
+    if not bad.any():
+        return v
+    t = np.arange(v.shape[0])
+    ok = ~bad
+    out = v.copy()
+    if ok.sum() >= 2:
+        out[bad] = PchipInterpolator(t[ok], v[ok], axis=0, extrapolate=True)(t[bad])
+    return out
+
+
+def _legendre(data: np.ndarray) -> np.ndarray:
+    """legendreCoeffs.m: (2n+1) trapz(xs, data * l_n) on equally spaced [0, 1]."""
+    xs = np.linspace(0.0, 1.0, data.shape[-1])
+    ell = np.stack([np.ones_like(xs), 2 * xs - 1, 6 * xs ** 2 - 6 * xs + 1])
+    return np.array([1.0, 3.0, 5.0]) * np.trapezoid(data[None, :] * ell, xs, axis=-1)
+
+
+def _cumulative_xy(angles: np.ndarray, ds: float) -> tuple[np.ndarray, np.ndarray]:
+    """anglesToSpatial.m: positions from the base by the trapezoid rule."""
+    zero = np.zeros((angles.shape[0], 1))
+    c, s = np.cos(angles), np.sin(angles)
+    x = np.concatenate([zero, np.cumsum(0.5 * (c[:, 1:] + c[:, :-1]) * ds, axis=1)], axis=1)
+    y = np.concatenate([zero, np.cumsum(0.5 * (s[:, 1:] + s[:, :-1]) * ds, axis=1)], axis=1)
+    return x, y
+
+
+_DIRECTIONS = np.linspace(0.0, np.pi, 64, endpoint=False)
+
+
+def _trapz_weights(s: np.ndarray) -> np.ndarray:
+    """Weights w with w @ f equal to trapz(s, f)."""
+    d = np.diff(s)
+    w = np.zeros_like(s)
+    w[:-1] += d / 2.0
+    w[1:] += d / 2.0
+    return w
+
+
+def _spatial_amplitudes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """computeSpatialAmplitudes.m: half the largest distance between any two frames, per point.
+
+    The largest spread along 64 directions, within 0.03% of the largest pairwise distance.
+    """
+    proj = (x[:, :, None] * np.cos(_DIRECTIONS) + y[:, :, None] * np.sin(_DIRECTIONS))
+    return (proj.max(axis=0) - proj.min(axis=0)).max(axis=1) / 2.0
+
+
+def _xy_fit_error(x, y, xr, yr, s, t) -> float:
+    """computeQualityOfFitXY.m: best rotation of the reconstruction per frame, then the overall error."""
+    norm = np.sqrt(x ** 2 + y ** 2).sum(axis=1)
+    norm = np.where(norm > 0, norm, 1.0)
+    w = _trapz_weights(s)
+
+    def score(theta):
+        c, sn = np.cos(theta)[:, None], np.sin(theta)[:, None]
+        xt, yt = c * xr - sn * yr, sn * xr + c * yr
+        return np.sqrt((xt - x) ** 2 + (yt - y) ** 2) @ w / norm
+
+    # fminunc from 0 finds the minimum nearest no rotation; golden section on [-0.5, 0.5] here.
+    a, b = np.full(x.shape[0], -0.5), np.full(x.shape[0], 0.5)
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    c1, c2 = b - g * (b - a), a + g * (b - a)
+    f1, f2 = score(c1), score(c2)
+    for _ in range(25):
+        left = f1 < f2
+        b, a = np.where(left, c2, b), np.where(left, a, c1)
+        c1, c2 = b - g * (b - a), a + g * (b - a)
+        f1, f2 = score(c1), score(c2)
+    theta = 0.5 * (a + b)
+    c, sn = np.cos(theta)[:, None], np.sin(theta)[:, None]
+    xt, yt = c * xr - sn * yr, sn * xr + c * yr
+    err = np.trapezoid(np.trapezoid((x - xt) ** 2 + (y - yt) ** 2, s, axis=1), t)
+    ref = np.trapezoid(np.trapezoid(x ** 2 + y ** 2, s, axis=1), t)
+    return float(np.sqrt(err / ref)) if ref > 0 else np.nan
+
+
+def analyse_window(curves: dict[str, np.ndarray], lo: int, hi: int, fps: float) -> dict:
+    """The pipeline's outputs for frames [lo, hi), as ``wave_*`` columns."""
+    out: dict[str, float] = {}
+    lengths = curves["length"][lo:hi]
+    overall = curves["overall"][lo:hi]
+    n_frames = hi - lo
+    if np.isfinite(lengths).sum() < 2:
+        return out
+    k = max(1, int(np.floor(n_frames / 10.0 + 0.5)))
+    flag_len = float(np.nanmax(_movmean_omitnan(lengths, k)))
+    overall_len = float(np.nanmax(_movmean_omitnan(overall, k)))
+    with np.errstate(invalid="ignore"):
+        bad = ~(lengths >= LENGTH_SHARE * flag_len) | ~(overall >= LENGTH_SHARE * overall_len)
+    frames, bridged, bad_window = _good_frame_range(bad)
+    if frames.size < MIN_GOOD_FRAMES:
+        bad_window = True
+    if frames.size < MIN_WINDOW_FRAMES:
+        return out
+    s = np.linspace(0.0, LENGTH_SHARE * flag_len, N_SAMPLES)
+    x = np.full((frames.size, N_SAMPLES), np.nan)
+    y = np.full((frames.size, N_SAMPLES), np.nan)
+    for j, f in enumerate(frames + lo):
+        if np.isfinite(curves["length"][f]):
+            arc = curves["arc"][f]
+            x[j] = np.interp(s, arc, curves["x"][f], left=np.nan, right=np.nan)
+            y[j] = np.interp(s, arc, curves["y"][f], left=np.nan, right=np.nan)
+    bad = bad[frames] | ~np.isfinite(x).all(axis=1)
+    if (~bad).sum() < 2:
+        return out
+    x[bad], y[bad] = np.nan, np.nan
+    x, y = _fill_pchip(x, bad), _fill_pchip(y, bad)
+    angles = np.unwrap(np.arctan2(np.gradient(y, s, axis=1), np.gradient(x, s, axis=1)), axis=1)
+    angles = smooth_rows(angles, ANGLE_TOLERANCE)
+    ds = s[1] - s[0]
+    n = angles.shape[0]
+    xs, ys = _cumulative_xy(angles, ds)
+
+    # fourierSpectra.m: no window, an odd count padded with one zero frame.
+    L = n + (n % 2)
+    freqs = fps * np.arange(L // 2 + 1) / L
+    spec = np.fft.fft(angles, n=L, axis=0)
+    amp = np.abs(spec / L)[: L // 2 + 1]
+    amp[1:-1] *= 2.0
+    w = int(np.floor(BAND_HZ / (freqs[1] - freqs[0])))
+    if amp.shape[0] <= w + 1:
+        return out
+    csum = np.vstack([np.zeros((1, N_SAMPLES)), np.cumsum(amp, axis=0)])
+    idx = np.arange(amp.shape[0])
+    a_lo, a_hi = np.clip(idx - w, 0, None), np.clip(idx + w + 1, None, amp.shape[0])
+    windowed = (csum[a_hi] - csum[a_lo]) / (a_hi - a_lo)[:, None] * (2 * w + 1)
+    weights = _trapz_weights(s)
+    summed = amp @ weights
+    wsummed = windowed @ weights
+
+    def peak(cols: np.ndarray) -> int:
+        part = (windowed[:, cols] @ _trapz_weights(s[cols]))[w + 1:]
+        # Ties (a flagellum that does not move) go to the first bin, as MATLAB's max does.
+        top = part.max()
+        return w + 1 + int(np.argmax(part >= top - 1e-12 * max(abs(top), 1e-300)))
+
+    k0 = peak(np.ones(N_SAMPLES, bool))
+    third = s.max() / 3.0
+    proximal, distal = s < third, s >= 2 * third
+    profile = windowed[k0]
+    phase = np.unwrap(np.angle(spec[k0]))
+    slope, intercept = np.polyfit(s, phase, 1)
+    resid = phase - (slope * s + intercept)
+    spread = phase - phase.mean()
+    rsq = 1.0 if np.allclose(phase, phase.mean()) else 1.0 - (resid ** 2).sum() / (spread ** 2).sum()
+    amp_c, phase_c = _legendre(profile), _legendre(phase)
+    static_summed = np.trapezoid(windowed[0], s)
+
+    # Single-frequency reconstruction: DC, the band around the peak, its mirror and the low bins.
+    keep = np.zeros(L, bool)
+    keep[0] = True
+    keep[k0 + np.arange(-w, w + 1)] = True
+    keep[(L - k0 + np.arange(-w, w + 1)) % L] = True
+    keep[1: w + 1] = True
+    keep[L - 1 - np.arange(w)] = True
+    rec = np.real(np.fft.ifft(np.where(keep[:, None], spec, 0.0), axis=0))[:n]
+    t = np.arange(n) / fps
+    err = np.trapezoid(np.trapezoid((angles - rec) ** 2, s, axis=1), t)
+    ref = np.trapezoid(np.trapezoid(angles ** 2, s, axis=1), t)
+    xr, yr = _cumulative_xy(rec, ds)
+    spatial = _spatial_amplitudes(xs, ys)
+    band = wsummed[w + 1:]
+    baseline = float(np.median(band))
+
+    out.update({
+        "wave_freq_hz": freqs[k0],
+        "wave_freq_proximal_hz": freqs[peak(proximal)],
+        "wave_freq_central_hz": freqs[peak(~(proximal | distal))],
+        "wave_freq_distal_hz": freqs[peak(distal)],
+        "wave_amp_mean": amp_c[0], "wave_amp_asym": amp_c[1], "wave_amp_para": amp_c[2],
+        "wave_amp_integral": wsummed[k0],
+        "wave_phase_asym": phase_c[1], "wave_phase_para": phase_c[2],
+        "wave_phase_rsq": rsq,
+        "wave_phase_cycles": (phase.max() - phase.min()) / (2 * np.pi),
+        "wave_static_mean": summed[0] / flag_len,
+        "wave_freq_dominance": wsummed[k0] / (summed.sum() - static_summed),
+        "wave_fit_error": float(np.sqrt(err / ref)) if ref > 0 else np.nan,
+        "wave_xy_fit_error": _xy_fit_error(xs, ys, xr, yr, s, t),
+        "wave_disp_amp_max": spatial.max(),
+        "wave_angular_amp": ((angles.max(axis=0) - angles.min(axis=0)) / 2.0).max(),
+        "wave_length_px": flag_len,
+        "wave_bad_window": float(bad_window),
+        "wave_phase_slope": slope,
+        "wave_disp_amp_mean": spatial.mean(), "wave_disp_amp_tip": spatial[-1],
+        "wave_excess": band.max() / baseline if baseline > 0 else np.nan,
+        "wave_interp_frac": bridged / frames.size,
+        "wave_window_frames": float(n),
+    })
+    # The time-mean angle profile, sign chosen so its mean is positive (a mirror image flips it).
+    static_c = _legendre(angles.mean(axis=0))
+    flip = -1.0 if static_c[0] < 0 else 1.0
+    out["wave_static_asym"], out["wave_static_para"] = flip * static_c[1], flip * static_c[2]
+    if abs(slope) > 1e-12:
+        wavelength = 2.0 * np.pi / abs(slope)
+        out["wave_wavelength_px"] = wavelength
+        out["wave_wavelength_ratio"] = wavelength / flag_len
+        out["wave_direction"] = -float(np.sign(slope))
+        out["wave_speed_px_s"] = out["wave_direction"] * wavelength * freqs[k0]
+    floor = max(BEAT_F_MIN_HZ, BEAT_MIN_CYCLES / (n / fps))
+    out["wave_resolvable_hz"] = floor
+    out["wave_censored"] = float(freqs[k0] < floor)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # the series
 # --------------------------------------------------------------------------- #
 def spectral_series(
-    px: np.ndarray,
-    py: np.ndarray,
-    fps: float,
-    window: int = DEFAULT_WINDOW,
-    hop: int = DEFAULT_HOP,
-    flow_frames: int = DEFAULT_FLOW_FRAMES,
+    px: np.ndarray, py: np.ndarray, fps: float, window: int = DEFAULT_WINDOW,
+    hop: int = DEFAULT_HOP, flow_frames: int = DEFAULT_FLOW_FRAMES,
 ) -> pd.DataFrame:
-    """Wave descriptors (:data:`SERIES_COLUMNS`) per sliding window, indexed by centre frame.
+    """Beat measurements (:data:`SERIES_COLUMNS`) per sliding window, indexed by centre frame.
 
-    ``px``/``py`` are (n_frames, n_keypoints) on the full frame grid, NaN where undetected.
+    ``px``/``py`` are (n_frames, n_keypoints) on the full frame grid, NaN where undetected:
+    Head, Base, then the flagellum to its tip.
     """
     px = np.asarray(px, dtype=float)
     py = np.asarray(py, dtype=float)
@@ -284,201 +588,52 @@ def spectral_series(
     if px.ndim != 2 or px.shape != py.shape or px.shape[1] < 4:
         return empty
     n_frames = px.shape[0]
-    window = int(max(MIN_WINDOW_FRAMES, window))
-    hop = int(max(1, hop))
+    fps = max(float(fps), 1e-6)
+    window, hop = int(max(MIN_WINDOW_FRAMES, window)), int(max(1, hop))
     if n_frames < MIN_WINDOW_FRAMES:
         return empty
-
-    # -- 1. per-frame geometry, computed ONCE ------------------------------- #
-    # Fill gaps in time; the transform assumes uniform sampling.
-    complete = np.isfinite(px).all(axis=1) & np.isfinite(py).all(axis=1)
-    px, py = _interp_nan(px), _interp_nan(py)
-
-    ox, oy = px[:, 1], py[:, 1]                       # Base = origin
-    axis = np.arctan2(py[:, 0] - oy, px[:, 0] - ox)   # Base -> Head
-    cos, sin = np.cos(-axis), np.sin(-axis)
-    fx = (px[:, 1:] - ox[:, None]) * cos[:, None] - (py[:, 1:] - oy[:, None]) * sin[:, None]
-    fy = (px[:, 1:] - ox[:, None]) * sin[:, None] + (py[:, 1:] - oy[:, None]) * cos[:, None]
-
-    dx, dy = np.diff(fx, axis=1), np.diff(fy, axis=1)
-    seg = np.hypot(dx, dy)
-    n_seg = seg.shape[1]
-    if n_seg < MIN_SEGMENTS:
-        return empty
-    arc = np.cumsum(seg, axis=1)
-    length = arc[:, -1]
-
-    # Unwrap along arclength first, then time.
-    psi = np.unwrap(np.arctan2(dy, dx), axis=1)
-
-    # Treat a zero-length flagellum as undetected.
-    degenerate = ~(np.isfinite(psi).all(axis=1) & np.isfinite(seg).all(axis=1)
-                   & np.isfinite(length) & (length > 1e-9))
-    complete = complete & ~degenerate
-    if degenerate.any():
-        psi[degenerate] = np.nan
-        psi = _interp_nan(psi)
-        seg[degenerate] = np.nan
-        seg = _interp_nan(seg)
-        arc = np.cumsum(seg, axis=1)
-        length = np.where(degenerate, np.nan, length)
-        length = _interp_nan(length[:, None])[:, 0]
-        length = np.where(np.isfinite(length) & (length > 1e-9), length, np.nan)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        node_s = (arc - seg / 2.0) / length[:, None]        # per-frame, normalised
-    node_s = np.where(np.isfinite(node_s), node_s, 0.0)
-
-    # For the circular mean of the raw angle, taken before the time unwrap.
-    tangent = np.exp(1j * psi)
-    psi = np.unwrap(psi, axis=0)                            # now along time
-
-    # -- 2. one transform for the whole track -------------------------------- #
-    freqs, spectrum, starts = _sliding_spectrum(psi, window, hop, fps)
-    if starts.size == 0:
-        return empty
     m = int(min(window, n_frames))
-    n_win = starts.size
+    starts = _slice_starts(n_frames, m, hop)
+    if starts.size == 0:
+        starts = np.array([(n_frames - m) // 2])
     centres = starts + m // 2
 
-    out = {c: np.full(n_win, np.nan) for c in SERIES_COLUMNS}
-    out["wave_window_frames"] = np.full(n_win, float(m))
+    curves = frame_curves(px, py)
+    rows = [analyse_window(curves, int(c), int(c) + m, fps) for c in starts]
+    out = {c: np.array([r.get(c, np.nan) for r in rows], dtype=float) for c in SERIES_COLUMNS}
 
-    # -- 2b. direction, read without the spectrum ---------------------------- #
-    # Before the band check, so rows without a resolvable beat still get it.
-    flow = flow_series(psi, arc - seg / 2.0, complete, flow_frames)
+    # Direction without a spectrum, from the keypoint chords over gaps filled in time.
+    complete = np.isfinite(px).all(axis=1) & np.isfinite(py).all(axis=1)
+    psi, arc = _chord_angles(_interp_nan(px), _interp_nan(py))
+    flow = flow_series(psi, arc, complete, flow_frames)
     reach = max(int(flow_frames) // 2, int(hop) // 2)
     out["wave_flow"] = _read_at(flow, centres, reach)
     out["wave_flow_coherence"] = _read_at(np.abs(flow), centres, reach)
-    out["wave_flow_direction"] = np.sign(out["wave_flow"])
-    out["wave_flow_direction"][out["wave_flow_direction"] == 0.0] = np.nan
+    direction = np.sign(out["wave_flow"])
+    out["wave_flow_direction"] = np.where(direction == 0.0, np.nan, direction)
 
-    # -- 3. per-window geometry, from sliding sums --------------------------- #
-    s = _sliding_mean(node_s, m, starts)                    # (n_win, n_seg)
-    mean_length = _sliding_mean(length[:, None], m, starts)[:, 0]
-    mean_dir = _sliding_mean(tangent, m, starts)            # (n_win, n_seg) complex
-    filled_frac = 1.0 - _sliding_mean(complete[:, None].astype(float), m, starts)[:, 0]
-    out["wave_interp_frac"] = filled_frac
-
-    # MAX_INTERP_FRAC applies per window.
-    usable = (filled_frac <= MAX_INTERP_FRAC)
-    usable &= ((1.0 - filled_frac) * m >= MIN_WINDOW_FRAMES)
-    usable &= np.isfinite(mean_length) & (mean_length > 1e-9)
-    usable &= np.isfinite(s).all(axis=1)
-    out["wave_length_px"] = np.where(usable, mean_length, np.nan)
-
-    # -- 4. static mode ------------------------------------------------------ #
-    psi_0 = np.unwrap(np.angle(mean_dir), axis=1)           # continuous along arclength
-    resultant = np.angle(mean_dir.mean(axis=1))
-    out["wave_static_cos"] = np.where(usable, np.cos(resultant), np.nan)
-    out["wave_static_sin"] = np.where(usable, np.sin(resultant), np.nan)
-    static_c = _legendre_batch(psi_0, s)
-    # Gradients of the profile, so the undecidable constant offset cancels.
-    out["wave_static_asym"] = np.where(usable, static_c[:, 1], np.nan)
-    out["wave_static_para"] = np.where(usable, static_c[:, 2], np.nan)
-
-    # -- 5. the fundamental -------------------------------------------------- #
-    # Band-limited as in `_beat_estimate`.
-    duration = m / max(fps, 1e-6)
-    f_floor = max(BEAT_F_MIN_HZ, BEAT_MIN_CYCLES / duration)
-    out["wave_resolvable_hz"] = np.where(usable, f_floor, np.nan)
-    band = np.flatnonzero(freqs >= f_floor)
-    if band.size < 3 or not np.isfinite(spectrum).all():
-        return _finish(out, centres, hop, m)
-
-    power = (np.abs(spectrum) ** 2).sum(axis=1)             # (n_freq, n_win), pooled
-    band_power = power[band]                                # (n_band, n_win)
-    local = np.argmax(band_power, axis=0)
-    peak = band[local]
-    win_idx = np.arange(n_win)
-    peak_power = band_power[local, win_idx]
-    baseline = np.median(band_power, axis=0)
-    total = band_power.sum(axis=0)
-    # A window with no variation has no beat.
-    with np.errstate(invalid="ignore", divide="ignore"):
-        moving = total > np.finfo(float).eps * max(1.0, float(np.nanmax(total, initial=0.0)))
-    usable = usable & moving
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        excess = np.where(baseline > 0, peak_power / baseline, np.nan)
-        frac = np.where(total > 0, peak_power / total, np.nan)
-    out["wave_excess"] = np.where(usable, excess, np.nan)
-    out["wave_fundamental_frac"] = np.where(usable, frac, np.nan)
-    # Peak on the band floor: the true frequency is at or below it.
-    censored = (local == 0)
-    out["wave_censored"] = np.where(usable, censored.astype(float), np.nan)
-    out["wave_freq_hz"] = np.where(usable, freqs[peak], np.nan)
-    measured = usable
-
-    peak_spec = spectrum[peak, :, win_idx]                  # (n_win, n_seg)
-    # Hanning halves the coherent gain, hence the extra factor of two.
-    amplitude = np.abs(peak_spec) * (2.0 / m) * 2.0
-    phase = np.unwrap(np.angle(peak_spec), axis=1)
-
-    amp_c = _legendre_batch(amplitude, s)
-    a0 = amp_c[:, 0]
-    scale = np.where(np.isfinite(a0) & (np.abs(a0) > 1e-9), a0, np.nan)
-    out["wave_amp_mean"] = np.where(measured, a0, np.nan)
-    # Normalised by the mean, as in the paper.
-    out["wave_amp_asym"] = np.where(measured, amp_c[:, 1] / scale, np.nan)
-    out["wave_amp_para"] = np.where(measured, amp_c[:, 2] / scale, np.nan)
-
-    phase_c = _legendre_batch(phase, s)
-    out["wave_phase_asym"] = np.where(usable, phase_c[:, 1], np.nan)
-    out["wave_phase_para"] = np.where(usable, phase_c[:, 2], np.nan)
-
-    # -- 6. wavelength and direction from the phase gradient ----------------- #
-    # Fitted against arclength in px.
-    arc_px = s * mean_length[:, None]
-    slope, rsq = _line_fit(arc_px, phase)                   # rad per px
-    slope = np.where(usable, slope, np.nan)
-    out["wave_phase_slope"] = slope
-    out["wave_phase_rsq"] = np.where(usable, rsq, np.nan)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        wavelength = np.where(np.abs(slope) > 1e-9, 2.0 * np.pi / np.abs(slope), np.nan)
-    out["wave_wavelength_px"] = wavelength
-    out["wave_wavelength_ratio"] = wavelength / mean_length
-    # +1 means Base -> Tip.
-    direction = -np.sign(slope)
-    direction = np.where(np.isfinite(wavelength) & (direction != 0.0), direction, np.nan)
-    out["wave_direction"] = direction
-    out["wave_speed_px_s"] = direction * wavelength * out["wave_freq_hz"]
-
-    # -- 7. beat stability ---------------------------------------------------- #
-    # Local and whole-track spread, over uncensored windows only.
-    freq = np.where(out["wave_censored"] == 1.0, np.nan, out["wave_freq_hz"])
-    out["wave_freq_drift_hz"] = _local_spread(freq, max(1, m // hop))
-    good = freq[np.isfinite(freq)]
+    # Frequency stability over windows that measured one.
+    steady = np.where((out["wave_censored"] == 1.0) | (out["wave_bad_window"] == 1.0), np.nan,
+                      out["wave_freq_hz"])
+    out["wave_freq_drift_hz"] = _local_spread(steady, max(1, m // hop))
+    good = steady[np.isfinite(steady)]
     if good.size >= 3:
-        out["wave_freq_track_sd_hz"] = np.full(n_win, float(good.std(ddof=1)))
-    return _finish(out, centres, hop, m)
-
-
-def _finish(out: dict, centres: np.ndarray, hop: int, m: int) -> pd.DataFrame:
-    """Assemble the series, in a fixed column order, indexed by centre frame."""
-    frame = pd.DataFrame({c: np.asarray(out[c], dtype=float) for c in SERIES_COLUMNS},
-                         index=pd.Index(centres, name="frame"))
-    frame.attrs["window"] = int(m)
-    frame.attrs["hop"] = int(hop)
+        out["wave_freq_track_sd_hz"] = np.full(centres.size, float(good.std(ddof=1)))
+    frame = pd.DataFrame({c: out[c] for c in SERIES_COLUMNS}, index=pd.Index(centres, name="frame"))
+    frame.attrs["window"], frame.attrs["hop"] = m, hop
     return frame.replace([np.inf, -np.inf], np.nan)
 
 
 def track_spectral_series(
-    sub: pd.DataFrame,
-    n_keypoints: int,
-    fps: float,
-    window: int = DEFAULT_WINDOW,
-    hop: int = DEFAULT_HOP,
-    n_frames: int | None = None,
-    f_start: int | None = None,
+    sub: pd.DataFrame, n_keypoints: int, fps: float, window: int = DEFAULT_WINDOW,
+    hop: int = DEFAULT_HOP, n_frames: int | None = None, f_start: int | None = None,
     flow_frames: int = DEFAULT_FLOW_FRAMES,
 ) -> pd.DataFrame:
     """:func:`spectral_series` from one track's rows, laid on the full frame grid first."""
     sub = sub.sort_values("frame")
     frames = sub["frame"].to_numpy(dtype=int)
     if frames.size == 0:
-        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop,
-                               flow_frames)
+        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop, flow_frames)
     if f_start is None:
         f_start = int(frames.min())
     if n_frames is None:
@@ -521,36 +676,29 @@ class WindowSource:
         out["centre_offset"] = np.nan
         if self.centres.size == 0:
             return out
-
         target = (float(f_start) + float(f_end)) / 2.0
         inside = (self.centres >= float(f_start)) & (self.centres < float(f_end))
         rows = (np.flatnonzero(inside) if inside.any()
                 else np.array([int(np.argmin(np.abs(self.centres - target)))]))
-
         out["n_windows"] = float(rows.size)
         out["centre_offset"] = float(np.median(self.centres[rows]) - target)
         block = self.values[rows]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             pooled = np.where(np.isnan(block).all(axis=0), np.nan,
-                              np.where(self.is_fraction,
-                                       np.nanmean(block, axis=0),
+                              np.where(self.is_fraction, np.nanmean(block, axis=0),
                                        np.nanmedian(block, axis=0)))
         for column, value in zip(self.columns, pooled):
             if np.isfinite(value):
                 out[column] = float(value)
-
         slope = out.get("wave_phase_slope", np.nan)
         out["wave_direction"] = _safe(
             -float(np.sign(slope)) if np.isfinite(slope) and slope != 0.0 else np.nan)
-        # From the signed median, never a median of +-1 values.
         flow = out.get("wave_flow", np.nan)
         out["wave_flow_direction"] = _safe(
-            float(np.sign(flow)) if np.isfinite(flow) and flow != 0.0 else np.nan
-        )
-        freq = out.get("wave_freq_hz", np.nan)
-        wavelength = out.get("wave_wavelength_px", np.nan)
-        out["wave_speed_px_s"] = _safe(out["wave_direction"] * wavelength * freq)
+            float(np.sign(flow)) if np.isfinite(flow) and flow != 0.0 else np.nan)
+        out["wave_speed_px_s"] = _safe(
+            out["wave_direction"] * out.get("wave_wavelength_px", np.nan) * out.get("wave_freq_hz", np.nan))
         return out
 
 

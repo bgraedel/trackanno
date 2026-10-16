@@ -72,6 +72,7 @@ needs only the movie. See [split runs](docs/detection.md#detecting-on-one-machin
 | [Detection and the clip cache](docs/detection.md) | tiling, trackers, shared models, split runs, pose, ND2 |
 | [The annotation screen](docs/annotation.md) | shortcuts, view, modes, clip order, the CSV |
 | [The label suggester](docs/suggester.md) | features, embeddings, context, the audit holdout |
+| [Measurements](docs/measurements.md) | what each feature measures, and its validation |
 | [Prediction, bouts and transitions](docs/prediction.md) | dense bouts, the Review page, the Markov chain |
 | [Label distribution and export](docs/export.md) | the distribution tab, overlay movies |
 | [Development](docs/development.md) | tests, source layout, conventions |

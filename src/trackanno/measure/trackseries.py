@@ -1,6 +1,8 @@
 """Per-frame series for one track (:func:`build_series`) and its reduction over any window.
 
-A window's features depend only on its frames; ``beat_*`` and ``wave_*`` are added by clipfeatures.
+A window's features depend only on its frames; ``wave_*`` are added by clipfeatures.
+Speed, rotation and turning compare means over ``KINEMATIC_LAG_S``, since per frame
+keypoint jitter swamps them.
 """
 
 from __future__ import annotations
@@ -12,17 +14,16 @@ import pandas as pd
 
 from .clipfeatures import (
     IMMOTILE_PX_PER_SEC,
+    KINEMATIC_LAG_S,
     LOCALISATION_NOISE_PX,
-    _heading_lag,
-    _interp_nan,
     _on_grid,
-    _path_length,
     _safe,
 )
 from ..config import Config
+from .wavespectra import segment_arcs
 
 __all__ = [
-    "build_series", "aggregate_window", "feature_names",
+    "build_series", "aggregate_window", "feature_names", "kinematic_lag",
     "SERIES_SPEC", "SERIES_COLUMNS", "WINDOW_FUNCTIONALS",
 ]
 
@@ -57,12 +58,13 @@ SERIES_SPEC: dict[str, tuple[str, ...]] = {
     "flagellum_len": ("mean", "std"),
     "flagellum_complete": ("frac",),
     # -- cell body, not the box ---------------------------------------------- #
-    "anchor_x": (),
+    "anchor_x": (),                 # Head-Base midpoint
     "anchor_y": (),
     "body_speed": ("mean", "median", "p90"),
+    "body_immotile": ("frac",),
     # -- orientation --------------------------------------------------------- #
-    "body_axis_ang": (),            # Base -> Head
-    "tip_ang": (),                  # Base -> most distal node
+    "body_axis_ang": (),            # Base -> Head, in the lab
+    "tip_ang": (),                  # Base -> Tip, relative to Head -> Base
 }
 
 SERIES_COLUMNS: tuple[str, ...] = tuple(SERIES_SPEC)
@@ -70,11 +72,12 @@ SERIES_COLUMNS: tuple[str, ...] = tuple(SERIES_SPEC)
 # Functionals of the whole window; NaN when not computable.
 WINDOW_FUNCTIONALS: tuple[str, ...] = (
     "path_length", "net_displacement", "straightness", "radius_gyration",
-    "turn_lag_frames", "turn_abs_mean", "turn_std", "turn_abs_p90", "turn_n_valid",
+    "turn_abs_mean", "turn_std", "turn_abs_p90", "turn_n_valid",
     "flagellum_len_cv",
-    "body_path_length", "body_net_displacement", "body_straightness",
+    "body_path_length", "body_net_displacement", "body_straightness", "body_radius_gyration",
+    "body_turn_abs_mean", "body_turn_std", "body_turn_abs_p90", "body_turn_n_valid",
     "body_displacement_per_len", "body_rotation_speed",
-    "tip_angle_std", "tip_angular_speed",
+    "tip_angle_std",
 )
 
 # Reducers see finite values only; "frac" is the mean of an indicator.
@@ -95,8 +98,8 @@ _FEATURE_NAMES: dict[tuple[str, str], str] = {
 # `kpt_conf_mean` is weighted by the per-frame keypoint count.
 _POOLED_WEIGHT: dict[str, str] = {"kpt_conf": "kpt_conf_n"}
 
-# Backward differences: the first in-window sample straddles the edge and is dropped.
-_BACKWARD_DIFF: tuple[str, ...] = ("speed", "immotile", "body_speed")
+# Sample i spans frames (i - 2*lag, i], so a window's first 2*lag - 1 samples reach before it.
+_LAGGED: tuple[str, ...] = ("speed", "immotile", "body_speed", "body_immotile")
 
 
 def feature_names() -> tuple[str, ...]:
@@ -109,6 +112,45 @@ def feature_names() -> tuple[str, ...]:
     return tuple(names) + WINDOW_FUNCTIONALS
 
 
+def kinematic_lag(fps: float) -> int:
+    """Frames in ``KINEMATIC_LAG_S`` at ``fps``, at least one."""
+    return max(1, int(round(KINEMATIC_LAG_S * float(fps))))
+
+
+def _lagged_change(values: np.ndarray, lag: int) -> np.ndarray:
+    """Change per frame from the mean over frames ``(i-2*lag, i-lag]`` to that over ``(i-lag, i]``.
+
+    A row with any NaN is missing; a mean needs half its frames and is timed at the frames it has.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.ndim == 1:
+        values = values[:, None]
+    n, d = values.shape
+    out = np.full((n, d), np.nan)
+    if n < 2 * lag:
+        return out
+    ok = np.isfinite(values).all(axis=1)
+    filled = np.where(ok[:, None], values, 0.0)
+    m = n - lag + 1                                   # block j covers frames j .. j+lag-1
+    total, count, when = np.zeros((m, d)), np.zeros(m), np.zeros(m)
+    # Summed in a fixed order, so a window gets the same bits in any longer series.
+    for k in range(lag):
+        total += filled[k:k + m]
+        count += ok[k:k + m]
+        when += k * ok[k:k + m]
+    count[count < (lag + 1) // 2] = np.nan
+    mean = total / count[:, None]
+    centre = when / count                             # mean frame offset within the block
+    span = lag + centre[lag:] - centre[:-lag]
+    out[2 * lag - 1:] = (mean[lag:] - mean[:-lag]) / span[:, None]
+    return out
+
+
+def _wrap(angle: np.ndarray) -> np.ndarray:
+    """Angles folded into [-pi, pi)."""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
 # --------------------------------------------------------------------------- #
 # series
 # --------------------------------------------------------------------------- #
@@ -117,10 +159,11 @@ def build_series(
 ) -> pd.DataFrame:
     """Per-frame quantities for one track on a frame grid starting at ``f_start``, NaN where undetected.
 
-    Rates are per second, so :func:`aggregate_window` needs the same ``fps``.
+    Rates are per second over :func:`kinematic_lag`, so :func:`aggregate_window` needs this ``fps``.
     """
     sub = sub.sort_values("frame")
     dt = 1.0 / max(fps, 1e-6)
+    lag = kinematic_lag(fps)
     n_frames = int(n_frames)
     f_start = int(f_start)
     nan = np.full(n_frames, np.nan)
@@ -149,7 +192,7 @@ def build_series(
         cols["box_h"] > 1e-6, cols["box_w"] / np.maximum(cols["box_h"], 1e-6), np.nan
     )
 
-    cols["speed"] = _backward_step(cols["cx"], cols["cy"]) / dt
+    cols["speed"] = _lagged_speed(cols["cx"], cols["cy"], lag) / dt
     finite_speed = np.isfinite(cols["speed"])
     cols["immotile"] = np.where(
         finite_speed, (cols["speed"] < IMMOTILE_PX_PER_SEC).astype(float), np.nan
@@ -166,7 +209,8 @@ def build_series(
     if not has_pose:
         for name in ("kpt_conf", "kpt_conf_n", "shape_extent", "shape_pc1", "shape_pc2",
                      "shape_elong", "body_len", "flagellum_len", "flagellum_complete",
-                     "anchor_x", "anchor_y", "body_speed", "body_axis_ang", "tip_ang"):
+                     "anchor_x", "anchor_y", "body_speed", "body_immotile", "body_axis_ang",
+                     "tip_ang"):
             cols[name] = nan.copy()
         return _frame(cols, f_start, n_frames, fps, has_pose=False)
 
@@ -211,29 +255,33 @@ def build_series(
         cols["body_len"] = np.hypot(px[:, 0] - px[:, 1], py[:, 0] - py[:, 1])
 
         # Only frames with the whole chain present.
-        seg = np.hypot(np.diff(px[:, 1:], axis=1), np.diff(py[:, 1:], axis=1))
+        dx, dy = np.diff(px[:, 1:], axis=1), np.diff(py[:, 1:], axis=1)
+        seg = segment_arcs(np.hypot(dx, dy), np.unwrap(np.arctan2(dy, dx), axis=1))
         complete = np.isfinite(seg).all(axis=1)
         cols["flagellum_len"] = np.where(complete, seg.sum(axis=1), np.nan)
         cols["flagellum_complete"] = complete.astype(float)
 
-        # -- translocation of the Head-Base midpoint ------------------------- #
-        cols["anchor_x"] = np.nanmean(px[:, :2], axis=1)
-        cols["anchor_y"] = np.nanmean(py[:, :2], axis=1)
-        cols["body_speed"] = _backward_step(cols["anchor_x"], cols["anchor_y"]) / dt
+        # -- translocation of the Head-Base midpoint, NaN unless both are seen -- #
+        cols["anchor_x"] = (px[:, 0] + px[:, 1]) / 2
+        cols["anchor_y"] = (py[:, 0] + py[:, 1]) / 2
+        cols["body_speed"] = _lagged_speed(cols["anchor_x"], cols["anchor_y"], lag) / dt
+        # The box sways with a beating flagellum; the body says whether the cell moves.
+        cols["body_immotile"] = np.where(
+            np.isfinite(cols["body_speed"]),
+            (cols["body_speed"] < IMMOTILE_PX_PER_SEC).astype(float), np.nan)
 
-        # Base -> Head.
         cols["body_axis_ang"] = np.arctan2(py[:, 0] - py[:, 1], px[:, 0] - px[:, 1])
-        cols["tip_ang"] = np.arctan2(py[:, -1] - py[:, 1], px[:, -1] - px[:, 1])
+        # The flagellum against the body, so the cell's own rotation cancels.
+        tip_lab = np.arctan2(py[:, -1] - py[:, 1], px[:, -1] - px[:, 1])
+        cols["tip_ang"] = _wrap(tip_lab - cols["body_axis_ang"] - np.pi)
 
     return _frame(cols, f_start, n_frames, fps, has_pose=True)
 
 
-def _backward_step(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """One-frame displacement where sample i is the step into frame i; NaN at the first."""
-    out = np.full(x.shape[0], np.nan)
-    if x.shape[0] >= 2:
-        out[1:] = np.hypot(np.diff(x), np.diff(y))
-    return out
+def _lagged_speed(x: np.ndarray, y: np.ndarray, lag: int) -> np.ndarray:
+    """Speed in px per frame from :func:`_lagged_change` of the position."""
+    v = _lagged_change(np.column_stack([x, y]), lag)
+    return np.hypot(v[:, 0], v[:, 1])
 
 
 def _frame(
@@ -255,8 +303,11 @@ def aggregate_window(
     f_start, f_end = int(f_start), int(f_end)
     if f_end <= f_start:
         raise ValueError(f"empty window [{f_start}, {f_end})")
-    win = _window(series, f_start, f_end)
-    n_frames = f_end - f_start
+    built = series.attrs.get("fps")
+    if built is not None and not np.isclose(float(built), float(fps)):
+        raise ValueError(f"series built at {built} fps cannot be read at {fps} fps")
+    lag = kinematic_lag(fps)
+    win = _window(series, f_start, f_end, lag)
     dt = 1.0 / max(fps, 1e-6)
 
     out: dict[str, float] = {}
@@ -264,15 +315,15 @@ def aggregate_window(
         # All-NaN slices are normal for undetected stretches.
         warnings.simplefilter("ignore", RuntimeWarning)
         _reduce(win, out)
-        _trajectory(win, out, n_frames, dt)
-        _pose(win, out, n_frames, dt, cfg)
+        _trajectory(win, out, dt, lag)
+        _pose(win, out, dt, lag)
 
     for key in WINDOW_FUNCTIONALS:
         out.setdefault(key, np.nan)
     return out
 
 
-def _window(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, np.ndarray]:
+def _window(series: pd.DataFrame, f_start: int, f_end: int, lag: int) -> dict[str, np.ndarray]:
     """Slice every column to ``[f_start, f_end)`` by absolute frame, positionally."""
     n_rows = len(series.index)
     if n_rows == 0:
@@ -288,10 +339,10 @@ def _window(series: pd.DataFrame, f_start: int, f_end: int) -> dict[str, np.ndar
         )
     block = series.to_numpy()[i0:i1]
     win = {name: block[:, j] for j, name in enumerate(series.columns)}
-    for name in _BACKWARD_DIFF:
+    for name in _LAGGED:
         # Copy: the slice is a view onto the caller's frame.
         edge = win[name].copy()
-        edge[0] = np.nan
+        edge[:2 * lag - 1] = np.nan
         win[name] = edge
     return win
 
@@ -318,43 +369,53 @@ def _reduce(win: dict[str, np.ndarray], out: dict[str, float]) -> None:
                 out[key] = _safe(fn(good))
 
 
-def _trajectory(
-    win: dict[str, np.ndarray], out: dict[str, float], n_frames: int, dt: float
-) -> None:
-    """Path, spread and turning of the box centroid over this window."""
-    cx, cy = win["cx"], win["cy"]
-    # Needs at least one measurable one-frame step.
-    if not np.isfinite(win["speed"]).any():
-        return
+def _path(x: np.ndarray, y: np.ndarray, speed: np.ndarray, dt: float, lag: int,
+          out: dict[str, float], prefix: str) -> bool:
+    """Net displacement, path length and straightness; False with under two positions."""
+    present = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+    if present.size < 2:
+        return False
+    first, last = present[0], present[-1]
+    net = float(np.hypot(x[last] - x[first], y[last] - y[first]))
+    out[prefix + "net_displacement"] = _safe(net)
+    speed = speed[np.isfinite(speed)]
+    if speed.size:
+        # Lagged speed over the span seen: summed frame steps would add up the jitter.
+        path = float(speed.mean()) * float(last - first) * dt
+        out[prefix + "path_length"] = _safe(path)
+        # Needs the motion a heading needs: a mean move per lag clear of the noise.
+        if float(speed.mean()) * lag * dt > 3.0 * LOCALISATION_NOISE_PX:
+            out[prefix + "straightness"] = _safe(min(net / path, 1.0))
+    return True
 
-    path, net = _path_length(cx, cy)
-    out["path_length"] = _safe(path)
-    out["net_displacement"] = _safe(net)
-    out["straightness"] = _safe(net / path if path > 1e-6 else np.nan)
-    out["radius_gyration"] = _safe(
-        np.sqrt(np.nanmean((cx - np.nanmean(cx)) ** 2 + (cy - np.nanmean(cy)) ** 2))
+
+def _turning(x: np.ndarray, y: np.ndarray, dt: float, lag: int,
+             out: dict[str, float], prefix: str) -> None:
+    """Spread and turning of a position over the window."""
+    out[prefix + "radius_gyration"] = _safe(
+        np.sqrt(np.nanmean((x - np.nanmean(x)) ** 2 + (y - np.nanmean(y)) ** 2))
     )
-
-    # Heading lag is chosen per window to clear the localisation noise.
-    lag = _heading_lag(cx, cy, n_frames)
-    out["turn_lag_frames"] = float(lag)
-    hx, hy = cx[lag:] - cx[:-lag], cy[lag:] - cy[:-lag]
-    moved = np.hypot(hx, hy) > LOCALISATION_NOISE_PX
-    heading = np.where(moved, np.arctan2(hy, hx), np.nan)
-    turn = heading[lag:] - heading[:-lag] if heading.size > lag else np.empty(0)
-    turn = (turn + np.pi) % (2 * np.pi) - np.pi
+    # Heading over one lag where the move clears the noise; turn over the next lag.
+    v = _lagged_change(np.column_stack([x, y]), lag)
+    moved = np.hypot(v[:, 0], v[:, 1]) * lag > 3.0 * LOCALISATION_NOISE_PX
+    heading = np.where(moved, np.arctan2(v[:, 1], v[:, 0]), np.nan)
+    turn = _wrap(heading[lag:] - heading[:-lag])
     turn = turn[np.isfinite(turn)]
     span = lag * dt
     if turn.size >= 2:
-        out["turn_abs_mean"] = _safe(np.abs(turn).mean() / span)
-        out["turn_std"] = _safe(turn.std() / span)
-        out["turn_abs_p90"] = _safe(np.percentile(np.abs(turn), 90) / span)
-    out["turn_n_valid"] = float(turn.size)
+        out[prefix + "turn_abs_mean"] = _safe(np.abs(turn).mean() / span)
+        out[prefix + "turn_std"] = _safe(turn.std() / span)
+        out[prefix + "turn_abs_p90"] = _safe(np.percentile(np.abs(turn), 90) / span)
+    out[prefix + "turn_n_valid"] = float(turn.size)
 
 
-def _pose(
-    win: dict[str, np.ndarray], out: dict[str, float], n_frames: int, dt: float, cfg: Config
-) -> None:
+def _trajectory(win: dict[str, np.ndarray], out: dict[str, float], dt: float, lag: int) -> None:
+    """Path, spread and turning of the box centroid over this window."""
+    if _path(win["cx"], win["cy"], win["speed"], dt, lag, out, ""):
+        _turning(win["cx"], win["cy"], dt, lag, out, "")
+
+
+def _pose(win: dict[str, np.ndarray], out: dict[str, float], dt: float, lag: int) -> None:
     """Window functionals that need the keypoints."""
     mean_arc = out.get("flagellum_len_mean", np.nan)
     out["flagellum_len_cv"] = _safe(
@@ -362,33 +423,27 @@ def _pose(
         if np.isfinite(mean_arc) and mean_arc > 1e-6 else np.nan
     )
 
-    anchor_x, anchor_y = win["anchor_x"], win["anchor_y"]
-    present = np.flatnonzero(np.isfinite(anchor_x) & np.isfinite(anchor_y))
-    if np.isfinite(win["body_speed"]).any() and present.size >= 2:
-        path, net = _path_length(anchor_x, anchor_y)
-        out["body_net_displacement"] = _safe(net)
-        out["body_path_length"] = _safe(path)
-        out["body_straightness"] = _safe(net / path if path > 1e-6 else np.nan)
+    if _path(win["anchor_x"], win["anchor_y"], win["body_speed"], dt, lag, out, "body_"):
+        _turning(win["anchor_x"], win["anchor_y"], dt, lag, out, "body_")
+        net = out["body_net_displacement"]
         body_len = out.get("body_len_mean", np.nan)
         out["body_displacement_per_len"] = _safe(
             net / body_len if np.isfinite(body_len) and body_len > 1e-6 else np.nan
         )
 
+    # Rotation over the lag as for speed, on the unwrapped detected samples.
     axis = win["body_axis_ang"]
-    valid = np.isfinite(axis)
-    if n_frames >= 2 and cfg.n_keypoints >= 3 and valid.sum() >= 2:
-        # Unwrap on the filled grid; keep only steps between two detected frames.
-        ang = np.unwrap(_interp_nan(axis[:, None])[:, 0])
-        turn = np.diff(ang)[valid[1:] & valid[:-1]]
-        if turn.size:
-            out["body_rotation_speed"] = _safe(np.nanmean(np.abs(turn)) / dt)
+    idx = np.flatnonzero(np.isfinite(axis))
+    if idx.size >= 2:
+        ang = np.full(axis.shape, np.nan)
+        ang[idx] = np.unwrap(axis[idx])
+        rate = _lagged_change(ang, lag)[:, 0]
+        rate = rate[np.isfinite(rate)]
+        if rate.size:
+            out["body_rotation_speed"] = _safe(np.abs(rate).mean() / dt)
 
-    # Unwrap detected samples only; rate steps only between adjacent frames.
+    # The swing of Base -> Tip against the body; its rate is the beat's, in the wave columns.
     tip = win["tip_ang"]
     idx = np.flatnonzero(np.isfinite(tip))
     if idx.size >= 8:
-        ang = np.unwrap(tip[idx])
-        out["tip_angle_std"] = _safe(np.std(ang))
-        step = np.diff(ang)[np.diff(idx) == 1]
-        if step.size:
-            out["tip_angular_speed"] = _safe(np.mean(np.abs(step)) / dt)
+        out["tip_angle_std"] = _safe(np.std(np.unwrap(tip[idx])))

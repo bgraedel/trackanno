@@ -1,8 +1,8 @@
 """Tests for the per-frame series and its window reduction.
 
-Closed-form tracks give known feature values; a window's features must not depend
-on the series built around it. Real projects can be added with
-``pytest --project-root PATH``.
+Closed-form tracks give known feature values, and a synthetic swimmer with keypoint
+noise checks them against ground truth; a window's features must not depend on the
+series built around it. Real projects can be added with ``pytest --project-root PATH``.
 """
 
 from __future__ import annotations
@@ -16,13 +16,15 @@ import pandas as pd
 import pytest
 from fixtures import make_project
 from trackanno.config import load_config
+from trackanno.measure.clipfeatures import IMMOTILE_PX_PER_SEC
 from trackanno.measure.trackseries import (
     SERIES_COLUMNS, SERIES_SPEC, WINDOW_FUNCTIONALS, aggregate_window, build_series,
-    feature_names,
+    feature_names, kinematic_lag,
 )
 
 TOL = 1e-9
 FPS, DT = 100.0, 0.01
+LAG = kinematic_lag(FPS)                 # 10 frames
 
 # Spectral estimators are out of scope for the series.
 SPECTRAL = ("beat_", "wave_")
@@ -253,17 +255,38 @@ def test_the_series_marks_gaps(gapped_series) -> None:
     assert present.sum() == 76
     assert not present[np.array(GAPS) - 500].any()
     # Undetected frames are NaN, never zero.
-    assert bool(series.loc[513:515, ["cx", "body_len", "speed"]].isna().all().all())
+    assert bool(series.loc[513:515, ["cx", "body_len", "anchor_x"]].isna().all().all())
     assert bool(series.loc[513, "flagellum_complete"] == 0.0), "0 where absent, not NaN"
     assert bool(np.isfinite(series.loc[500:512, ["body_len", "shape_pc1",
                                                  "body_axis_ang"]]).all().all())
 
 
-def test_a_gap_does_not_become_a_step(gapped_series) -> None:
-    speed = gapped_series["speed"]
-    assert np.isnan(speed[516]) and np.isnan(speed[541]), "no predecessor after a gap"
-    assert np.isnan(speed[500]), "the first frame has no incoming step"
-    assert np.isfinite(speed[512]) and np.isfinite(speed[517])
+def test_the_speed_needs_two_lags_of_history(gapped_series) -> None:
+    speed = gapped_series["speed"].to_numpy()
+    assert np.isnan(speed[:2 * LAG - 1]).all() and np.isfinite(speed[2 * LAG - 1])
+
+
+def test_a_gap_does_not_become_a_step(cfg) -> None:
+    """Each lag mean is timed at the frames it has, so missing frames bias nothing."""
+    n = 120
+    drop = (30, 31, 32, 57, 80, 81, 82, 83, 84, 85, 86)
+    track = straight_track(n, cfg.n_keypoints, V)
+    series = build_series(track[~track["frame"].isin(drop)], cfg, FPS, 0, n)
+    speed, body = series["speed"].to_numpy(), series["body_speed"].to_numpy()
+    finite = np.isfinite(speed)
+    assert np.allclose(speed[finite], V / DT, rtol=1e-6), speed[finite]
+    assert np.allclose(body[finite], V / DT, rtol=1e-6)
+    # A lag that lost more than half its frames gives no speed.
+    assert np.isnan(speed[86]) and np.isnan(speed[96]), "frames 77-86 keep 3 of 10"
+    assert finite[2 * LAG - 1:].sum() > 0.8 * (n - 2 * LAG + 1)
+
+
+def test_the_body_midpoint_needs_both_ends(cfg) -> None:
+    track = straight_track(30, cfg.n_keypoints, V)
+    track.loc[10, ["kp_x_0", "kp_y_0"]] = np.nan
+    series = build_series(track, cfg, FPS, 0, 30)
+    assert np.isnan(series.loc[10, "anchor_x"]), "not Base alone, half a body away"
+    assert np.isfinite(series.loc[11, "anchor_x"])
 
 
 def test_a_detect_project_has_nan_pose_columns(detect_cfg) -> None:
@@ -321,7 +344,8 @@ def test_a_straight_line_has_closed_form_path_features(straight) -> None:
 def test_a_straight_line_does_not_turn(straight) -> None:
     assert_close(straight, {
         "turn_abs_mean": 0.0, "turn_std": 0.0, "turn_abs_p90": 0.0,
-        "turn_lag_frames": 1.0, "turn_n_valid": float(N - 2),
+        # A heading needs two lags of frames and a turn one more.
+        "turn_n_valid": float(N - 3 * LAG + 1),
     })
 
 
@@ -343,7 +367,7 @@ def test_a_rigid_pose_has_exact_lengths_and_motion(cfg, straight) -> None:
         "body_speed_mean": speed, "body_path_length": (N - 1) * V,
         "body_net_displacement": (N - 1) * V, "body_straightness": 1.0,
         "body_displacement_per_len": (N - 1) * V / HEAD,
-        "body_rotation_speed": 0.0, "tip_angle_std": 0.0, "tip_angular_speed": 0.0,
+        "body_rotation_speed": 0.0, "tip_angle_std": 0.0,
     })
 
 
@@ -371,16 +395,30 @@ def test_a_circle_has_a_constant_turn_rate(cfg, circle) -> None:
 
 def test_a_circle_has_closed_form_speed_and_path(cfg, circle) -> None:
     got = aggregate_window(circle, 0, N, FPS, cfg)
-    chord = 2.0 * RADIUS * np.sin(W / 2.0)
-    assert close(got["speed_mean"], chord / DT, 1e-3)
-    assert close(got["path_length"], (N - 1) * chord, 1e-4)
+    # Means of LAG points on a circle sit on a circle shrunk by `shrink`; speed is its chord.
+    half = W * LAG / 2.0
+    shrink = np.sin(half) / (LAG * np.sin(W / 2.0))
+    speed = 2.0 * RADIUS * shrink * np.sin(half) / (LAG * DT)
+    assert close(got["speed_mean"], speed, 1e-3), (got["speed_mean"], speed)
+    assert close(got["path_length"], speed * (N - 1) * DT, 1e-4)
     assert close(got["net_displacement"], 2.0 * RADIUS * np.sin(W * (N - 1) / 2.0), 1e-4)
 
 
 def test_the_turn_rate_does_not_move_with_the_window_length(cfg, circle) -> None:
     rates = [aggregate_window(circle, 0, length, FPS, cfg)["turn_abs_mean"]
-             for length in (12, 25, 40, 60)]
+             for length in (3 * LAG + 1, 40, 50, 60)]
     assert max(abs(r - W / DT) for r in rates) < 1e-2, rates
+
+
+def test_a_window_too_short_for_the_lag_has_no_rates(cfg, circle) -> None:
+    rates = ("speed_mean", "immotile_frac", "body_speed_mean", "body_rotation_speed",
+             "path_length", "straightness", "body_path_length")
+    short = aggregate_window(circle, 5, 5 + 2 * LAG - 1, FPS, cfg)
+    assert all(np.isnan(short[k]) for k in rates), {k: short[k] for k in rates}
+    assert np.isfinite(short["net_displacement"]) and np.isfinite(short["radius_gyration"])
+    enough = aggregate_window(circle, 5, 5 + 2 * LAG, FPS, cfg)
+    assert all(np.isfinite(enough[k]) for k in rates)
+    assert np.isnan(enough["turn_abs_mean"]), "a turn needs a third lag"
 
 
 def test_closed_forms_hold_at_every_window_length_and_offset(cfg) -> None:
@@ -392,14 +430,20 @@ def test_closed_forms_hold_at_every_window_length_and_offset(cfg) -> None:
         for start in range(0, total - length + 1, max(length // 3, 1)):
             got = aggregate_window(series, start, start + length, FPS, cfg)
             expected = {
-                "speed_mean": V / DT, "speed_std": 0.0,
-                "path_length": (length - 1) * V, "net_displacement": (length - 1) * V,
-                "straightness": 1.0, "area_mean": 288.0, "aspect_mean": 2.0,
-                "present_frac": 1.0, "turn_abs_mean": 0.0,
+                "net_displacement": (length - 1) * V, "area_mean": 288.0,
+                "aspect_mean": 2.0, "present_frac": 1.0,
                 "radius_gyration": V * np.sqrt((length * length - 1) / 12.0),
             }
+            if length >= 2 * LAG:
+                expected.update({"speed_mean": V / DT, "speed_std": 0.0,
+                                  "path_length": (length - 1) * V, "straightness": 1.0})
+            else:
+                assert np.isnan(got["speed_mean"]) and np.isnan(got["path_length"])
+            if length > 3 * LAG:
+                expected["turn_abs_mean"] = 0.0
             for key, want in expected.items():
                 deviation = abs(float(got[key]) - want)
+                deviation = deviation if np.isfinite(deviation) else np.inf
                 if deviation > worst:
                     worst, worst_note = deviation, f"{key} at [{start}, {start + length})"
             n_windows += 1
@@ -425,15 +469,8 @@ def _tip(cfg, track) -> dict:
 
 def test_a_constant_tip_rotation_comes_back(cfg, spinning) -> None:
     got = _tip(cfg, spinning)
-    assert close(got["tip_angular_speed"], TIP_W / DT, 1e-4)
     # Evenly spaced angles, so the spread is w * sd(0..n-1).
     assert close(got["tip_angle_std"], TIP_W * np.std(np.arange(TIP_N)), 1e-4)
-
-
-def test_a_long_gap_does_not_inflate_the_tip_rotation_rate(cfg, spinning) -> None:
-    """Compacting before differencing folds a 4.1 rad gap into one wrapped step."""
-    got = _tip(cfg, spinning[~spinning["frame"].isin(np.arange(40, 80))])
-    assert close(got["tip_angular_speed"], TIP_W / DT, 1e-3), got["tip_angular_speed"]
 
 
 def test_the_tip_angle_spread_is_over_the_frames_seen(cfg, spinning) -> None:
@@ -444,12 +481,219 @@ def test_the_tip_angle_spread_is_over_the_frames_seen(cfg, spinning) -> None:
 
 
 def test_tip_angle_spread_survives_a_gap_across_the_branch_cut(cfg) -> None:
-    """A tip near +-pi lost while crossing the cut keeps its spread."""
+    """A tip near +-pi from Head -> Base lost while crossing the cut keeps its spread."""
     w = 0.002
-    sub = spinning_tip_track(TIP_N, cfg.n_keypoints, w, base_angle=np.pi - 0.1)
+    # Head -> Base points along -x, so a lab angle of -0.1 is pi - 0.1 in the body frame.
+    sub = spinning_tip_track(TIP_N, cfg.n_keypoints, w, base_angle=-0.1)
     got = _tip(cfg, sub[~sub["frame"].isin(np.arange(45, 55))])
     kept = np.concatenate([np.arange(45), np.arange(55, TIP_N)])
     assert close(got["tip_angle_std"], w * np.std(kept), 1e-4), got["tip_angle_std"]
+
+
+# --------------------------------------------------------------------------- #
+# ground truth at the measured keypoint noise
+# --------------------------------------------------------------------------- #
+BODY, FLAGELLUM = 40.0, 60.0             # px: Head-Base, and Base-Tip arc length
+NOISE = (0.3, 0.6)                       # px per coordinate: body points, flagellum points
+GT_FRAMES, GT_WINDOW = 400, 50
+GT_SPAN = (GT_WINDOW - 1) * DT           # seconds from a window's first frame to its last
+
+
+def swimmer(v: float = 0.0, omega: float = 0.0, yaw: float = 0.0, amp: float = 0.0,
+            waves: float = 1.0, beat_hz: float = 23.0, noise=NOISE, seed: int = 0
+            ) -> tuple[pd.DataFrame, dict]:
+    """A cell swimming at ``v`` px/s along its body axis and turning at ``omega`` rad/s.
+
+    The body yaws ``yaw`` rad at ``beat_hz`` about its centre; the flagellum's tangent angle
+    is ``amp * sin(2 pi (beat_hz t - waves s / FLAGELLUM))``. Returns the noisy track and the
+    noise-free keypoints and box centre as complex numbers.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(GT_FRAMES) * DT
+    heading = 0.3 + omega * t
+    if omega:
+        centre = 300 + 300j + v / omega * -1j * (np.exp(1j * heading) - np.exp(0.3j))
+    else:
+        centre = 300 + 300j + v * t * np.exp(0.3j)
+    axis = np.exp(1j * (heading + yaw * np.sin(2 * np.pi * beat_hz * t)))   # Head -> Base
+    s = np.linspace(0.0, FLAGELLUM, 601)
+    tangent = np.exp(1j * (np.angle(axis)[:, None] + amp * np.sin(
+        2 * np.pi * (beat_hz * t[:, None] - waves * s / FLAGELLUM))))
+    arc = np.cumsum(tangent[:, 1:] + tangent[:, :-1], axis=1) * (s[1] / 2)   # trapezoid
+    base = centre + BODY / 2 * axis
+    kpts = np.column_stack([centre - BODY / 2 * axis, base,
+                            base[:, None] + arc[:, 99::100]])             # nodes 10 px apart
+    sigma = np.array([noise[0]] * 2 + [noise[1]] * 6)
+    seen = kpts + sigma * (rng.normal(size=kpts.shape) + 1j * rng.normal(size=kpts.shape))
+
+    # The box hugs the true keypoints; its centre gets body-point noise.
+    lo, hi = kpts.real.min(axis=1) - 4, kpts.real.max(axis=1) + 4
+    bottom, top = kpts.imag.min(axis=1) - 4, kpts.imag.max(axis=1) + 4
+    box = (lo + hi) / 2 + 1j * (bottom + top) / 2
+    shown = box + noise[0] * (rng.normal(size=GT_FRAMES) + 1j * rng.normal(size=GT_FRAMES))
+    w, h = (hi - lo) / 2, (top - bottom) / 2
+    data = {"frame": np.arange(GT_FRAMES), "track_id": 1,
+            "x1": shown.real - w, "y1": shown.imag - h,
+            "x2": shown.real + w, "y2": shown.imag + h, "conf": 0.9}
+    for k in range(kpts.shape[1]):
+        data[f"kp_x_{k}"], data[f"kp_y_{k}"] = seen[:, k].real, seen[:, k].imag
+        data[f"kp_c_{k}"] = 0.9
+    return pd.DataFrame(data), {"kpts": kpts, "box": box}
+
+
+def clips(cfg, track: pd.DataFrame) -> pd.DataFrame:
+    """Features of consecutive clip-length windows over a generated track."""
+    series = build_series(track, cfg, FPS, 0, GT_FRAMES)
+    return pd.DataFrame([aggregate_window(series, a, a + GT_WINDOW, FPS, cfg)
+                         for a in range(0, GT_FRAMES, GT_WINDOW)])
+
+
+def per_window(values: np.ndarray, fn) -> np.ndarray:
+    return np.array([fn(values[a:a + GT_WINDOW]) for a in range(0, GT_FRAMES, GT_WINDOW)])
+
+
+# Per-frame steps read 122, 128 and 140 px/s of box speed here (34, 44 and 67 px/s at the
+# body), and immotile_frac 0.15 on the still cell; without the yaw, 54 px/s and 0.49.
+@pytest.mark.parametrize("v", [0.0, 30.0, 60.0])
+def test_the_speeds_recover_the_swimming_speed(cfg, v) -> None:
+    got = clips(cfg, swimmer(v=v, yaw=0.05, amp=0.6)[0])
+    assert abs(got["body_speed_mean"].mean() - v) < 1.5, got["body_speed_mean"].tolist()
+    assert np.abs(got["body_speed_median"] - v).max() < 3.0
+    # The box centre is fixed on the cell only while it does not turn.
+    assert abs(got["speed_mean"].mean() - v) < 3.0, got["speed_mean"].tolist()
+    assert (got["immotile_frac"] == float(v < IMMOTILE_PX_PER_SEC)).all()
+
+
+# Per-frame steps read 4.3 and 4.4 rad/s here, and 1.3 on a still cell without the yaw. A plain
+# 0.1 s difference without the lag means read 0.53 rad/s at 0.2, from the aliased 23 Hz yaw.
+@pytest.mark.parametrize("omega", [0.2, 1.0])
+def test_the_body_rotation_recovers_the_turning_rate(cfg, omega) -> None:
+    got = clips(cfg, swimmer(v=50.0, omega=omega, yaw=0.05, amp=0.6)[0])
+    rotation = got["body_rotation_speed"]
+    assert abs(rotation.mean() - omega) < 0.03, rotation.tolist()
+    assert np.abs(rotation - omega).max() < 0.08
+
+
+def test_the_body_rotation_floor(cfg) -> None:
+    # Noise gives 0.03 rad/s; what the lag means leave of the 0.05 rad yaw brings it to 0.07.
+    got = clips(cfg, swimmer(v=50.0, yaw=0.05, amp=0.6)[0])
+    assert got["body_rotation_speed"].mean() < 0.1, got["body_rotation_speed"].tolist()
+    assert clips(cfg, swimmer(v=50.0)[0])["body_rotation_speed"].mean() < 0.05
+
+
+def test_a_noise_free_turning_cell_has_the_closed_form_rates(cfg) -> None:
+    v, omega = 50.0, 1.0
+    got = clips(cfg, swimmer(v=v, omega=omega, noise=(0.0, 0.0))[0])
+    # Means over a lag sit on a circle shrunk by sin(x) / (LAG sin(x / LAG)).
+    x = omega * LAG * DT / 2
+    speed = v * np.sin(x) / (LAG * np.sin(x / LAG)) * np.sin(x) / x
+    assert np.allclose(got["body_speed_mean"], speed, rtol=1e-9)
+    assert np.allclose(got["body_rotation_speed"], omega, rtol=1e-9)
+    assert np.allclose(got["tip_angle_std"], 0.0, atol=1e-9), "the flagellum turns with the body"
+
+
+# Summed frame steps read 66 px of box path (28 at the body) against 24.5 here, straightness
+# 0.37 (0.86), and 60 px (17) on a still cell.
+def test_path_features_match_a_straight_swim(cfg) -> None:
+    v = 50.0
+    got = clips(cfg, swimmer(v=v, yaw=0.05, amp=0.6)[0])
+    for prefix in ("", "body_"):
+        assert np.abs(got[prefix + "path_length"] - v * GT_SPAN).max() < 1.0
+        # Raw end points: 0.3 px noise, and the box centre sways 1.5 px with the yaw.
+        assert np.abs(got[prefix + "net_displacement"] - v * GT_SPAN).max() < 1.5
+        assert got[prefix + "straightness"].min() > 0.95, got[prefix + "straightness"].tolist()
+
+
+def test_path_features_match_a_circle(cfg) -> None:
+    v, omega = 50.0, 2.0
+    got = clips(cfg, swimmer(v=v, omega=omega, yaw=0.05)[0])
+    arc, chord = v * GT_SPAN, 2 * v / omega * np.sin(omega * GT_SPAN / 2)
+    assert np.abs(got["body_path_length"] / arc - 1).max() < 0.03
+    assert np.abs(got["body_net_displacement"] - chord).max() < 1.5
+    assert np.abs(got["body_straightness"] - chord / arc).max() < 0.05
+
+    # A rigid cell's box centre circles at another radius; compare with its noise-free path.
+    track, truth = swimmer(v=v, omega=omega)
+    got = clips(cfg, track)
+    path = per_window(truth["box"], lambda b: np.abs(np.diff(b)).sum())
+    net = per_window(truth["box"], lambda b: abs(b[-1] - b[0]))
+    assert np.abs(got["path_length"] / path - 1).max() < 0.03, (got["path_length"].tolist(), path)
+    assert np.abs(got["net_displacement"] - net).max() < 1.5
+    assert np.abs(got["straightness"] - net / path).max() < 0.05
+
+
+def test_a_still_cell_has_no_path_shape(cfg) -> None:
+    got = clips(cfg, swimmer(v=0.0, yaw=0.05, amp=0.6)[0])
+    assert got["body_path_length"].max() < 1.5 and got["body_net_displacement"].max() < 1.5
+    # Jitter adds 2 sigma^2 to the squared radius of gyration; the yaw sways the box too.
+    assert got["radius_gyration"].max() < 1.2
+    assert clips(cfg, swimmer(v=0.0)[0])["radius_gyration"].max() < 0.6
+    # Straightness needs 3 x LOCALISATION_NOISE_PX per lag, 15 px/s, as a heading does.
+    for v, defined in ((0.0, False), (10.0, False), (20.0, True)):
+        got = clips(cfg, swimmer(v=v, yaw=0.05, amp=0.6)[0])
+        for key in ("straightness", "body_straightness"):
+            assert got[key].notna().all() if defined else got[key].isna().all(), (v, key)
+
+
+# A lag picked per window, with a 1.8 px noise floor, read 0.99 rad/s on a straight swim and
+# 1.38 on this 1 rad/s circle.
+@pytest.mark.parametrize("omega,tol", [(1.0, 0.15), (3.0, 0.05)])
+def test_turning_matches_a_circle(cfg, omega, tol) -> None:
+    got = clips(cfg, swimmer(v=50.0, omega=omega)[0])
+    assert abs(got["turn_abs_mean"].mean() / omega - 1) < tol, got["turn_abs_mean"].tolist()
+    assert (got["turn_n_valid"] == GT_WINDOW - 3 * LAG + 1).all()
+
+
+@pytest.mark.parametrize("omega", [1.0, 3.0])
+def test_body_turning_matches_a_circle_under_a_beating_flagellum(cfg, omega) -> None:
+    """The body midpoint keeps the circle's heading where the box sways with the beat."""
+    got = clips(cfg, swimmer(v=50.0, omega=omega, amp=1.0, waves=0.6)[0])
+    assert abs(got["body_turn_abs_mean"].mean() / omega - 1) < 0.08, got["body_turn_abs_mean"].tolist()
+
+
+def test_a_beating_cell_that_stays_put_is_immotile_at_the_body(cfg) -> None:
+    got = clips(cfg, swimmer(v=0.0, amp=1.0, waves=0.6)[0])
+    assert (got["body_immotile_frac"] == 1.0).all(), got["body_immotile_frac"].tolist()
+    moving = clips(cfg, swimmer(v=50.0, amp=1.0, waves=0.6)[0])
+    assert (moving["body_immotile_frac"] == 0.0).all()
+
+
+def test_turning_has_a_noise_floor_and_needs_motion(cfg) -> None:
+    straight = clips(cfg, swimmer(v=50.0)[0])
+    # Heading noise over 0.1 s at 50 px/s: about 0.45 rad/s.
+    assert straight["turn_abs_mean"].mean() < 0.6, straight["turn_abs_mean"].tolist()
+    still = clips(cfg, swimmer(v=0.0)[0])
+    assert still["turn_abs_mean"].isna().all() and (still["turn_n_valid"] == 0).all()
+
+
+@pytest.mark.parametrize("amp", [0.0, 0.6, 1.0])
+def test_lengths_match_the_cell(cfg, amp) -> None:
+    track, truth = swimmer(v=50.0, omega=1.0, amp=amp)
+    got = clips(cfg, track)
+    assert np.abs(got["body_len_mean"] - BODY).max() < 0.25
+    # Chords 10 px long on one wavelength fall short of the arc by amp^2/4 (1 - sinc^2(1/6)):
+    # 0.8 % at amp 0.6, 2.2 % at amp 1.0. Taking each segment as a circular arc recovers it.
+    deficit = amp ** 2 / 4 * (1 - np.sinc(1 / 6) ** 2)
+    chords = np.abs(np.diff(truth["kpts"][:, 1:], axis=1)).sum(axis=1)
+    assert abs(chords.mean() / FLAGELLUM - (1 - deficit)) < 1e-3
+    # Noise lengthens each chord by about sigma^2 / length, 0.2 px over the six.
+    assert abs(got["flagellum_len_mean"].mean() / FLAGELLUM - 1.0) < 0.006
+
+
+def test_the_tip_angle_ignores_the_body_turning(cfg) -> None:
+    # A whole wavelength keeps Base -> Tip still against the body, so only noise is left;
+    # measured in the lab, the 1 rad/s turn spread it by 0.145 rad.
+    got = clips(cfg, swimmer(v=50.0, omega=1.0, amp=0.6)[0])
+    assert got["tip_angle_std"].max() < 0.03, got["tip_angle_std"].tolist()
+
+
+def test_a_swinging_tip_is_recovered(cfg) -> None:
+    track, truth = swimmer(v=50.0, omega=1.0, yaw=0.05, amp=0.8, waves=0.5)
+    got = clips(cfg, track)
+    k = truth["kpts"]
+    tip = np.angle((k[:, -1] - k[:, 1]) / (k[:, 1] - k[:, 0]))
+    spread = per_window(tip, np.std)
+    assert np.abs(got["tip_angle_std"] - spread).max() < 0.01
 
 
 # --------------------------------------------------------------------------- #
@@ -490,10 +734,12 @@ EXPECTED_FEATURES = frozenset({
     "flagellum_len_cv",
     "body_speed_mean", "body_speed_median", "body_speed_p90",
     "path_length", "net_displacement", "straightness", "radius_gyration",
-    "turn_lag_frames", "turn_abs_mean", "turn_std", "turn_abs_p90", "turn_n_valid",
-    "body_path_length", "body_net_displacement", "body_straightness",
+    "turn_abs_mean", "turn_std", "turn_abs_p90", "turn_n_valid",
+    "body_path_length", "body_net_displacement", "body_straightness", "body_radius_gyration",
+    "body_turn_abs_mean", "body_turn_std", "body_turn_abs_p90", "body_turn_n_valid",
+    "body_immotile_frac",
     "body_displacement_per_len", "body_rotation_speed",
-    "tip_angle_std", "tip_angular_speed",
+    "tip_angle_std",
 })
 
 

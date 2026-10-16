@@ -260,7 +260,7 @@ def test_embedding_and_context_groups_follow_their_settings(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("column", ["speed_mean", "area_mean", "body_len_mean",
-                                    "beat_freq_hz", "wave_amp_asym", "ctx_speed_mean",
+                                    "wave_disp_amp_tip", "wave_amp_asym", "ctx_speed_mean",
                                     "conf_std"])
 def test_every_feature_column_maps_to_a_group(column) -> None:
     from trackanno.measure.clipfeatures import FEATURE_GROUPS, group_of

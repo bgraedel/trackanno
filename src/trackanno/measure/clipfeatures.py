@@ -27,21 +27,17 @@ CLIP_FEATURES_KEY_FILE = "clip_features.key"
 CONTEXT_PREFIX = "ctx_"
 
 # Rates are per second so movies at different frame rates stay comparable.
-IMMOTILE_PX_PER_SEC = 50.0
-LOCALISATION_NOISE_PX = 1.8   # measured per-frame keypoint jitter
-BEAT_NFFT = 128               # fixed grid so beat frequency is comparable across clips
+# Below this a cell is not translocating; in px/s, so it depends on magnification (about 3 um/s
+# at 0.325 um/px), and well above the 1-2.5 px/s that keypoint jitter leaves in the lagged speed.
+IMMOTILE_PX_PER_SEC = 10.0
+# Measured about 0.3 px on body points and 0.5-0.8 px on flagellum points.
+LOCALISATION_NOISE_PX = 0.5
+KINEMATIC_LAG_S = 0.1         # rates are changes over this span, not per frame
 BEAT_F_MIN_HZ = 1.0
-# The window must span this many cycles of a frequency to resolve it.
-BEAT_MIN_CYCLES = 3.0
+# The window must span this many cycles of a frequency to resolve it (validated: <1% error).
+BEAT_MIN_CYCLES = 2.5
 # Above this interpolated share a spectral estimate is NaN (computeGoodFrameRange.m).
 MAX_INTERP_FRAC = 0.20
-
-_BEAT_FEATURES = (
-    "beat_amp_mean", "beat_amp_max", "beat_speed_mean", "beat_amp_distal",
-    "beat_freq_hz", "beat_power_frac", "beat_excess", "beat_resolvable_hz",
-    "beat_censored",
-)
-
 
 _SCHEMA_CACHE: tuple[str, ...] | None = None
 
@@ -54,7 +50,6 @@ def feature_schema() -> tuple[str, ...]:
 
         _SCHEMA_CACHE = tuple(dict.fromkeys(
             tuple(trackseries.feature_names())
-            + _BEAT_FEATURES
             + tuple(wavespectra.SERIES_COLUMNS)
         ))
     return _SCHEMA_CACHE
@@ -106,72 +101,6 @@ def grid_delta(values: np.ndarray, offsets: np.ndarray, span: int) -> np.ndarray
         return np.nan_to_num(np.nanmean(steps, axis=0))
 
 
-def _beat_estimate(lateral: np.ndarray, fps: float) -> dict:
-    """Dominant frequency (Hz) of body-frame lateral displacement, with excess and censoring."""
-    out = {"beat_freq_hz": np.nan, "beat_power_frac": np.nan, "beat_excess": np.nan}
-    if lateral.ndim != 2 or lateral.shape[0] < 8 or lateral.shape[1] == 0:
-        return out
-
-    sig = _interp_nan(lateral)
-    n = sig.shape[0]
-    t = np.arange(n)
-    # Remove per-keypoint linear drift.
-    slope, intercept = np.polyfit(t, sig, 1)
-    sig -= t[:, None] * slope + intercept
-
-    # A motionless signal has no beat.
-    if not np.isfinite(sig).any() or float(np.nanmax(np.abs(sig))) < 1e-9:
-        return out
-
-    window = np.hanning(n)[:, None]
-    # BEAT_NFFT is a floor: rfft would truncate a longer signal.
-    nfft = max(BEAT_NFFT, n)
-    spec = np.abs(np.fft.rfft(sig * window, n=nfft, axis=0)) ** 2        # power
-    power = spec.sum(axis=1)                                            # pool keypoints
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / max(fps, 1e-6))
-
-    duration = n / max(fps, 1e-6)
-    f_floor = max(BEAT_F_MIN_HZ, BEAT_MIN_CYCLES / duration)
-    out["beat_resolvable_hz"] = float(f_floor)
-    band = freqs >= f_floor
-    if band.sum() < 3:
-        return out
-    band_power, band_freqs = power[band], freqs[band]
-    peak = int(np.argmax(band_power))
-    baseline = float(np.median(band_power))
-    total = float(band_power.sum())
-
-    out["beat_freq_hz"] = float(band_freqs[peak])
-    out["beat_power_frac"] = _safe(band_power[peak] / total if total > 0 else np.nan)
-    out["beat_excess"] = _safe(band_power[peak] / baseline if baseline > 0 else np.nan)
-    # Peak at the band floor: an upper bound. Tolerance is half a native resolution element.
-    out["beat_censored"] = float(
-        band_freqs[peak] < f_floor + 0.5 * max(fps, 1e-6) / n
-    )
-    return out
-
-
-def _path_length(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    """Path length and net displacement over present positions, so ``path >= net``."""
-    present = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
-    if present.size < 2:
-        return np.nan, np.nan
-    px_, py_ = x[present], y[present]
-    path = float(np.hypot(np.diff(px_), np.diff(py_)).sum())
-    net = float(np.hypot(px_[-1] - px_[0], py_[-1] - py_[0]))
-    return path, net
-
-
-def _heading_lag(x: np.ndarray, y: np.ndarray, n_frames: int) -> int:
-    """Smallest frame lag whose median displacement clears the localisation noise floor."""
-    max_lag = max(1, min(n_frames // 4, 25))
-    floor = 3.0 * LOCALISATION_NOISE_PX
-    for lag in range(1, max_lag + 1):
-        d = np.hypot(x[lag:] - x[:-lag], y[lag:] - y[:-lag])
-        d = d[np.isfinite(d)]
-        if d.size and float(np.median(d)) > floor:
-            return lag
-    return max_lag
 
 
 def _shifted_legendre(s: np.ndarray, order: int) -> np.ndarray:
@@ -181,108 +110,9 @@ def _shifted_legendre(s: np.ndarray, order: int) -> np.ndarray:
     return np.stack(out[: order + 1], axis=0)
 
 
-def _body_frame_motion(px: np.ndarray, py: np.ndarray, dt: float = 1.0) -> dict:
-    """Flagellum motion in the body frame (Base node 1 to Head node 0)."""
-    out: dict[str, float] = {}
-    if px.shape[0] < 2 or px.shape[1] < 3:
-        return out
-
-    ox, oy = px[:, 1], py[:, 1]                       # Base = origin
-    axis = np.arctan2(py[:, 0] - oy, px[:, 0] - ox)   # Base -> Head
-    valid = np.isfinite(axis) & np.isfinite(ox) & np.isfinite(oy)
-    if valid.sum() < 2:
-        return out
-
-    cos, sin = np.cos(-axis), np.sin(-axis)
-    rx = (px[:, 2:] - ox[:, None]) * cos[:, None] - (py[:, 2:] - oy[:, None]) * sin[:, None]
-    ry = (px[:, 2:] - ox[:, None]) * sin[:, None] + (py[:, 2:] - oy[:, None]) * cos[:, None]
-
-    # Mask rather than drop rows, keeping uniform sampling.
-    rx = np.where(valid[:, None], rx, np.nan)
-    ry = np.where(valid[:, None], ry, np.nan)
-    if valid.sum() < 2:
-        return out
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN rows are expected
-        amp = np.sqrt(np.nanmean((ry - np.nanmean(ry, axis=0)) ** 2, axis=1))  # lateral
-        step = np.sqrt(np.nanmean(np.diff(rx, axis=0) ** 2 + np.diff(ry, axis=0) ** 2, axis=1))
-        out["beat_amp_mean"] = _safe(np.nanmean(amp))
-        out["beat_amp_max"] = _safe(np.nanmax(amp))
-        out["beat_speed_mean"] = _safe(np.nanmean(step) / dt)
-
-    out["beat_amp_distal"] = _safe(
-        np.sqrt(np.nanmean((ry[:, -1] - np.nanmean(ry[:, -1])) ** 2))
-    )
-
-    # Unwrap on the filled grid; keep only steps between two detected frames.
-    ang = np.unwrap(_interp_nan(axis[:, None])[:, 0])
-    turn = np.diff(ang)[valid[1:] & valid[:-1]]
-    out["body_rotation_speed"] = _safe(np.nanmean(np.abs(turn)) / dt) if turn.size else np.nan
-
-    # For the spectral estimator, unless too much would be interpolated.
-    if (1.0 - valid.mean()) <= MAX_INTERP_FRAC:
-        out["_lateral"] = ry
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # per-track measurement
 # --------------------------------------------------------------------------- #
-class _KeypointGrid:
-    """One track's keypoints on its full frame grid, built once and sliced per window."""
-
-    __slots__ = ("px", "py", "present", "first", "last")
-
-    def __init__(self, tdf: pd.DataFrame, n_keypoints: int):
-        frames = tdf["frame"].to_numpy(dtype=int)
-        self.first, self.last = int(frames.min()), int(frames.max()) + 1
-        n = self.last - self.first
-        kx = [f"kp_x_{k}" for k in range(n_keypoints)]
-        ky = [f"kp_y_{k}" for k in range(n_keypoints)]
-        self.px = _on_grid(tdf, kx, n, self.first)
-        self.py = _on_grid(tdf, ky, n, self.first)
-        # Frames with a row, even if its keypoints are all NaN.
-        self.present = np.zeros(n, dtype=bool)
-        self.present[frames - self.first] = True
-
-    @staticmethod
-    def maybe(tdf: pd.DataFrame, cfg: Config) -> "_KeypointGrid | None":
-        """The grid, or None on a detect project or a table without keypoints."""
-        if not cfg.is_pose:
-            return None
-        needed = [f"kp_{a}_{k}" for k in range(cfg.n_keypoints) for a in ("x", "y")]
-        if not all(c in tdf.columns for c in needed):
-            return None
-        return _KeypointGrid(tdf, cfg.n_keypoints)
-
-
-def _beat_on_window(grid: "_KeypointGrid | None", cfg: Config, fps: float,
-                    f_start: int, f_end: int) -> dict:
-    """Beat features on a ``spectral.window`` span centred on the clip, as the waveform series."""
-    if grid is None:
-        return {}
-    first, last = grid.first, grid.last
-    span = int(cfg.spectral.window)
-    centre = (int(f_start) + int(f_end)) // 2
-    hi = min(max(centre + span // 2, first + span), last)
-    lo = max(first, hi - span)
-    n = hi - lo
-    if n < 8:
-        return {}
-    lo_i, hi_i = lo - first, hi - first
-    if not grid.present[lo_i:hi_i].any():
-        return {}
-    px, py = grid.px[lo_i:hi_i], grid.py[lo_i:hi_i]
-    motion = _body_frame_motion(px, py, 1.0 / max(fps, 1e-6))
-    lateral = motion.pop("_lateral", None)
-    # body_rotation_speed comes from trackseries, over the clip.
-    out = {k: v for k, v in motion.items() if k.startswith("beat_")}
-    if lateral is not None:
-        out.update(_beat_estimate(lateral, fps))
-    return out
-
-
 def _context_span(first: int, last: int, f_start: int, f_end: int, n: int
                   ) -> tuple[int, int]:
     """``n`` frames centred on the window, clipped to ``[first, last)``."""
@@ -336,13 +166,11 @@ def window_features(
             flow_frames=FLOW_FRAMES,
         )
 
-    grid = _KeypointGrid.maybe(tdf, cfg)
     waves = wavespectra.WindowSource(spectra) if spectra is not None else None
 
     rows = []
     for f_start, f_end in windows:
         entry = trackseries.aggregate_window(series, int(f_start), int(f_end), fps, cfg)
-        entry.update(_beat_on_window(grid, cfg, fps, int(f_start), int(f_end)))
         if waves is not None and len(spectra):
             entry.update(waves.at(int(f_start), int(f_end)))
         for key in feature_schema():
@@ -557,7 +385,7 @@ def cached_clip_features(cfg: Config) -> pd.DataFrame | None:
 
 
 # Bump whenever a feature's meaning changes, not only when columns change.
-FEATURE_VERSION = 5
+FEATURE_VERSION = 7
 
 # Carried in the table, never fed to a model.
 META_COLUMNS = (
@@ -581,19 +409,19 @@ FEATURE_GROUPS: dict[str, dict] = {
     "pose": {
         "needs": "pose",
         "label": "body and flagellum",
-        "about": "Body length, flagellum length, beat amplitude and frequency, "
-                 "and translocation anchored on the cell body rather than the "
-                 "box centroid. Needs keypoints.",
+        "about": "Body and flagellum length, keypoint shape, the tip's angle to the body, "
+                 "and translocation and rotation of the cell body rather than the box "
+                 "centroid. Needs keypoints.",
         "prefixes": (
-            "kpt_", "body_", "flagellum_", "beat_", "tip_", "shape_",
+            "kpt_", "body_", "flagellum_", "tip_", "shape_",
         ),
     },
     "waveform": {
         "needs": "pose",
         "label": "beat waveform",
-        "about": "Tangent-angle shape descriptors after Geyer, Howard and "
-                 "Sartori (2022): static curvature, amplitude and phase "
-                 "profiles, and the wavelength. Needs keypoints.",
+        "about": "The beat as the flagella-analysis-pipeline (Fochler et al. 2025) measures it: "
+                 "frequency, amplitude and phase profiles, spatial and angular amplitude, average "
+                 "angle and fit quality, plus wavelength and direction. Needs keypoints.",
         "prefixes": ("wave_",),
     },
     "context": {

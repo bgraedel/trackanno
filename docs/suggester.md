@@ -80,28 +80,10 @@ table. `--ablate` ignores `feature_columns` and compares whole groups.
 
 ## Beat waveform
 
-The `waveform` group follows Geyer, Howard and Sartori, *Ciliary beating
-patterns map onto a low-dimensional behavioural space*, Nature Physics 18,
-193-200 (2022): the flagellum's tangent angle against normalised arclength, a
-static mode plus `a(s) cos(2 pi f t + phi(s))`, projected onto Legendre
-polynomials.
-
-| column | paper | meaning |
-|---|---|---|
-| `wave_freq_hz` | f | beat frequency |
-| `wave_amp_mean` | a0 | mean amplitude |
-| `wave_amp_asym` | a1/a0 | amplitude asymmetry |
-| `wave_amp_para` | a2/a0 | amplitude parabolicity |
-| `wave_phase_asym` | phi1 | phase asymmetry |
-| `wave_phase_para` | phi2 | phase parabolicity |
-| `wave_length_px` | L | flagellum length |
-
-`wave_static_*` describe the static curvature. `wave_wavelength_ratio` is
-lambda/L, a tracking check. `wave_fundamental_frac` is a quality readout.
-`wave_direction` (`+1` = base to tip) is read at the beat frequency and needs a
-beat `spectral.window` can resolve (`wave_censored` flags where it cannot);
-`wave_flow_direction` comes from the phase gradient, with `wave_flow_coherence`
-as its confidence.
+The `waveform` group measures the beat as the flagella-analysis-pipeline (Fochler et al. 2025)
+does: the Fourier spectrum of the flagellum's tangent angle, with amplitude and phase profiles at
+the dominant frequency reduced to Legendre coefficients. Definitions, validation against the MATLAB
+pipeline and the synthetic Leishmania simulator, and limits are in [measurements.md](measurements.md).
 
 ## Guardrails
 
