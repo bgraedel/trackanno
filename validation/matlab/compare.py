@@ -3,7 +3,8 @@
     uv run python validation/matlab/compare.py --cells OUT
 
 Writes comparison.csv, same_input.png (MATLAB reads the keypoints trackanno reads),
-dense_trace.png (MATLAB reads the dense skeleton) and summary.md.
+dense_trace.png (MATLAB reads the dense skeleton), per_frame_*.png (the per-frame readout over
+each snippet against the same MATLAB outputs) and summary.md.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import scipy.io
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from simulate import N_KEYPOINTS  # noqa: E402
 
+from trackanno.measure import instantaneous as inst  # noqa: E402
 from trackanno.measure import wavespectra as ws  # noqa: E402
 
 SNIPPET = 75
@@ -47,6 +49,13 @@ PAIRS = {
     "wave_bad_window": ("badFileFlag", None, False),
 }
 FLAGS = {"wave_bad_window"}
+# Per-frame column -> the pipeline output it estimates; read over the snippet.
+PER_FRAME = {
+    "inst_freq_hz": "wave_freq_hz", "inst_amp_mean": "wave_amp_mean",
+    "inst_amp_asym": "wave_amp_asym", "inst_amp_para": "wave_amp_para",
+    "inst_phase_asym": "wave_phase_asym", "inst_phase_para": "wave_phase_para",
+}
+PER_FRAME_TOL = 0.10
 # MATLAB input -> the keypoints trackanno reads for it
 INPUTS = {"kp_clean": "clean", "kp_jitter": "jitter", "dense_clean": "clean", "dense_traced": "jitter"}
 FIGURES = {
@@ -74,6 +83,9 @@ def collect(cells: Path) -> pd.DataFrame:
     rows = []
     for cell in meta.itertuples():
         tracks = pd.read_parquet(cells / f"cell_{cell.seed:03d}_keypoints.parquet")
+        beats = {}
+        for name, track in tracks.groupby("kind"):
+            beats[name] = inst.beat_series(track[kx].to_numpy(float), track[ky].to_numpy(float), fps)
         for folder in sorted(cells.glob(f"*/cell_{cell.seed:03d}_f*.tif_analysis")):
             if not (folder / "compared.mat").exists():
                 continue
@@ -88,11 +100,18 @@ def collect(cells: Path) -> pd.DataFrame:
                              "segments_per_wavelength": cell.segments_per_wavelength,
                              "matlab_input": kind, "column": col,
                              "matlab": want[col], "trackanno": float(got[col])})
+            frames = inst.window_values(beats[INPUTS[kind]], lo, lo + SNIPPET)
+            for col, output in PER_FRAME.items():
+                rows.append({"seed": cell.seed, "start": lo, "mode": cell.mode,
+                             "segments_per_wavelength": cell.segments_per_wavelength,
+                             "matlab_input": kind, "column": col,
+                             "matlab": want[output], "trackanno": frames[col]})
     return pd.DataFrame(rows)
 
 
 def unit(col: str, d: pd.DataFrame) -> np.ndarray:
     """What 1% is taken of: the amplitude for its shape coefficients, pi for the phase curvature."""
+    col = PER_FRAME.get(col, col)
     if col in ("wave_amp_asym", "wave_amp_para"):
         return d["amp"].abs().to_numpy(float)
     if col == "wave_phase_para":
@@ -100,19 +119,21 @@ def unit(col: str, d: pd.DataFrame) -> np.ndarray:
     return d["matlab"].abs().to_numpy(float)
 
 
-def stats(df: pd.DataFrame, kind: str, col: str) -> dict:
-    """r and the share within 1% over resolvable beats; agreement for flags."""
+def stats(df: pd.DataFrame, kind: str, col: str, tol: float = 0.01) -> dict:
+    """r, the share within ``tol`` and the median difference over resolvable beats; agreement for flags."""
     d = df[(df.matlab_input == kind) & (df.column == col) & df.resolvable]
     d = d[np.isfinite(d.matlab) & np.isfinite(d.trackanno)]
     x, y = d.matlab.to_numpy(float), d.trackanno.to_numpy(float)
     if col in FLAGS:
         return {"n": len(d), "agree": float(np.mean(x == y)) if len(d) else np.nan}
     r = np.corrcoef(x, y)[0, 1] if len(d) > 2 and np.std(x) > 0 else np.nan
-    within = float(np.mean(np.abs(y - x) <= 0.01 * unit(col, d) + 1e-9)) if len(d) else np.nan
-    return {"n": len(d), "r": r, "within": within}
+    scale = unit(col, d)
+    within = float(np.mean(np.abs(y - x) <= tol * scale + 1e-9)) if len(d) else np.nan
+    bias = float(np.median((y - x) / np.maximum(scale, 1e-12))) if len(d) else np.nan
+    return {"n": len(d), "r": r, "within": within, "bias": bias}
 
 
-def figure(df: pd.DataFrame, kinds, out: Path) -> None:
+def figure(df: pd.DataFrame, kinds, out: Path, cols=None, tol: float = 0.01) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -122,8 +143,8 @@ def figure(df: pd.DataFrame, kinds, out: Path) -> None:
     colors = ("#2a78d6", "#eb6834")
     plt.rcParams.update({"font.size": 7, "axes.edgecolor": muted, "xtick.color": muted,
                          "ytick.color": muted, "axes.linewidth": 0.6})
-    cols = list(PAIRS)
-    n_cols = 5
+    cols = list(PAIRS) if cols is None else list(cols)
+    n_cols = min(5, len(cols))
     n_rows = int(np.ceil(len(cols) / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.3 * n_cols, 2.35 * n_rows),
                              facecolor=surface, squeeze=False)
@@ -146,9 +167,9 @@ def figure(df: pd.DataFrame, kinds, out: Path) -> None:
             ax.scatter(x[ok & res], y[ok & res], s=7, color=colors[i], edgecolor=surface,
                        linewidth=0.3, alpha=0.8, zorder=3)
             shown.append(np.r_[x[ok & res], y[ok & res]])
-            s = stats(df, kind, col)
+            s = stats(df, kind, col, tol)
             note = (f"{s['agree']:.0%} agree" if col in FLAGS
-                    else f"r {s['r']:.3f}, {s['within']:.0%} within 1%")
+                    else f"r {s['r']:.3f}, {s['within']:.0%} within {tol:.0%}")
             ax.text(0.03, 0.97 - 0.08 * i, note, transform=ax.transAxes, ha="left", va="top",
                     fontsize=5.5, color=colors[i])
         if col in FLAGS:
@@ -198,8 +219,21 @@ def summary(df: pd.DataFrame) -> str:
                              else f"r {s['r']:.3f}, {s['within']:.0%} within 1%")
             lines.append(f"| {col} | {cells[0]} | {cells[1]} |")
         lines.append("")
-    lines.append("Within 1%: of MATLAB's value; of its wave_amp_mean for wave_amp_asym and "
-                 "wave_amp_para; of pi for wave_phase_para.")
+    for name, kinds in FIGURES.items():
+        lines += [f"## per frame, {name}: the median over each snippet "
+                  "against MATLAB's output for the snippet", "",
+                  f"| column | MATLAB output | {kinds[0][1]} | {kinds[1][1]} |", "|---|---|---|---|"]
+        for col, output in PER_FRAME.items():
+            cells = []
+            for kind, _label in kinds:
+                s = stats(df, kind, col, PER_FRAME_TOL)
+                cells.append(f"r {s['r']:.3f}, {s['within']:.0%} within {PER_FRAME_TOL:.0%}, "
+                             f"median {s['bias']:+.3f}")
+            lines.append(f"| {col} | {output} | {cells[0]} | {cells[1]} |")
+        lines.append("")
+    lines.append("Within: of MATLAB's value; of its wave_amp_mean for the amplitude shape "
+                 "coefficients; of pi for the phase curvature. Median: the signed difference in "
+                 "those units.")
     return "\n".join(lines) + "\n"
 
 
@@ -216,6 +250,7 @@ def main(argv=None) -> int:
     df.drop(columns="amp").to_csv(cells / "comparison.csv", index=False)
     for name, kinds in FIGURES.items():
         figure(df, kinds, cells / f"{name}.png")
+        figure(df, kinds, cells / f"per_frame_{name}.png", cols=PER_FRAME, tol=PER_FRAME_TOL)
     (cells / "summary.md").write_text(summary(df), encoding="utf-8")
     print(summary(df))
     return 0

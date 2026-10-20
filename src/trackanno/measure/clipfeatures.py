@@ -36,8 +36,6 @@ KINEMATIC_LAG_S = 0.1         # rates are changes over this span, not per frame
 BEAT_F_MIN_HZ = 1.0
 # The window must span this many cycles of a frequency to resolve it (validated: <1% error).
 BEAT_MIN_CYCLES = 2.5
-# Above this interpolated share a spectral estimate is NaN (computeGoodFrameRange.m).
-MAX_INTERP_FRAC = 0.20
 
 _SCHEMA_CACHE: tuple[str, ...] | None = None
 
@@ -46,11 +44,12 @@ def feature_schema() -> tuple[str, ...]:
     """Every column a feature row carries, whatever the task or data."""
     global _SCHEMA_CACHE
     if _SCHEMA_CACHE is None:
-        from . import trackseries, wavespectra
+        from . import instantaneous, trackseries, wavespectra
 
         _SCHEMA_CACHE = tuple(dict.fromkeys(
             tuple(trackseries.feature_names())
             + tuple(wavespectra.SERIES_COLUMNS)
+            + tuple(instantaneous.CLIP_COLUMNS)
         ))
     return _SCHEMA_CACHE
 
@@ -101,15 +100,6 @@ def grid_delta(values: np.ndarray, offsets: np.ndarray, span: int) -> np.ndarray
         return np.nan_to_num(np.nanmean(steps, axis=0))
 
 
-
-
-def _shifted_legendre(s: np.ndarray, order: int) -> np.ndarray:
-    """Shifted Legendre polynomials P~n on s in [0, 1], as (order+1, len(s))."""
-    x = 2.0 * s - 1.0                      # map [0,1] -> [-1,1]
-    out = [np.ones_like(x), x, 0.5 * (3.0 * x ** 2 - 1.0)]
-    return np.stack(out[: order + 1], axis=0)
-
-
 # --------------------------------------------------------------------------- #
 # per-track measurement
 # --------------------------------------------------------------------------- #
@@ -149,7 +139,7 @@ def window_features(
 
     ``codes`` maps an embedding name to PCA codes row-aligned with ``tdf``.
     """
-    from . import trackseries, wavespectra
+    from . import instantaneous, trackseries, wavespectra
 
     frames = tdf["frame"].to_numpy(dtype=int)
     first, last = int(frames.min()), int(frames.max()) + 1
@@ -158,13 +148,14 @@ def window_features(
     hi = max(int(frames.max()) + 1, max(int(w[1]) for w in windows))
     series = trackseries.build_series(tdf, cfg, fps, lo, hi - lo)
 
-    spectra = None
+    spectra = beats = None
     if cfg.is_pose:
         spectra = wavespectra.track_spectral_series(
             tdf, cfg.n_keypoints, fps,
             window=cfg.spectral.window, hop=SPECTRAL_HOP,
             flow_frames=FLOW_FRAMES,
         )
+        beats = instantaneous.track_beat_series(tdf, cfg.n_keypoints, fps)
 
     waves = wavespectra.WindowSource(spectra) if spectra is not None else None
 
@@ -173,6 +164,8 @@ def window_features(
         entry = trackseries.aggregate_window(series, int(f_start), int(f_end), fps, cfg)
         if waves is not None and len(spectra):
             entry.update(waves.at(int(f_start), int(f_end)))
+        if beats is not None:
+            entry.update(instantaneous.window_values(beats, int(f_start), int(f_end)))
         for key in feature_schema():
             entry.setdefault(key, np.nan)
         if n_context > 0:
@@ -385,7 +378,7 @@ def cached_clip_features(cfg: Config) -> pd.DataFrame | None:
 
 
 # Bump whenever a feature's meaning changes, not only when columns change.
-FEATURE_VERSION = 7
+FEATURE_VERSION = 10
 
 # Carried in the table, never fed to a model.
 META_COLUMNS = (
@@ -423,6 +416,15 @@ FEATURE_GROUPS: dict[str, dict] = {
                  "frequency, amplitude and phase profiles, spatial and angular amplitude, average "
                  "angle and fit quality, plus wavelength and direction. Needs keypoints.",
         "prefixes": ("wave_",),
+    },
+    "beat": {
+        "needs": "pose",
+        "label": "beat per frame",
+        "about": "The beat read in every frame from a wavelet transform of the flagellum's "
+                 "tangent angle, then summarised over the clip: frequency and its spread, "
+                 "direction, amplitude and phase profiles, mean angle and curvature. "
+                 "Needs keypoints.",
+        "prefixes": ("inst_",),
     },
     "context": {
         "needs": "context",

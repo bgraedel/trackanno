@@ -320,7 +320,7 @@ def test_the_form_shows_what_the_loader_uses(app) -> None:
         f"an omitted stride shows clips.frames: {shown['clips.stride']}")
     assert shown["suggest.select_rule"] == "margin", (
         f"a retired value shows its replacement: {shown['suggest.select_rule']}")
-    assert shown["suggest.feature_groups"] == ["kinematic", "pose", "waveform", "context"], (
+    assert shown["suggest.feature_groups"] == ["kinematic", "pose", "waveform", "beat", "context"], (
         f"omitted feature groups show the effective set: {shown['suggest.feature_groups']}")
     assert shown["detection.imgsz"] == 640, "an omitted number shows its default"
     assert form.values() == {}, "nothing is offered for writing"

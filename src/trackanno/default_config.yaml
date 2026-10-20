@@ -101,8 +101,8 @@ suggest:
   enabled: true         # show what a classifier trained on your labels predicts
   model: catboost       # catboost | hist (scikit-learn HistGradientBoosting)
   device: cpu           # where CatBoost fits: cpu | gpu | auto
-  # Feature families the model may use: kinematic | pose | waveform | context | emb_<name>
-  feature_groups: [kinematic, pose, waveform]
+  # Feature families the model may use: kinematic | pose | waveform | beat | context | emb_<name>
+  feature_groups: [kinematic, pose, waveform, beat]
   # Embedding inputs, e.g. {name: det, source: detector} or
   # {name: ae, source: file, path: embeddings/{movie_id}.parquet}
   embeddings: []

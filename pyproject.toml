@@ -12,8 +12,8 @@ dependencies = [
     "imagecodecs>=2024.1.1",
     "pandas>=2.0",
     "pyarrow>=15.0",
-    # Imported directly: `ShortTimeFFT` in wavespectra, `splprep`/`splev` in
-    # kymograph. scikit-learn happens to pull it in too - declare it anyway, or
+    # Imported directly: splines in wavespectra and kymograph, filters in
+    # instantaneous. scikit-learn happens to pull it in too - declare it anyway, or
     # the app depends on a transitive dependency it does not control.
     "scipy>=1.11",
     "opencv-python-headless>=4.9",

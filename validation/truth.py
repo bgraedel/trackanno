@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from trackanno.measure import instantaneous as inst
 from trackanno.measure import wavespectra as ws
 
 
 def dense_curves(theta: np.ndarray, s: np.ndarray, length_px: float,
-                 head_base_px: np.ndarray) -> dict:
+                 head_base_px: np.ndarray, cutoff_segments: float | None = None) -> dict:
     """The flagellum of each frame from its exact tangent angle (frames x s), as the pipeline frames it.
 
     The angle is relative to the Head-Base axis, so the Head sits ``head_base_px`` behind the Base
@@ -21,7 +22,9 @@ def dense_curves(theta: np.ndarray, s: np.ndarray, length_px: float,
     zero = np.zeros((theta.shape[0], 1))
     x = np.concatenate([zero, np.cumsum(mid_c * step, axis=1)], axis=1)
     y = np.concatenate([zero, np.cumsum(mid_s * step, axis=1)], axis=1)
-    out = ws.body_frame_curves(x, y, -0.5 * head_base_px, np.zeros_like(head_base_px))
+    cutoff = None if cutoff_segments is None else cutoff_segments * (s.size - 1) / 6.0
+    out = ws.body_frame_curves(x, y, -0.5 * head_base_px, np.zeros_like(head_base_px), cutoff=cutoff,
+                               axis_to_base=cutoff is not None)
     out["overall"] = head_base_px + length_px
     return out
 
@@ -31,6 +34,14 @@ def wave_truth(theta: np.ndarray, s: np.ndarray, length_px: float, head_base_px:
     """The ``wave_*`` outputs of one window of the exact, noise-free angle (frames x s)."""
     curves = dense_curves(theta, s, length_px, head_base_px)
     return ws.analyse_window(curves, 0, theta.shape[0], fps)
+
+
+def beat_truth(theta: np.ndarray, s: np.ndarray, length_px: float, head_base_px: np.ndarray,
+               fps: float):
+    """The per-frame beat (:data:`instantaneous.SERIES_COLUMNS`) of the exact angle (frames x s),
+    smoothed as the per-frame readout smooths keypoints (six segments over the flagellum)."""
+    curves = dense_curves(theta, s, length_px, head_base_px, inst.SMOOTHING_SEGMENTS)
+    return inst.beat_from_curves(curves, fps)
 
 
 def physical_truth(mode: str, freq: float, wavelength_px: float, length_px: float) -> dict:

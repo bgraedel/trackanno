@@ -75,7 +75,7 @@ def test_the_suggester_preset_is_pose_from_the_start(root: Path) -> None:
     assert cfg.suggest.enabled is True
     assert cfg.detection.task == "pose"
     assert cfg.keypoints.nodes == [], "node names are left to the checkpoint"
-    assert set(cfg.suggest.feature_groups) == {"kinematic", "pose", "waveform"}
+    assert set(cfg.suggest.feature_groups) == {"kinematic", "pose", "waveform", "beat"}
     assert cfg.render.show_skeleton is True
     assert cfg.predict.min_bout_frames == 0
 
@@ -83,7 +83,7 @@ def test_the_suggester_preset_is_pose_from_the_start(root: Path) -> None:
 def test_the_dense_bouts_preset_measures_25_frames_and_steps_5(root: Path) -> None:
     cfg = _config(root, "bouts")
     assert cfg.detection.task == "pose" and cfg.suggest.enabled is True
-    assert set(cfg.suggest.feature_groups) == {"kinematic", "pose", "waveform"}
+    assert set(cfg.suggest.feature_groups) == {"kinematic", "pose", "waveform", "beat"}
     assert cfg.clips.frames == 25
     assert cfg.predict.resolved_stride(cfg.clips) == 5
     assert cfg.predict.min_bout_frames >= 2, "a shortest bout to be sticky about"

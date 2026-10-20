@@ -37,8 +37,9 @@ page disables families the project cannot compute.
 | group | contents | requires |
 |---|---|---|
 | `kinematic` | speed, straightness, turning, box area and aspect | nothing |
-| `pose` | body and flagellum length, beat amplitude and frequency, body-anchored translocation | `task: pose` |
-| `waveform` | beat-shape descriptors, below | `task: pose` |
+| `pose` | body and flagellum length, keypoint shape, tip angle, body-anchored translocation and rotation | `task: pose` |
+| `waveform` | the beat per 0.75 s window, as the MATLAB pipeline measures it (below) | `task: pose` |
+| `beat` | the beat read in every frame, summarised over the clip | `task: pose` |
 | `context` | kinematic features over `suggest.context_frames` | `context_frames > 0` |
 | `emb_<name>` | an embedding from `suggest.embeddings` | see below |
 
@@ -82,8 +83,10 @@ table. `--ablate` ignores `feature_columns` and compares whole groups.
 
 The `waveform` group measures the beat as the flagella-analysis-pipeline (Fochler et al. 2025)
 does: the Fourier spectrum of the flagellum's tangent angle, with amplitude and phase profiles at
-the dominant frequency reduced to Legendre coefficients. Definitions, validation against the MATLAB
-pipeline and the synthetic Leishmania simulator, and limits are in [measurements.md](measurements.md).
+the dominant frequency reduced to Legendre coefficients. The `beat` group reads the same profiles in
+every frame from a wavelet transform and takes their median over the clip.
+Definitions, validation against the MATLAB pipeline and the synthetic Leishmania simulator, and
+limits are in [measurements.md](measurements.md).
 
 ## Guardrails
 
@@ -103,7 +106,7 @@ pipeline and the synthetic Leishmania simulator, and limits are in [measurements
 | `suggest.enabled` | `true` | train and show suggestions |
 | `suggest.model` | `catboost` | `catboost` or `hist` |
 | `suggest.device` | `cpu` | `cpu`, `gpu` or `auto` |
-| `suggest.feature_groups` | `[kinematic, pose, waveform]` | families the model may use |
+| `suggest.feature_groups` | `[kinematic, pose, waveform, beat]` | families the model may use |
 | `suggest.embeddings` | `[]` | embedding inputs |
 | `suggest.context_frames` | `0` | context span; 0 is off |
 | `suggest.feature_columns` | `null` | narrow to these columns |

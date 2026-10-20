@@ -611,7 +611,7 @@ class Suggest(_Section):
                       choices=("catboost", "hist"))
     device: str = knob("cpu", "Where CatBoost fits: cpu, gpu or auto.",
                        choices=("cpu", "gpu", "auto"))
-    feature_groups: list[str] = knob(["kinematic", "pose", "waveform"],
+    feature_groups: list[str] = knob(["kinematic", "pose", "waveform", "beat"],
                                      "Feature families the model may use.")
     embeddings: list[EmbeddingSpec] = knob([], "Per-detection embedding inputs.",
                                            parse=_embeddings)

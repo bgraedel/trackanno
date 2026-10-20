@@ -8,5 +8,5 @@ about: >
 set:
   detection.task: pose
   suggest.enabled: true
-  suggest.feature_groups: [kinematic, pose, waveform]
+  suggest.feature_groups: [kinematic, pose, waveform, beat]
   render.show_skeleton: true

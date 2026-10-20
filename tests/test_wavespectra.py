@@ -390,3 +390,29 @@ def test_segment_arcs_are_exact_for_a_circle() -> None:
     angles = np.arange(6) * turn
     chords = np.full(6, 2.0 * radius * np.sin(turn / 2.0))
     assert np.allclose(ws.segment_arcs(chords, angles), radius * turn)
+
+
+# --------------------------------------------------------------------------- #
+# found by the independent verification
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("angle", [0.3, 0.7, 1.2])
+def test_the_fit_rotation_is_not_bounded(angle: float) -> None:
+    s = np.linspace(0.0, 60.0, 200)
+    x = np.tile(s, (5, 1))
+    y = np.zeros_like(x)
+    c, sn = np.cos(angle), np.sin(angle)
+    xr, yr = c * x - sn * y, sn * x + c * y          # the reconstruction, turned by ``angle``
+    assert ws._xy_fit_error(x, y, xr, yr, s, np.arange(5) / FPS) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_phase_linearity_is_one_only_for_an_exactly_flat_phase() -> None:
+    s = np.linspace(0.0, 1.0, 200)
+    assert ws._phase_line(np.full(200, 0.5), s)[1] == 1.0
+    noisy = 0.5 + 1e-6 * np.random.default_rng(0).normal(size=200)
+    assert ws._phase_line(noisy, s)[1] < 0.1
+
+
+def test_a_flagellum_smoothed_straight_has_no_direction() -> None:
+    px, py = travelling_wave(150, freq_hz=12.0, amplitude=0.004)
+    s = spectral_series(px, py, FPS, 75, 75)
+    assert s["wave_direction"].isna().all() and s["wave_wavelength_px"].isna().all()

@@ -18,7 +18,7 @@ from .clipfeatures import BEAT_F_MIN_HZ, BEAT_MIN_CYCLES, _interp_nan, _on_grid,
 
 __all__ = [
     "spectral_series", "window_values", "WindowSource", "track_spectral_series",
-    "flow_series", "segment_arcs", "smooth_rows", "frame_curves", "body_frame_curves",
+    "flow_series", "segment_arcs", "smooth_rows", "linear_smooth", "frame_curves", "body_frame_curves",
     "analyse_window",
     "SERIES_COLUMNS", "DEFAULT_WINDOW", "DEFAULT_HOP", "DEFAULT_FLOW_FRAMES",
 ]
@@ -108,25 +108,45 @@ def smooth_rows(values: np.ndarray, budget) -> np.ndarray:
     power = coef ** 2
     budget = np.broadcast_to(np.asarray(budget, dtype=float), (rows,))
     # The residual rises with log mu to the line fit; rows within budget of the line take it.
-    # Otherwise safeguarded Newton on log mu inside a bracket that always holds the root.
+    # Otherwise safeguarded Newton on log mu inside a bracket that always holds the root, each
+    # row until its residual is within 1e-10 of the budget or of rounding.
     line = (power * (lam > 0)).sum(axis=1)
     lo, hi = np.full(rows, -60.0), np.full(rows, 60.0)
     t = np.zeros(rows)
     log_lam = np.log(np.where(lam > 0, lam, 1.0))[None, :]
+    done = line <= budget
+    tol = 1e-10 * budget + 1e-13 * line
     for _ in range(40):
         g = 1.0 / (1.0 + np.exp(np.clip(-(t[:, None] + log_lam), -700.0, 700.0)))
         g = np.where(lam[None, :] > 0, g, 0.0)
         resid = (g * g * power).sum(axis=1) - budget
+        done |= np.abs(resid) <= tol
+        if done.all():
+            break
         lo = np.where(resid < 0, t, lo)
         hi = np.where(resid >= 0, t, hi)
         slope = (2.0 * g * g * (1.0 - g) * power).sum(axis=1)
         newton = t - resid / np.where(slope > 1e-300, slope, np.nan)
-        inside = np.isfinite(newton) & (newton > lo) & (newton < hi)
-        t = np.where(inside, newton, 0.5 * (lo + hi))
+        inside = np.isfinite(newton) & (newton >= lo) & (newton <= hi)
+        t = np.where(done, t, np.where(inside, newton, 0.5 * (lo + hi)))
     mu = np.where((line <= budget)[:, None], np.inf, np.exp(t)[:, None] * lam[None, :])
     with np.errstate(invalid="ignore"):
         shrink = np.where(lam[None, :] > 0, 1.0 / (1.0 + mu), 1.0)
     return ((coef * shrink) @ vec.T) / root
+
+
+def linear_smooth(values: np.ndarray, cutoff: float) -> np.ndarray:
+    """Rows smoothed by a cubic smoothing spline of fixed strength, on unit-spaced samples.
+
+    A wave of ``cutoff`` samples keeps about half its amplitude, longer ones more. The same
+    operator acts on every row, so smoothing x and y alike leaves a rotated curve rotated.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.shape[1] < 3 or values.shape[0] == 0:
+        return values.copy()
+    lam, vec, root = _basis(values.shape[1])
+    shrink = 1.0 / (1.0 + lam / (2.0 * np.pi / cutoff) ** 4)
+    return (((values * root) @ vec) * shrink @ vec.T) / root
 
 
 # --------------------------------------------------------------------------- #
@@ -262,11 +282,14 @@ def _local_spread(values: np.ndarray, radius: int) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # per frame: the smoothed flagellum in the body frame (processFile.m lines 37-73)
 # --------------------------------------------------------------------------- #
-def frame_curves(px: np.ndarray, py: np.ndarray) -> dict[str, np.ndarray]:
+def frame_curves(px: np.ndarray, py: np.ndarray,
+                 cutoff_segments: float | None = None) -> dict[str, np.ndarray]:
     """Smoothed flagellum per frame in the body frame: x, y, arc (frames, DENSE_POINTS) and lengths.
 
     The flagellum is a cubic spline through Base..Tip by node index; the body centre is the
-    Head-Base midpoint.
+    Head-Base midpoint. By default it is smoothed as the pipeline does (``spaps``, axis to the
+    smoothed base). With ``cutoff_segments`` it is smoothed by :func:`linear_smooth` with that
+    cutoff, in segments between keypoints, and the axis runs to the Base keypoint itself.
     """
     n_frames = px.shape[0]
     n = DENSE_POINTS
@@ -296,8 +319,10 @@ def frame_curves(px: np.ndarray, py: np.ndarray) -> dict[str, np.ndarray]:
            "overall": np.full(n_frames, np.nan)}
     if rows.size == 0:
         return out
+    cutoff = None if cutoff_segments is None else cutoff_segments * (n - 1) / (px.shape[1] - 2)
     framed = body_frame_curves(xs[rows], ys[rows], 0.5 * (px[rows, 0] + px[rows, 1]),
-                               0.5 * (py[rows, 0] + py[rows, 1]))
+                               0.5 * (py[rows, 0] + py[rows, 1]), cutoff=cutoff,
+                               axis_to_base=cutoff is not None)
     for key in ("x", "y", "arc", "length"):
         out[key][rows] = framed[key]
     body = np.hypot(px[rows, 0] - px[rows, 1], py[rows, 0] - py[rows, 1])
@@ -306,19 +331,26 @@ def frame_curves(px: np.ndarray, py: np.ndarray) -> dict[str, np.ndarray]:
     return out
 
 
-def body_frame_curves(x: np.ndarray, y: np.ndarray, centre_x: np.ndarray,
-                      centre_y: np.ndarray) -> dict[str, np.ndarray]:
+def body_frame_curves(x: np.ndarray, y: np.ndarray, centre_x: np.ndarray, centre_y: np.ndarray,
+                      cutoff: float | None = None,
+                      axis_to_base: bool = False) -> dict[str, np.ndarray]:
     """Flagella (frames, points; base to tip, even in arclength, px) smoothed and in the body frame.
 
-    Smoothed as spaps with tolerance 0.2 L px^2, then moved so the smoothed base is the origin and
-    the axis from the body centre to it is +x.
+    Smoothed as spaps with tolerance 0.2 L px^2, or by :func:`linear_smooth` with ``cutoff``
+    points, then moved so the smoothed base is the origin and the axis from the body centre to
+    it is +x. With ``axis_to_base`` the axis runs to the unsmoothed base instead, which does not
+    sway with the smoothing of the beat.
     """
     n = x.shape[1]
-    # spaps tolerance 0.2 L (px) with trapezoid weights of spacing L / (n - 1): 0.2 (n - 1) per unit.
-    smoothed = smooth_rows(np.vstack([x, y]), XY_TOLERANCE * (n - 1))
+    if cutoff is None:
+        # spaps tolerance 0.2 L (px) with trapezoid weights of spacing L / (n - 1): 0.2 (n - 1) per unit.
+        smoothed = smooth_rows(np.vstack([x, y]), XY_TOLERANCE * (n - 1))
+    else:
+        smoothed = linear_smooth(np.vstack([x, y]), cutoff)
     sx, sy = smoothed[:x.shape[0]], smoothed[x.shape[0]:]
     bx, by = sx[:, :1], sy[:, :1]
-    ang = np.arctan2(by[:, 0] - centre_y, bx[:, 0] - centre_x)
+    ax, ay = (x[:, 0], y[:, 0]) if axis_to_base else (bx[:, 0], by[:, 0])
+    ang = np.arctan2(ay - centre_y, ax - centre_x)
     c, s = np.cos(-ang)[:, None], np.sin(-ang)[:, None]
     rx, ry = sx - bx, sy - by
     fx, fy = c * rx - s * ry, s * rx + c * ry
@@ -392,6 +424,7 @@ def _cumulative_xy(angles: np.ndarray, ds: float) -> tuple[np.ndarray, np.ndarra
 
 
 _DIRECTIONS = np.linspace(0.0, np.pi, 64, endpoint=False)
+_NO_WAVE_RAD = 1e-6              # phase range along s below which a window has no wave
 
 
 def _trapz_weights(s: np.ndarray) -> np.ndarray:
@@ -412,6 +445,19 @@ def _spatial_amplitudes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return (proj.max(axis=0) - proj.min(axis=0)).max(axis=1) / 2.0
 
 
+def _phase_line(phase: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+    """Slope of a least-squares line through the phase, and its R^2 (1 only for an exactly flat phase)."""
+    slope, intercept = np.polyfit(s, phase, 1)
+    if np.all(phase == phase.mean()):
+        return float(slope), 1.0
+    resid = phase - (slope * s + intercept)
+    spread = phase - phase.mean()
+    return float(slope), float(1.0 - (resid ** 2).sum() / (spread ** 2).sum())
+
+
+_ROTATION_STEP = 0.02           # rad, grid of the rotation search in _xy_fit_error
+
+
 def _xy_fit_error(x, y, xr, yr, s, t) -> float:
     """computeQualityOfFitXY.m: best rotation of the reconstruction per frame, then the overall error."""
     norm = np.sqrt(x ** 2 + y ** 2).sum(axis=1)
@@ -423,8 +469,23 @@ def _xy_fit_error(x, y, xr, yr, s, t) -> float:
         xt, yt = c * xr - sn * yr, sn * xr + c * yr
         return np.sqrt((xt - x) ** 2 + (yt - y) ** 2) @ w / norm
 
-    # fminunc from 0 finds the minimum nearest no rotation; golden section on [-0.5, 0.5] here.
-    a, b = np.full(x.shape[0], -0.5), np.full(x.shape[0], 0.5)
+    # fminunc from 0 ends in the minimum downhill of no rotation: walk the grid from 0 to it,
+    # then refine it by golden section.
+    grid = np.arange(-np.pi, np.pi + 1e-9, _ROTATION_STEP)
+    here = np.full(x.shape[0], int(np.argmin(np.abs(grid))))
+    f_here = score(grid[here])
+    for _ in range(grid.size):
+        left = np.maximum(here - 1, 0)
+        right = np.minimum(here + 1, grid.size - 1)
+        f_left, f_right = score(grid[left]), score(grid[right])
+        down_left, down_right = f_left < f_here, f_right < f_here
+        to_left = down_left & ~(down_right & (f_right < f_left))
+        to_right = down_right & ~to_left
+        if not (to_left | to_right).any():
+            break
+        here = np.where(to_left, left, np.where(to_right, right, here))
+        f_here = np.where(to_left, f_left, np.where(to_right, f_right, f_here))
+    a, b = grid[here] - _ROTATION_STEP, grid[here] + _ROTATION_STEP
     g = (np.sqrt(5.0) - 1.0) / 2.0
     c1, c2 = b - g * (b - a), a + g * (b - a)
     f1, f2 = score(c1), score(c2)
@@ -506,10 +567,7 @@ def analyse_window(curves: dict[str, np.ndarray], lo: int, hi: int, fps: float) 
     proximal, distal = s < third, s >= 2 * third
     profile = windowed[k0]
     phase = np.unwrap(np.angle(spec[k0]))
-    slope, intercept = np.polyfit(s, phase, 1)
-    resid = phase - (slope * s + intercept)
-    spread = phase - phase.mean()
-    rsq = 1.0 if np.allclose(phase, phase.mean()) else 1.0 - (resid ** 2).sum() / (spread ** 2).sum()
+    slope, rsq = _phase_line(phase, s)
     amp_c, phase_c = _legendre(profile), _legendre(phase)
     static_summed = np.trapezoid(windowed[0], s)
 
@@ -557,7 +615,8 @@ def analyse_window(curves: dict[str, np.ndarray], lo: int, hi: int, fps: float) 
     static_c = _legendre(angles.mean(axis=0))
     flip = -1.0 if static_c[0] < 0 else 1.0
     out["wave_static_asym"], out["wave_static_para"] = flip * static_c[1], flip * static_c[2]
-    if abs(slope) > 1e-12:
+    # A flagellum the smoothing has made straight has no wave along it; its slope is rounding noise.
+    if abs(slope) > 1e-12 and np.ptp(phase) > _NO_WAVE_RAD:
         wavelength = 2.0 * np.pi / abs(slope)
         out["wave_wavelength_px"] = wavelength
         out["wave_wavelength_ratio"] = wavelength / flag_len

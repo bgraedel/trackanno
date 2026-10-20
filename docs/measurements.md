@@ -7,7 +7,8 @@ matches ground truth. Lengths are in px, times in s, angles in rad.
 
 The beat is measured as `processFile.m` of the flagella-analysis-pipeline (Fochler et al. 2025)
 measures it, with the smoothing tolerance in px (the spatialScale^2 fix). Each sliding window
-(`spectral.window` frames, 0.75 s by default) is one pipeline run, read at the clip's centre.
+(`spectral.window` frames, 0.75 s by default, one every 5 frames) is one pipeline run. A clip takes
+the median of the windows centred inside it, or the nearest window if none is.
 
 Per frame, the flagellum is a cubic spline through Base, Flag1..Flag5, Tip, smoothed as `spaps`
 does with tolerance 0.2 L px^2, then moved so its base is the origin and the axis from the
@@ -53,15 +54,54 @@ Read off the same analysis:
 
 Details that matter for correctness:
 
-* `spaps` is reproduced exactly: the cubic smoothing spline with trapezoid weights, its
-  smoothing parameter solved for the residual budget. The tolerance is in px, so the same
-  flagellum is smoothed relatively more at low magnification (see Limits).
-* Ties in the spectrum go to the first bin, as MATLAB's `max` does, so a still flagellum reads
-  1.3 Hz at 0.75 s.
+* The smoothing is `spaps`' problem solved exactly: the cubic smoothing spline with trapezoid
+  weights, its smoothing parameter set by the residual budget. MATLAB's `spaps` stops once the
+  residual is within 1% of the budget, which leaves differences below 1% on identical input. The
+  tolerance is in px, so the same flagellum is smoothed relatively more at low magnification
+  (see Limits).
+* At the default 0.75 s window the +-1 Hz band is the peak bin alone, so a beat between two bins
+  reads up to 36% low in `wave_amp_*`.
+* A still flagellum has no peak. trackanno reads the first bin (1.3 Hz at 0.75 s); MATLAB reads
+  whichever bin its rounding favours.
 * The pipeline takes the body centre from the body's skeleton; trackanno has Head and Base, so
   the centre is their midpoint. For a bent body the two axes differ by a constant angle, which
   shifts `wave_static_mean` and nothing else (0.07 rad median on the simulator's cells).
-* A mirror image flips every angle; no column depends on which side the cell is seen from.
+* The smoothing works on x and y separately, so the measured shape depends slightly on the cell's
+  orientation in the image, and a mirror image is not measured exactly alike (see Limits).
+
+## Beat per frame (`inst_*`)
+
+The beat read in every frame, so a switch of beat type shows within a few frames instead of
+across a 0.75 s window. Each frame's flagellum is the spline through the keypoints, smoothed with
+a fixed cutoff: a bend one keypoint segment long keeps half its amplitude. The same smoothing acts
+on x and y, so unlike the pipeline's it does not depend on the cell's orientation, does not
+straighten a weak beat, and does not depend on magnification. Its tangent angle is taken at 100
+points along 0.9 of that frame's length. A 1 Hz high-pass removes the static shape, then each
+point's angle goes through a Morlet wavelet transform (omega0 = 6) on 48 log-spaced frequencies
+from 1.5 Hz to 0.35 times the frame rate. The ridge is the frequency path through the power summed
+along s that pays a penalty for each octave it moves (a Viterbi path). At the ridge every frame has
+an amplitude and a phase per point along s, read as the pipeline reads its spectrum at the peak.
+
+| column | definition |
+|---|---|
+| `inst_freq_hz` | phase advance per frame at the ridge, weighted by power along s |
+| `inst_excess` | ridge power over the median power across frequencies: the confidence of the frame |
+| `inst_amp_mean`, `_asym`, `_para` | Legendre coefficients 0 to 2 of the amplitude along s |
+| `inst_phase_asym`, `_para` | Legendre coefficients 1 and 2 of the phase along s, unwrapped |
+| `inst_phase_slope`, `inst_wavelength_px`, `inst_direction` | slope of a line through the phase (rad/px), 2 pi / abs(slope), and -sign(slope) |
+| `inst_angle_mean` | mean tangent angle along 0.9 L, its sign chosen per track so the median is positive |
+| `inst_curvature_mean` | mean absolute change of the angle along s (rad/px) |
+
+The `beat` feature group summarises a clip: the median of each column over its frames inside the
+wavelet's cone of influence (all frames for the angle, curvature and excess), with
+`inst_freq_sd_hz`, `inst_angle_sd` and `inst_confident_frac`, the share of those frames with
+`inst_excess` >= 30. The cut only counts frames, since slow beats read a lower excess (see Limits).
+
+* The wavelet's time window shrinks with frequency: its width is 6 / (2 pi f), 0.16 s at 6 Hz and
+  0.05 s at 20 Hz.
+* `inst_amp_*` is the cosine amplitude, within 2% wherever the beat falls between the 48
+  frequencies. Below 3 Hz the 1 Hz high-pass lowers it: 4% at 2.5 Hz, 10% at 1.8 Hz.
+* Up to 5 missing frames are bridged in time (their values are NaN); a longer gap splits the track.
 
 ## Trajectory, body and shape
 
@@ -124,16 +164,18 @@ Share of snippets within 1% of MATLAB's value (of its `wave_amp_mean` for `wave_
 | `wave_static_mean` | 100% | 93% | 6% | 7% |
 | `wave_freq_dominance` | 92% | 88% | 20% | 0% |
 | `wave_fit_error` | 82% | 86% | 12% | 3% |
-| `wave_xy_fit_error` | 77% | 81% | 28% | 2% |
+| `wave_xy_fit_error` | 81% | 87% | 28% | 2% |
 | `wave_disp_amp_max` | 68% | 47% | 28% | 2% |
 | `wave_angular_amp` | 66% | 71% | 27% | 4% |
 | `wave_length_px` | 100% | 100% | 86% | 8% |
 | `wave_bad_window` | 100% agree | 100% agree | 100% agree | 93% agree |
 
 On the same input every column correlates at r >= 0.97 with MATLAB's, except `wave_phase_rsq`
-on clean keypoints (0.68, from one window; 93% within 1%). What remains is sampling: the pipeline
-smooths at the trace's own points, about 1 px apart, and trackanno at 128 points; sampling at
-1 px halves the differences. Against the dense skeleton, the static angle differs by the body
+on clean keypoints (0.68, from one window; 93% within 1%). What remains is the sampling (the
+pipeline smooths at the trace's own points, about 1 px apart, trackanno at 128 points) and
+MATLAB's `spaps` stopping within 1% of its budget. Fed the dense skeleton itself, at MATLAB's own
+points and body centre, trackanno matches MATLAB within 1% in every resolvable window.
+Against the dense skeleton, the static angle differs by the body
 axis (see above), the amplitude profile carries detail between keypoints that the spline cannot
 recover, and on realistic input the integer-pixel skeleton and the keypoint jitter each add noise
 of their own.
@@ -147,7 +189,7 @@ the same analysis run on the simulator's exact flagellum over the same frames, s
 included; frequency, wavelength, direction and length are also compared with the simulator's
 own parameters.
 
-    uv run python validation/run.py --simulator PATH/synthetic_leishmania.py --out OUT --workers 6
+    uv run python validation/run.py --simulator PATH/synthetic_leishmania.py --out OUT --workers 3
 
 Results (250 cells, 4835 windows of 0.75 s with a resolvable beat, 100 fps, 0.325 um/px; p90 of
 the absolute error, relative where marked %):
@@ -191,12 +233,76 @@ flagellum length with the simulator's own, and keypoint descriptors with the noi
 | `body_len_mean`, `shape_extent_mean` | 2.5%, 0.4% |
 | `tip_angle_std` | 0.02 rad |
 
+### Beat per frame
+
+The same 250 cells, frame by frame: 70,615 frames inside one beat type with a resolvable wave,
+against the simulator's beat at that frame. The windowed estimate is the window centred on the
+frame. Frames without a value count as wrong.
+
+| estimate | frequency within 10% | within 5% | direction right |
+|---|---|---|---|
+| per frame, clean keypoints | 97.1% | 94.8% | 98.7% |
+| per frame, with jitter | 87.3% | 84.8% | 88.6% |
+| per frame, with jitter, `inst_excess` >= 30 (59% of frames) | 100.0% | 99.2% | 99.1% |
+| windowed, with jitter (a value in 80% of frames) | 66.7% | 58.2% | 75.7% |
+
+The wavelet width, jump penalty, smoothing cutoff and confidence cut were chosen on cells with seeds
+below 250. On 250 fresh cells (`--first-seed 5000`) the same rows read 96.7%, 86.8% and 99.9% for
+the frequency and 98.1%, 88.6% and 99.4% for the direction.
+
+After 155 switches between beat types, the per-frame frequency settles within 10% of the new beat
+already during the simulator's 0.2 s blend (median 6 frames before it ends; 81% settle), the
+windowed one 24 frames after it (68% settle). Over 50-frame clips with jitter, every clip has a
+value: `inst_freq_hz` is within 2.1% of the simulator's frequency (p90), `inst_wavelength_px`
+within 1.1% of its wavelength (median; `wave_wavelength_px` reads 31% long) and `inst_direction`
+right in 96.6%. Medians over the frames with `inst_excess` >= 30 alone reach 1.6% and 99.4%, but
+leave a quarter of base-to-tip clips and an eighth of tip-to-base clips without a value; on those
+clips the all-frame median is right in direction 82% of the time, so read `inst_confident_frac`
+alongside.
+
+Against MATLAB's outputs for the same 0.75 s snippets (`validation/matlab/compare.py`), the
+per-frame frequency lies within half a MATLAB bin (0.66 Hz) of MATLAB's in 81 to 91% of snippets.
+Amplitude and phase gradient read 14 to 23% and about 10% higher than MATLAB's, because the
+pipeline's smoothing and its peak-bin readout both lower them. On the same snippets, against the
+true beat (computed independently from the simulator's angle):
+
+| clean / jittered keypoints | MATLAB | per frame |
+|---|---|---|
+| amplitude, median error | -18% / -18% | -0.6% / +0.8% |
+| phase slope, median error | -17% / -18% | +1.7% / -2.5% |
+| phase asymmetry, median error | -0.56 / -0.45 rad | 0.00 / -0.03 rad |
+| frequency, p90 error | 0.56 / 0.61 Hz | 0.17 / 0.29 Hz |
+| direction right | 94% / 98% | 100% / 99% |
+
+On a clean, noise-free wave the two agree where MATLAB's window is exact: on a frequency bin,
+frequency and amplitude match, and the remaining gap is the pipeline's smoothing (amplitude 16%
+low at 60 px, 1.4% at 400 px; phase gradient 18% low at 60 px, 8% at 400 px). Without that
+smoothing, the pipeline's analysis and the per-frame readout both land within 2% of the truth.
+
+How much beat the per-frame readout needs, on synthetic beats with and without jitter:
+
+| beat available | frequency |
+|---|---|
+| half a period | 25% off: not measurable |
+| 1 period | 2 to 3% off |
+| 3 periods | within about 2%; `inst_excess` passes 30 from about 3 periods |
+| a burst of another frequency for 1 period | 26 to 61% of the change shows |
+| a burst for 3 periods | 87 to 97% of the change shows, 80 to 97% of its frames within 10% |
+
+The 0.75 s window needs a burst to last about 0.4 s, whatever its frequency. A narrower wavelet
+(omega0 = 3) would catch 2-period bursts but drops the per-frame accuracy with jitter from 94% to
+88% of frames within 10%; the jump penalty makes no difference to brief bursts.
+
 ### Real tracks
 
 On 66 real tracks (powa_6, 100 fps, 0.325 um/px), measured windows above 15 Hz are 100% tip to base
 and windows of 4 to 10 Hz 81% base to tip with a static angle of 0.87 rad, as expected for
 *Leishmania*; the spectral and flow directions agree on 99% and 93% of them. 38% of real windows
 are marked bad.
+
+On powa_large (670 labelled clips, 2-fold leave-movie-out), real beats are slow or weak: only 5 to
+22% of base-to-tip frames reach `inst_excess` 30. The `beat` group alone scores a macro-F1 of
+0.68 with its clip medians over all frames inside the cone, against 0.56 over confident frames only.
 
 ## Limits
 
@@ -206,11 +312,22 @@ are marked bad.
   Treat a measured `wave_wavelength_ratio` below 0.5 with suspicion.
 * **Slow beats.** A beat needs 2.5 cycles in the window; slower ones are censored. A longer
   `spectral.window` lowers the floor but blurs switches between beat types.
+* **Brief changes.** The per-frame readout follows a change of beat that lasts about 3 periods
+  (0.15 s at 20 Hz, 0.3 s at 10 Hz); a shorter one shows only in part, and half a period of beat
+  gives no frequency. Its ridge starts at 1.5 Hz, so on a short flagellum with a weak beat slow
+  drift of the shape can win; `inst_excess` stays below the confidence cut there.
+* **Confidence of slow beats.** Each frequency's wavelet collects noise in proportion to its
+  bandwidth, and a slow beat's overtones fall inside the searched range, so `inst_excess` favours
+  fast beats: a 4 Hz beat reads about a third of a 20 Hz beat of the same size. On the simulator
+  40 to 48% of base-to-tip frames reach 30, against 72 to 77% of tip-to-base frames; on powa_large
+  4 to 9%, against 67%. Compare `inst_excess` only between beats of similar frequency.
 * **Smoothing at low magnification.** The smoothing allows an RMS residual of 0.45 px at any
   scale, so a flagellum of 25 to 90 px (20x) is smoothed hard. Against the simulator's parameters,
   wavelengths come out 31% long (median), and on the exact flagellum the pipeline's direction is
   wrong in 7% of windows, mostly flagella under 30 px or waves longer than 2 L. The pipeline does
-  the same on such movies.
+  the same on such movies. It smooths a flagellum whose sideways swing is within about 1 px to a
+  straight line (6 of 86 simulated windows), and it smooths x and y separately, so turning a cell
+  by 45 degrees in the image changes its wavelength by up to 9%. The per-frame columns avoid both.
 * **Keypoint jitter.** Read `wave_excess` as the confidence of a window; below 3 the beat is lost
   in the noise. Jitter moves the per-frame length of a short flagellum by more than the 10% the
   pipeline allows, so a quarter of windows on flagella under 30 px are marked bad (3% above that).
