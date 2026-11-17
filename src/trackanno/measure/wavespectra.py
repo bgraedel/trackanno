@@ -135,16 +135,19 @@ def smooth_rows(values: np.ndarray, budget) -> np.ndarray:
     return ((coef * shrink) @ vec.T) / root
 
 
-def linear_smooth(values: np.ndarray, cutoff: float) -> np.ndarray:
+def linear_smooth(values: np.ndarray, cutoff) -> np.ndarray:
     """Rows smoothed by a cubic smoothing spline of fixed strength, on unit-spaced samples.
 
-    A wave of ``cutoff`` samples keeps about half its amplitude, longer ones more. The same
-    operator acts on every row, so smoothing x and y alike leaves a rotated curve rotated.
+    A wave of ``cutoff`` samples keeps about half its amplitude, longer ones more; ``cutoff`` is
+    one number or one per row. Smoothing x and y alike leaves a rotated curve rotated.
     """
     values = np.asarray(values, dtype=float)
     if values.shape[1] < 3 or values.shape[0] == 0:
         return values.copy()
     lam, vec, root = _basis(values.shape[1])
+    cutoff = np.asarray(cutoff, dtype=float)
+    if cutoff.ndim:
+        cutoff = cutoff[:, None]
     shrink = 1.0 / (1.0 + lam / (2.0 * np.pi / cutoff) ** 4)
     return (((values * root) @ vec) * shrink @ vec.T) / root
 
@@ -282,14 +285,20 @@ def _local_spread(values: np.ndarray, radius: int) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # per frame: the smoothed flagellum in the body frame (processFile.m lines 37-73)
 # --------------------------------------------------------------------------- #
-def frame_curves(px: np.ndarray, py: np.ndarray,
-                 cutoff_segments: float | None = None) -> dict[str, np.ndarray]:
+def frame_curves(px: np.ndarray, py: np.ndarray, cutoff_segments: float | None = None,
+                 cutoff_px: float | None = None, whole_trace: bool = True) -> dict[str, np.ndarray]:
     """Smoothed flagellum per frame in the body frame: x, y, arc (frames, DENSE_POINTS) and lengths.
 
     The flagellum is a cubic spline through Base..Tip by node index; the body centre is the
     Head-Base midpoint. By default it is smoothed as the pipeline does (``spaps``, axis to the
     smoothed base). With ``cutoff_segments`` it is smoothed by :func:`linear_smooth` with that
-    cutoff, in segments between keypoints, and the axis runs to the Base keypoint itself.
+    cutoff, in segments between keypoints, and the axis runs to the Base keypoint itself;
+    ``cutoff_px`` does the same with a cutoff in pixels, for a densely sampled centerline.
+
+    ``overall`` is the whole trace for the pipeline's second bad-frame test: Head-Base plus the
+    flagellum, standing in for the skeleton through body and flagellum. ``whole_trace=False``
+    makes it the flagellum itself, so that test repeats the flagellum one and drops out: a
+    centerline has no traced body (processFileCenterline.m, which drops the test too).
     """
     n_frames = px.shape[0]
     n = DENSE_POINTS
@@ -320,6 +329,10 @@ def frame_curves(px: np.ndarray, py: np.ndarray,
     if rows.size == 0:
         return out
     cutoff = None if cutoff_segments is None else cutoff_segments * (n - 1) / (px.shape[1] - 2)
+    if cutoff_px is not None:
+        # Each frame's curve has n points over its own length.
+        length = np.hypot(np.diff(xs[rows], axis=1), np.diff(ys[rows], axis=1)).sum(axis=1)
+        cutoff = cutoff_px * (n - 1) / length
     framed = body_frame_curves(xs[rows], ys[rows], 0.5 * (px[rows, 0] + px[rows, 1]),
                                0.5 * (py[rows, 0] + py[rows, 1]), cutoff=cutoff,
                                axis_to_base=cutoff is not None)
@@ -327,7 +340,7 @@ def frame_curves(px: np.ndarray, py: np.ndarray,
         out[key][rows] = framed[key]
     body = np.hypot(px[rows, 0] - px[rows, 1], py[rows, 0] - py[rows, 1])
     chain = np.hypot(np.diff(px[rows, 1:], axis=1), np.diff(py[rows, 1:], axis=1)).sum(axis=1)
-    out["overall"][rows] = body + chain
+    out["overall"][rows] = body + chain if whole_trace else out["length"][rows]
     return out
 
 
@@ -337,7 +350,7 @@ def body_frame_curves(x: np.ndarray, y: np.ndarray, centre_x: np.ndarray, centre
     """Flagella (frames, points; base to tip, even in arclength, px) smoothed and in the body frame.
 
     Smoothed as spaps with tolerance 0.2 L px^2, or by :func:`linear_smooth` with ``cutoff``
-    points, then moved so the smoothed base is the origin and the axis from the body centre to
+    points (one number, or one per frame), then moved so the smoothed base is the origin and the axis from the body centre to
     it is +x. With ``axis_to_base`` the axis runs to the unsmoothed base instead, which does not
     sway with the smoothing of the beat.
     """
@@ -346,7 +359,9 @@ def body_frame_curves(x: np.ndarray, y: np.ndarray, centre_x: np.ndarray, centre
         # spaps tolerance 0.2 L (px) with trapezoid weights of spacing L / (n - 1): 0.2 (n - 1) per unit.
         smoothed = smooth_rows(np.vstack([x, y]), XY_TOLERANCE * (n - 1))
     else:
-        smoothed = linear_smooth(np.vstack([x, y]), cutoff)
+        cutoff = np.asarray(cutoff, dtype=float)
+        smoothed = linear_smooth(np.vstack([x, y]),
+                                 np.concatenate([cutoff, cutoff]) if cutoff.ndim else cutoff)
     sx, sy = smoothed[:x.shape[0]], smoothed[x.shape[0]:]
     bx, by = sx[:, :1], sy[:, :1]
     ax, ay = (x[:, 0], y[:, 0]) if axis_to_base else (bx[:, 0], by[:, 0])
@@ -633,12 +648,12 @@ def analyse_window(curves: dict[str, np.ndarray], lo: int, hi: int, fps: float) 
 # --------------------------------------------------------------------------- #
 def spectral_series(
     px: np.ndarray, py: np.ndarray, fps: float, window: int = DEFAULT_WINDOW,
-    hop: int = DEFAULT_HOP, flow_frames: int = DEFAULT_FLOW_FRAMES,
+    hop: int = DEFAULT_HOP, flow_frames: int = DEFAULT_FLOW_FRAMES, whole_trace: bool = True,
 ) -> pd.DataFrame:
     """Beat measurements (:data:`SERIES_COLUMNS`) per sliding window, indexed by centre frame.
 
     ``px``/``py`` are (n_frames, n_keypoints) on the full frame grid, NaN where undetected:
-    Head, Base, then the flagellum to its tip.
+    Head, Base, then the flagellum to its tip. ``whole_trace`` as for :func:`frame_curves`.
     """
     px = np.asarray(px, dtype=float)
     py = np.asarray(py, dtype=float)
@@ -657,7 +672,7 @@ def spectral_series(
         starts = np.array([(n_frames - m) // 2])
     centres = starts + m // 2
 
-    curves = frame_curves(px, py)
+    curves = frame_curves(px, py, whole_trace=whole_trace)
     rows = [analyse_window(curves, int(c), int(c) + m, fps) for c in starts]
     out = {c: np.array([r.get(c, np.nan) for r in rows], dtype=float) for c in SERIES_COLUMNS}
 
@@ -686,13 +701,14 @@ def spectral_series(
 def track_spectral_series(
     sub: pd.DataFrame, n_keypoints: int, fps: float, window: int = DEFAULT_WINDOW,
     hop: int = DEFAULT_HOP, n_frames: int | None = None, f_start: int | None = None,
-    flow_frames: int = DEFAULT_FLOW_FRAMES,
+    flow_frames: int = DEFAULT_FLOW_FRAMES, whole_trace: bool = True,
 ) -> pd.DataFrame:
     """:func:`spectral_series` from one track's rows, laid on the full frame grid first."""
     sub = sub.sort_values("frame")
     frames = sub["frame"].to_numpy(dtype=int)
     if frames.size == 0:
-        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop, flow_frames)
+        return spectral_series(np.empty((0, 0)), np.empty((0, 0)), fps, window, hop, flow_frames,
+                               whole_trace)
     if f_start is None:
         f_start = int(frames.min())
     if n_frames is None:
@@ -701,7 +717,7 @@ def track_spectral_series(
     ky = [f"kp_y_{k}" for k in range(n_keypoints)]
     px = _on_grid(sub, kx, int(n_frames), int(f_start))
     py = _on_grid(sub, ky, int(n_frames), int(f_start))
-    series = spectral_series(px, py, fps, window, hop, flow_frames)
+    series = spectral_series(px, py, fps, window, hop, flow_frames, whole_trace)
     series.index = pd.Index(series.index.to_numpy(dtype=int) + int(f_start), name="frame")
     return series
 

@@ -49,8 +49,11 @@ along arclength (vertical, base at top) against time (horizontal). A travelling
 wave shows as diagonal stripes, a standing wave as vertical ones, a mistracked
 frame as a gap. Clicking moves the clip to that frame.
 
-A smoothing spline is fitted through the keypoint chain (ordered by
-`keypoints.edges`) each frame and differentiated analytically.
+A smoothing spline is fitted through the keypoint chain from Base to Tip
+(ordered by `keypoints.edges`; the Head is left out) each frame and
+differentiated analytically. On a centerline project the curve is first
+smoothed over 2 um, the same for every cell and magnification, rather than with
+a tolerance per point, which on 129 close points would erase the small bends.
 `ui.kymo_sign: canonical` flips each clip so its time-averaged shape has
 positive curvature, where that sign is clear; otherwise the clip is shown as
 measured and the panel says "sign not determined". `raw` never flips.

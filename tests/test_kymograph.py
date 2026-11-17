@@ -440,3 +440,16 @@ def test_a_detect_project_hides_it(app, root: Path) -> None:
     assert plain.kymo_view.kymo is None, "never computes one"
     plain.shutdown()
     plain.close()
+
+
+def test_a_dense_centerline_keeps_its_bends() -> None:
+    """On 129 close points a per-point tolerance deletes a small bend; a distance cutoff keeps it."""
+    from trackanno.measure.kymograph import resample_centreline
+
+    s = np.linspace(0.0, 40.0, 129)                   # 40 px, about 0.3 px apart
+    x, y = s, 0.4 * np.sin(2 * np.pi * s / 10.0)      # a 0.4 px bend every 5 px
+    truth = 0.4 * (2 * np.pi / 10.0) ** 2
+    _, per_point, _ = resample_centreline(x, y, 128, smooth_px=0.6)
+    _, by_distance, _ = resample_centreline(x, y, 128, cutoff_px=2.0)
+    assert np.nanmax(np.abs(per_point[16:-16])) < 0.2 * truth, "the per-point tolerance flattens it"
+    assert np.nanmax(np.abs(by_distance[16:-16])) > 0.9 * truth

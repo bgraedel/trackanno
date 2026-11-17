@@ -69,6 +69,9 @@ cpu = [
     "torch>=2.2",
     "torchvision>=0.17",
 ]
+# centerline.enabled: the centerline model's backbone. The centerline code itself is
+# found at centerline.code, or installed next to trackanno.
+centerline = ["timm>=1.0.15"]
 
 [project.scripts]
 # `uv tool install .` puts `trackanno` on PATH; that one command IS the app.

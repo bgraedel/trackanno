@@ -1,7 +1,8 @@
 """Beat readouts per frame, from the ridge of a Morlet wavelet transform of the tangent angle.
 
 The flagellum is the spline through the keypoints, smoothed with a fixed cutoff of one segment between
-keypoints (the same in x and y, so the cell's orientation does not matter), and its tangent angle is taken
+keypoints, or of ``SMOOTHING_UM`` along a dense centerline (the same in x and y, so the cell's
+orientation does not matter), and its tangent angle is taken
 per frame at ``N_POINTS`` along 0.9 of that frame's length. After a 1 Hz high-pass, each point's angle goes
 through a Morlet transform (omega0 = 6) on a log grid of frequencies. The ridge is the frequency path
 through the power summed along s that pays ``JUMP_COST`` per octave it moves. At the ridge each frame
@@ -26,7 +27,8 @@ __all__ = [
 ]
 
 N_POINTS = 100                   # points along 0.9 L
-SMOOTHING_SEGMENTS = 1.0         # smoothing cutoff, in segments between keypoints
+SMOOTHING_SEGMENTS = 1.0         # smoothing cutoff for keypoints, in segments between them
+SMOOTHING_UM = 2.0               # smoothing cutoff for a centerline (about one pose segment)
 OMEGA0 = 6.0                     # Morlet: the window spans about one period per radian of omega0
 F_LOW = 1.5                      # Hz, lowest ridge frequency
 F_HIGH_SHARE = 0.35              # of the frame rate, highest ridge frequency
@@ -187,17 +189,25 @@ def beat_from_curves(curves: dict[str, np.ndarray], fps: float) -> pd.DataFrame:
     return frame.replace([np.inf, -np.inf], np.nan)
 
 
-def beat_series(px: np.ndarray, py: np.ndarray, fps: float) -> pd.DataFrame:
-    """:data:`SERIES_COLUMNS` per frame; ``px``/``py`` as for :func:`wavespectra.spectral_series`."""
+def beat_series(px: np.ndarray, py: np.ndarray, fps: float,
+                um_per_px: float | None = None) -> pd.DataFrame:
+    """:data:`SERIES_COLUMNS` per frame; ``px``/``py`` as for :func:`wavespectra.spectral_series`.
+
+    With ``um_per_px`` the nodes are a dense centerline, smoothed over ``SMOOTHING_UM``."""
     px = np.asarray(px, dtype=float)
     py = np.asarray(py, dtype=float)
     if px.ndim != 2 or px.shape != py.shape or px.shape[1] < 4 or px.shape[0] == 0:
         return pd.DataFrame(columns=list(SERIES_COLUMNS), dtype=float)
-    return beat_from_curves(ws.frame_curves(px, py, cutoff_segments=SMOOTHING_SEGMENTS), fps)
+    if um_per_px:
+        curves = ws.frame_curves(px, py, cutoff_px=SMOOTHING_UM / um_per_px)
+    else:
+        curves = ws.frame_curves(px, py, cutoff_segments=SMOOTHING_SEGMENTS)
+    return beat_from_curves(curves, fps)
 
 
 def track_beat_series(sub: pd.DataFrame, n_keypoints: int, fps: float,
-                      n_frames: int | None = None, f_start: int | None = None) -> pd.DataFrame:
+                      n_frames: int | None = None, f_start: int | None = None,
+                      um_per_px: float | None = None) -> pd.DataFrame:
     """:func:`beat_series` from one track's rows, laid on the full frame grid first."""
     sub = sub.sort_values("frame")
     frames = sub["frame"].to_numpy(dtype=int)
@@ -207,7 +217,7 @@ def track_beat_series(sub: pd.DataFrame, n_keypoints: int, fps: float,
     n_frames = int(frames.max()) - f_start + 1 if n_frames is None else int(n_frames)
     px = _on_grid(sub, [f"kp_x_{k}" for k in range(n_keypoints)], n_frames, f_start)
     py = _on_grid(sub, [f"kp_y_{k}" for k in range(n_keypoints)], n_frames, f_start)
-    series = beat_series(px, py, fps)
+    series = beat_series(px, py, fps, um_per_px)
     series.index = pd.Index(series.index.to_numpy(dtype=int) + f_start, name="frame")
     return series
 

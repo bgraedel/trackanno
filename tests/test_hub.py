@@ -515,6 +515,29 @@ def test_a_detect_checkpoint_keeps_the_typed_keypoint_names(app, hub, project) -
     assert not back.needs_keypoints
 
 
+def test_a_centerline_project_is_not_offered_the_pose_model_keypoints(app, hub, project) -> None:
+    """The keypoints name the centerline's output, so the pose model's count must not replace them."""
+    from trackanno.gui.hub import ConfigPage
+    from trackanno.project import write_config
+
+    nodes = ["Head", "Base"] + [f"C{i}" for i in range(1, 128)] + ["Tip"]
+    write_config(project, {"detection.task": "pose", "centerline.enabled": True,
+                           "centerline.checkpoint": "a.ckpt", "centerline.hint_model": "b.pt"},
+                 keypoints={"nodes": nodes, "edges": []})
+    hub.reload_project()
+    page = hub.page(ConfigPage)
+    hub.go_to(hub.pages.index(page))
+    app.processEvents()
+    page._on_model_info({"task": "pose", "n_keypoints": 8, "classes": ["cell"],
+                         "imgsz": 640, "name": "best_pose.pt"})
+    app.processEvents()
+    assert page.model_row.isHidden(), "no offer to shrink 130 names to the pose model's 8"
+    assert page.keypoints.count.value() == 130
+    assert not page.keypoints.read_button.isEnabled()
+    assert "centerline" in page.keypoints.state.text()
+    assert not page.pose_notice.isVisible()
+
+
 def test_a_dead_share_is_never_probed_on_the_ui_thread(app, tmp_path, monkeypatch) -> None:
     from trackanno.gui.hub import Hub
     from trackanno.project import create_project, write_config

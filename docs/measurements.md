@@ -54,6 +54,10 @@ Read off the same analysis:
 
 Details that matter for correctness:
 
+* The pipeline also rejects a frame whose whole trace, body included, is under 0.9 of its
+  typical length. Here that trace is Head-Base plus the flagellum. A centerline project
+  (`centerline.enabled`) has no traced body and drops that test, judging frames on the
+  flagellum alone, as the centerline pipeline's `processFileCenterline.m` does.
 * The smoothing is `spaps`' problem solved exactly: the cubic smoothing spline with trapezoid
   weights, its smoothing parameter set by the residual budget. MATLAB's `spaps` stops once the
   residual is within 1% of the budget, which leaves differences below 1% on identical input. The
@@ -73,7 +77,9 @@ Details that matter for correctness:
 
 The beat read in every frame, so a switch of beat type shows within a few frames instead of
 across a 0.75 s window. Each frame's flagellum is the spline through the keypoints, smoothed with
-a fixed cutoff: a bend one keypoint segment long keeps half its amplitude. The same smoothing acts
+a fixed cutoff: a bend one keypoint segment long keeps half its amplitude. On a centerline
+(`centerline.enabled`) the cutoff is 2 um instead, the same for every cell and magnification,
+which needs the pixel size (`tiff.pixel_size_um` for TIFF). The same smoothing acts
 on x and y, so unlike the pipeline's it does not depend on the cell's orientation, does not
 straighten a weak beat, and does not depend on magnification. Its tangent angle is taken at 100
 points along 0.9 of that frame's length. A 1 Hz high-pass removes the static shape, then each

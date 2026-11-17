@@ -104,6 +104,9 @@ _DETECT_KEYS = (
     "normalize.mode", "normalize.percentiles",
     "nd2.channel", "nd2.z", "tiff.channel",
     "nd2.fps", "tiff.fps",   # scale the tracker's track_buffer
+    "centerline.enabled", "centerline.checkpoint", "centerline.hint_model",
+    "centerline.stack_stride", "centerline.hint_conf", "centerline.hint_imgsz",
+    "centerline.hint_tile",
 )
 # Settings that change what the clip stage cuts from the same tracks.
 _CLIP_KEYS = (
@@ -461,6 +464,27 @@ def handoff_is_fresh(cfg: Config, movie_id: str) -> bool:
         return False
 
 
+def _centerline_model(detector, cfg: Config, reporter: Reporter):
+    """The centerline model, loaded once per detector."""
+    from .centerline import CenterlineModel
+
+    made = getattr(detector, "centerline_model", None)
+    if made is None:
+        reporter.stage("loading the centerline model", None)
+        made = CenterlineModel(cfg, reporter)
+        detector.centerline_model = made
+    if cfg.keypoints.n != made.K + 1:
+        from ..project import write_config
+        from .centerline import node_names
+
+        nodes = node_names(made.K)
+        edges = [[a, b] for a, b in zip(nodes, nodes[1:])]
+        write_config(cfg.path, {}, keypoints={"nodes": nodes, "edges": edges})
+        cfg.keypoints.nodes, cfg.keypoints.edges = nodes, [tuple(e) for e in edges]
+        reporter.log(f"keypoints.nodes set to the Head and the centerline's {made.K} points")
+    return made
+
+
 def _detector(source):
     """Accept either a detector or something that builds one on demand."""
     return source() if callable(source) else source
@@ -511,7 +535,13 @@ def detect_movie(
     )
     normalizer.save(out_dir / NORM_FILE)
 
+    # Loaded first: it names the output nodes, and tracking keeps the pose Head only with names.
+    centerline = _centerline_model(detector, cfg, reporter) if cfg.centerline.enabled else None
     tracks, feats = run_tracking(movie, detector, cfg, normalizer, limit_frames, reporter)
+    if centerline is not None:
+        from .centerline import refine_tracks
+
+        tracks = refine_tracks(movie, tracks, cfg, normalizer, centerline, reporter)
     tracks.to_parquet(out_dir / TRACKS_FILE, index=False)
 
     feature_path = out_dir / FEATURES_FILE
@@ -540,6 +570,8 @@ def detect_movie(
         "n_tracks": int(tracks["track_id"].nunique()) if not tracks.empty else 0,
         # Names may come from the checkpoint, which stage 2 never loads.
         "keypoint_nodes": list(cfg.keypoints.nodes),
+        "centerline": ({"checkpoint": centerline.name, "epoch": centerline.epoch}
+                       if centerline is not None else None),
         "tiled": bool(tiled),
         "n_tiles": n_tiles,
         "feature_dim": feature_dim,

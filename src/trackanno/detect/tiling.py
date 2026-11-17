@@ -20,7 +20,8 @@ FEATURE_LEVELS = _FIXED["features.levels"]
 FEATURE_POOL = _FIXED["features.pool"]
 FEATURE_DTYPE = _FIXED["features.dtype"]
 
-__all__ = ["Detections", "tile_grid", "TiledDetector", "read_keypoint_count",
+__all__ = ["Detections", "tile_grid", "merge_tiles", "split_edge_truncated", "TiledDetector",
+           "read_keypoint_count",
            "default_node_names", "resolve_device", "device_label",
            "cuda_status", "cuda_devices", "read_model_info"]
 
@@ -356,6 +357,75 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (inter / np.maximum(area_a[:, None] + area_b[None, :] - inter, 1e-9)).astype(np.float32)
 
 
+def split_edge_truncated(
+    dets: Detections, tile: tuple[int, int, int, int], height: int, width: int
+) -> tuple[Detections, Detections]:
+    """Split into (kept, suspect): suspect boxes touch an interior tile border.
+
+    The neighbouring tile sees those objects whole; boxes on a frame border are kept."""
+    x0, y0, x1, y1 = tile
+    m = EDGE_MARGIN_PX
+    b = dets.xyxy
+    touches = np.zeros(len(dets), bool)
+    if x0 > 0:
+        touches |= b[:, 0] <= x0 + m
+    if y0 > 0:
+        touches |= b[:, 1] <= y0 + m
+    if x1 < width:
+        touches |= b[:, 2] >= x1 - m
+    if y1 < height:
+        touches |= b[:, 3] >= y1 - m
+    return dets.take(~touches), dets.take(touches)
+
+
+def merge_tiles(
+    parts: Sequence[Detections], tiles: Sequence[tuple[int, int, int, int]],
+    height: int, width: int, merge_iou: float, per_class: bool = False,
+) -> Detections:
+    """Per-tile detections (already in frame coordinates) -> one set for the frame.
+
+    Boxes cut by an interior tile border are dropped unless nothing else covers them, then
+    overlapping boxes from neighbouring tiles are merged by NMS. ``per_class`` does both
+    within each class, for models whose classes nest (a body inside its animal)."""
+    if per_class:
+        classes = np.unique(np.concatenate([p.cls for p in parts])) if parts else []
+        merged = Detections.concat([
+            merge_tiles([p.take(p.cls == c) for p in parts], tiles, height, width, merge_iou)
+            for c in classes
+        ])
+        return merged.take(np.argsort(-merged.conf, kind="stable"))
+
+    tiled = len(tiles) > 1
+    kept_parts, suspect_parts = [], []
+    for dets, tile in zip(parts, tiles):
+        if tiled and DROP_EDGE_TRUNCATED and len(dets):
+            keep, suspect = split_edge_truncated(dets, tile, height, width)
+            kept_parts.append(keep)
+            suspect_parts.append(suspect)
+        else:
+            kept_parts.append(dets)
+
+    merged = Detections.concat(kept_parts)
+
+    # Re-admit suspect boxes nothing else covers (objects larger than the overlap).
+    if suspect_parts:
+        suspect = Detections.concat(suspect_parts)
+        if len(suspect):
+            if len(merged):
+                unmatched = _iou_matrix(suspect.xyxy, merged.xyxy).max(axis=1) < 0.3
+            else:
+                unmatched = np.ones(len(suspect), bool)
+            if unmatched.any():
+                merged = Detections.concat([merged, suspect.take(unmatched)])
+
+    if not tiled or len(merged) == 0:
+        return merged
+    keep = _nms(merged.xyxy, merged.conf, merge_iou)
+    merged = merged.take(keep)
+    # Highest confidence first, for a deterministic order.
+    return merged.take(np.argsort(-merged.conf, kind="stable"))
+
+
 # --------------------------------------------------------------------------- #
 # detector
 # --------------------------------------------------------------------------- #
@@ -388,7 +458,13 @@ class TiledDetector:
         model_kpts = getattr(getattr(self.model, "model", None), "kpt_shape", None)
         model_kpts = int(model_kpts[0]) if model_kpts else None
 
-        if cfg.needs_keypoints:
+        centerline = getattr(getattr(cfg, "centerline", None), "enabled", False)
+        if centerline and cfg.is_pose:
+            # keypoints.nodes name the centerline output; this reads the pose model's own.
+            if not model_kpts:
+                raise ValueError(f"centerline.enabled needs a pose model; {cfg.paths.model} "
+                                 "predicts no keypoints")
+        elif cfg.needs_keypoints:
             if not model_kpts:
                 raise ValueError(
                     f"detection.task is 'pose' but {cfg.paths.model} is not a pose model; "
@@ -405,7 +481,7 @@ class TiledDetector:
                 f"model has {model_kpts} keypoints but keypoints.nodes lists "
                 f"{cfg.n_keypoints}; fix keypoints.nodes"
             )
-        self.n_kpts = cfg.n_keypoints
+        self.n_kpts = model_kpts if centerline and cfg.is_pose else cfg.n_keypoints
         self._grid_cache: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
 
         # Embedding hook on the head, installed for the detector's lifetime.
@@ -511,30 +587,15 @@ class TiledDetector:
     def _drop_edge_truncated(
         self, dets: Detections, tile: tuple[int, int, int, int], height: int, width: int
     ) -> tuple[Detections, Detections]:
-        """Split into (kept, suspect): suspect boxes touch an interior tile border.
-
-        The neighbouring tile sees those objects whole; boxes on a frame border are kept."""
+        """Split into (kept, suspect); see :func:`split_edge_truncated`."""
         if len(dets) == 0:
             return dets, Detections.empty(self.n_kpts)
-        x0, y0, x1, y1 = tile
-        m = EDGE_MARGIN_PX
-        b = dets.xyxy
-        touches = np.zeros(len(dets), bool)
-        if x0 > 0:
-            touches |= b[:, 0] <= x0 + m
-        if y0 > 0:
-            touches |= b[:, 1] <= y0 + m
-        if x1 < width:
-            touches |= b[:, 2] >= x1 - m
-        if y1 < height:
-            touches |= b[:, 3] >= y1 - m
-        return dets.take(~touches), dets.take(touches)
+        return split_edge_truncated(dets, tile, height, width)
 
     def detect(self, frame_rgb: np.ndarray) -> Detections:
         """Detections for one full RGB uint8 frame, in original pixel coordinates."""
         height, width = frame_rgb.shape[:2]
         tiles = self.tiles_for(height, width)
-        tiled = len(tiles) > 1
 
         crops = [np.ascontiguousarray(frame_rgb[y0:y1, x0:x1]) for x0, y0, x1, y1 in tiles]
         imgsz = int(self.cfg.detection.imgsz)
@@ -544,35 +605,9 @@ class TiledDetector:
             results = self._predict(crops, imgsz)
             feat_blocks = [None] * len(results)
 
-        kept_parts, suspect_parts = [], []
-        for r, tile, feats in zip(results, tiles, feat_blocks):
-            dets = self._result_to_dets(r, tile[0], tile[1], feats)
-            if tiled and DROP_EDGE_TRUNCATED:
-                keep, suspect = self._drop_edge_truncated(dets, tile, height, width)
-                kept_parts.append(keep)
-                suspect_parts.append(suspect)
-            else:
-                kept_parts.append(dets)
-
-        merged = Detections.concat(kept_parts)
-
-        # Re-admit suspect boxes nothing else covers (objects larger than the overlap).
-        if suspect_parts:
-            suspect = Detections.concat(suspect_parts)
-            if len(suspect):
-                if len(merged):
-                    unmatched = _iou_matrix(suspect.xyxy, merged.xyxy).max(axis=1) < 0.3
-                else:
-                    unmatched = np.ones(len(suspect), bool)
-                if unmatched.any():
-                    merged = Detections.concat([merged, suspect.take(unmatched)])
-
-        if not tiled or len(merged) == 0:
-            return merged
-        keep = _nms(merged.xyxy, merged.conf, self.cfg.tiling.merge_iou)
-        merged = merged.take(keep)
-        # Highest confidence first, for a deterministic order.
-        return merged.take(np.argsort(-merged.conf, kind="stable"))
+        parts = [self._result_to_dets(r, tile[0], tile[1], feats)
+                 for r, tile, feats in zip(results, tiles, feat_blocks)]
+        return merge_tiles(parts, tiles, height, width, self.cfg.tiling.merge_iou)
 
     def detect_untiled(self, frame_rgb: np.ndarray) -> Detections:
         """Single-shot whole-frame inference. Used by ``trackanno prepare --self-test``."""

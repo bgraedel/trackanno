@@ -200,7 +200,7 @@ class TiffMovie(MovieSource):
         self.series = 0
         self.channel = int(cfg.tiff.channel)
         self.fps = float(cfg.tiff.fps)
-        self.pixel_size_um = None
+        self.pixel_size_um = cfg.tiff.pixel_size_um
 
         self._tif = tifffile.TiffFile(str(self.path))
         series = self._tif.series[0]

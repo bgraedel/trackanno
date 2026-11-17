@@ -22,7 +22,12 @@ from ..project import _exists
 from .theme import compact_button
 
 __all__ = ["ConfigForm", "CategoryEditor", "KeypointEditor", "GROUPS", "FIELDS",
-           "BASIC", "NEEDS_REPREPARE", "HAS_STATUS"]
+           "BASIC", "NEEDS_REPREPARE", "HAS_STATUS", "CENTERLINE_TASK"]
+
+# The task combo's third choice. Not a value of detection.task: it is written as
+# detection.task: pose plus centerline.enabled: true, the pose model still tracking.
+CENTERLINE_TASK = "pose + centerline"
+CENTERLINE_KEYS = ("centerline.checkpoint", "centerline.hint_model", "tiff.pixel_size_um")
 
 
 def _options(dotted: str, extra: dict) -> list[str]:
@@ -45,12 +50,20 @@ GROUPS: list[tuple[str, str, list[tuple[str, str, str, dict]]]] = [
          {"filter": "CSV (*.csv);;All files (*)", "save": True}),
     ]),
     ("Detection", "How animals are found in each frame.", [
-        ("detection.task", "choice", "task", {}),
+        ("detection.task", "task", "task", {}),
         ("detection.device", "choice", "compute device",
          {"options": ["auto", "cpu", "0", "mps"]}),
         ("detection.conf", "float", "confidence", {"step": 0.05}),
         ("detection.batch", "int", "batch", {"max": 64}),
         ("detection.imgsz", "int", "inference size", {"max": 4096, "step": 32}),
+    ]),
+    ("Centerline", "Task pose + centerline: a model traces the whole flagellum after the "
+     "pose model has tracked the cells.", [
+        ("centerline.checkpoint", "file", "centerline checkpoint",
+         {"filter": "Checkpoints (*.ckpt);;All files (*)"}),
+        ("centerline.hint_model", "file", "body and flagellum detector",
+         {"filter": "PyTorch weights (*.pt);;All files (*)"}),
+        ("tiff.pixel_size_um", "text", "TIFF pixel size (um)", {}),
     ]),
     ("Tracking", "Linking detections across frames.", [
         ("tracking.backend", "choice", "tracker", {}),
@@ -96,7 +109,7 @@ FIELDS: list[tuple[str, str, str, str, str, dict]] = [
 # The settings to decide when setting up a project; the rest go on Advanced.
 BASIC = {
     "paths.video_dir", "paths.model", "paths.work_dir", "paths.csv",
-    "detection.task", "detection.device",
+    "detection.task", "detection.device", *CENTERLINE_KEYS,
     "tracking.min_track_length",
     "clips.frames", "clips.stride", "clips.window_mode", "clips.follow", "clips.pad",
     "ui.fps", "ui.annotator",
@@ -130,6 +143,7 @@ class ConfigForm(QScrollArea):
         self._kinds: dict[str, str] = {}
         self._status: dict[str, QLabel] = {}
         self._rows: dict[str, QHBoxLayout] = {}
+        self._groups: dict[str, QGroupBox] = {}
         # Values at load; values() returns only what differs.
         self._at_load: dict[str, Any] = {}
         # Original tooltips while mark() shows a warning instead.
@@ -166,6 +180,7 @@ class ConfigForm(QScrollArea):
                 self._widgets[dotted] = widget
                 self._kinds[dotted] = kind
             layout.addWidget(box)
+            self._groups[title] = box
 
         note = QLabel("Settings marked <b>*</b> need Detect &amp; crop re-run.")
         note.setWordWrap(True)
@@ -173,6 +188,7 @@ class ConfigForm(QScrollArea):
         layout.addWidget(note)
         layout.addStretch(1)
         self.setWidget(body)
+        self._paint_task()
 
     @staticmethod
     def _in_scope(scope: str, dotted: str) -> bool:
@@ -238,6 +254,12 @@ class ConfigForm(QScrollArea):
             widget.setEditable(not meta.get("choices"))
             widget.currentTextChanged.connect(self.changed)
             return widget
+        if kind == "task":
+            widget = QComboBox()
+            widget.addItems(_options(dotted, extra) + [CENTERLINE_TASK])
+            widget.currentTextChanged.connect(self._paint_task)
+            widget.currentTextChanged.connect(self.changed)
+            return widget
         if kind == "int":
             widget = QSpinBox()
             widget.setRange(int(extra.get("min", 0)), int(extra.get("max", 1_000_000)))
@@ -269,15 +291,31 @@ class ConfigForm(QScrollArea):
         values = effective_values(data)
         for dotted, widget in self._widgets.items():
             if dotted in values:
-                self._set(widget, self._kinds[dotted], values[dotted])
+                value = values[dotted]
+                if self._kinds[dotted] == "task" and value == "pose" and values.get(
+                        "centerline.enabled"):
+                    value = CENTERLINE_TASK
+                self._set(widget, self._kinds[dotted], value)
+        self._paint_task()
         self._at_load = self.current()
+
+    def centerline_on(self) -> bool:
+        """Whether the task combo (on this form) has the centerline chosen."""
+        widget = self._widgets.get("detection.task")
+        return widget is not None and widget.currentText() == CENTERLINE_TASK
+
+    def _paint_task(self, *_args) -> None:
+        """The centerline's own fields show only with its task."""
+        box = self._groups.get("Centerline")
+        if box is not None and "detection.task" in self._widgets:
+            box.setVisible(self.centerline_on())
 
     def _set(self, widget: QWidget, kind: str, value: Any) -> None:
         widget.blockSignals(True)
         try:
             if kind == "bool":
                 widget.setChecked(bool(value))
-            elif kind == "choice":
+            elif kind in ("choice", "task"):
                 widget.setCurrentText(str(value))
             elif kind == "int":
                 widget.setValue(int(value))
@@ -339,8 +377,10 @@ class ConfigForm(QScrollArea):
             p = Path(str(text))
             return p if p.is_absolute() or str(p).startswith("//") else (root or Path.cwd()) / p
 
-        for key, must in (("paths.video_dir", "folder"), ("paths.model", "file"),
-                          ("paths.work_dir", None)):
+        checks = [("paths.video_dir", "folder"), ("paths.model", "file"), ("paths.work_dir", None)]
+        if values.get("centerline.enabled"):
+            checks += [("centerline.checkpoint", "file"), ("centerline.hint_model", "file")]
+        for key, must in checks:
             if key not in values:
                 continue
             text = str(values[key] or "").strip()
@@ -398,6 +438,10 @@ class ConfigForm(QScrollArea):
                 out[dotted] = bool(widget.isChecked())
             elif kind == "choice":
                 out[dotted] = widget.currentText().strip()
+            elif kind == "task":
+                on = widget.currentText() == CENTERLINE_TASK
+                out[dotted] = "pose" if on else widget.currentText().strip()
+                out["centerline.enabled"] = on
             elif kind == "int":
                 out[dotted] = int(widget.value())
             elif kind == "float":

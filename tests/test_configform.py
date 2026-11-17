@@ -28,7 +28,7 @@ def test_every_field_reaches_exactly_one_tab(app) -> None:
     from trackanno.gui.configform import FIELDS, GROUPS, ConfigForm
 
     defined = [f"{section}.{key}" for section, key, *_ in FIELDS]
-    assert 25 <= len(defined) <= 32, f"the form stays short: {len(defined)}"
+    assert 25 <= len(defined) <= 36, f"the form stays short: {len(defined)}"
     assert all(tip for *_, tip, _e in FIELDS), "every field has help from the schema"
     assert len(defined) == len(set(defined)), (
         f"no field is defined twice: {sorted({d for d in defined if defined.count(d) > 1})}")
@@ -169,16 +169,22 @@ def test_leaving_auto_starts_from_the_number_it_stood_for(default_form) -> None:
 def test_a_fixed_set_of_values_is_never_free_text(app) -> None:
     """Every setting with a fixed set of values is a combo of exactly that set."""
     from trackanno.config import meta_for
-    from trackanno.gui.configform import FIELDS, ConfigForm, _options
+    from trackanno.gui.configform import CENTERLINE_TASK, FIELDS, ConfigForm, _options
 
     form = ConfigForm("all")
     for section, key, kind, _label, _tip, extra in FIELDS:
         dotted = f"{section}.{key}"
         choices = meta_for(dotted).get("choices")
         if choices:
-            assert kind == "choice", f"{dotted} is a combo: {kind}"
+            # The task combo adds one choice, written as task pose + centerline.enabled.
+            assert kind == ("task" if dotted == "detection.task" else "choice"), (
+                f"{dotted} is a combo: {kind}")
             assert _options(dotted, extra) == [str(c) for c in choices], (
                 f"{dotted} offers the schema's choices")
+            offered = [form._widgets[dotted].itemText(i)
+                       for i in range(form._widgets[dotted].count())]
+            assert offered == [str(c) for c in choices] + (
+                [CENTERLINE_TASK] if kind == "task" else []), f"{dotted}: {offered}"
             assert not form._widgets[dotted].isEditable(), f"{dotted} cannot be typed into"
     assert all(_options(f"{f[0]}.{f[1]}", f[5]) for f in FIELDS if f[2] == "choice"), (
         "every combo has options to offer")
@@ -466,3 +472,30 @@ def test_a_group_this_project_cannot_compute_is_flagged(app, picker) -> None:
     groups._refresh_note()
     assert not groups.note.isHidden()
     assert "detection.task" in groups.note.text(), groups.note.text()
+
+
+def test_centerline_is_a_task_choice_written_as_pose_plus_the_switch(app) -> None:
+    """'pose + centerline' sits beside pose and detect; config.yaml keeps task: pose."""
+    from trackanno.gui.configform import CENTERLINE_TASK, ConfigForm
+
+    form = ConfigForm("basic")
+    task = form._widgets["detection.task"]
+    assert [task.itemText(i) for i in range(task.count())][-1] == CENTERLINE_TASK
+    for key in ("centerline.checkpoint", "centerline.hint_model", "tiff.pixel_size_um"):
+        assert key in form._widgets, f"{key} is on the basic page"
+    assert "centerline.enabled" not in form._widgets, "the task combo owns the switch"
+    assert "centerline.checkpoint" not in ConfigForm("advanced")._widgets
+
+    form.load(_raw({"detection.task": "pose", "centerline.enabled": True,
+                    "centerline.checkpoint": "a.ckpt"}))
+    assert task.currentText() == CENTERLINE_TASK and form.centerline_on()
+    assert not form._groups["Centerline"].isHidden()
+    assert form.values() == {}, "loading changes nothing"
+
+    task.setCurrentText("pose")
+    assert form.values() == {"centerline.enabled": False}
+    assert form._groups["Centerline"].isHidden(), "its fields hide with the task"
+
+    form.load(_raw({"detection.task": "detect"}))
+    task.setCurrentText(CENTERLINE_TASK)
+    assert form.values() == {"detection.task": "pose", "centerline.enabled": True}

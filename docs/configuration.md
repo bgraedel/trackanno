@@ -18,6 +18,7 @@ value stops the load with a one-line message.
 | `paths.patterns` | `*.tif`, `*.tiff`, `*.nd2` | which files are movies |
 | `nd2.channel`, `nd2.z`, `nd2.positions`, `nd2.fps` | `0`, `0`, `all`, `auto` | see [ND2 files](detection.md#nd2-files) |
 | `tiff.fps`, `tiff.channel` | `100`, `0` | TIFF stores no frame rate |
+| `tiff.pixel_size_um` | empty | TIFF pixel size; needed by a centerline project |
 | `normalize.mode` | `per_frame` | `per_frame` or `fixed` (one mapping per movie) |
 | `normalize.percentiles` | `[0.5, 99.5]` | mapped to 0 and 255 |
 | `detection.task` | `detect` | `detect` (boxes) or `pose` (keypoints) |
@@ -32,6 +33,8 @@ value stops the load with a one-line message.
 | `tracking.border_margin_px`, `tracking.border_max_frac` | `0`, `0.0` | [frame edge](detection.md#the-frame-edge) |
 | `tracking.overrides` | `{gmc_method: none}` | passed to the tracker |
 | `keypoints.nodes`, `keypoints.edges` | `[]` | names in the model's order; skeleton links |
+| `centerline.enabled`, `.checkpoint`, `.hint_model`, `.code` | off, empty | see [Centerline model](detection.md#centerline-model) |
+| `centerline.stack_stride`, `.hint_conf`, `.hint_tile`, `.hint_imgsz`, `.batch` | `1`, `0.3`, `640`, `640`, `16` | crop stack and hint detector settings |
 | `clips.frames` | `50` | frames per clip, and the window the model is fitted at |
 | `clips.stride` | `= clips.frames` | frames between clip starts |
 | `clips.window_mode` | `all` | `first`, `first_per_track` or `all` |

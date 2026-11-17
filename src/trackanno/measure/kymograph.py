@@ -123,6 +123,8 @@ MIN_NODES = 4
 
 # Per-point positional tolerance of the spline fit, px.
 DEFAULT_SMOOTH_PX = 0.6
+# Equal-arclength sites a dense centerline is smoothed on.
+DENSE_SITES = 256
 
 
 @dataclass
@@ -172,9 +174,12 @@ class Kymograph:
             return (self.kappa * length).astype(np.float32)
 
 
-def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX):
+def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX,
+                        cutoff_px: float | None = None):
     """Fit one frame's chain and resample at equal arclength.
 
+    ``smooth_px`` is the spline's tolerance per point, for a few keypoints. A dense centerline
+    takes ``cutoff_px`` instead: it is smoothed over that distance, however densely it is sampled.
     Returns ``(points, kappa 1/px, length px)``, or ``(None, None, nan)`` if unfittable.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
@@ -197,6 +202,9 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
 
     # splprep's s bounds the summed squared residuals, so scale it by point count.
     total = float(x.size) * float(smooth_px) ** 2
+    if cutoff_px is not None:
+        x, y = _smooth_over(x, y, float(cutoff_px))
+        total = 0.0
     try:
         with warnings.catch_warnings():
             # "s too small" still yields a valid spline.
@@ -228,13 +236,25 @@ def resample_centreline(x, y, n_samples: int = 128, smooth_px: float = DEFAULT_S
     return np.column_stack([px, py]), kappa, length
 
 
+def _smooth_over(x: np.ndarray, y: np.ndarray, cutoff_px: float) -> tuple[np.ndarray, np.ndarray]:
+    """The polyline at equal arclength, smoothed so a bend ``cutoff_px`` long keeps half its size."""
+    from .wavespectra import linear_smooth
+
+    arc = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
+    at = np.linspace(0.0, arc[-1], DENSE_SITES)
+    rows = np.vstack([np.interp(at, arc, x), np.interp(at, arc, y)])
+    smoothed = linear_smooth(rows, cutoff_px * (DENSE_SITES - 1) / max(arc[-1], 1e-9))
+    return smoothed[0], smoothed[1]
+
+
 def curvature_kymograph(
     kx, ky, n_samples: int = 128, smooth_px: float = DEFAULT_SMOOTH_PX,
-    order=None, first_node: int = 1,
+    order=None, first_node: int = 1, cutoff_px: float | None = None,
 ) -> Kymograph:
     """Signed curvature along the flagellum for every frame of (frames, nodes) keypoints.
 
     ``order`` is the base-first chain from :func:`chain_from_edges`; else ``first_node..N``.
+    ``cutoff_px`` smooths a dense centerline over a distance (see :func:`resample_centreline`).
     """
     kx = np.asarray(kx, dtype=np.float64)
     ky = np.asarray(ky, dtype=np.float64)
@@ -253,7 +273,7 @@ def curvature_kymograph(
     kappa = np.full((n_frames, n_samples), np.nan, dtype=np.float32)
     lengths = np.full(n_frames, np.nan, dtype=np.float32)
     for t in range(n_frames):
-        _, k, length = resample_centreline(chain_x[t], chain_y[t], n_samples, smooth_px)
+        _, k, length = resample_centreline(chain_x[t], chain_y[t], n_samples, smooth_px, cutoff_px)
         if k is not None:
             kappa[t] = k.astype(np.float32)
             lengths[t] = length

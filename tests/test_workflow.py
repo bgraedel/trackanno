@@ -918,7 +918,9 @@ def config_page(app, hub):
 def test_configure_splits_basics_from_advanced(config_page) -> None:
     basics, advanced = config_page.form.current(), config_page.advanced.current()
     assert 5 < len(basics) < 25, len(basics)
-    assert len(advanced) > len(basics), "advanced holds the rest"
+    # Not "more than the basics": the centerline task's fields made the two tabs about
+    # equal. test_configform checks that every field reaches exactly one tab.
+    assert advanced, "advanced holds the rest"
     assert not (set(basics) & set(advanced)), "no setting appears on both tabs"
 
 

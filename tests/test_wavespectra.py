@@ -416,3 +416,20 @@ def test_a_flagellum_smoothed_straight_has_no_direction() -> None:
     px, py = travelling_wave(150, freq_hz=12.0, amplitude=0.004)
     s = spectral_series(px, py, FPS, 75, 75)
     assert s["wave_direction"].isna().all() and s["wave_wavelength_px"].isna().all()
+
+
+def test_a_centerline_judges_frames_on_the_flagellum_alone() -> None:
+    """whole_trace=False drops the pipeline's whole-trace test, as processFileCenterline.m does:
+    a Head that jumps toward the Base no longer rejects frames whose flagellum is whole."""
+    px, py = travelling_wave(300)
+    short = px.copy(), py.copy()
+    for a in short:  # every third frame, the Head lands most of the way to the Base
+        a[::3, 0] = a[::3, 1] + 0.1 * (a[::3, 0] - a[::3, 1])
+    whole = spectral_series(*short, FPS, 300, 300).iloc[0]
+    alone = spectral_series(*short, FPS, 300, 300, whole_trace=False).iloc[0]
+    intact = spectral_series(px, py, FPS, 300, 300).iloc[0]
+    assert whole["wave_interp_frac"] > 0.2, "with a body in the trace, those frames are bad"
+    assert alone["wave_interp_frac"] == intact["wave_interp_frac"] == 0.0
+    assert alone["wave_window_frames"] == intact["wave_window_frames"] == 300
+    # The angles still move: the axis runs from the body centre to the SMOOTHED base, and a
+    # centre that close to the base turns that small offset into a large angle.

@@ -215,6 +215,7 @@ is left untouched.</p>
         self._paint_dirty()
         self.form.changed.connect(self._mark_dirty)
         self.advanced.changed.connect(self._mark_dirty)
+        self.form.changed.connect(self._paint_centerline)
         self.categories.changed.connect(self._mark_dirty)
         self.keypoints.changed.connect(self._mark_dirty)
 
@@ -323,20 +324,39 @@ is left untouched.</p>
             10000,
         )
 
+    def _centerline_on(self) -> bool:
+        """Whether the task is pose + centerline."""
+        return self.form.centerline_on()
+
+    def _paint_centerline(self) -> None:
+        """With a centerline, the keypoints are its output, not the pose model's."""
+        on = self._centerline_on()
+        self.keypoints.read_button.setEnabled(not on and not self.bg_running("keypoints"))
+        if on:
+            self.keypoints.state.setText("named by the centerline model: the Head, then its points "
+                                         "from Base to Tip")
+            self.pose_row.setVisible(False)
+
     def _offer_model_info(self, info: dict) -> dict:
         """Show the checkpoint's task and keypoint count where the form differs."""
         offer: dict = {}
         task_widget = self.form._widgets.get("detection.task")
+        # pose + centerline runs a pose model, so a pose checkpoint matches it.
+        task_now = self.form.current().get("detection.task", "") if task_widget else ""
         model_task = info.get("task")
         count = info.get("n_keypoints") or 0
         name = info.get("name", "the model")
         if (model_task in ("pose", "detect") and task_widget is not None
-                and task_widget.currentText() != model_task):
+                and task_now != model_task):
             offer["task"] = model_task
-        pose = offer.get("task", task_widget.currentText() if task_widget else "") == "pose"
-        if count and pose and self.keypoints.count.value() != count:
+        pose = offer.get("task", task_now) == "pose"
+        # A centerline names its own output; the pose model's count does not apply.
+        if count and pose and not self._centerline_on() and self.keypoints.count.value() != count:
             offer["count"] = count
-        self.keypoints.state.setText(f"{count} from {name}" if count else "")
+        if self._centerline_on():
+            self._paint_centerline()
+        else:
+            self.keypoints.state.setText(f"{count} from {name}" if count else "")
         self._model_offer = offer
         if offer:
             said = [f"task {offer['task']}"] if "task" in offer else []
@@ -437,6 +457,7 @@ is left untouched.</p>
             picker.set_available(available_groups(self.cfg))
         self.pose_row.setVisible(bool(self.cfg and self.cfg.needs_keypoints))
         self.tabs.setTabEnabled(self.KEYPOINT_TAB, bool(self.cfg and self.cfg.is_pose))
+        self._paint_centerline()
         return warnings
 
     def _read_keypoints(self) -> None:

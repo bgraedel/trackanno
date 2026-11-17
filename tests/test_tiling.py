@@ -141,3 +141,23 @@ def test_the_probe_reports_a_plain_detector_as_one(tmp_path) -> None:
     info = _probe(tmp_path, {"model": plain, "train_args": {"task": "detect"}})
     assert not info["n_keypoints"], info
     assert info["task"] == "detect"
+
+
+def test_merge_tiles_per_class_keeps_nested_classes() -> None:
+    from trackanno.detect.tiling import merge_tiles
+
+    def dets(rows, cls, conf):
+        return Detections(xyxy=np.array(rows, np.float32), conf=np.array(conf, np.float32),
+                          cls=np.array(cls, np.int32), kpts=None)
+
+    # Two overlapping tiles of a 100x200 frame; both see the same animal and its body.
+    tiles = [(0, 0, 120, 100), (80, 0, 200, 100)]
+    animal, body = [85, 20, 115, 60], [86, 21, 114, 55]   # body IoU with animal > 0.6
+    parts = [dets([animal, body], [0, 1], [0.9, 0.8]),
+             dets([animal, body], [0, 1], [0.85, 0.7])]
+    agnostic = merge_tiles(parts, tiles, 100, 200, 0.6)
+    assert sorted(agnostic.cls.tolist()) == [0], "class-agnostic NMS lets the animal eat its body"
+    merged = merge_tiles(parts, tiles, 100, 200, 0.6, per_class=True)
+    assert sorted(merged.cls.tolist()) == [0, 1], "one animal and one body survive"
+    assert merged.conf.tolist() == sorted(merged.conf.tolist(), reverse=True)
+    assert float(merged.conf[merged.cls == 0][0]) == pytest.approx(0.9), "the stronger copy wins"

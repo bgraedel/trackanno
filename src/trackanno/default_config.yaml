@@ -23,6 +23,7 @@ nd2:
 tiff:
   fps: 100            # acquisition frame rate; TIFF does not record it
   channel: 0          # channel index
+  pixel_size_um: null  # pixel size in um; TIFF does not record it
 
 
 # --- Raw to 8-bit intensity ---------------------------------------------------
@@ -73,6 +74,20 @@ keypoints:
   nodes: []           # keypoint names, in the model's order
   edges: []           # skeleton links, drawn on screen only
 
+
+# --- Centerline model (detection.task: pose) ----------------------------------
+# Replaces the pose flagellum after tracking. keypoints.nodes then name the output:
+# the pose Head, then the curve from Base to Tip at equal arc length.
+centerline:
+  enabled: false
+  checkpoint: ""      # centerline checkpoint (.ckpt)
+  hint_model: ""      # YOLO weights with animal, body and flagellum classes
+  code: ""            # the centerline repository, if the package is not installed
+  stack_stride: 1     # frames between stack planes; 2 for a movie at about 200 fps
+  hint_conf: 0.3      # minimum confidence of the hint boxes
+  hint_tile: 640      # native pixels per hint tile (tiling.overlap, merge_iou); 0 = whole frame
+  hint_imgsz: 640     # resolution the hint detector sees each tile (or the frame) at
+  batch: 16           # crops per forward pass
 
 # --- Clips -------------------------------------------------------------------
 clips:

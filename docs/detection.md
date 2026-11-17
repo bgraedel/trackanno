@@ -134,7 +134,7 @@ marks such a movie `[detected]` and the button reads **Cut clips**, which needs
 no model.
 
 `detect_done.json` fingerprints the settings that change detection (detection,
-tiling, tracker, features, normalisation, channel, z, fps) and the weights'
+tiling, tracker, features, normalisation, channel, z, fps, centerline) and the weights'
 sha256; device, batch and `--tile` are left out. `prepare_done.json` fingerprints
 the clip keys (`clips.*`, `tracking.min_track_length`, `tracking.border_*`).
 A movie whose fingerprint does not match is reported with the changed keys,
@@ -150,6 +150,49 @@ Order matters: keypoint 0 is the head, 1 the body base, 1 onwards the flagellum
 chain. On the Keypoints tab, **Read from model file** takes the count from the
 checkpoint, a rename carries through the skeleton links, and **connect in
 order** wires 0-1, 1-2, and so on. `edges` affect display only.
+
+## Centerline model
+
+A centerline checkpoint can replace the pose flagellum. After tracking, each
+tracked box is cropped as the model was trained: a stack of frames around it,
+body and flagellum hint boxes from a 3-class detector (animal, body,
+flagellum), and the model's own curves from earlier frames of the same track.
+The output overwrites the keypoint columns: node 0 keeps the pose Head, nodes 1
+onwards are the model's own points from Base to Tip (129 for the current
+checkpoints), and each node's confidence is the model's visibility there.
+`keypoints.nodes` is filled in with Head, Base, C1, ..., Tip on the first run.
+
+```yaml
+detection:
+  task: pose                 # the pose model still tracks and gives the Head
+tiff:
+  pixel_size_um: 0.325       # the beat smoothing is in um; ND2 records it
+centerline:
+  enabled: true
+  checkpoint: path/to/last.ckpt
+  hint_model: path/to/detect3.pt
+  code: path/to/centerline_regression          # unless the package is installed
+```
+
+In the GUI it is a third choice of the task on the Configure page, `pose +
+centerline`, beside `pose` and `detect`; it is saved as the YAML above. Choosing
+it shows both models and the TIFF pixel size under it, and the Keypoints tab then
+shows the names the model writes instead of reading the pose model. It needs `timm`
+(`trackanno[centerline]`). Every frame runs the hint detector plus one model
+pass per box, so detection takes much longer. The hint detector is tiled like
+the pose model: `centerline.hint_tile` native pixels per tile (640, the detect3
+training tiles), seen at `centerline.hint_imgsz`, with `tiling.overlap` and
+`tiling.merge_iou`; tiles are merged per class, so an animal box never
+suppresses its own body. Sent whole (`hint_tile: 0`), a frame is shrunk to
+`hint_imgsz`: 0.27x for a 2400 px 20x frame, where a third of the boxes found
+no hint cell. For a movie well above 100 fps, set `centerline.stack_stride`
+so the stack spans the time window the model was trained on. To compare with
+the pose chain, prepare the same movies in two projects, one with the setting
+on and one with it off.
+
+The beat per frame (`inst_*`) smooths a centerline over 2 um rather than over
+one keypoint segment, so every cell is smoothed alike whatever its length or
+the magnification.
 
 ## ND2 files
 

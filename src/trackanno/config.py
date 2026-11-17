@@ -384,12 +384,27 @@ class ND2Options(_Section):
                             special=("auto",), min=0)
 
 
+def _pixel_size(value, where: str) -> float | None:
+    """A positive number, or empty for not set."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where} must be a number in um, or empty, got {value!r}") from None
+    if out <= 0:
+        raise ConfigError(f"{where} must be positive, got {value!r}")
+    return out
+
+
 @dataclass
 class TiffOptions(_Section):
     NAME: ClassVar[str] = "tiff"
 
     fps: float = knob(100.0, "Acquisition frame rate; TIFF does not record it.", min=0)
     channel: int = knob(0, "Channel index.", min=0)
+    pixel_size_um: float | None = knob(None, "Pixel size in um; TIFF does not record it.",
+                                       parse=_pixel_size)
 
 
 def _percentiles(value, where: str) -> tuple[float, float]:
@@ -493,6 +508,26 @@ class Keypoints(_Section):
             for name in (a, b):
                 if name not in self.nodes:
                     raise ConfigError(f"keypoints.edges references unknown node {name!r}")
+
+
+@dataclass
+class Centerline(_Section):
+    """A centerline model that replaces the pose flagellum after tracking."""
+
+    NAME: ClassVar[str] = "centerline"
+
+    enabled: bool = knob(False, "Replace the pose flagellum with the centerline model's curve.")
+    checkpoint: str = knob("", "Centerline checkpoint (.ckpt).")
+    hint_model: str = knob("", "YOLO weights with animal, body and flagellum classes.")
+    code: str = knob("", "The centerline repository, if the package is not installed.")
+    stack_stride: int = knob(1, "Frames between stack planes; 2 for a movie at about 200 fps.",
+                             min=1)
+    hint_conf: float = knob(0.3, "Minimum confidence of the hint boxes.", min=0.0, max=1.0)
+    hint_tile: int = knob(640, "Native pixels per hint-detector tile; 0 sends the whole frame.",
+                          min=0)
+    hint_imgsz: int = knob(640, "Resolution the hint detector sees each tile (or the frame) at.",
+                           min=32)
+    batch: int = knob(16, "Crops per forward pass.", min=1)
 
 
 @dataclass
@@ -910,7 +945,8 @@ class Render(_Section):
 SECTIONS: dict[str, type] = {
     "paths": Paths, "nd2": ND2Options, "tiff": TiffOptions, "normalize": Normalize,
     "detection": Detection, "model": ModelSource, "tiling": Tiling,
-    "tracking": Tracking, "keypoints": Keypoints, "features": Features,
+    "tracking": Tracking, "keypoints": Keypoints, "centerline": Centerline,
+    "features": Features,
     "spectral": Spectral, "suggest": Suggest, "predict": Predict, "clips": Clips,
     "ui": UI, "render": Render,
 }
@@ -929,6 +965,7 @@ class Config:
     tiling: Tiling
     tracking: Tracking
     keypoints: Keypoints
+    centerline: Centerline
     features: Features
     spectral: Spectral
     suggest: Suggest
@@ -1012,6 +1049,14 @@ def load_config(path: str | Path | None = None) -> Config:
             and "embeddings" not in old and cfg.features.enabled):
         _warn("detector embeddings are now opt-in; add suggest.embeddings "
               "[{name: det, source: detector}] and emb_det to feature_groups to use them")
+
+    if cfg.centerline.enabled:
+        if not cfg.is_pose:
+            raise ConfigError("centerline.enabled needs detection.task pose; the Head comes "
+                              "from the pose model")
+        for key in ("checkpoint", "hint_model"):
+            if not getattr(cfg.centerline, key).strip():
+                raise ConfigError(f"centerline.enabled needs centerline.{key}")
 
     stride = cfg.predict.resolved_stride(cfg.clips)
     if stride > int(cfg.clips.frames):

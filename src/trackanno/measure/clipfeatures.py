@@ -133,11 +133,12 @@ def context_names() -> list[str]:
 
 def window_features(
     tdf: pd.DataFrame, cfg: Config, fps: float, windows: Sequence[tuple[int, int]],
-    codes: dict[str, np.ndarray] | None = None,
+    codes: dict[str, np.ndarray] | None = None, um_per_px: float | None = None,
 ) -> list[dict]:
     """Feature rows for several (possibly overlapping) windows of one frame-sorted track.
 
-    ``codes`` maps an embedding name to PCA codes row-aligned with ``tdf``.
+    ``codes`` maps an embedding name to PCA codes row-aligned with ``tdf``; ``um_per_px`` is
+    needed when the keypoints are a centerline.
     """
     from . import instantaneous, trackseries, wavespectra
 
@@ -154,8 +155,13 @@ def window_features(
             tdf, cfg.n_keypoints, fps,
             window=cfg.spectral.window, hop=SPECTRAL_HOP,
             flow_frames=FLOW_FRAMES,
+            # A centerline has no traced body: frames are judged on the flagellum alone.
+            whole_trace=not cfg.centerline.enabled,
         )
-        beats = instantaneous.track_beat_series(tdf, cfg.n_keypoints, fps)
+        if cfg.centerline.enabled and not um_per_px:
+            raise ValueError("a centerline project needs the pixel size: set tiff.pixel_size_um")
+        beats = instantaneous.track_beat_series(
+            tdf, cfg.n_keypoints, fps, um_per_px=um_per_px if cfg.centerline.enabled else None)
 
     waves = wavespectra.WindowSource(spectra) if spectra is not None else None
 
@@ -235,7 +241,9 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
     for movie_id, man in manifest.groupby("movie_id", sort=True):
         tracks = tracks_by_movie[movie_id]
         codes = movie_codes(cfg, work / movie_id, tracks, inputs)
-        fps = float(json.loads((work / movie_id / "cache.json").read_text())["movie"]["fps"])
+        movie = json.loads((work / movie_id / "cache.json").read_text())["movie"]
+        fps = float(movie["fps"])
+        um_per_px = movie.get("pixel_size_um") or cfg.tiff.pixel_size_um
         by_track = {t: df for t, df in tracks.groupby("track_id", sort=False)}
 
         by_spec: dict[int, list] = {}
@@ -253,7 +261,7 @@ def build_clip_features(cfg: Config, verbose: bool = True, reporter=None,
             rows_idx = tdf.index.to_numpy()
             windows = [(int(s.f_start), int(s.f_end)) for s in specs]
             measured = window_features(
-                tdf, cfg, fps, windows, {n: c[rows_idx] for n, c in codes.items()})
+                tdf, cfg, fps, windows, {n: c[rows_idx] for n, c in codes.items()}, um_per_px)
 
             for spec, features in zip(specs, measured):
                 reporter.advance()
@@ -341,7 +349,8 @@ def feature_cache_key(cfg: Config) -> str:
         "clips": _plain(cfg.clips),
         "spectral": [_plain(cfg.spectral), SPECTRAL_HOP, FLOW_FRAMES],
         "fixed": {k: v for k, v in FIXED_SETTINGS.items() if k.startswith("clips.")},
-        "pose": [bool(cfg.is_pose), int(cfg.n_keypoints)],
+        "pose": [bool(cfg.is_pose), int(cfg.n_keypoints), bool(cfg.centerline.enabled),
+                 cfg.tiff.pixel_size_um],
         "detector_features": bool(cfg.features.enabled),
         "suggest": {
             "pca_components": int(emb.PCA_COMPONENTS),
@@ -378,7 +387,7 @@ def cached_clip_features(cfg: Config) -> pd.DataFrame | None:
 
 
 # Bump whenever a feature's meaning changes, not only when columns change.
-FEATURE_VERSION = 10
+FEATURE_VERSION = 11
 
 # Carried in the table, never fed to a model.
 META_COLUMNS = (

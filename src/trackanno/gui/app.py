@@ -551,7 +551,7 @@ class AnnotationWidget(QWidget):
             self.viewer.play()
 
         self.metadata.update_from(meta, self.store.origins(index))
-        self._update_kymograph(self._boxes)
+        self._update_kymograph(self._boxes, meta)
 
         clip_id = str(meta["clip_id"])
         self._resuggest(clip_id)
@@ -813,6 +813,21 @@ class AnnotationWidget(QWidget):
         self._retrain_thread.start()
 
     # ---------------------------------------------------------- kymograph -- #
+    def _kymo_cutoff_px(self, meta) -> float | None:
+        """A centerline's smoothing distance in cache pixels, or None for keypoints."""
+        if not self.cfg.centerline.enabled or meta is None:
+            return None
+        from ..measure.instantaneous import SMOOTHING_UM
+
+        try:
+            movie = self.store.header(str(meta["movie_id"])).get("movie", {})
+            um_per_px = float(movie.get("pixel_size_um") or self.cfg.tiff.pixel_size_um or 0)
+        except (KeyError, TypeError, ValueError):
+            um_per_px = 0.0
+        if um_per_px <= 0:
+            return None
+        return SMOOTHING_UM / um_per_px * float(meta.get("scale", 1.0) or 1.0)
+
     def _kymograph_wanted(self) -> bool:
         """Whether to show the kymograph (pose projects with 2+ keypoints)."""
         return bool(SHOW_KYMOGRAPH and self.cfg.is_pose
@@ -852,19 +867,20 @@ class AnnotationWidget(QWidget):
         threading.Thread(target=work, name="trackanno-spline-warm",
                          daemon=True).start()
 
-    def _update_kymograph(self, boxes) -> None:
+    def _update_kymograph(self, boxes, meta=None) -> None:
         """Recompute the kymograph for the clip on screen."""
         if not self._kymograph_wanted():
             return
         from ..measure.kymograph import chain_from_edges, kymograph_from_boxes
 
-        # The skeleton's chain order sets the sign of the chart.
+        # The skeleton's chain order sets the sign of the chart; node 0 is the Head, not flagellum.
         order = chain_from_edges(self.cfg.n_keypoints, self.cfg.keypoints.edge_idx)
+        order = [i for i in order if i != 0]
         try:
             kymo = kymograph_from_boxes(
                 boxes, self.cfg.n_keypoints, int(self._clip.shape[0]),
                 min_conf=0.0, n_samples=128, order=order,
-                smooth_px=KYMO_SMOOTH_PX,
+                smooth_px=KYMO_SMOOTH_PX, cutoff_px=self._kymo_cutoff_px(meta),
             )
         except Exception as exc:                 # never take the clip down
             print(f"[trackanno] kymograph failed: {exc}")
