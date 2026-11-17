@@ -11,21 +11,27 @@ label every frame of every track as behavioural bouts.
 
 ## Install
 
+From GitHub:
+
 ```bash
-uv tool install trackanno
+uv tool install git+https://github.com/bgraedel/trackanno
 trackanno
 ```
 
-Replace `trackanno` with `.` from a clone, or with
-`git+https://github.com/bgraedel/trackanno`. From a clone, `uv sync` and
-`uv run trackanno` work the same way.
+uv picks a Python the package supports (3.10 to 3.12) by itself. Append
+`@<commit or tag>` to the URL to install a fixed version. Replace the URL with
+`trackanno` to install from PyPI, or with `.` from a clone. From a clone,
+`uv sync` and `uv run trackanno` work the same way.
 
 `detection.device: auto` picks CUDA, then MPS, then the CPU at run time. The
-plain install covers Linux (CUDA) and macOS (Metal). Two extras cover the rest:
+plain install covers Linux (CUDA) and macOS (Metal). Two extras cover the rest;
+with a URL, the package name and extra go in front of it:
 
 ```bash
-uv tool install "trackanno[cuda]"     # Windows with an NVIDIA GPU
-uv tool install "trackanno[cpu]"      # Linux without a GPU: skips the CUDA wheels
+# Windows with an NVIDIA GPU
+uv tool install "trackanno[cuda] @ git+https://github.com/bgraedel/trackanno"
+# Linux without a GPU: skips the CUDA wheels
+uv tool install "trackanno[cpu] @ git+https://github.com/bgraedel/trackanno"
 ```
 
 ## Quick start
