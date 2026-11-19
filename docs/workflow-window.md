@@ -56,8 +56,10 @@ To share one, save it, then **Template > Export** writes it to a file, and
 **Import...** next to **start from** in the New project dialog adds it on
 another computer. Import also takes another project's `config.yaml`. Export
 lists the settings that name files on this computer (`paths.model` unless
-`model.source` is set, and the `centerline` weights and code), which the
-recipient has to set on the Configure page.
+`model.source` is set, and the `centerline` weights and code); Import lists
+those that do not exist on the new one, to be set on the Configure page or in
+`config.yaml`. A relative path counts as missing, since it points into the new
+project.
 
 ```python
 from trackanno.project import create_project

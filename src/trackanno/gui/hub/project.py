@@ -192,14 +192,11 @@ dialog adds one.</p>
         except Exception as exc:
             QMessageBox.warning(self, "Export template", str(exc))
             return
-        local = local_files(dest)
-        if local:
-            QMessageBox.information(
-                self, "Export template",
-                "These settings name files on this computer. Whoever imports the "
-                "template has to set them on the Configure page:\n\n"
-                + "\n".join(f"{key}: {value}" for key, value in local.items()),
-            )
+        _tell_files(
+            self, "Export template", local_files(dest),
+            "These settings name files on this computer. Whoever imports the "
+            "template has to set them",
+        )
         self.status_message.emit(f"exported template to {dest}", 8000)
 
     def _go_next(self) -> None:
@@ -291,6 +288,7 @@ class NewProjectDialog(QDialog):
         self.template_note.setWordWrap(True)
         self.template_note.setProperty("role", "muted")
         self._fill_templates()
+        self.template.currentIndexChanged.connect(self._sync_selection)
         template_row = QHBoxLayout()
         template_row.addWidget(self.template, 1)
         template_row.addWidget(self.import_btn)
@@ -386,7 +384,6 @@ class NewProjectDialog(QDialog):
         index = self.template.findData(current)
         self.template.setCurrentIndex(max(0, index))
         self._sync_selection()
-        self.template.currentIndexChanged.connect(self._sync_selection)
 
     def _sync_selection(self) -> None:
         """Show the template summary; only saved templates can be forgotten."""
@@ -410,7 +407,7 @@ class NewProjectDialog(QDialog):
             self._fill_templates()
 
     def _import_template(self) -> None:
-        from ...templates import _stored_name
+        from ...templates import _stored_name, missing_files
 
         picked, _ = QFileDialog.getOpenFileName(
             self, "Import template", str(Path.home()),
@@ -419,9 +416,14 @@ class NewProjectDialog(QDialog):
         if not picked:
             return
         template = _store_template(self, picked, _stored_name(Path(picked)))
-        if template is not None:
-            self._fill_templates()
-            self.template.setCurrentIndex(self.template.findData(template.name))
+        if template is None:
+            return
+        self._fill_templates()
+        self.template.setCurrentIndex(self.template.findData(template.name))
+        _tell_files(
+            self, "Import template", missing_files(template.path),
+            "These settings name files that do not exist on this computer. Set them",
+        )
 
     def _pick_shared_model(self) -> None:
         """Choose registry weights; they are downloaded after the project is created."""
@@ -484,6 +486,16 @@ def _store_template(parent, source, suggested: str):
     except Exception as exc:
         QMessageBox.warning(parent, "Save as template", str(exc))
         return None
+
+
+def _tell_files(parent, title: str, files: dict, intro: str) -> None:
+    """List file settings the user has to set, if there are any."""
+    if files:
+        QMessageBox.information(
+            parent, title,
+            f"{intro} on the Configure page or in config.yaml:\n\n"
+            + "\n".join(f"{key}: {value}" for key, value in files.items()),
+        )
 
 
 class _Browse(QWidget):

@@ -15,7 +15,7 @@ from .yamledit import set_values
 __all__ = [
     "Template", "Preset", "BUILTIN_NAME", "BUILTIN_SUMMARY", "templates_dir",
     "list_templates", "find_template", "template_text", "save_template",
-    "export_template", "local_files", "delete_template", "list_presets",
+    "export_template", "local_files", "missing_files", "delete_template", "list_presets",
     "find_preset", "preset_text",
 ]
 
@@ -89,7 +89,7 @@ def _slug(name: str) -> str:
 def _stored_name(path: Path) -> str:
     """The name in the header line, or the file name if there is none."""
     try:
-        with path.open(encoding="utf-8") as handle:
+        with path.open(encoding="utf-8-sig") as handle:
             first = handle.readline()
     except OSError:
         return path.stem
@@ -221,20 +221,14 @@ def template_text(template: Template | str | Path | None) -> str:
             path = Path(template)
             if not path.is_file():
                 raise ValueError(f"no template named {str(template)!r}")
-            text = _strip_header(path.read_text(encoding="utf-8"))
+            text = _strip_header(path.read_text(encoding="utf-8-sig"))
             return set_values(text, dict(_PROJECT_PATHS))
         template = found
     if template.preset:
         return preset_text(template.preset)
     if template.builtin or template.path is None:
         return DEFAULT_CONFIG
-    return _strip_header(template.path.read_text(encoding="utf-8"))
-
-
-def _write(target: Path, text: str) -> None:
-    staged = target.with_name(target.name + ".part")
-    staged.write_text(text, encoding="utf-8")
-    staged.replace(target)
+    return _strip_header(template.path.read_text(encoding="utf-8-sig"))
 
 
 def save_template(name: str, config_path: str | Path, overwrite: bool = False) -> Template:
@@ -252,7 +246,7 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
     if clash is not None:
         raise ValueError(f"{clash.name!r} is a preset that ships with trackanno; choose another name")
 
-    text = _strip_header(Path(config_path).read_text(encoding="utf-8"))
+    text = _strip_header(Path(config_path).read_text(encoding="utf-8-sig"))
     text = set_values(text, dict(_PROJECT_PATHS))
     with tempfile.TemporaryDirectory() as tmp:
         probe = Path(tmp) / "config.yaml"
@@ -264,7 +258,9 @@ def save_template(name: str, config_path: str | Path, overwrite: bool = False) -
     target = directory / f"{_slug(name)}.yaml"
     if target.exists() and not overwrite:
         raise FileExistsError(f"a template named {target.stem!r} already exists")
-    _write(target, f"{_HEADER}{name}\n{text}")
+    staged = target.with_name(target.name + ".part")
+    staged.write_text(f"{_HEADER}{name}\n{text}", encoding="utf-8")
+    staged.replace(target)
     return Template(name, target)
 
 
@@ -274,20 +270,49 @@ def export_template(name: str, dest: str | Path) -> Path:
     if template is None:
         raise ValueError(f"no template named {name!r}")
     dest = Path(dest)
-    _write(dest, f"{_HEADER}{template.name}\n{template_text(template)}")
+    dest.write_text(f"{_HEADER}{template.name}\n{template_text(template)}", encoding="utf-8")
     return dest
 
 
+def _lookup(data, key: str):
+    for part in key.split("."):
+        if not isinstance(data, dict):
+            return None
+        data = data.get(part)
+    return data
+
+
 def local_files(path: str | Path) -> dict[str, str]:
-    """The settings in a template or config file that name files on this computer."""
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    remote = bool((data.get("model") or {}).get("source"))
+    """The settings in a template or config file that name files on this computer.
+
+    Empty values and the shipped defaults are left out."""
+    from .project import DEFAULT_CONFIG
+
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    default = yaml.safe_load(DEFAULT_CONFIG)
+    remote = str(_lookup(data, "model.source") or "").strip()
     out = {}
     for key in _LOCAL_FILES:
-        section, _, leaf = key.partition(".")
-        value = (data.get(section) or {}).get(leaf)
-        if value and not (key == "paths.model" and remote):
-            out[key] = str(value)
+        value = str(_lookup(data, key) or "").strip()
+        if not value or value == _lookup(default, key) or (key == "paths.model" and remote):
+            continue
+        out[key] = value
+    return out
+
+
+def missing_files(path: str | Path) -> dict[str, str]:
+    """The ``local_files`` that do not exist here; relative ones point into a new, empty project."""
+    from .project import _exists
+
+    out = {}
+    for key, value in local_files(path).items():
+        target = Path(value)
+        absolute = target.is_absolute() or value.startswith("//")
+        if not absolute or not _exists(target, "dir" if key == "centerline.code" else "file"):
+            out[key] = value
     return out
 
 

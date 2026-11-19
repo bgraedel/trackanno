@@ -1186,12 +1186,13 @@ def test_a_template_can_be_found_however_it_is_named(root) -> None:
 def test_a_template_can_be_shared_as_a_file(tmp_path) -> None:
     """A saved template exports to a file; import and create_project take the file."""
     from trackanno.config import load_config
-    from trackanno.project import create_project
+    from trackanno.project import create_project, forget_path_probes
     from trackanno.templates import (
-        delete_template, export_template, find_template, local_files, save_template,
+        delete_template, export_template, find_template, local_files, missing_files,
+        save_template,
     )
 
-    source, _ = _tuned_source(tmp_path)
+    source, weights = _tuned_source(tmp_path)
     save_template("Shared 100 fps", source)
     try:
         shared = export_template("shared-100-fps", tmp_path / "shared.yaml")
@@ -1199,6 +1200,7 @@ def test_a_template_can_be_shared_as_a_file(tmp_path) -> None:
         assert text.startswith("# trackanno template: Shared 100 fps\n"), "the typed name"
         assert "tpl-videos" not in text and "someone" not in text, "no paths or annotator"
         assert set(local_files(shared)) == {"paths.model"}, "the local weights are flagged"
+        assert local_files(create_project(tmp_path / "plain")) == {}, "./best.pt is not flagged"
 
         for name, template in (("from-file", shared), ("from-config", source)):
             cfg = load_config(create_project(tmp_path / name, template=template))
@@ -1207,10 +1209,19 @@ def test_a_template_can_be_shared_as_a_file(tmp_path) -> None:
             assert cfg.paths.video_dir == (tmp_path / name / "videos").resolve(), name
 
         assert delete_template("Shared 100 fps")
+        shared.write_text(text, encoding="utf-8-sig")   # as Notepad saves it
         imported = save_template("Shared 100 fps", shared)
         assert find_template("Shared 100 fps") == imported
         stored = imported.path.read_text(encoding="utf-8")
         assert stored.count("# trackanno template:") == 1, "one header after a round trip"
+
+        assert missing_files(shared) == {}, "the weights exist on this computer"
+        weights.unlink()
+        forget_path_probes()
+        assert set(missing_files(shared)) == {"paths.model"}, "missing weights are listed"
+        shared.write_text(text.replace(str(weights).replace("\\", "/"), "./w.pt"),
+                          encoding="utf-8")
+        assert missing_files(shared) == {"paths.model": "./w.pt"}, "relative counts as missing"
     finally:
         delete_template("Shared 100 fps")
     with pytest.raises(ValueError):
