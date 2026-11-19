@@ -90,10 +90,12 @@ limits are in [measurements.md](measurements.md).
 
 ## Guardrails
 
-* Cross-validation splits on whole movies; the report gives the grouped score.
-* A suggestion is shown only once Cohen's kappa clears zero at the 5th bootstrap
-  percentile and macro-F1 clears 0.45. Classes with fewer than
-  `suggest.min_per_class` labels are not modelled.
+* Cross-validation holds out whole movies: each one alone up to 5 movies, 5
+  stratified folds above that. Every fold trains on every class, so a class
+  needs labels in at least two movies.
+* A suggestion is shown only once Cohen's kappa clears zero at the 5th
+  percentile of a bootstrap over tracks and macro-F1 clears 0.45. Classes with
+  fewer than `suggest.min_per_class` labels are not modelled.
 * `suggest.audit_fraction` (0.10) of tracks form the audit holdout: never
   trained on, never shown a suggestion. Agreement on them is the honest measure,
   reported as `audit_accuracy`.

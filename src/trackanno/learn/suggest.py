@@ -37,6 +37,13 @@ BALANCE_CLASSES = FIXED_SETTINGS["suggest.balance_classes"]
 SEED = FIXED_SETTINGS["suggest.seed"]
 # The model stays silent below this cross-validated macro-F1.
 MIN_MACRO_F1 = FIXED_SETTINGS["suggest.min_macro_f1"]
+# Up to this many movies each is held out alone; above it they share this many folds.
+MAX_FOLDS = 5
+# Seeds tried for a stratified split before falling back to leave-one-movie-out.
+_FOLD_SEEDS = 20
+# Resamples behind kappa's lower bound, and the fewest usable ones it needs.
+_KAPPA_RESAMPLES = 400
+_KAPPA_MIN_RESAMPLES = 50
 
 # Window-length-dependent columns, named in the mismatch message.
 _LENGTH_DEPENDENT_EXAMPLES = ("path_length", "net_displacement", "speed_std")
@@ -264,18 +271,75 @@ def _fit(model, X, y, cfg: Config, reporter, label: str):
     return model
 
 
-def _grouped_cv_predictions(X, y, groups, cfg: Config, n_splits: int,
-                            reporter=None, label: str = ""):
-    """Out-of-fold predictions and confidences, folds split on whole movies."""
-    from sklearn.model_selection import StratifiedGroupKFold
+def _movie_folds(y, groups) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Folds of whole movies whose training side holds every class; [] if there are none.
 
+    Each movie is held out alone up to ``MAX_FOLDS`` movies. Above that the movies share
+    ``MAX_FOLDS`` stratified folds, or are held out alone if no such split keeps every class.
+    """
+    from sklearn.model_selection import LeaveOneGroupOut, StratifiedGroupKFold
+
+    y, groups = np.asarray(y), np.asarray(groups)
+    n_classes, n_movies = len(np.unique(y)), len(np.unique(groups))
+    if n_movies < 2:
+        return []
+    rows = np.zeros(len(y))
+
+    def complete(folds) -> bool:
+        return all(len(test) and len(np.unique(y[train])) == n_classes
+                   for train, test in folds)
+
+    if n_movies > MAX_FOLDS:
+        for seed in range(SEED, SEED + _FOLD_SEEDS):
+            splitter = StratifiedGroupKFold(n_splits=MAX_FOLDS, shuffle=True, random_state=seed)
+            with warnings.catch_warnings():
+                # A class smaller than the fold count only stratifies less evenly.
+                warnings.simplefilter("ignore", UserWarning)
+                folds = list(splitter.split(rows, y, groups=groups))
+            if complete(folds):
+                return folds
+    folds = list(LeaveOneGroupOut().split(rows, y, groups=groups))
+    return folds if complete(folds) else []
+
+
+def _kappa_lower(y, pred, movies, tracks, classes) -> float:
+    """5th percentile of kappa over tracks resampled within each movie.
+
+    ``-inf`` when too few resamples hold two classes.
+    """
+    from sklearn.metrics import cohen_kappa_score
+
+    y, pred = np.asarray(y), np.asarray(pred)
+    keys = pd.DataFrame({"movie": np.asarray(movies), "track": np.asarray(tracks)})
+    by_movie: dict = {}
+    for (movie, _), rows in sorted(keys.groupby(["movie", "track"]).indices.items()):
+        by_movie.setdefault(movie, []).append(rows)
+
+    rng = np.random.default_rng(SEED)
+    kappas = []
+    for _ in range(_KAPPA_RESAMPLES):
+        idx = np.concatenate([
+            members[i] for members in by_movie.values()
+            for i in rng.integers(len(members), size=len(members))
+        ])
+        if len(np.unique(y[idx])) < 2:
+            continue
+        kappas.append(cohen_kappa_score(y[idx], pred[idx], labels=classes))
+    if len(kappas) < _KAPPA_MIN_RESAMPLES:
+        return float("-inf")
+    return float(np.percentile(kappas, 5))
+
+
+def _grouped_cv_predictions(X, y, groups, cfg: Config, folds,
+                            reporter=None, label: str = ""):
+    """Out-of-fold predictions and confidences over ``folds`` of whole movies."""
     from ..progress import NullReporter
 
     reporter = reporter or NullReporter()
     pred = np.empty(len(y), dtype=object)
     conf = np.full(len(y), np.nan, dtype=float)
-    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X, y, groups=groups), start=1):
+    n_splits = len(folds)
+    for fold, (train_idx, test_idx) in enumerate(folds, start=1):
         held_out = sorted(set(np.asarray(groups)[test_idx]))
         reporter.log(
             f"{label}fold {fold}/{n_splits}: holding out {', '.join(map(str, held_out))} "
@@ -401,7 +465,6 @@ def train_group(
             f"only {len(classes)} class has >= {cfg.suggest.min_per_class} labels "
             f"(counts: {all_counts})"
         )
-    smallest = min(counts.values())
 
     X = merged[columns].to_numpy(dtype=np.float32)
     y = merged[group_name].astype(str).to_numpy()
@@ -409,11 +472,12 @@ def train_group(
     # Grouped by movie: clips of one movie share imaging conditions.
     groups = merged["movie_id"].astype(str).to_numpy()
     n_movies = int(len(np.unique(groups)))
-    tracks_per_clip = merged.groupby(["movie_id", "track_id"]).size()
+    tracks = merged["track_id"].to_numpy()
+    n_tracks = int(len(merged.groupby(["movie_id", "track_id"])))
 
-    # Folds are limited by movies per class, not clips per class.
-    groups_per_class = int(merged.groupby(group_name)["movie_id"].nunique().min())
-    n_splits = int(min(5, groups_per_class, n_movies))
+    # A fold model can only predict a class it was fitted on.
+    folds = _movie_folds(y, groups)
+    n_splits = len(folds)
     if n_splits < 2:
         if n_movies < 2:
             return bail(
@@ -440,23 +504,14 @@ def train_group(
            "labelled and held out entirely" if len(audit_set) else "")
     )
     pred, pred_conf = _grouped_cv_predictions(
-        X, y, groups, cfg, n_splits, reporter=reporter, label=f"{group_name} ")
+        X, y, groups, cfg, folds, reporter=reporter, label=f"{group_name} ")
     macro_f1 = float(f1_score(y, pred, average="macro", labels=classes, zero_division=0))
     accuracy = float(accuracy_score(y, pred))
     baseline = float(max(counts.values()) / len(y))
     kappa = float(cohen_kappa_score(y, pred, labels=classes))
 
-    # Bootstrap kappa's lower bound over movies, the unit the folds split on.
-    rng = np.random.default_rng(SEED)
-    unique_groups = np.unique(groups)
-    kappas = []
-    for _ in range(400):
-        picked = rng.choice(unique_groups, size=len(unique_groups), replace=True)
-        idx = np.concatenate([np.flatnonzero(groups == g) for g in picked])
-        if len(np.unique(y[idx])) < 2:
-            continue
-        kappas.append(cohen_kappa_score(y[idx], pred[idx], labels=classes))
-    kappa_lo = float(np.percentile(kappas, 5)) if len(kappas) >= 50 else float("-inf")
+    # Clips of one track are not independent, so the bound resamples tracks.
+    kappa_lo = _kappa_lower(y, pred, groups, tracks, classes)
 
     # Gate on chance-corrected kappa (bootstrap lower bound), not accuracy.
     reliable = kappa_lo > 0.0 and macro_f1 >= MIN_MACRO_F1
@@ -464,7 +519,7 @@ def train_group(
         reason = (
             f"agreement is not distinguishable from chance "
             f"(kappa {kappa:.2f}, 5th-percentile bound {kappa_lo:.2f} <= 0 "
-            f"over {n_movies} movie(s))"
+            f"over {n_tracks} track(s))"
         )
     elif macro_f1 < MIN_MACRO_F1:
         reason = (
