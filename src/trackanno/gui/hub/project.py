@@ -9,7 +9,7 @@ from qtpy.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from ...project import (
@@ -28,12 +28,17 @@ class ProjectPage(Page):
         new_btn.clicked.connect(self._new_project)
         open_btn = QPushButton("Open project...")
         open_btn.clicked.connect(self._open_project)
-        self.template_btn = QPushButton("Save as template...")
+        self.template_btn = QPushButton("Template")
         self.template_btn.setToolTip(
-            "Save this project's settings, without its paths, for new projects."
+            "Save this project's settings for new projects, or export a saved template to share."
         )
-        self.template_btn.clicked.connect(self._save_template)
-        self.template_btn.setEnabled(False)
+        template_menu = QMenu(self.template_btn)
+        self.save_action = template_menu.addAction("Save as template...")
+        self.save_action.triggered.connect(self._save_template)
+        self.save_action.setEnabled(False)
+        self.export_menu = template_menu.addMenu("Export")
+        self.export_menu.aboutToShow.connect(self._fill_export_menu)
+        self.template_btn.setMenu(template_menu)
 
         buttons = QHBoxLayout()
         buttons.addWidget(new_btn)
@@ -94,9 +99,11 @@ clip cache) and <b>annotations.csv</b>.</p>
 box detector), <b>suggester</b> (pose weights plus a trained classifier) and
 <b>dense bouts</b> (score every frame and review bouts).</p>
 
-<p><b>Templates</b>: <i>Save as template</i> stores this project's config.yaml
-without video_dir, work_dir and csv, and <i>New project</i> offers it under
-<b>start from</b>.</p>
+<p><b>Templates</b>: <i>Template &gt; Save as template</i> stores this
+project's config.yaml without video_dir, work_dir and csv, and <i>New
+project</i> offers it under <b>start from</b>. <i>Template &gt; Export</i>
+writes a saved template to a file to share; <i>Import</i> in the New project
+dialog adds one.</p>
 """,
         ))
         layout.addLayout(buttons)
@@ -132,7 +139,7 @@ without video_dir, work_dir and csv, and <i>New project</i> offers it under
         if dialog.run():
             try:
                 path = create_project(**dialog.values())
-            except (OSError, FileExistsError) as exc:
+            except (OSError, ValueError) as exc:
                 QMessageBox.warning(self, "Could not create project", str(exc))
                 return
             self.hub.open_project(path)
@@ -148,33 +155,52 @@ without video_dir, work_dir and csv, and <i>New project</i> offers it under
 
     def _save_template(self) -> None:
         """Save the open project's settings as a named template."""
-        from ...templates import find_template, save_template
-
         if self.cfg is None:
             return
-        suggested = self.cfg.path.parent.name
-        name, ok = QInputDialog.getText(
-            self, "Save as template", "Name for these settings:", text=suggested
-        )
-        name = (name or "").strip()
-        if not ok or not name:
-            return
-        if find_template(name) is not None:
-            answer = QMessageBox.question(
-                self, "Save as template",
-                f"A template named {name!r} already exists. Replace it?",
-                QMessageBox.Yes | QMessageBox.No,
+        template = _store_template(self, self.cfg.path, self.cfg.path.parent.name)
+        if template is not None:
+            self.status_message.emit(
+                f"saved template {template.name!r}; Template > Export writes it to a file", 8000
             )
-            if answer != QMessageBox.Yes:
-                return
-        try:
-            template = save_template(name, self.cfg.path, overwrite=True)
-        except Exception as exc:
-            QMessageBox.warning(self, "Save as template", str(exc))
-            return
-        self.status_message.emit(
-            f"saved template {template.name!r}", 8000
+
+    def _fill_export_menu(self) -> None:
+        """List the saved templates; presets ship with trackanno, so they are not offered."""
+        from ...templates import list_templates
+
+        self.export_menu.clear()
+        saved = [t for t in list_templates() if t.path is not None]
+        for template in saved:
+            action = self.export_menu.addAction(template.name)
+            action.triggered.connect(
+                lambda _=False, name=template.name: self._export_template(name)
+            )
+        if not saved:
+            self.export_menu.addAction("no saved templates").setEnabled(False)
+
+    def _export_template(self, name: str) -> None:
+        """Write a saved template to a file."""
+        from ...templates import _slug, export_template, local_files
+
+        picked, _ = QFileDialog.getSaveFileName(
+            self, "Export template", str(Path.home() / f"{_slug(name)}.yaml"),
+            "Template (*.yaml)",
         )
+        if not picked:
+            return
+        try:
+            dest = export_template(name, picked)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export template", str(exc))
+            return
+        local = local_files(dest)
+        if local:
+            QMessageBox.information(
+                self, "Export template",
+                "These settings name files on this computer. Whoever imports the "
+                "template has to set them on the Configure page:\n\n"
+                + "\n".join(f"{key}: {value}" for key, value in local.items()),
+            )
+        self.status_message.emit(f"exported template to {dest}", 8000)
 
     def _go_next(self) -> None:
         self.hub.go_to(self._next_page)
@@ -187,7 +213,7 @@ without video_dir, work_dir and csv, and <i>New project</i> offers it under
 
     # -- display ------------------------------------------------------------ #
     def on_project(self) -> None:
-        self.template_btn.setEnabled(self.cfg is not None)
+        self.save_action.setEnabled(self.cfg is not None)
         self.refresh_recent()
         self._paint_summary()
 
@@ -255,6 +281,9 @@ class NewProjectDialog(QDialog):
         self.model_note.setVisible(False)
 
         self.template = QComboBox()
+        self.import_btn = QPushButton("Import...")
+        self.import_btn.setToolTip("Add a template file, or another project's config.yaml.")
+        self.import_btn.clicked.connect(self._import_template)
         self.forget_btn = QPushButton("Forget")
         self.forget_btn.setToolTip("Delete the selected template. Presets stay.")
         self.forget_btn.clicked.connect(self._forget_template)
@@ -264,6 +293,7 @@ class NewProjectDialog(QDialog):
         self._fill_templates()
         template_row = QHBoxLayout()
         template_row.addWidget(self.template, 1)
+        template_row.addWidget(self.import_btn)
         template_row.addWidget(self.forget_btn)
 
         form = QFormLayout()
@@ -379,6 +409,20 @@ class NewProjectDialog(QDialog):
         if answer == QMessageBox.Yes and delete_template(name):
             self._fill_templates()
 
+    def _import_template(self) -> None:
+        from ...templates import _stored_name
+
+        picked, _ = QFileDialog.getOpenFileName(
+            self, "Import template", str(Path.home()),
+            "Template or config (*.yaml *.yml);;All files (*)",
+        )
+        if not picked:
+            return
+        template = _store_template(self, picked, _stored_name(Path(picked)))
+        if template is not None:
+            self._fill_templates()
+            self.template.setCurrentIndex(self.template.findData(template.name))
+
     def _pick_shared_model(self) -> None:
         """Choose registry weights; they are downloaded after the project is created."""
         dialog = ModelRegistryDialog(self)
@@ -415,6 +459,31 @@ class NewProjectDialog(QDialog):
             "model": None if self._entry is not None else (self.model.value() or None),
             "template": self.template.currentData(),
         }
+
+
+def _store_template(parent, source, suggested: str):
+    """Ask for a name and save ``source``'s settings as a template; None if cancelled or refused."""
+    from ...templates import find_template, save_template
+
+    name, ok = QInputDialog.getText(
+        parent, "Save as template", "Name for these settings:", text=suggested
+    )
+    name = (name or "").strip()
+    if not ok or not name:
+        return None
+    if find_template(name) is not None:
+        answer = QMessageBox.question(
+            parent, "Save as template",
+            f"A template named {name!r} already exists. Replace it?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return None
+    try:
+        return save_template(name, source, overwrite=True)
+    except Exception as exc:
+        QMessageBox.warning(parent, "Save as template", str(exc))
+        return None
 
 
 class _Browse(QWidget):

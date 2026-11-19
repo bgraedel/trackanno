@@ -55,20 +55,21 @@ def create_project(
     csv: str | Path | None = None,
     categories: list[dict] | None = None,
     overwrite: bool = False,
-    template: str | None = None,
+    template: str | Path | None = None,
 ) -> Path:
     """Write a commented ``config.yaml`` from ``template`` (or the default) and return its path.
 
-    The given paths always override the template's."""
+    ``template`` is a template's name or a template file. The given paths always
+    override the template's."""
+    from .templates import template_text
+
+    text = template_text(template)
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONFIG_NAME
     if path.exists() and not overwrite:
         raise FileExistsError(f"{path} already exists")
 
-    from .templates import template_text
-
-    text = template_text(template)
     updates: dict[str, object] = {}
     if video_dir:
         updates["paths.video_dir"] = _relative_to(Path(video_dir), directory)

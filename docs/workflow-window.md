@@ -12,7 +12,7 @@ Longer explanations sit behind the `?` beside each page title.
 
 | page | purpose |
 |---|---|
-| **Project** | create, open or reopen a project; save it as a template |
+| **Project** | create, open or reopen a project; save it as a template and export that |
 | **Configure** | settings, category buttons, keypoint names |
 | **Detect & crop** | detection, tracking and the clip cache ([details](detection.md)) |
 | **Annotate** | the annotation screen ([details](annotation.md)) |
@@ -45,23 +45,32 @@ new set of clips to label.
 
 ## Templates
 
-**Save as template...** on the Project page stores the open project's
+**Template > Save as template...** on the Project page stores the open project's
 `config.yaml`, comments included, under a name. It is parsed by the loader
 first, so a template that would not load is refused. `paths.video_dir`,
 `paths.work_dir`, `paths.csv` and `ui.annotator` are reset; `paths.model` is
 kept. Templates are `.yaml` files in the `templates` folder of the state
-directory and can be shared as files.
+directory.
+
+To share one, save it, then **Template > Export** writes it to a file, and
+**Import...** next to **start from** in the New project dialog adds it on
+another computer. Import also takes another project's `config.yaml`. Export
+lists the settings that name files on this computer (`paths.model` unless
+`model.source` is set, and the `centerline` weights and code), which the
+recipient has to set on the Configure page.
 
 ```python
 from trackanno.project import create_project
-from trackanno.templates import list_templates, save_template
+from trackanno.templates import export_template, list_templates, save_template
 
 create_project("new-project", video_dir="movies/", template="dense bouts")
+create_project("other-project", template="shared.yaml")   # a template file
 save_template("Trypanosome 100 fps", "path/to/config.yaml")
+export_template("Trypanosome 100 fps", "shared.yaml")
 ```
 
-`list_templates()` returns the built-in default, the presets, then saved
-templates.
+An unknown template name raises `ValueError`. `list_templates()` returns the
+built-in default, the presets, then saved templates.
 
 ## The Configure page
 

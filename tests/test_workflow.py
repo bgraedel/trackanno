@@ -1174,12 +1174,47 @@ def test_a_template_can_be_found_however_it_is_named(root) -> None:
         found = find_template(spelling)
         assert found is not None and found.name == "Wide Field 20x", spelling
     assert find_template("no such thing") is None
-    made = create_project(root / "tpl-d", template="no such thing")
-    assert load_config(made).clips.frames == 50, "an unknown template falls back to the built-in"
+    with pytest.raises(ValueError):
+        create_project(root / "tpl-d", template="no such thing")
+    assert not (root / "tpl-d").exists(), "a bad template name leaves no folder behind"
 
     assert not delete_template("default"), "the built-in cannot be deleted"
     assert delete_template("Wide Field 20x")
     assert find_template("Wide Field 20x") is None
+
+
+def test_a_template_can_be_shared_as_a_file(tmp_path) -> None:
+    """A saved template exports to a file; import and create_project take the file."""
+    from trackanno.config import load_config
+    from trackanno.project import create_project
+    from trackanno.templates import (
+        delete_template, export_template, find_template, local_files, save_template,
+    )
+
+    source, _ = _tuned_source(tmp_path)
+    save_template("Shared 100 fps", source)
+    try:
+        shared = export_template("shared-100-fps", tmp_path / "shared.yaml")
+        text = shared.read_text(encoding="utf-8")
+        assert text.startswith("# trackanno template: Shared 100 fps\n"), "the typed name"
+        assert "tpl-videos" not in text and "someone" not in text, "no paths or annotator"
+        assert set(local_files(shared)) == {"paths.model"}, "the local weights are flagged"
+
+        for name, template in (("from-file", shared), ("from-config", source)):
+            cfg = load_config(create_project(tmp_path / name, template=template))
+            assert cfg.clips.frames == 33, name
+            assert cfg.ui.annotator == "", f"{name}: the annotator is reset"
+            assert cfg.paths.video_dir == (tmp_path / name / "videos").resolve(), name
+
+        assert delete_template("Shared 100 fps")
+        imported = save_template("Shared 100 fps", shared)
+        assert find_template("Shared 100 fps") == imported
+        stored = imported.path.read_text(encoding="utf-8")
+        assert stored.count("# trackanno template:") == 1, "one header after a round trip"
+    finally:
+        delete_template("Shared 100 fps")
+    with pytest.raises(ValueError):
+        export_template("no such thing", tmp_path / "missing.yaml")
 
 
 def test_a_template_that_would_not_load_is_refused(root) -> None:
