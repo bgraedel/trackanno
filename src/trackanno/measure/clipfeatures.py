@@ -387,7 +387,7 @@ def cached_clip_features(cfg: Config) -> pd.DataFrame | None:
 
 
 # Bump whenever a feature's meaning changes, not only when columns change.
-FEATURE_VERSION = 11
+FEATURE_VERSION = 12
 
 # Carried in the table, never fed to a model.
 META_COLUMNS = (

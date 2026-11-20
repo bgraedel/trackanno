@@ -120,6 +120,19 @@ def test_window_values_take_every_frame_inside_the_cone() -> None:
     assert set(out) == set(inst.CLIP_COLUMNS)
 
 
+def test_a_clip_wholly_outside_the_cone_is_read_over_all_its_frames() -> None:
+    series = pd.DataFrame({c: np.nan for c in inst.SERIES_COLUMNS}, index=pd.RangeIndex(8, name="frame"))
+    series["inst_excess"] = [np.nan] * 4 + [50.0] * 4
+    series["inst_freq_hz"] = [9.0, 10.0, 11.0, 10.0, 20.0, 20.0, 20.0, 20.0]
+    series["inst_direction"] = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+    outside = inst.window_values(series, 0, 4)
+    assert outside["inst_freq_hz"] == 10.0 and outside["inst_direction"] == 1.0
+    assert outside["inst_freq_sd_hz"] == pytest.approx(np.std([9, 10, 11, 10]))
+    assert np.isnan(outside["inst_confident_frac"]) and np.isnan(outside["inst_excess"])
+    # One frame inside is enough to leave the others out.
+    assert inst.window_values(series, 1, 5)["inst_freq_hz"] == 20.0
+
+
 def test_a_slow_beat_below_the_confidence_cut_keeps_its_frequency() -> None:
     """Slow beats read a lower excess than fast ones of the same size."""
     px, py = travelling_wave(400, freq_hz=3.5, amplitude=0.2, noise_px=0.8, seed=2)

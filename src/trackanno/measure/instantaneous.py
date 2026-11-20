@@ -46,8 +46,9 @@ SERIES_COLUMNS = (
     "inst_phase_asym", "inst_phase_para", "inst_phase_slope", "inst_wavelength_px",
     "inst_direction", "inst_angle_mean", "inst_curvature_mean",
 )
-# Per clip: the median of each series column over its frames inside the cone of influence (all
-# frames for the shape columns), and the spreads and confident share.
+# Per clip: the median of each series column over its frames inside the cone of influence, or over
+# all its frames when none is inside (all frames always for the shape columns), and the spreads and
+# confident share.
 CLIP_COLUMNS = SERIES_COLUMNS + ("inst_freq_sd_hz", "inst_angle_sd", "inst_confident_frac")
 _SHAPE_COLUMNS = ("inst_angle_mean", "inst_curvature_mean", "inst_excess")
 
@@ -234,14 +235,16 @@ def window_values(series: pd.DataFrame | None, f_start: int, f_end: int) -> dict
     seen = np.isfinite(excess)          # inside the cone of influence
     confident = seen & (excess >= CONFIDENT_EXCESS)
     out["inst_confident_frac"] = float(confident.sum() / seen.sum()) if seen.any() else np.nan
+    # A clip wholly outside the cone still reads a weaker beat from all its frames.
+    used = seen if seen.any() else np.ones(len(rows), dtype=bool)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         for col in SERIES_COLUMNS:
             values = rows[col].to_numpy(dtype=float)
-            values = values if col in _SHAPE_COLUMNS else values[seen]
+            values = values if col in _SHAPE_COLUMNS else values[used]
             if np.isfinite(values).any():
                 out[col] = float(np.nanmedian(values))
-        freq = rows["inst_freq_hz"].to_numpy(dtype=float)[seen]
+        freq = rows["inst_freq_hz"].to_numpy(dtype=float)[used]
         if np.isfinite(freq).sum() >= 2:
             out["inst_freq_sd_hz"] = float(np.nanstd(freq))
         angle = rows["inst_angle_mean"].to_numpy(dtype=float)

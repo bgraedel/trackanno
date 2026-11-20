@@ -102,6 +102,8 @@ The `beat` feature group summarises a clip: the median of each column over its f
 wavelet's cone of influence (all frames for the angle, curvature and excess), with
 `inst_freq_sd_hz`, `inst_angle_sd` and `inst_confident_frac`, the share of those frames with
 `inst_excess` >= 30. The cut only counts frames, since slow beats read a lower excess (see Limits).
+A clip with no frame inside the cone, near the end of a track or a gap, is summarised over all its
+frames, which is a weaker reading.
 
 * The wavelet's time window shrinks with frequency: its width is 6 / (2 pi f), 0.16 s at 6 Hz and
   0.05 s at 20 Hz.
@@ -322,6 +324,11 @@ On powa_large (670 labelled clips, 2-fold leave-movie-out), real beats are slow 
   (0.15 s at 20 Hz, 0.3 s at 10 Hz); a shorter one shows only in part, and half a period of beat
   gives no frequency. Its ridge starts at 1.5 Hz, so on a short flagellum with a weak beat slow
   drift of the shape can win; `inst_excess` stays below the confidence cut there.
+* **Angle slips.** At a sharp bend, often where a keypoint doubles back onto its neighbour, the
+  angle unwrapped along s can turn the other way from one frame to the next, so the rest of the
+  flagellum reads a whole turn off in that frame. The per-frame amplitude and the spread of the
+  angle are inflated around such frames, and the windowed `wave_angular_amp` too. The angle is
+  not corrected in time.
 * **Confidence of slow beats.** Each frequency's wavelet collects noise in proportion to its
   bandwidth, and a slow beat's overtones fall inside the searched range, so `inst_excess` favours
   fast beats: a 4 Hz beat reads about a third of a 20 Hz beat of the same size. On the simulator
