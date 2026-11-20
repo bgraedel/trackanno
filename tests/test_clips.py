@@ -126,3 +126,68 @@ def test_a_cancelled_rebuild_leaves_the_old_cache_intact(tmp_path: Path) -> None
     assert not [n for n in after if n.endswith(".part")], f"staged files left: {list(after)}"
     assert after == good, str(set(after) ^ set(good)) or "contents differ"
     assert len(ClipStore(cfg.paths.work_dir)) == before, "the old cache still loads"
+
+
+def test_a_16_bit_movie_is_cut_under_one_mapping(tmp_path: Path) -> None:
+    import cv2
+    import numpy as np
+    from fixtures import PIPELINE_CONFIG as CONFIG_TEXT, SyntheticMovie
+
+    from trackanno.annotate.clips import (
+        _crop, cache_normalizer, choose_crop_size, finalise_geometry, plan_clips,
+        write_clip_cache,
+    )
+    from trackanno.config import load_config
+    from trackanno.video.movies import Normalizer
+
+    (tmp_path / "config.yaml").write_text(CONFIG_TEXT, encoding="utf-8")
+    cfg = load_config(tmp_path / "config.yaml")
+    movie = SyntheticMovie()
+    drift = np.arange(movie.n_frames, dtype=np.uint16)[:, None, None] * 8
+    movie._data = movie._data.astype(np.uint16) * 16 + 100 + drift
+    movie.dtype = np.dtype(np.uint16)
+
+    specs = plan_clips(movie.tracks(), movie.id, movie.n_frames, cfg)
+    size = choose_crop_size(specs, cfg)
+    origins = finalise_geometry(specs, size, cfg.clips.frames)
+    out_dir = cfg.movie_dir(movie.id)
+    write_clip_cache(movie, specs, origins, size, out_dir, cache_normalizer(movie), cfg)
+
+    header = json.loads((out_dir / "cache.json").read_text(encoding="utf-8"))
+    mapping = Normalizer(header["intensity"]["lo"], header["intensity"]["hi"])
+    cache = np.memmap(out_dir / "clips.dat", dtype=np.uint8, mode="r",
+                      shape=(len(specs), cfg.clips.frames, size, size))
+    s = specs[0]
+    for t in (0, s.f_end - s.f_start - 1):
+        x0, y0 = origins[0, t]
+        crop = _crop(mapping.to_u8(movie.frame(s.f_start + t)), int(x0), int(y0),
+                     s.crop_w, s.crop_h, movie.height, movie.width)
+        if crop.shape != (size, size):
+            crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+        assert np.array_equal(cache[0, t], crop), f"frame {t} is not under the movie's mapping"
+    del cache
+
+
+def test_detection_records_the_cache_range_and_the_cut_reuses_it(tmp_path: Path) -> None:
+    import numpy as np
+    from fixtures import SyntheticMovie
+
+    from trackanno.annotate.clips import cache_normalizer
+    from trackanno.video.movies import Normalizer
+
+    movie = SyntheticMovie()
+    movie._data = movie._data.astype(np.uint16) * 16 + 100
+    movie.dtype = np.dtype(np.uint16)
+    measured = Normalizer.from_movie(movie)
+    measured.save(tmp_path / "norm.json")
+    loaded = Normalizer.load(tmp_path / "norm.json")
+    lo, hi = loaded.cache_range
+    assert loaded.cache_range == measured.cache_range
+    assert movie._data.min() <= lo < hi <= movie._data.max(), (lo, hi)
+
+    def no_reads(index):
+        raise AssertionError("the cut read a frame to find the range")
+
+    movie.frame = no_reads
+    mapping = cache_normalizer(movie, loaded)
+    assert (float(mapping.lo), float(mapping.hi)) == (lo, hi)

@@ -39,8 +39,28 @@ only).
 
 Zoom magnifies the crop without resampling the cache.
 
-These toggles (marker, neighbours, keypoints, view, zoom) are remembered per
-user in `view.ini` in the state directory, not in `config.yaml`.
+## Contrast
+
+The bar under the clip shows the clip's histogram and the display window over
+it. The **contrast** box in the top bar hides it; its settings still apply. Drag a limit to move it, or drag between the limits to move both. The
+numbers are raw movie intensities.
+
+* **auto: clip**: limits at the 0.5th and 99.5th percentile of the whole clip.
+* **auto: frame**: the same per frame; brightness can change between frames.
+* **fixed**: the limits set by dragging, kept for every clip. Dragging switches
+  to fixed.
+
+**gamma** below 1 brightens dim pixels, above 1 darkens them. **reset** returns
+to auto: clip and gamma 1. Zero padding outside the movie frame is left out of
+the auto limits.
+
+The clip cache maps each movie's 0.01st to 99.99th percentile to 8 bits, one
+mapping for all frames, so the contrast set here does not flicker and clips
+almost nothing.
+
+These toggles (marker, neighbours, keypoints, view, zoom, contrast bar, contrast
+mode, gamma) are remembered per user in `view.ini` in the state directory, not in
+`config.yaml`.
 
 ## Curvature kymograph
 

@@ -20,7 +20,7 @@ import pandas as pd
 from ..annotate.clips import (
     DETECT_FILE, DONE_FILE, FEATURES_FILE, MANIFEST_FILE, NORM_FILE, TRACKS_FILE,
     BOXES_FILE,
-    StagedWrite, build_box_table, choose_crop_size,
+    StagedWrite, build_box_table, cache_normalizer, choose_crop_size,
     finalise_geometry, plan_clips,
     specs_to_frame, write_clip_cache,
 )
@@ -641,7 +641,8 @@ def cut_movie(
 
     reporter.stage(f"{movie.id}  planning clips", None)
     tracks = pd.read_parquet(out_dir / TRACKS_FILE)
-    normalizer = Normalizer.load(out_dir / NORM_FILE)
+    norm_path = out_dir / NORM_FILE
+    detected_norm = Normalizer.load(norm_path) if norm_path.exists() else None
 
     n_frames = int(detected.get("n_frames") or movie.n_frames)
     frame_size = (movie.height, movie.width)
@@ -680,7 +681,7 @@ def cut_movie(
             (out_dir / BOXES_FILE).unlink()
 
         write_clip_cache(
-            movie, specs, origins, size, out_dir, normalizer, cfg,
+            movie, specs, origins, size, out_dir, cache_normalizer(movie, detected_norm), cfg,
             progress=lambda it: reporter.track(it, f"{movie.id}  cutting clips"),
             staged=staged,
         )

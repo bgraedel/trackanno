@@ -1,6 +1,7 @@
 """Clip planning, crop geometry and the pre-cropped ``S x S`` clip cache.
 
-Crops follow the track, are zero-padded at the frame edge and downscaled into ``S`` when larger."""
+Crops follow the track, are zero-padded at the frame edge and downscaled into ``S`` when larger.
+Pixels are uint8 under one wide mapping per movie; the annotation window sets the contrast."""
 
 from __future__ import annotations
 
@@ -12,7 +13,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..config import FIXED_SETTINGS, Config
+from ..config import FIXED_SETTINGS, Config, Normalize
+from ..video.movies import Normalizer
 
 CROP_FROM = FIXED_SETTINGS["clips.crop_from"]            # bbox: p95 box extent
 SMOOTH_WINDOW = FIXED_SETTINGS["clips.smooth_window"]    # frames, follow: smooth
@@ -23,7 +25,7 @@ MAX_CLIPS_PER_TRACK = FIXED_SETTINGS["clips.max_clips_per_track"]  # 0 is unlimi
 __all__ = [
     "ClipSpec", "clip_id_for", "plan_clips", "border_flags", "drop_border_rows",
     "too_much_border", "choose_crop_size", "finalise_geometry",
-    "build_box_table", "write_clip_cache", "ClipStore", "StagedWrite",
+    "build_box_table", "write_clip_cache", "cache_normalizer", "ClipStore", "StagedWrite",
 ]
 
 CACHE_FILE = "clips.dat"
@@ -371,6 +373,19 @@ def build_box_table(
 # --------------------------------------------------------------------------- #
 # cache writing
 # --------------------------------------------------------------------------- #
+def cache_normalizer(movie, detected=None):
+    """One mapping for the whole movie that clips almost nothing; uint8 movies are kept as is.
+
+    Takes the range recorded by detection in ``detected``, else samples the movie.
+    """
+    if np.dtype(movie.dtype) == np.uint8:
+        return Normalizer(0.0, 255.0)
+    span = detected.cache_range if detected else None
+    if span is None:
+        span = Normalizer.from_movie(movie, Normalize(mode="fixed")).cache_range
+    return Normalizer(*span)
+
+
 def write_clip_cache(
     movie,
     specs: list[ClipSpec],
@@ -382,7 +397,10 @@ def write_clip_cache(
     progress=None,
     staged: "StagedWrite | None" = None,
 ) -> None:
-    """Cut every clip's pixels in one sequential pass, reading each frame once."""
+    """Cut every clip's pixels in one sequential pass, reading each frame once.
+
+    ``normalizer`` is one mapping for the whole movie (see ``cache_normalizer``).
+    """
     import cv2
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +412,9 @@ def write_clip_cache(
         "size": size,
         "dtype": "uint8",
         "movie": movie.describe(),
+        # Raw intensity of cache values 0 and 255.
+        "intensity": {"lo": float(np.ravel(normalizer.lo)[0]),
+                      "hi": float(np.ravel(normalizer.hi)[0])},
     }
 
     # Staged and renamed at the end; a caller's ``staged`` commits other files with it.

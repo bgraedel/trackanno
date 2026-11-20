@@ -92,6 +92,9 @@ VIEW_SETTINGS: dict[str, Any] = {
     "ui.show_context_tracks": False,
     "ui.follow": "centred",
     "ui.view_zoom": 1.0,
+    "ui.show_contrast": True,
+    "ui.contrast": "clip",
+    "ui.gamma": 1.0,
 }
 
 # Removed keys, with the reason.

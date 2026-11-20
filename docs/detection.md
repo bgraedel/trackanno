@@ -38,12 +38,12 @@ In `work/<movie_id>/`:
 |---|---|
 | `tracks.parquet` | every detection, in full-frame coordinates |
 | `instance_features.npy` | detector embeddings, row-aligned with `tracks.parquet` (`features.enabled`) |
-| `norm.json` | the intensity mapping |
+| `norm.json` | the intensity mapping the detector sees, and the range the clip cache maps to 8 bits |
 | `detect_done.json` | detection marker and fingerprint |
 | `clips.parquet` | one row per clip, with its crop rectangle and scale |
 | `clip_boxes.parquet` | overlay geometry in cache coordinates |
 | `clips.dat` | cropped pixels, uncompressed `uint8` memmap |
-| `cache.json` | cache header |
+| `cache.json` | cache header, with the raw intensities of 0 and 255 |
 | `prepare_done.json` | clip-stage marker; re-running skips finished movies |
 
 The cache is uncompressed so a clip loads with one contiguous read. Keep

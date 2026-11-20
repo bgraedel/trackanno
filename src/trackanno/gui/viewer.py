@@ -1,6 +1,7 @@
 """The clip player: grayscale frames with a vector marker on top.
 
-Centring and zoom are display-time transforms of a :class:`~trackanno.view.overlay.ClipView`.
+Centring and zoom are display-time transforms of a :class:`~trackanno.view.overlay.ClipView`;
+contrast is a display-time mapping of the cached pixels.
 """
 
 from __future__ import annotations
@@ -16,20 +17,26 @@ from qtpy.QtWidgets import (
 from ..view.overlay import CONTEXT_RGB, FOLLOW_LABELS, FOLLOW_MODES, TARGET_RGB, ClipView
 from .theme import tokens
 
-__all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas", "follow_combo"]
+__all__ = ["ClipViewer", "SimpleViewer", "ClipCanvas", "choice_combo", "follow_combo"]
+
+
+def choice_combo(choices: dict[str, tuple[str, str]], current: str) -> QComboBox:
+    """A selector that takes no focus; ``choices`` maps each value to (label, tooltip)."""
+    combo = QComboBox()
+    for i, (value, (label, tip)) in enumerate(choices.items()):
+        combo.addItem(label, value)
+        combo.setItemData(i, tip, Qt.ToolTipRole)
+    values = list(choices)
+    combo.setCurrentIndex(values.index(current) if current in values else 0)
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+    combo.setFocusPolicy(Qt.NoFocus)
+    combo.setToolTip("\n".join(tip for _, tip in choices.values()))
+    return combo
 
 
 def follow_combo(mode: str = "centred") -> QComboBox:
     """The shared "view follows" selector for the annotation and review screens."""
-    combo = QComboBox()
-    for i, name in enumerate(FOLLOW_MODES):
-        combo.addItem(name, name)
-        combo.setItemData(i, FOLLOW_LABELS[name], Qt.ToolTipRole)
-    combo.setCurrentIndex(FOLLOW_MODES.index(mode) if mode in FOLLOW_MODES else 0)
-    combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-    combo.setFocusPolicy(Qt.NoFocus)
-    combo.setToolTip("\n".join(FOLLOW_LABELS[m] for m in FOLLOW_MODES))
-    return combo
+    return choice_combo({m: (m, FOLLOW_LABELS[m]) for m in FOLLOW_MODES}, mode)
 
 
 def _background() -> QColor:
@@ -94,6 +101,8 @@ class ClipCanvas(QWidget):
         self._array: np.ndarray | None = None
         self._view: ClipView | None = None
         self._pixmaps: list[QPixmap | None] = []
+        # (frame, t) -> uint8; None shows the pixels as they are.
+        self._display = None
         self._frame = 0
         self._edges: list[tuple[int, int]] = []
         self.show_overlay = True
@@ -110,6 +119,12 @@ class ClipCanvas(QWidget):
 
     def set_frame(self, t: int) -> None:
         self._frame = int(t)
+        self.update()
+
+    def set_display(self, display) -> None:
+        """Map each frame with ``display(frame, t)`` before it is painted."""
+        self._display = display
+        self._pixmaps = [None] * len(self._pixmaps)
         self.update()
 
     def set_edges(self, edges) -> None:
@@ -138,8 +153,11 @@ class ClipCanvas(QWidget):
             return None
         pix = self._pixmaps[t]
         if pix is None:
+            frame = self._array[t]
+            if self._display is not None:
+                frame = self._display(frame, t)
             # Cached unscaled; scaling happens at draw time.
-            pix = QPixmap.fromImage(_to_qimage(self._array[t]))
+            pix = QPixmap.fromImage(_to_qimage(frame))
             self._pixmaps[t] = pix
         return pix
 
@@ -313,6 +331,10 @@ class SimpleViewer(ClipViewer):
         """Drop the clip so nothing keeps the cache's memory map alive."""
         self._array = None
         self.canvas.set_clip(np.zeros((0, 1, 1), np.uint8), None)
+
+    def set_display(self, display) -> None:
+        """Map each frame with ``display(frame, t)`` (see :mod:`.contrast`)."""
+        self.canvas.set_display(display)
 
     def set_view(self, view: ClipView | None) -> None:
         """Re-centre or re-zoom without touching the pixels or the pixmap cache."""

@@ -14,6 +14,8 @@ from ..config import FIXED_SETTINGS, Config
 
 # Every Nth pixel along each axis feeds the percentiles.
 SUBSAMPLE = FIXED_SETTINGS["normalize.subsample"]
+# Movie percentiles the clip cache maps to 0 and 255.
+CACHE_PERCENTILES = (0.01, 99.99)
 
 __all__ = [
     "MovieSource",
@@ -30,11 +32,15 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 @dataclass
 class Normalizer:
-    """Percentile to uint8 mapping for a movie: one for all frames (``fixed``) or one per frame."""
+    """Percentile to uint8 mapping for a movie: one for all frames (``fixed``) or one per frame.
+
+    ``cache_range`` is the movie's ``CACHE_PERCENTILES`` range, measured in the same pass.
+    """
 
     lo: float | list[float]
     hi: float | list[float]
     mode: str = "fixed"
+    cache_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         self._lo = np.atleast_1d(np.asarray(self.lo, dtype=np.float32))
@@ -79,12 +85,16 @@ class Normalizer:
             "lo": self._lo.tolist() if self._per_frame else float(self._lo[0]),
             "hi": self._hi.tolist() if self._per_frame else float(self._hi[0]),
         }
+        if self.cache_range is not None:
+            payload["cache_range"] = [float(v) for v in self.cache_range]
         path.write_text(json.dumps(payload), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path) -> "Normalizer":
         data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(lo=data["lo"], hi=data["hi"], mode=data.get("mode", "fixed"))
+        span = data.get("cache_range")
+        return cls(lo=data["lo"], hi=data["hi"], mode=data.get("mode", "fixed"),
+                   cache_range=tuple(span) if span else None)
 
     @classmethod
     def from_movie(
@@ -96,7 +106,7 @@ class Normalizer:
         opt = options or Normalize()
         n = min(movie.n_frames, n_frames) if n_frames else movie.n_frames
         step = max(1, SUBSAMPLE)
-        pcts = opt.percentiles
+        pcts = (*opt.percentiles, *CACHE_PERCENTILES)
 
         if opt.mode == "fixed":
             idx = np.unique(np.linspace(0, n - 1, min(20, n)).astype(int))
@@ -104,27 +114,23 @@ class Normalizer:
             idx = np.arange(n)
 
         iterator = progress(idx) if progress else idx
-        los, his = [], []
+        rows = []
         for i in iterator:
             frame = np.asarray(movie.frame(int(i)))[::step, ::step]
-            if frame.size == 0:
-                los.append(0.0)
-                his.append(255.0)
-                continue
-            lo, hi = np.nanpercentile(frame, pcts)
-            los.append(float(lo))
-            his.append(float(hi))
+            rows.append(np.nanpercentile(frame, pcts) if frame.size else (0.0, 255.0) * 2)
 
-        if not los:
+        if not rows:
             return cls(0.0, 255.0, mode=opt.mode)
 
-        los_a, his_a = np.asarray(los, float), np.asarray(his, float)
+        los_a, his_a, wide_lo, wide_hi = np.asarray(rows, float).T
+        span_lo = float(np.median(wide_lo))
+        span = (span_lo, max(float(np.median(wide_hi)), span_lo + 1.0))
         if opt.mode == "fixed":
             lo, hi = float(np.median(los_a)), float(np.median(his_a))
-            return cls(lo, max(hi, lo + 1.0), mode="fixed")
+            return cls(lo, max(hi, lo + 1.0), mode="fixed", cache_range=span)
 
         hi_curve = np.maximum(his_a, los_a + 1.0)
-        return cls(lo=los_a.tolist(), hi=hi_curve.tolist(), mode=opt.mode)
+        return cls(lo=los_a.tolist(), hi=hi_curve.tolist(), mode=opt.mode, cache_range=span)
 
 
 # --------------------------------------------------------------------------- #

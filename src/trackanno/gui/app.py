@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import time
 
-from qtpy.QtCore import QEvent, Qt, Signal
+from qtpy.QtCore import QEvent, Qt, QTimer, Signal
 from qtpy.QtGui import QKeySequence
 
 try:  # QtGui on Qt6, QtWidgets on Qt5
@@ -27,6 +27,7 @@ from ..infer.agreement import differs, load_cv_predictions
 from ..view.overlay import FOLLOW_LABELS, FOLLOW_MODES, build_clip_view
 from ..annotate.store import AnnotationStore
 from ..learn.suggest import Suggester
+from .contrast import ContrastBar
 from .panels import CategoryPanel, MetadataPanel
 from .prefetch import Prefetcher
 from .theme import compact_button
@@ -79,8 +80,10 @@ class AnnotationWidget(QWidget):
         self.show_overlay = view["show_overlay"]
         self.show_context = view["show_context_tracks"]
         self.show_skeleton = view["show_skeleton"]
+        self.show_contrast = view["show_contrast"]
         self.follow = view["follow"] if view["follow"] in FOLLOW_MODES else "centred"
         self.zoom = float(min(max(view["view_zoom"], ZOOM_STEPS[0]), ZOOM_STEPS[-1]))
+        self._saved_contrast = (view["contrast"], view["gamma"])
         self._loaded_at = time.time()
         self._current_values: dict[str, str] = {}
         self._suppress_advance = False
@@ -173,6 +176,13 @@ class AnnotationWidget(QWidget):
         self.skeleton_box.setVisible(self.cfg.is_pose)
         self.skeleton_box.stateChanged.connect(self._on_skeleton_toggled)
 
+        self.contrast_box = QCheckBox("contrast")
+        self.contrast_box.setToolTip(
+            "Show the contrast bar under the clip; hidden, its settings still apply.")
+        self.contrast_box.setChecked(self.show_contrast)
+        self.contrast_box.setFocusPolicy(Qt.NoFocus)
+        self.contrast_box.stateChanged.connect(self._on_contrast_toggled)
+
         self.follow_combo = follow_combo(self.follow)
         self.follow_combo.currentIndexChanged.connect(self._on_follow_changed)
 
@@ -194,6 +204,7 @@ class AnnotationWidget(QWidget):
         top.addWidget(self.overlay_box)
         top.addWidget(self.context_box)
         top.addWidget(self.skeleton_box)
+        top.addWidget(self.contrast_box)
         top.addSpacing(12)
         top.addWidget(QLabel("view (s)"))
         top.addWidget(self.follow_combo)
@@ -239,6 +250,23 @@ class AnnotationWidget(QWidget):
         side.setLayout(side_layout)
         side.setMinimumWidth(280)
 
+        self.contrast = ContrastBar(*self._saved_contrast)
+        self._saved_contrast = (self.contrast.mode, round(self.contrast.gamma, 3))
+        self.contrast.changed.connect(self._on_contrast_changed)
+        self.contrast.setVisible(self.show_contrast)
+        self.viewer.frame_changed.connect(self.contrast.set_frame)
+        # Remembers the contrast mode and gamma once a drag settles.
+        self._contrast_timer = QTimer(self)
+        self._contrast_timer.setSingleShot(True)
+        self._contrast_timer.setInterval(500)
+        self._contrast_timer.timeout.connect(self._save_contrast)
+
+        clip_pane = QWidget()
+        clip_layout = QVBoxLayout(clip_pane)
+        clip_layout.setContentsMargins(0, 0, 0, 0)
+        clip_layout.addWidget(self.viewer, 1)
+        clip_layout.addWidget(self.contrast)
+
         self.kymo_view = KymographView()
         self.kymo_view.frame_picked.connect(self._scrub_to)
         self.kymo_view.set_sign_mode(self.cfg.ui.kymo_sign)
@@ -247,7 +275,7 @@ class AnnotationWidget(QWidget):
             self.viewer.frame_changed.connect(self.kymo_view.set_frame)
 
         left = QSplitter(Qt.Vertical)
-        left.addWidget(self.viewer)
+        left.addWidget(clip_pane)
         left.addWidget(self.kymo_view)
         left.setStretchFactor(0, 3)
         left.setStretchFactor(1, 1)
@@ -547,6 +575,8 @@ class AnnotationWidget(QWidget):
             self.show_overlay, self.show_context, self.show_skeleton
         )
         self.viewer.set_clip(self._clip, view)
+        self.contrast.set_clip(
+            self._clip, self.store.header(str(meta["movie_id"])).get("intensity"))
         if AUTOPLAY and not self.viewer.is_playing:
             self.viewer.play()
 
@@ -1051,6 +1081,11 @@ class AnnotationWidget(QWidget):
         save_view(show_skeleton=self.show_skeleton)
         self._refresh_view()
 
+    def _on_contrast_toggled(self, state) -> None:
+        self.show_contrast = bool(self.contrast_box.isChecked())
+        save_view(show_contrast=self.show_contrast)
+        self.contrast.setVisible(self.show_contrast)
+
     def _on_follow_changed(self, index: int) -> None:
         self.follow = self.follow_combo.currentData() or "centred"
         save_view(follow=self.follow)
@@ -1074,6 +1109,16 @@ class AnnotationWidget(QWidget):
 
     def _sync_zoom_label(self) -> None:
         self.zoom_label.setText(f"{self.zoom:.2f}x".replace(".00x", ".0x"))
+
+    def _on_contrast_changed(self) -> None:
+        self.viewer.set_display(self.contrast.mapper())
+        self._contrast_timer.start()
+
+    def _save_contrast(self) -> None:
+        current = (self.contrast.mode, round(self.contrast.gamma, 3))
+        if current != self._saved_contrast:
+            save_view(contrast=current[0], gamma=current[1])
+            self._saved_contrast = current
 
     # ---------------------------------------------------------------- notes -- #
     def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
@@ -1140,8 +1185,11 @@ class AnnotationWidget(QWidget):
         finally:
             if not self.prefetcher.stop():
                 print("[trackanno] prefetch thread did not stop in time")
+        self._contrast_timer.stop()
+        self._save_contrast()
         # Drop views on the cache's memory map so Windows can rewrite it.
         self._clip = None
         self._boxes = None
         if hasattr(self.viewer, "clear"):
             self.viewer.clear()
+        self.contrast.clear()

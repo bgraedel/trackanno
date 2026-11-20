@@ -248,6 +248,33 @@ def test_the_marker_is_painted_over_the_frame(app, window) -> None:
     assert window._clip.ndim == 3, f"the marker is not burned into the clip: {window._clip.shape}"
 
 
+def test_the_contrast_window_repaints_the_clip(app, window) -> None:
+    canvas = window.viewer.canvas
+    canvas.resize(400, 400)
+    window.viewer.pause()
+    window.overlay_box.setChecked(False)
+    app.processEvents()
+    before = _painted(canvas).astype(float).mean()
+    window.contrast.histogram.moved.emit(0.0, 60.0)
+    app.processEvents()
+    after = _painted(canvas).astype(float).mean()
+    window.contrast.reset()
+    window.overlay_box.setChecked(True)
+    assert window.contrast.mode == "clip"
+    assert after > before + 20, f"mean grey {before:.0f} -> {after:.0f}"
+
+
+def test_the_contrast_bar_hides_and_is_remembered(app, window) -> None:
+    from trackanno.gui.viewprefs import load_view
+
+    window.contrast_box.setChecked(False)
+    app.processEvents()
+    assert not window.contrast.isVisible() and load_view()["show_contrast"] is False
+    window.contrast_box.setChecked(True)
+    app.processEvents()
+    assert window.contrast.isVisible() and load_view()["show_contrast"] is True
+
+
 def test_painting_keeps_up_with_playback(app, window) -> None:
     from qtpy.QtGui import QPixmap
 

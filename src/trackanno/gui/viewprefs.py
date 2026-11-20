@@ -28,7 +28,8 @@ def _typed(raw, default):
 
 
 def load_view() -> dict[str, Any]:
-    """``{show_overlay, show_skeleton, show_context_tracks, follow, view_zoom}``."""
+    """``{show_overlay, show_skeleton, show_context_tracks, follow, view_zoom, show_contrast,
+    contrast, gamma}``."""
     store = _store()
     out = {}
     for dotted, default in VIEW_SETTINGS.items():

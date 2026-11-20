@@ -19,7 +19,7 @@ value stops the load with a one-line message.
 | `nd2.channel`, `nd2.z`, `nd2.positions`, `nd2.fps` | `0`, `0`, `all`, `auto` | see [ND2 files](detection.md#nd2-files) |
 | `tiff.fps`, `tiff.channel` | `100`, `0` | TIFF stores no frame rate |
 | `tiff.pixel_size_um` | empty | TIFF pixel size; needed by a centerline project |
-| `normalize.mode` | `per_frame` | `per_frame` or `fixed` (one mapping per movie) |
+| `normalize.mode` | `per_frame` | detector input: `per_frame` or `fixed` (one mapping per movie) |
 | `normalize.percentiles` | `[0.5, 99.5]` | mapped to 0 and 255 |
 | `detection.task` | `detect` | `detect` (boxes) or `pose` (keypoints) |
 | `detection.conf` | `0.25` | minimum confidence |
@@ -70,8 +70,8 @@ Settings that are not configurable live as constants in `FIXED_SETTINGS` in
 sets one loads with a warning naming the value in use.
 
 Display toggles of the annotation window (`show_overlay`, `show_skeleton`,
-`show_context_tracks`, `follow`, `view_zoom`) are per user, kept in
-`view.ini` in the state directory (`VIEW_SETTINGS` in `config.py`). In
+`show_context_tracks`, `follow`, `view_zoom`, `show_contrast`, `contrast`,
+`gamma`) are per user, kept in `view.ini` in the state directory (`VIEW_SETTINGS` in `config.py`). In
 `config.yaml` they are ignored with a warning.
 
 The state directory is `$TRACKANNO_STATE_DIR`, else `%APPDATA%\trackanno`, else
